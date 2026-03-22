@@ -1,0 +1,198 @@
+# SoccerMaster Data Curation Pipeline - Default Configuration
+
+# Stage 0: Shot Detection & Segmentation (Preprocessing)
+shot_detection:
+  enabled: true
+  method: "adaptive"           # "adaptive", "histogram", or "fixed"
+  frame_diff:
+    adaptive_ratio: 3.0        # Adaptive threshold = mean + ratio * std
+    window_size: 50            # Sliding window size for local statistics
+  histogram:
+    color_space: "hsv"         # Color space for histogram comparison
+    bins: [8, 12, 3]           # Histogram bins for H, S, V channels
+  min_shot_duration: 1.0       # Minimum shot duration in seconds
+
+video_segmentation:
+  enabled: true                # Whether to export segment video files
+  output_format: "mkv"         # Output video format
+  export_frame_ranges: true    # Export frame_ranges.json for lazy processing
+  accurate_cut: true           # Re-encode for frame-accurate cuts (slower but precise)
+
+# Video Processing
+video:
+  process_fps: 10         # Frames per second to process (e.g., 10 = process 10 frames per second)
+                          # Set to null or 0 to process all frames
+                          # Example: video at 50fps with process_fps=10 will process every 5th frame
+  resize_width: 1920      # Resize width (null for original)
+  resize_height: 1080     # Resize height (null for original)
+
+# Stage 1: Field Registration
+field_registration:
+  backend: "pnlcalib"     # "pnlcalib" (default) or "nbjw"
+
+  # PnLCalib backend settings (used when backend="pnlcalib")
+  pnlcalib:
+    keypoint_weights: "SV_kp"    # "SV_kp", "WC14_kp", or "TSWC_kp"
+    keypoint_threshold: 0.3434
+    line_weights: "SV_lines"     # "SV_lines", "WC14_lines", or "TSWC_lines"
+    line_threshold: 0.15
+    pnl_refine: false            # Enable joint point+line optimization
+    line_weight: 1.0             # Relative weight of line constraints vs points
+
+  # NBJW backend settings (used when backend="nbjw")
+  nbjw:
+    use_prev_homography: true    # Use previous frame's H on failure
+    weights_dir: null            # Path to weights (null = auto-download)
+
+  # Legacy settings for backwards compatibility
+  keypoint_detector:
+    backend: "resnet50"   # "resnet50" (default) or "pnlcalib"
+    model: "resnet50"     # Backbone for resnet50 backend
+    confidence_threshold: 0.5
+    num_keypoints: 115    # SoccerNet-GSR format (115 for resnet50, 58 for pnlcalib)
+    pnlcalib:
+      weights: "SV_kp"
+      confidence_threshold: 0.3434
+
+  line_detector:
+    backend: "hough"      # "hough" (default) or "pnlcalib"
+    hough_threshold: 50
+    min_line_length: 100
+    max_line_gap: 10
+    pnlcalib:
+      weights: "SV_lines"
+      confidence_threshold: 0.15
+
+  pnl_solver:
+    ransac_iterations: 1000
+    reprojection_threshold: 8.0
+    pnl_refine: false
+    line_weight: 1.0
+
+# Stage 2: Tracking and Identification
+detection:
+  model: "yolov8x"        # YOLOv8 variant (n, s, m, l, x)
+  confidence_threshold: 0.5
+  iou_threshold: 0.45
+  classes: [0]            # Person class only
+  imgsz: 1280
+
+# Ball Detection (sports ball class 32 in COCO)
+ball_detection:
+  enabled: true
+  model: "yolov8x"
+  confidence_threshold: 0.3  # Lower threshold for small object
+  iou_threshold: 0.45
+  classes: [32]              # Sports ball class
+  imgsz: 1920                # Higher resolution for small ball
+  min_size: 5                # Minimum bbox dimension in pixels
+  max_size: 100              # Maximum bbox dimension in pixels
+  min_aspect_ratio: 0.5      # Ball should be roughly circular
+  max_aspect_ratio: 2.0
+
+# Ball Tracking
+ball_tracking:
+  enabled: true
+  max_age: 60                # Frames to keep lost track (longer for occlusions)
+  n_init: 2                  # Detections to confirm track (faster confirmation)
+  max_position_distance: 200 # Max distance for matching (pixels)
+  trajectory_length: 30      # Frames of trajectory history
+
+tracking:
+  algorithm: "strongsort"
+  max_age: 30             # Max frames to keep lost tracks
+  min_hits: 3             # Min detections before track is confirmed
+  iou_threshold: 0.3
+
+reid:
+  backend: "osnet"        # "osnet" (default) or "prtreid"
+  model: "osnet_x1_0"     # Model for OSNet backend
+  feature_dim: 512        # Feature dimension (512 for OSNet, 256 for PRTReID)
+  batch_size: 32
+
+  # OSNet backend settings (used when backend="osnet")
+  osnet:
+    model: "osnet_x1_0"
+    feature_dim: 512
+
+  # PRTReID backend settings (used when backend="prtreid")
+  prtreid:
+    feature_dim: 256
+    referee_confidence_threshold: 0.85
+    goalkeeper_confidence_threshold: 0.7
+    weights_path: null    # Path to weights (null = auto-download)
+
+jersey_recognition:
+  backend: "qwen_vl"      # "qwen_vl" (default) or "mmocr"
+  enabled: false          # Whether jersey recognition is enabled
+  mode: "local"           # "local" or "api" (for qwen_vl backend)
+
+  # Qwen VL backend settings (used when backend="qwen_vl")
+  local:
+    model: "Qwen/Qwen3-VL-8B-Instruct"
+    device: "cuda"
+    max_new_tokens: 10
+  api:
+    base_url: null        # API endpoint URL
+    model: "qwen3-vl-8b"
+    api_key_env: "QWEN_API_KEY"
+
+  # MMOCR backend settings (used when backend="mmocr")
+  mmocr:
+    det_model: "dbnet_resnet18_fpnc_1200e_icdar2015"
+    rec_model: "SAR"
+    min_confidence: 0.3
+    batch_size: 1
+
+team_classification:
+  backend: "kmeans"       # "kmeans" (default) or "tracklet"
+  position_weight: 0.1    # Weight for position features in clustering
+  min_samples_per_team: 5 # Minimum samples before classification
+
+  # Tracklet clustering settings (used when backend="tracklet")
+  tracklet:
+    n_clusters: 2
+    random_state: 42
+    n_init: 10
+    min_samples: 2
+
+role_classification:
+  # Classification mode:
+  # - "reid": Use ReID embeddings for team classification (RECOMMENDED - SoccerMaster paper)
+  # - "color": Legacy color histogram clustering (not recommended)
+  mode: "reid"
+  n_clusters: 2           # Two teams
+  use_field_position: true  # Use pitch position to assign left/right labels
+
+  # Legacy color-based settings (only used when mode="color")
+  color_space: "hsv"
+  feature_type: "histogram"
+  use_background_removal: true
+
+visualization:
+  backend: "minimal"      # "minimal" (default) or "step"
+
+# Stage 3: Post-processing
+postprocess:
+  sam2:
+    enabled: true
+    model: "sam2_hiera_large"
+    device: "cuda"
+  majority_voting:
+    window_size: 5        # Temporal window for voting
+  trajectory_merger:
+    reid_threshold: 0.8   # Cosine similarity threshold
+    max_gap_frames: 30    # Max frames gap for merging
+    require_same_jersey: true
+
+# Output
+output:
+  format: "json"          # Output format
+  save_visualizations: true
+  visualization_fps: 10
+  save_embeddings: false  # Whether to save ReID embeddings
+
+# Hardware
+device: "cuda"            # "cuda" or "cpu"
+num_workers: 4
+batch_size: 16
