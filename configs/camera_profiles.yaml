@@ -1,0 +1,23 @@
+# Camera intrinsic profiles for physical calibration backend.
+# Each profile provides fixed K (intrinsic matrix) and dist_coeffs (distortion)
+# that are NEVER modified by the optimizer — only 6-DOF extrinsics are optimized.
+#
+# To add a new camera: measure or calibrate K and dist_coeffs offline,
+# then add a named entry below.
+
+profiles:
+  veo_1080p:
+    image_size: [1920, 1080]
+    K:
+      - [1728.25, 0.0, 960.0]
+      - [0.0, 1728.25, 540.0]
+      - [0.0, 0.0, 1.0]
+    dist_coeffs: [-0.2375, 0.0167, 0.0, 0.0, 0.0]
+
+  broadcast_1080p:
+    image_size: [1920, 1080]
+    K:
+      - [1500.0, 0.0, 960.0]
+      - [0.0, 1500.0, 540.0]
+      - [0.0, 0.0, 1.0]
+    dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]

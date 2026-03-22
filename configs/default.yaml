@@ -28,7 +28,7 @@ video:
 
 # Stage 1: Field Registration
 field_registration:
-  backend: "pnlcalib"     # "pnlcalib" (default) or "nbjw"
+  backend: "pnlcalib"     # "pnlcalib" (default), "broadtrack", "physical", or "nbjw"
 
   # PnLCalib backend settings (used when backend="pnlcalib")
   pnlcalib:
@@ -43,6 +43,21 @@ field_registration:
   nbjw:
     use_prev_homography: true    # Use previous frame's H on failure
     weights_dir: null            # Path to weights (null = auto-download)
+
+  # Physical calibrator settings (used when backend="physical")
+  # Uses fixed camera intrinsics from a profile, optimizes only 6-DOF extrinsics
+  physical:
+    camera_profile: "veo_1080p"        # Profile name from camera_profiles.yaml
+    camera_profiles_path: null          # Path to camera_profiles.yaml (null = auto)
+    ransac_reproj_error: 15.0           # PnP RANSAC reprojection threshold (px)
+    line_weight: 1.0                    # Weight for line residuals vs point residuals
+    line_sample_points: 20              # Points sampled along each line
+    max_reproj_error: 15.0              # Temporal tracker error threshold
+    use_line_model: false               # Use HRNet line model (vs derive from keypoints)
+    focal_bounds: [1200.0, 2200.0]    # Focal length optimization bounds (px)
+    cx_bounds: [-100.0, 100.0]       # Optical center cx offset bounds (px)
+    cy_bounds: [-50.0, 50.0]         # Optical center cy offset bounds (px)
+    k1_bounds: [-0.35, -0.15]        # Radial distortion k1 absolute bounds
 
   # Legacy settings for backwards compatibility
   keypoint_detector:

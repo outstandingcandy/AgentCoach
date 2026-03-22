@@ -246,6 +246,9 @@ def get_calibrator(config: dict[str, Any] | None = None) -> "BaseCalibrator":
         backend_config = fr_config.get("nbjw", {})
         backend_config["device"] = config.get("device", "cuda")
         return NbjwCalibrator(backend_config)
+    elif backend == "physical":
+        from ..field_registration.physical_calibrator import PhysicalCalibrator
+        return PhysicalCalibrator
     else:
         # Default: PnLCalib (use existing FramebyFrameCalib)
         from ..field_registration.pnlcalib import FramebyFrameCalib

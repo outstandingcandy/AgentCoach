@@ -1,0 +1,21 @@
+# Configuration for physical calibration backend with Veo camera
+# Uses fixed camera intrinsics and 6-DOF extrinsic optimization
+
+video:
+  process_fps: 0.1
+
+field_registration:
+  backend: "physical"
+
+  physical:
+    camera_profile: "veo_1080p"
+    ransac_reproj_error: 15.0
+    line_weight: 1.0
+    line_sample_points: 20
+    max_reproj_error: 15.0
+    use_line_model: false
+
+  pnlcalib:
+    keypoint_weights: "SV_kp"
+    keypoint_model_path: "data/finetuned_models/run_20260319_135637/models/best_model.pt"
+    keypoint_threshold: 0.3434
