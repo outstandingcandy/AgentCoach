@@ -37,6 +37,104 @@ from .tracking import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Undistortion-aware pitch projection helpers (for physical camera backend)
+# ---------------------------------------------------------------------------
+
+# FIFA pitch half-dimensions (meters)
+_PITCH_HALF_LENGTH = 52.5
+_PITCH_HALF_WIDTH = 34.0
+
+
+def _undistort_and_project_to_pitch(pts_2d: np.ndarray, pose: dict) -> list[float] | None:
+    """Project a single distorted image point to pitch coordinates via undistortion.
+
+    Args:
+        pts_2d: (1, 2) or (N, 2) array of distorted pixel coordinates.
+        pose: dict with K, dist_coeffs, rvec, tvec from camera_poses.pkl.
+
+    Returns:
+        [x_world, y_world] on the ground plane, or None if projection fails.
+    """
+    K = np.array(pose["K"], dtype=np.float64)
+    dist = np.array(pose["dist_coeffs"], dtype=np.float64)
+
+    # Step 1: Undistort pixel coords → ideal pixel coords (P=K keeps in pixel space)
+    pts = np.array(pts_2d, dtype=np.float64).reshape(-1, 1, 2)
+    pts_undist = cv2.undistortPoints(pts, K, dist, P=K)
+
+    # Step 2: Apply H_inv (image→world) on undistorted points
+    R, _ = cv2.Rodrigues(np.array(pose["rvec"], dtype=np.float64))
+    tvec = np.array(pose["tvec"], dtype=np.float64).flatten()
+    H = K @ np.column_stack([R[:, 0], R[:, 1], tvec])
+    try:
+        H_inv = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        return None
+
+    pt = pts_undist.reshape(-1, 2)[0]
+    ph = H_inv @ np.array([pt[0], pt[1], 1.0])
+    if abs(ph[2]) > 1e-6:
+        return [float(ph[0] / ph[2]), float(ph[1] / ph[2])]
+    return None
+
+
+def _filter_by_pitch_undistorted(
+    detections: list[dict],
+    pose: dict,
+    margin: float = 5.0,
+) -> list[dict]:
+    """Filter detections by pitch boundary using undistorted projection.
+
+    Args:
+        detections: List of detection dicts with 'bbox' key.
+        pose: Physical camera pose dict.
+        margin: Extra meters beyond pitch boundary to allow.
+
+    Returns:
+        Filtered detection list.
+    """
+    if not detections:
+        return detections
+
+    K = np.array(pose["K"], dtype=np.float64)
+    dist = np.array(pose["dist_coeffs"], dtype=np.float64)
+    R, _ = cv2.Rodrigues(np.array(pose["rvec"], dtype=np.float64))
+    tvec = np.array(pose["tvec"], dtype=np.float64).flatten()
+    H = K @ np.column_stack([R[:, 0], R[:, 1], tvec])
+    try:
+        H_inv = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        return detections
+
+    # Extract foot points from all detections
+    foot_pts = []
+    for det in detections:
+        bbox = det["bbox"]
+        foot_x = (bbox[0] + bbox[2]) / 2
+        foot_y = bbox[3]
+        foot_pts.append([foot_x, foot_y])
+
+    foot_pts = np.array(foot_pts, dtype=np.float64).reshape(-1, 1, 2)
+    foot_undist = cv2.undistortPoints(foot_pts, K, dist, P=K).reshape(-1, 2)
+
+    # Project to world and filter by pitch boundary
+    filtered = []
+    x_lim = _PITCH_HALF_LENGTH + margin
+    y_lim = _PITCH_HALF_WIDTH + margin
+
+    for i, det in enumerate(detections):
+        pt = foot_undist[i]
+        ph = H_inv @ np.array([pt[0], pt[1], 1.0])
+        if abs(ph[2]) < 1e-6:
+            continue
+        wx, wy = ph[0] / ph[2], ph[1] / ph[2]
+        if -x_lim <= wx <= x_lim and -y_lim <= wy <= y_lim:
+            filtered.append(det)
+
+    return filtered
+
+
 # Team colors for visualization
 TEAM_COLORS = {
     "team_A": (0, 0, 255),     # Red
@@ -190,13 +288,29 @@ def run_stage2(
         config = get_default_config()
     process_fps = get_process_fps_from_config(config)
 
-    # Load calibration data
+    # Load calibration data (supports both physical camera poses and legacy homographies)
     homographies = {}
-    if calibration_dir and (calibration_dir / "homographies.pkl").exists():
-        print("Loading Stage 1 calibration results...")
-        with open(calibration_dir / "homographies.pkl", "rb") as f:
-            homographies = pickle.load(f)
-        print(f"  Loaded {len(homographies)} homographies")
+    camera_poses = {}
+    if calibration_dir:
+        if (calibration_dir / "camera_poses.pkl").exists():
+            print("Loading Stage 1 physical camera poses...")
+            with open(calibration_dir / "camera_poses.pkl", "rb") as f:
+                camera_poses = pickle.load(f)
+            print(f"  Loaded {len(camera_poses)} camera poses")
+            # Pre-compute homographies from physical params for legacy code paths
+            for fidx, pose in camera_poses.items():
+                R, _ = cv2.Rodrigues(np.array(pose["rvec"], dtype=np.float64))
+                K = np.array(pose["K"], dtype=np.float64)
+                tvec = np.array(pose["tvec"], dtype=np.float64).flatten()
+                H = K @ np.column_stack([R[:, 0], R[:, 1], tvec])
+                if abs(H[2, 2]) > 1e-10:
+                    H = H / H[2, 2]
+                homographies[fidx] = H
+        elif (calibration_dir / "homographies.pkl").exists():
+            print("Loading Stage 1 calibration results...")
+            with open(calibration_dir / "homographies.pkl", "rb") as f:
+                homographies = pickle.load(f)
+            print(f"  Loaded {len(homographies)} homographies")
 
     # Initialize detector
     print("Stage 2: Initializing YOLOv8 detector...")
@@ -311,7 +425,9 @@ def run_stage2(
         )
 
         # Filter by pitch boundary if calibration available
-        if H is not None:
+        if frame_idx in camera_poses:
+            detections = _filter_by_pitch_undistorted(detections, camera_poses[frame_idx], margin=5.0)
+        elif H is not None:
             detections = detector.filter_by_pitch(detections, H, margin=5.0)
 
         # Extract ReID features
@@ -338,7 +454,15 @@ def run_stage2(
 
             # Compute pitch position
             pitch_pos = None
-            if H is not None:
+            if frame_idx in camera_poses:
+                # Physical camera path: undistort pixel coords before projection
+                foot_x = (track["bbox"][0] + track["bbox"][2]) / 2
+                foot_y = track["bbox"][3]
+                pitch_pos = _undistort_and_project_to_pitch(
+                    np.array([[foot_x, foot_y]]), camera_poses[frame_idx]
+                )
+            elif H is not None:
+                # Legacy homography path (no undistortion)
                 foot_x = (track["bbox"][0] + track["bbox"][2]) / 2
                 foot_y = track["bbox"][3]
                 pt_h = np.array([foot_x, foot_y, 1.0])
@@ -384,8 +508,12 @@ def run_stage2(
             ball_detections = ball_detector.detect(frame)
             ball_detections = ball_detector.filter_by_size(ball_detections)
 
-            # Filter by pitch if homography available
-            if H is not None:
+            # Filter by pitch if calibration available
+            if frame_idx in camera_poses:
+                ball_detections = _filter_by_pitch_undistorted(
+                    ball_detections, camera_poses[frame_idx], margin=5.0
+                )
+            elif H is not None:
                 ball_detections = ball_detector.filter_by_pitch(ball_detections, H)
 
             # Update ball tracker

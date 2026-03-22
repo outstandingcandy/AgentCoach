@@ -588,6 +588,9 @@ def run_stage1(video_path: Path, output_dir: Path, config: dict | None = None):
     elif backend == "broadtrack":
         from .stage1_broadtrack import run_stage1_broadtrack
         return run_stage1_broadtrack(video_path, output_dir, vis_dir, config, process_fps)
+    elif backend == "physical":
+        from .stage1_physical import run_stage1_physical
+        return run_stage1_physical(video_path, output_dir, vis_dir, config, process_fps)
     else:
         return _run_stage1_pnlcalib(video_path, output_dir, vis_dir, config, process_fps)
 
