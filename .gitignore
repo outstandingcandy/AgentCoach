@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Data & models (too large for git)
+data/
+output/
+*.pt
+*.pth
+*.onnx
+
+# Temp test files
+test_*.py
+test_*.jpg
+debug_*.py
+
+# OS
+.DS_Store
+*.swp
+
+# Claude
+.claude/
