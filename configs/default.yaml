@@ -58,6 +58,7 @@ field_registration:
     cx_bounds: [-100.0, 100.0]       # Optical center cx offset bounds (px)
     cy_bounds: [-50.0, 50.0]         # Optical center cy offset bounds (px)
     k1_bounds: [-0.35, -0.15]        # Radial distortion k1 absolute bounds
+    world_residual_weight: 0.0       # Weight for world-space back-projection residuals (0=disabled)
 
   # Legacy settings for backwards compatibility
   keypoint_detector:

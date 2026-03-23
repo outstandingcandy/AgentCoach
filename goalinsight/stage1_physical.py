@@ -235,6 +235,7 @@ def run_stage1_physical(
         cy_bounds=tuple(phys_config.get("cy_bounds", [-50.0, 50.0])),
         k1_bounds=tuple(phys_config.get("k1_bounds", [-0.35, -0.15])),
         intrinsic_reg_weight=phys_config.get("intrinsic_reg_weight", 0.0),
+        world_residual_weight=phys_config.get("world_residual_weight", 0.0),
     )
 
     # Initialize temporal tracker
@@ -305,6 +306,8 @@ def run_stage1_physical(
                 "total_points": result["total_points"],
                 "inliers": result["inliers"],
                 "reprojection_error": result["final_error"],
+                "world_error": result.get("world_error"),
+                "world_error_all": result.get("world_error_all"),
                 "line_constraints": result["line_constraints_count"],
                 "warm_start": init_rvec is not None,
             }
@@ -371,9 +374,27 @@ def run_stage1_physical(
         for idx in calibration_results["frames"]
         if calibration_results["frames"][idx].get("calibrated")
     ]
+    world_errors = [
+        calibration_results["frames"][idx]["world_error"]
+        for idx in calibration_results["frames"]
+        if calibration_results["frames"][idx].get("calibrated")
+        and calibration_results["frames"][idx].get("world_error") is not None
+    ]
+    world_errors_all = [
+        calibration_results["frames"][idx]["world_error_all"]
+        for idx in calibration_results["frames"]
+        if calibration_results["frames"][idx].get("calibrated")
+        and calibration_results["frames"][idx].get("world_error_all") is not None
+    ]
     if errors:
         stats["mean_error"] = float(np.mean(errors))
         stats["median_error"] = float(np.median(errors))
+    if world_errors:
+        stats["mean_world_error"] = float(np.mean(world_errors))
+        stats["median_world_error"] = float(np.median(world_errors))
+    if world_errors_all:
+        stats["mean_world_error_all"] = float(np.mean(world_errors_all))
+        stats["median_world_error_all"] = float(np.median(world_errors_all))
 
     print(f"\nStage 1 (Physical) Complete:")
     print(f"  Calibrated: {calibrated_count}/{len(sampler)} ({stats['calibration_rate']*100:.1f}%)")
@@ -381,6 +402,10 @@ def run_stage1_physical(
     if errors:
         print(f"  Median error: {stats['median_error']:.2f} px")
         print(f"  Mean error: {stats['mean_error']:.2f} px")
+    if world_errors:
+        print(f"  Median world error (detected): {stats['median_world_error']:.2f} m")
+    if world_errors_all:
+        print(f"  Median world error (all 57):   {stats['median_world_error_all']:.2f} m")
 
     return stats
 
@@ -453,6 +478,8 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
 
     if result is not None:
         info["reprojection_error"] = result.get("final_error")
+        info["world_error"] = result.get("world_error")
+        info["world_error_all"] = result.get("world_error_all")
         info["num_keypoints"] = result.get("num_keypoints", 0)
         info["num_lines"] = result.get("num_lines", 0)
         info["total_points"] = result.get("total_points", 0)
@@ -591,6 +618,9 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
                     detail["error_px"] = float(np.linalg.norm(
                         projected[i] - img_pts[i]
                     ))
+                per_world = result.get("per_point_world_errors")
+                if per_world is not None and i < len(per_world):
+                    detail["error_world_m"] = float(per_world[i])
                 keypoint_details.append(detail)
             info["keypoint_details"] = keypoint_details
 
@@ -735,10 +765,12 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
 
         # Header
         err = result.get("final_error", 0)
+        world_err = result.get("world_error", 0)
+        world_err_all = result.get("world_error_all", 0)
         n_in = result.get("inliers", 0)
         n_total = result.get("total_points", 0)
         n_lines = result.get("line_constraints_count", 0)
-        header = f"Physical Err: {err:.1f}px | Inliers: {n_in}/{n_total} | Lines: {n_lines}"
+        header = f"Physical Err: {err:.1f}px | World: {world_err:.2f}m (det) / {world_err_all:.2f}m (all) | Inliers: {n_in}/{n_total} | Lines: {n_lines}"
     else:
         header = "Physical: Calibration FAILED"
 

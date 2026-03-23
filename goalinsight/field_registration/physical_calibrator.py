@@ -72,6 +72,7 @@ class PhysicalCalibrator:
         cy_bounds: tuple[float, float] = (-50.0, 50.0),
         k1_bounds: tuple[float, float] = (-0.35, -0.15),
         intrinsic_reg_weight: float = 0.0,
+        world_residual_weight: float = 0.0,
     ):
         """Initialize with camera intrinsics profile.
 
@@ -88,6 +89,9 @@ class PhysicalCalibrator:
             k1_bounds: (min_k1, max_k1) absolute bounds for radial distortion k1.
             intrinsic_reg_weight: Regularization weight penalizing intrinsic deviation
                 from profile. 0 = no regularization, higher = stronger prior.
+            world_residual_weight: Weight for world-space back-projection residuals.
+                0 = disabled. Adds residuals that minimize deviation of back-projected
+                detected pixels from true world positions (meters).
         """
         self.K = np.array(K, dtype=np.float64)
         self.dist_coeffs = np.array(dist_coeffs, dtype=np.float64).ravel()
@@ -100,6 +104,7 @@ class PhysicalCalibrator:
         self.cy_bounds = cy_bounds
         self.k1_bounds = k1_bounds
         self.intrinsic_reg_weight = intrinsic_reg_weight
+        self.world_residual_weight = world_residual_weight
 
         self._keypoints: list[dict] = []
         self._lines: list[dict] = []
@@ -194,6 +199,12 @@ class PhysicalCalibrator:
         mean_error, inlier_mask, inlier_count = self._compute_reprojection_stats(
             rvec_opt, tvec_opt, img_pts, world_pts, K=K_opt, dist=dist_opt
         )
+        world_error, per_point_world_errors = self._compute_world_error(
+            rvec_opt, tvec_opt, img_pts, world_pts, K=K_opt, dist=dist_opt
+        )
+        world_error_all, per_kp_world_errors = self._compute_world_error_all(
+            rvec_opt, tvec_opt, K=K_opt, dist=dist_opt
+        )
 
         # Build result
         R, _ = cv2.Rodrigues(rvec_opt.reshape(3, 1))
@@ -207,6 +218,10 @@ class PhysicalCalibrator:
         return {
             "homography": H,
             "final_error": float(mean_error),
+            "world_error": float(world_error),
+            "world_error_all": float(world_error_all),
+            "per_point_world_errors": per_point_world_errors,
+            "per_kp_world_errors": per_kp_world_errors,
             "num_keypoints": len(self._keypoints),
             "num_lines": len(self._lines),
             "num_intersections": 0,
@@ -232,6 +247,8 @@ class PhysicalCalibrator:
                 "rvec": rvec_opt.tolist(),
                 "tvec": tvec_opt.tolist(),
                 "reprojection_error": float(mean_error),
+                "world_error": float(world_error),
+                "world_error_all": float(world_error_all),
                 "inliers_count": int(inlier_count),
             },
             "img_pts": img_pts,
@@ -432,28 +449,43 @@ class PhysicalCalibrator:
             projected = projected.reshape(-1, 2)
             point_residuals = (projected - img_pts).ravel()
 
-            if not valid_lc:
-                return point_residuals
+            all_residuals = [point_residuals]
 
             # Line residuals (zero out degenerate projections outside image bounds)
-            img_bound = max(self.width, self.height) * 3
-            line_residuals = []
-            for i, lc in enumerate(valid_lc):
-                proj_line, _ = cv2.projectPoints(
-                    lc["world_samples"].reshape(-1, 1, 3),
-                    rvec, tvec, K_cur, dist_cur,
-                )
-                proj_line = proj_line.reshape(-1, 2)
-                diffs = proj_line - line_origins[i]
-                distances = diffs @ line_normals[i]
-                # Zero out degenerate projections (keeps residual vector fixed-size)
-                valid = (np.abs(proj_line[:, 0]) < img_bound) & (np.abs(proj_line[:, 1]) < img_bound)
-                distances[~valid] = 0.0
-                line_residuals.append(distances * per_sample_weight)
+            if valid_lc:
+                img_bound = max(self.width, self.height) * 3
+                for i, lc in enumerate(valid_lc):
+                    proj_line, _ = cv2.projectPoints(
+                        lc["world_samples"].reshape(-1, 1, 3),
+                        rvec, tvec, K_cur, dist_cur,
+                    )
+                    proj_line = proj_line.reshape(-1, 2)
+                    diffs = proj_line - line_origins[i]
+                    distances = diffs @ line_normals[i]
+                    # Zero out degenerate projections (keeps residual vector fixed-size)
+                    valid = (np.abs(proj_line[:, 0]) < img_bound) & (np.abs(proj_line[:, 1]) < img_bound)
+                    distances[~valid] = 0.0
+                    all_residuals.append(distances * per_sample_weight)
 
-            all_residuals = [point_residuals]
-            if line_residuals:
-                all_residuals.append(np.concatenate(line_residuals))
+            # World-space back-projection residuals
+            if self.world_residual_weight > 0:
+                R_cur, _ = cv2.Rodrigues(rvec)
+                cam_center = -R_cur.T @ tvec.ravel()
+                pts_undist = cv2.undistortPoints(
+                    img_pts.reshape(-1, 1, 2).astype(np.float64), K_cur, dist_cur
+                ).reshape(-1, 2)
+                world_res = np.zeros(len(pts_undist) * 2)
+                for j in range(len(pts_undist)):
+                    ray_world = R_cur.T @ np.array([pts_undist[j, 0], pts_undist[j, 1], 1.0])
+                    if abs(ray_world[2]) < 1e-10:
+                        continue
+                    t_param = -cam_center[2] / ray_world[2]
+                    if t_param < 0:
+                        continue
+                    wp = cam_center + t_param * ray_world
+                    world_res[j * 2] = (wp[0] - world_pts[j, 0]) * self.world_residual_weight
+                    world_res[j * 2 + 1] = (wp[1] - world_pts[j, 1]) * self.world_residual_weight
+                all_residuals.append(world_res)
 
             # Intrinsic regularization: penalize deviation from profile values
             if self.intrinsic_reg_weight > 0:
@@ -509,3 +541,85 @@ class PhysicalCalibrator:
         inlier_count = int(np.sum(inlier_mask))
 
         return mean_error, inlier_mask, inlier_count
+
+    def _compute_world_error(self, rvec, tvec, img_pts, world_pts, K=None, dist=None):
+        """Compute world-space back-projection error for detected keypoints (meters).
+
+        Back-projects detected image pixels to ground plane (z=0) and measures
+        distance from true world positions.
+        """
+        K_use = K if K is not None else self.K
+        dist_use = dist if dist is not None else self.dist_coeffs
+        errors = self._backproject_errors(rvec, tvec, img_pts, world_pts, K_use, dist_use)
+        valid = np.isfinite(errors)
+        mean_error = float(np.mean(errors[valid])) if valid.any() else float("inf")
+        return mean_error, errors
+
+    def _compute_world_error_all(self, rvec, tvec, K=None, dist=None):
+        """Compute world-space round-trip error for ALL 57 ground keypoints (meters).
+
+        For each template keypoint: project world→image, then back-project image→world.
+        The round-trip deviation reveals projection model accuracy across the full pitch,
+        including points outside the camera FOV.
+        """
+        from .pnlcalib import KeypointMapper
+
+        K_use = K if K is not None else self.K
+        dist_use = dist if dist is not None else self.dist_coeffs
+        R, _ = cv2.Rodrigues(rvec.reshape(3, 1))
+
+        all_world = KeypointMapper.PNLCALIB_WORLD_COORDS_2D
+        non_ground = KeypointMapper.NON_GROUND_KEYPOINTS
+
+        # Collect ground keypoints
+        kp_ids = []
+        world_3d = []
+        for kid, (wx, wy) in enumerate(all_world):
+            if kid in non_ground:
+                continue
+            kp_ids.append(kid)
+            world_3d.append([wx, wy, 0.0])
+        world_3d = np.array(world_3d, dtype=np.float64)
+
+        # Project world→image
+        projected, _ = cv2.projectPoints(
+            world_3d.reshape(-1, 1, 3),
+            rvec.reshape(3, 1), tvec.reshape(3, 1),
+            K_use, dist_use,
+        )
+        img_pts = projected.reshape(-1, 2)
+
+        # Back-project image→world and compute error
+        errors = self._backproject_errors(rvec, tvec, img_pts, world_3d, K_use, dist_use)
+
+        # Build per-keypoint dict
+        per_kp = {}
+        valid_errors = []
+        for i, kid in enumerate(kp_ids):
+            per_kp[kid] = float(errors[i])
+            if np.isfinite(errors[i]):
+                valid_errors.append(errors[i])
+
+        mean_error = float(np.mean(valid_errors)) if valid_errors else float("inf")
+        return mean_error, per_kp
+
+    def _backproject_errors(self, rvec, tvec, img_pts, world_pts, K, dist):
+        """Back-project image points to ground plane and compute distance from world_pts."""
+        R, _ = cv2.Rodrigues(rvec.reshape(3, 1))
+        cam_center = -R.T @ tvec.ravel()
+
+        pts_undist = cv2.undistortPoints(
+            img_pts.reshape(-1, 1, 2).astype(np.float64), K, dist
+        ).reshape(-1, 2)
+
+        errors = np.full(len(pts_undist), float("inf"))
+        for j in range(len(pts_undist)):
+            ray_world = R.T @ np.array([pts_undist[j, 0], pts_undist[j, 1], 1.0])
+            if abs(ray_world[2]) < 1e-10:
+                continue
+            t_param = -cam_center[2] / ray_world[2]
+            if t_param < 0:
+                continue
+            wp = cam_center + t_param * ray_world
+            errors[j] = np.sqrt((wp[0] - world_pts[j, 0])**2 + (wp[1] - world_pts[j, 1])**2)
+        return errors
