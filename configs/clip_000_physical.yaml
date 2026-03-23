@@ -9,11 +9,16 @@ field_registration:
 
   physical:
     camera_profile: "veo_1080p"
-    ransac_reproj_error: 15.0
+    ransac_reproj_error: 50.0
     line_weight: 1.0
     line_sample_points: 20
     max_reproj_error: 15.0
     use_line_model: false
+    focal_bounds: [1628.0, 1828.0]
+    cx_bounds: [-30.0, 30.0]
+    cy_bounds: [-30.0, 30.0]
+    k1_bounds: [-0.29, -0.19]
+    intrinsic_reg_weight: 10.0
 
   pnlcalib:
     keypoint_weights: "SV_kp"

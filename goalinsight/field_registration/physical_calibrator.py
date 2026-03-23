@@ -71,6 +71,7 @@ class PhysicalCalibrator:
         cx_bounds: tuple[float, float] = (-100.0, 100.0),
         cy_bounds: tuple[float, float] = (-50.0, 50.0),
         k1_bounds: tuple[float, float] = (-0.35, -0.15),
+        intrinsic_reg_weight: float = 0.0,
     ):
         """Initialize with camera intrinsics profile.
 
@@ -85,6 +86,8 @@ class PhysicalCalibrator:
             cx_bounds: (min_offset, max_offset) from profile cx.
             cy_bounds: (min_offset, max_offset) from profile cy.
             k1_bounds: (min_k1, max_k1) absolute bounds for radial distortion k1.
+            intrinsic_reg_weight: Regularization weight penalizing intrinsic deviation
+                from profile. 0 = no regularization, higher = stronger prior.
         """
         self.K = np.array(K, dtype=np.float64)
         self.dist_coeffs = np.array(dist_coeffs, dtype=np.float64).ravel()
@@ -96,6 +99,7 @@ class PhysicalCalibrator:
         self.cx_bounds = cx_bounds
         self.cy_bounds = cy_bounds
         self.k1_bounds = k1_bounds
+        self.intrinsic_reg_weight = intrinsic_reg_weight
 
         self._keypoints: list[dict] = []
         self._lines: list[dict] = []
@@ -447,9 +451,21 @@ class PhysicalCalibrator:
                 distances[~valid] = 0.0
                 line_residuals.append(distances * per_sample_weight)
 
+            all_residuals = [point_residuals]
             if line_residuals:
-                return np.concatenate([point_residuals, np.concatenate(line_residuals)])
-            return point_residuals
+                all_residuals.append(np.concatenate(line_residuals))
+
+            # Intrinsic regularization: penalize deviation from profile values
+            if self.intrinsic_reg_weight > 0:
+                reg = np.array([
+                    (f - f_init) / f_init * self.intrinsic_reg_weight,
+                    (cx - cx_init) / 100.0 * self.intrinsic_reg_weight,
+                    (cy - cy_init) / 100.0 * self.intrinsic_reg_weight,
+                    (k1 - k1_init) / abs(k1_init) * self.intrinsic_reg_weight,
+                ])
+                all_residuals.append(reg)
+
+            return np.concatenate(all_residuals)
 
         bounds = (
             [-np.inf] * 6 + [
