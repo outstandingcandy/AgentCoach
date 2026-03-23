@@ -19,6 +19,7 @@ field_registration:
     cy_bounds: [-30.0, 30.0]
     k1_bounds: [-0.29, -0.19]
     intrinsic_reg_weight: 10.0
+    world_residual_weight: 10.0
 
   pnlcalib:
     keypoint_weights: "SV_kp"
