@@ -3,7 +3,7 @@
 
 # Video Processing
 video:
-  process_fps: 0.5         # Process 10 fps
+  process_fps: 0.1         # Process 10 fps
 
 # Stage 1: Field Registration with fine-tuned model
 field_registration:

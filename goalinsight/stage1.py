@@ -97,18 +97,16 @@ def _project_with_camera_model(template_points, camera_params):
     for name, points in template_points.items():
         # Build 3D points (z=0 ground plane)
         obj = np.array([[pt[0], pt[1], 0.0] for pt in points], dtype=np.float64)
-        
-        # Check Z coordinate in camera space. If any point in the segment/polygon
-        # is behind the camera (Z <= 0.1), discard the whole line to prevent wrapping bugs
+
+        # Per-point camera-space Z check
         cam_pts = (R @ obj.T).T + tvec.flatten()
-        if np.any(cam_pts[:, 2] <= 0.1):
-            projected[name] = [None] * len(points)
-            continue
-            
         img, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
         proj_points = []
-        for pt2d in img.reshape(-1, 2):
-            proj_points.append((int(pt2d[0]), int(pt2d[1])))
+        for j, pt2d in enumerate(img.reshape(-1, 2)):
+            if cam_pts[j, 2] <= 0.1:
+                proj_points.append(None)  # Behind camera
+            else:
+                proj_points.append((int(pt2d[0]), int(pt2d[1])))
         projected[name] = proj_points
     return projected
 
@@ -190,34 +188,6 @@ def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_m
     font = cv2.FONT_HERSHEY_SIMPLEX
     r = max(3, int(0.8 * scale))
 
-    # Plot keypoints at their known world positions (from KeypointMapper)
-    for kp in keypoints:
-        if kp.get("confidence", 0) < 0.3:
-            continue
-        kp_id = kp["id"]
-        if kp_id in KeypointMapper.NON_GROUND_KEYPOINTS:
-            continue
-
-        world_xy = keypoint_mapper.get_world_coordinates(kp_id)
-        if world_xy is None:
-            continue
-        wx, wy = world_xy
-
-        px, py = w2p(wx, wy)
-        if not (0 <= px < width and 0 <= py < height):
-            continue
-
-        # Color: green inlier, red outlier
-        kp_key = (round(float(kp["x"]), 1), round(float(kp["y"]), 1))
-        if inlier_img_set and kp_key in inlier_img_set:
-            cv2.circle(pitch, (px, py), r, (0, 255, 0), -1)
-        else:
-            cv2.circle(pitch, (px, py), r, (0, 0, 255), 2)
-        cv2.circle(pitch, (px, py), r, (0, 0, 0), 1)
-
-        # ID label
-        cv2.putText(pitch, str(kp_id), (px + r + 2, py + 3), font, 0.35, (255, 255, 255), 1)
-
     # Draw line intersections at their known world positions
     for inter in calibrator.line_intersections:
         wx, wy = inter["world_x"], inter["world_y"]
@@ -292,20 +262,24 @@ def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_m
         # Project pitch template lines through camera model and back to world
         # This shows how the camera "sees" the pitch lines
         line_color_proj = (0, 165, 255)  # orange, same as left panel
+        margin = 200
         for _name, template_pts in get_pitch_template_points().items():
             # Project world→image via camera model, then back-project image→world
             obj_3d = np.array([[p[0], p[1], 0.0] for p in template_pts], dtype=np.float64)
+            # Per-point camera-space Z check
+            cam_pts_3d = (R_cam @ obj_3d.T).T + tvec_cam
             img_proj, _ = cv2.projectPoints(
                 obj_3d, cam_params["rvec"], cam_params["tvec"], K_cam, dist_cam,
             )
             img_proj = img_proj.reshape(-1, 2)
-            # Filter to points within image bounds
+            # Filter: skip points behind camera, check image bounds
             for i in range(len(img_proj) - 1):
+                if cam_pts_3d[i, 2] <= 0.1 or cam_pts_3d[i + 1, 2] <= 0.1:
+                    continue
                 p1_img = img_proj[i]
                 p2_img = img_proj[i + 1]
-                # Both endpoints should be roughly within image
-                p1_in = -100 < p1_img[0] < img_w + 100 and -100 < p1_img[1] < img_h + 100
-                p2_in = -100 < p2_img[0] < img_w + 100 and -100 < p2_img[1] < img_h + 100
+                p1_in = -margin < p1_img[0] < img_w + margin and -margin < p1_img[1] < img_h + margin
+                p2_in = -margin < p2_img[0] < img_w + margin and -margin < p2_img[1] < img_h + margin
                 if p1_in or p2_in:
                     # Back-project to world
                     wp = _img_to_world([p1_img.tolist(), p2_img.tolist()])
@@ -314,33 +288,103 @@ def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_m
                         px2, py2 = w2p(wp[1][0], wp[1][1])
                         cv2.line(pitch, (px1, py1), (px2, py2), line_color_proj, max(1, lw))
 
-    # Draw predicted (undetected) keypoints
-    cam_params = result.get("camera_params")
-    if cam_params is not None:
+        # --- Keypoints on top-down view ---
+        # Detected keypoints: back-project detected IMAGE pixel to world.
+        #   This is independent of the camera model's forward projection,
+        #   so displacement from white template genuinely reveals calibration error.
+        # Undetected keypoints: round-trip (world→image→world) with large max_range.
         detected_ids = {kp["id"] for kp in keypoints if kp.get("confidence", 0) >= 0.3}
         all_world_coords = KeypointMapper.PNLCALIB_WORLD_COORDS_2D
         non_ground = KeypointMapper.NON_GROUND_KEYPOINTS
-        img_w, img_h = calibrator.image_size
 
-        # Build 3D points for all keypoints
+        # 3a. Draw detected keypoints (green/red) at back-projected detected pixel positions
+        for kp in keypoints:
+            if kp.get("confidence", 0) < 0.3:
+                continue
+            kp_id = kp["id"]
+            if kp_id in non_ground:
+                continue
+            world_xy = keypoint_mapper.get_world_coordinates(kp_id)
+            if world_xy is None:
+                continue
+            wx, wy = world_xy
+
+            # Back-project the detected image pixel through camera model
+            wp = _img_to_world([(kp["x"], kp["y"])], max_range=200.0)
+            if wp[0] is not None:
+                px, py = w2p(wp[0][0], wp[0][1])
+            else:
+                px, py = w2p(wx, wy)  # fallback to true position
+            if not (0 <= px < width and 0 <= py < height):
+                continue
+
+            kp_key = (round(float(kp["x"]), 1), round(float(kp["y"]), 1))
+            if inlier_img_set and kp_key in inlier_img_set:
+                cv2.circle(pitch, (px, py), r, (0, 255, 0), -1)
+            else:
+                cv2.circle(pitch, (px, py), r, (0, 0, 255), 2)
+            cv2.circle(pitch, (px, py), r, (0, 0, 0), 1)
+            cv2.putText(pitch, str(kp_id), (px + r + 2, py + 3), font, 0.35, (255, 255, 255), 1)
+
+        # 3b. Draw undetected keypoints at round-trip positions (world→image→world)
         for kid, (wx, wy) in enumerate(all_world_coords):
             if kid in detected_ids or kid in non_ground:
                 continue
-            z = 0.0
-            obj = np.array([[[wx, wy, z]]], dtype=np.float64)
-            proj, _ = cv2.projectPoints(
-                obj, cam_params["rvec"], cam_params["tvec"],
-                cam_params["K"], cam_params["dist_coeffs"],
-            )
-            ix, iy = proj.ravel()
-            # Check if within image bounds (with small margin)
-            if -50 < ix < img_w + 50 and -50 < iy < img_h + 50:
+
+            cam_pt = R_cam @ np.array([wx, wy, 0.0]) + tvec_cam
+            if cam_pt[2] <= 0.1:
+                # Behind camera → gray at true position
                 px, py = w2p(wx, wy)
                 if 0 <= px < width and 0 <= py < height:
-                    # Small hollow cyan circle = predicted but undetected
-                    cv2.circle(pitch, (px, py), r - 1, (200, 200, 0), 1)
+                    cv2.circle(pitch, (px, py), r - 1, (128, 128, 128), 1)
                     cv2.putText(pitch, str(kid), (px + r + 2, py + 3),
-                                font, 0.3, (200, 200, 0), 1)
+                                font, 0.3, (128, 128, 128), 1)
+                continue
+
+            # Forward project world→image
+            obj = np.array([[[wx, wy, 0.0]]], dtype=np.float64)
+            proj, _ = cv2.projectPoints(
+                obj, cam_params["rvec"], cam_params["tvec"], K_cam, dist_cam,
+            )
+            ix, iy = float(proj.ravel()[0]), float(proj.ravel()[1])
+            in_fov = -50 < ix < img_w + 50 and -50 < iy < img_h + 50
+
+            # Back-project image→world (round-trip)
+            wp = _img_to_world([(ix, iy)], max_range=200.0)
+            if wp[0] is not None:
+                px, py = w2p(wp[0][0], wp[0][1])
+            else:
+                px, py = w2p(wx, wy)  # fallback
+            if not (0 <= px < width and 0 <= py < height):
+                continue
+
+            color = (200, 200, 0) if in_fov else (128, 128, 128)
+            cv2.circle(pitch, (px, py), r - 1, color, 1)
+            cv2.putText(pitch, str(kid), (px + r + 2, py + 3),
+                        font, 0.3, color, 1)
+
+    else:
+        # No camera params — draw detected keypoints at true world positions
+        for kp in keypoints:
+            if kp.get("confidence", 0) < 0.3:
+                continue
+            kp_id = kp["id"]
+            if kp_id in KeypointMapper.NON_GROUND_KEYPOINTS:
+                continue
+            world_xy = keypoint_mapper.get_world_coordinates(kp_id)
+            if world_xy is None:
+                continue
+            wx, wy = world_xy
+            px, py = w2p(wx, wy)
+            if not (0 <= px < width and 0 <= py < height):
+                continue
+            kp_key = (round(float(kp["x"]), 1), round(float(kp["y"]), 1))
+            if inlier_img_set and kp_key in inlier_img_set:
+                cv2.circle(pitch, (px, py), r, (0, 255, 0), -1)
+            else:
+                cv2.circle(pitch, (px, py), r, (0, 0, 255), 2)
+            cv2.circle(pitch, (px, py), r, (0, 0, 0), 1)
+            cv2.putText(pitch, str(kp_id), (px + r + 2, py + 3), font, 0.35, (255, 255, 255), 1)
 
     return pitch
 

@@ -3,7 +3,7 @@
 
 # Video Processing
 video:
-  process_fps: 0.5
+  process_fps: 0.1
 
 # Stage 1: Field Registration with BroadTrack algorithm
 field_registration:
@@ -24,7 +24,7 @@ field_registration:
 
   broadtrack:
     cauchy_f_scale: 5.0          # Cauchy loss scale (pixels)
-    line_sample_points: 20       # Points sampled per detected line
+    line_sample_points: 5        # Points sampled per detected line
     line_weight: 1.0             # Line residual weight vs keypoints
     focal_candidates: [600, 800, 1000, 1300, 1600, 2000]
     max_nfev: 500                # Max optimizer iterations

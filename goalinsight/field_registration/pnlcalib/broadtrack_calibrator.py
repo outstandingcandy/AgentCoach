@@ -53,6 +53,29 @@ class BroadTrackCalibrator:
     # Ground-only line IDs (exclude crossbars and goal posts)
     GROUND_LINE_IDS = set(range(23)) - {6, 7, 8, 9, 10, 11}
 
+    # Keypoints that lie on each ground line (ordered by arc-length parameter t).
+    # Derived from pitch geometry: keypoint world coords matched to line segments.
+    # Non-ground keypoints (12,14,16,18 = goal post tops) are excluded.
+    LINE_KEYPOINTS: dict[int, list[int]] = {
+        0:  [3, 4],                         # Big rect. left top
+        1:  [4, 30, 45, 33, 24],            # Big rect. left side
+        2:  [24, 23],                        # Big rect. left bottom
+        3:  [6, 5],                          # Big rect. right top
+        4:  [5, 32, 55, 35, 25],            # Big rect. right side
+        5:  [25, 26],                        # Big rect. right bottom
+        12: [28, 34, 50, 31, 1],            # Middle line
+        13: [0, 1, 2],                       # Side line top
+        14: [27, 23, 19, 15, 11, 7, 3, 0],  # Side line left (goal line)
+        15: [29, 26, 22, 17, 13, 10, 6, 2], # Side line right (goal line)
+        16: [27, 28, 29],                    # Side line bottom
+        17: [7, 8],                          # Small rect. left top
+        18: [8, 20],                         # Small rect. left side
+        19: [20, 19],                        # Small rect. left bottom
+        20: [10, 9],                         # Small rect. right top
+        21: [9, 21],                         # Small rect. right side
+        22: [21, 22],                        # Small rect. right bottom
+    }
+
     # Distortion priors for wide-angle camera initialization
     # (matching goal-insight's iterative PnP approach)
     DISTORTION_PRIORS = [
@@ -92,19 +115,32 @@ class BroadTrackCalibrator:
     def calibrate(
         self,
         keypoint_mapper,
-        line_mapper,
+        line_mapper=None,
         min_confidence: float = 0.3,
     ) -> dict[str, Any] | None:
-        """Run BroadTrack-style calibration on current frame data."""
+        """Run BroadTrack-style calibration on current frame data.
+
+        Args:
+            keypoint_mapper: KeypointMapper for 3D correspondences.
+            line_mapper: LineMapper for line world coords. If None, lines are
+                derived from detected keypoints (no line model needed).
+            min_confidence: Minimum keypoint confidence threshold.
+        """
         # Step 1: Prepare keypoint correspondences
-        kp_img_centered, kp_world_3d, kp_img_original = self._prepare_keypoints(
+        kp_img_centered, kp_world_3d, kp_img_original, kp_ids = self._prepare_keypoints(
             keypoint_mapper, min_confidence
         )
         if len(kp_world_3d) < 6:
             return None
 
         # Step 2: Prepare line curve constraints
-        line_constraints = self._prepare_line_constraints(line_mapper, min_confidence)
+        # Prefer derived lines from keypoints (no extra model needed).
+        # Fall back to line detector if line_mapper is provided and lines exist.
+        line_constraints = self._derive_lines_from_keypoints(
+            kp_ids, kp_img_original, keypoint_mapper, line_mapper,
+        )
+        if not line_constraints and line_mapper is not None:
+            line_constraints = self._prepare_line_constraints(line_mapper, min_confidence)
 
         # Step 3: PnP initialization with multi-distortion-prior sweep
         init_result = self._initialize_pnp(kp_world_3d, kp_img_original)
@@ -129,19 +165,19 @@ class BroadTrackCalibrator:
 
         # Step 6: Extract and format results
         return self._format_result(
-            opt_result, kp_img_original, kp_world_3d, line_constraints
+            opt_result, kp_img_original, kp_world_3d, kp_ids, line_constraints
         )
 
     def _prepare_keypoints(self, keypoint_mapper, min_confidence):
         """Extract 3D-2D keypoint correspondences."""
-        img_pts, world_pts, _ = keypoint_mapper.build_3d_correspondence_matrix(
+        img_pts, world_pts, kp_ids = keypoint_mapper.build_3d_correspondence_matrix(
             self._keypoints,
             filter_by_confidence=min_confidence,
             exclude_non_ground=False,
         )
 
         if len(img_pts) == 0:
-            return np.zeros((0, 2)), np.zeros((0, 3)), np.zeros((0, 2))
+            return np.zeros((0, 2)), np.zeros((0, 3)), np.zeros((0, 2)), []
 
         img_original = img_pts.astype(np.float64)
         world_3d = world_pts.astype(np.float64)
@@ -150,7 +186,84 @@ class BroadTrackCalibrator:
         img_centered[:, 0] -= self.cx
         img_centered[:, 1] -= self.cy
 
-        return img_centered, world_3d, img_original
+        return img_centered, world_3d, img_original, kp_ids
+
+    def _derive_lines_from_keypoints(
+        self, kp_ids, kp_img_original, keypoint_mapper, line_mapper,
+    ):
+        """Derive line constraints from detected keypoints (no line model needed).
+
+        For each ground line, if >=2 of its keypoints are detected, connect the
+        two most extreme ones in image space and sample points along that segment.
+        The 3D polyline uses the line's world-coordinate endpoints.
+
+        Args:
+            kp_ids: List of detected keypoint IDs.
+            kp_img_original: (N, 2) image coordinates of detected keypoints.
+            keypoint_mapper: KeypointMapper instance.
+            line_mapper: LineMapper for world line endpoints (or None to use
+                LINE_DEFINITIONS directly).
+
+        Returns:
+            List of line constraint dicts (same format as _prepare_line_constraints).
+        """
+        from .line_mapping import LineMapper
+
+        detected = {}  # kp_id -> image coords
+        for i, kid in enumerate(kp_ids):
+            detected[kid] = kp_img_original[i]
+
+        constraints = []
+        non_ground = keypoint_mapper.NON_GROUND_KEYPOINTS
+
+        for line_id, kp_list in self.LINE_KEYPOINTS.items():
+            # Find detected keypoints on this line (skip non-ground)
+            found = [(kid, detected[kid]) for kid in kp_list
+                     if kid in detected and kid not in non_ground]
+            if len(found) < 2:
+                continue
+
+            # Get world line endpoints
+            if line_mapper is not None:
+                world_line = line_mapper.get_line_world_coords(line_id)
+            else:
+                ld = LineMapper.LINE_DEFINITIONS[line_id]
+                world_line = {
+                    "x1": ld["p1"][0], "y1": ld["p1"][1], "z1": ld["p1"][2],
+                    "x2": ld["p2"][0], "y2": ld["p2"][1], "z2": ld["p2"][2],
+                }
+            if world_line is None:
+                continue
+
+            p1_w = np.array([world_line["x1"], world_line["y1"], world_line["z1"]])
+            p2_w = np.array([world_line["x2"], world_line["y2"], world_line["z2"]])
+            polyline_3d = np.array([p1_w, p2_w], dtype=np.float64)
+            cum_lengths = compute_cumulated_lengths(polyline_3d)
+
+            # Use the two most extreme keypoints (first and last in ordered list)
+            # kp_list is already ordered by arc-length parameter
+            first_img = found[0][1]
+            last_img = found[-1][1]
+
+            # Sample points along the image line between these two keypoints
+            img_pts = sample_points_on_image_line(
+                float(first_img[0]), float(first_img[1]),
+                float(last_img[0]), float(last_img[1]),
+                n_points=self.line_sample_points,
+            )
+            img_pts_centered = img_pts.copy()
+            img_pts_centered[:, 0] -= self.cx
+            img_pts_centered[:, 1] -= self.cy
+
+            constraints.append({
+                "polyline_3d": polyline_3d,
+                "cumulated_lengths": cum_lengths,
+                "img_pts_centered": img_pts_centered,
+                "line_id": line_id,
+                "derived_from_keypoints": [f[0] for f in found],
+            })
+
+        return constraints
 
     def _prepare_line_constraints(self, line_mapper, min_confidence):
         """Prepare line curve constraints from detected lines."""
@@ -391,7 +504,7 @@ class BroadTrackCalibrator:
             "cost": opt.cost,
         }
 
-    def _format_result(self, opt_result, kp_img_original, kp_world_3d, line_constraints):
+    def _format_result(self, opt_result, kp_img_original, kp_world_3d, kp_ids, line_constraints):
         """Convert optimization result to stage1-compatible output format."""
         aa = opt_result["angle_axis"]
         pos = opt_result["position"]
@@ -437,6 +550,63 @@ class BroadTrackCalibrator:
             "focal_length": f,
         }
 
+        # Detailed per-keypoint information
+        projected_original = projected.copy()
+        projected_original[:, 0] += self.cx
+        projected_original[:, 1] += self.cy
+
+        keypoint_details = []
+        for i in range(len(kp_world_3d)):
+            keypoint_details.append({
+                "kp_id": int(kp_ids[i]) if i < len(kp_ids) else -1,
+                "detected": [float(kp_img_original[i, 0]), float(kp_img_original[i, 1])],
+                "projected": [float(projected_original[i, 0]), float(projected_original[i, 1])],
+                "world_3d": [float(kp_world_3d[i, 0]), float(kp_world_3d[i, 1]), float(kp_world_3d[i, 2])],
+                "error_px": float(errors[i]),
+                "is_inlier": bool(inlier_mask[i]),
+            })
+
+        # Detailed per-line information
+        arc_params = opt_result["arc_params"]
+        line_details = []
+        arc_idx = 0
+        for lc in line_constraints:
+            n_pts = len(lc["img_pts_centered"])
+            line_img_centered = lc["img_pts_centered"]
+            line_arc = arc_params[arc_idx:arc_idx + n_pts]
+
+            # Project optimized 3D line points back to image
+            line_projected = []
+            line_world_pts = []
+            line_errors = []
+            for j in range(n_pts):
+                pt_3d = interpolate_on_polyline(
+                    lc["polyline_3d"], lc["cumulated_lengths"], line_arc[j]
+                )
+                proj_centered = broadtrack_project(aa, pos, f, k1, pt_3d.reshape(1, 3), k2=k2)[0]
+                proj_original = [float(proj_centered[0] + self.cx), float(proj_centered[1] + self.cy)]
+                detected_original = [
+                    float(line_img_centered[j, 0] + self.cx),
+                    float(line_img_centered[j, 1] + self.cy),
+                ]
+                err = float(np.linalg.norm(proj_centered - line_img_centered[j]))
+                line_projected.append(proj_original)
+                line_world_pts.append([float(pt_3d[0]), float(pt_3d[1]), float(pt_3d[2])])
+                line_errors.append(err)
+
+            polyline_endpoints = lc["polyline_3d"].tolist()
+            line_details.append({
+                "line_id": int(lc["line_id"]),
+                "polyline_endpoints": polyline_endpoints,
+                "num_sample_points": n_pts,
+                "sampled_image_pts": (line_img_centered + np.array([[self.cx, self.cy]])).tolist(),
+                "projected_pts": line_projected,
+                "world_pts": line_world_pts,
+                "errors_px": line_errors,
+                "mean_error_px": float(np.mean(line_errors)) if line_errors else 0.0,
+            })
+            arc_idx += n_pts
+
         return {
             "homography": H,
             "final_error": median_error,
@@ -448,4 +618,6 @@ class BroadTrackCalibrator:
             "camera_params": camera_params,
             "img_pts": kp_img_original,
             "inlier_mask": inlier_mask,
+            "keypoint_details": keypoint_details,
+            "line_details": line_details,
         }

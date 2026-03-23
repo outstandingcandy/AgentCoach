@@ -234,6 +234,7 @@ def run_stage1_physical(
         cx_bounds=tuple(phys_config.get("cx_bounds", [-100.0, 100.0])),
         cy_bounds=tuple(phys_config.get("cy_bounds", [-50.0, 50.0])),
         k1_bounds=tuple(phys_config.get("k1_bounds", [-0.35, -0.15])),
+        intrinsic_reg_weight=phys_config.get("intrinsic_reg_weight", 0.0),
     )
 
     # Initialize temporal tracker
@@ -339,6 +340,7 @@ def run_stage1_physical(
                 frame_idx, keypoints, lines, result,
                 warm_start=init_rvec is not None,
                 debug_info=calibrator._last_debug if result is None else None,
+                image_size=(width, height),
             )
             json_str = json.dumps(frame_info, indent=2, default=_json_default)
             with open(vis_calib_dir / json_fname, "w") as jf:
@@ -383,7 +385,7 @@ def run_stage1_physical(
     return stats
 
 
-def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, debug_info=None):
+def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, debug_info=None, image_size=None):
     """Build detailed JSON dict for a single frame's calibration data.
 
     Includes all detected keypoints, lines, camera parameters, per-point
@@ -592,6 +594,62 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
                 keypoint_details.append(detail)
             info["keypoint_details"] = keypoint_details
 
+        # Projection consistency check: project ALL template keypoints and compare
+        # with detected keypoints to find phantom/missing projections
+        if cam and "rvec" in cam and "tvec" in cam:
+            import cv2 as _cv2
+            from .field_registration.pnlcalib import KeypointMapper
+
+            all_world = KeypointMapper.PNLCALIB_WORLD_COORDS_2D
+            non_ground = KeypointMapper.NON_GROUND_KEYPOINTS
+            detected_ids = {kp["id"] for kp in keypoints if kp.get("confidence", 0) >= 0.3}
+            img_w, img_h = image_size if image_size else (1920, 1080)
+            margin = 50
+
+            projected_in_image = []  # template points that project into image
+            phantom_count = 0  # projected in image but not detected
+            missing_count = 0  # detected but projected outside image
+
+            for kid, (wx, wy) in enumerate(all_world):
+                if kid in non_ground:
+                    continue
+                obj = np.array([[[wx, wy, 0.0]]], dtype=np.float64)
+                proj, _ = _cv2.projectPoints(
+                    obj, cam["rvec"].reshape(3, 1), cam["tvec"].reshape(3, 1),
+                    cam["K"], cam["dist_coeffs"],
+                )
+                ix, iy = float(proj.ravel()[0]), float(proj.ravel()[1])
+                in_image = -margin < ix < img_w + margin and -margin < iy < img_h + margin
+                detected = kid in detected_ids
+
+                if in_image:
+                    status = "detected" if detected else "phantom"
+                    if not detected:
+                        phantom_count += 1
+                    projected_in_image.append({
+                        "kp_id": kid,
+                        "proj_x": round(ix, 1),
+                        "proj_y": round(iy, 1),
+                        "status": status,
+                    })
+                elif detected:
+                    missing_count += 1
+                    projected_in_image.append({
+                        "kp_id": kid,
+                        "proj_x": round(ix, 1),
+                        "proj_y": round(iy, 1),
+                        "status": "missing",  # detected but projected outside
+                    })
+
+            info["projection_consistency"] = {
+                "total_ground_keypoints": len(all_world) - len(non_ground),
+                "projected_in_image": len([p for p in projected_in_image if p["status"] != "missing"]),
+                "detected_count": len(detected_ids),
+                "phantom_count": phantom_count,
+                "missing_count": missing_count,
+                "details": projected_in_image,
+            }
+
     return info
 
 
@@ -623,15 +681,22 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
             result["homography"], pitch_template, camera_params,
         )
 
-        # Draw projected pitch lines (yellow)
+        # Draw projected pitch lines (yellow) — only segments within image bounds
+        margin = 200
         for name, pts in projected.items():
             for i in range(len(pts) - 1):
                 if pts[i] is not None and pts[i + 1] is not None:
                     try:
                         p1 = (int(float(pts[i][0])), int(float(pts[i][1])))
                         p2 = (int(float(pts[i + 1][0])), int(float(pts[i + 1][1])))
-                        if all(-5000 < c < 10000 for c in p1 + p2):
-                            cv2.line(vis, p1, p2, (0, 255, 255), 2)
+                        p1_in = -margin < p1[0] < w + margin and -margin < p1[1] < h + margin
+                        p2_in = -margin < p2[0] < w + margin and -margin < p2[1] < h + margin
+                        if p1_in or p2_in:
+                            # Clamp for OpenCV safety
+                            clamp = w + h
+                            p1c = (max(-clamp, min(clamp, p1[0])), max(-clamp, min(clamp, p1[1])))
+                            p2c = (max(-clamp, min(clamp, p2[0])), max(-clamp, min(clamp, p2[1])))
+                            cv2.line(vis, p1c, p2c, (0, 255, 255), 2)
                     except (ValueError, OverflowError, TypeError):
                         continue
 
@@ -648,6 +713,25 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
                 x1, y1 = int(line["x1"]), int(line["y1"])
                 x2, y2 = int(line["x2"]), int(line["y2"])
                 cv2.line(vis, (x1, y1), (x2, y2), (255, 255, 0), 1)
+
+        # Draw projected template keypoints (yellow, matching pitch lines)
+        from .field_registration.pnlcalib import KeypointMapper
+        all_world = KeypointMapper.PNLCALIB_WORLD_COORDS_2D
+        non_ground = KeypointMapper.NON_GROUND_KEYPOINTS
+        for kid, (wx, wy) in enumerate(all_world):
+            if kid in non_ground:
+                continue
+            obj = np.array([[[wx, wy, 0.0]]], dtype=np.float64)
+            proj, _ = cv2.projectPoints(
+                obj, camera_params["rvec"], camera_params["tvec"],
+                camera_params["K"], camera_params["dist_coeffs"],
+            )
+            ix, iy = proj.ravel()
+            if -50 < ix < w + 50 and -50 < iy < h + 50:
+                pt = (int(ix), int(iy))
+                cv2.circle(vis, pt, 3, (0, 255, 255), -1)
+                cv2.putText(vis, str(kid), (pt[0] + 5, pt[1] - 3),
+                            font, 0.3, (0, 255, 255), 1)
 
         # Header
         err = result.get("final_error", 0)
