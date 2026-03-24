@@ -223,6 +223,30 @@ def run_stage1_physical(
     K, dist_coeffs = _load_camera_profile(config, width, height)
 
     # Initialize calibrator with fixed intrinsics
+    do_joint = phys_config.get("joint_optimize", True)
+
+    # When joint_optimize=false, lock intrinsics at profile values (only optimize 6-DOF extrinsics)
+    if do_joint:
+        focal_bounds = tuple(phys_config.get("focal_bounds", [1200.0, 2200.0]))
+        cx_bounds = tuple(phys_config.get("cx_bounds", [-100.0, 100.0]))
+        cy_bounds = tuple(phys_config.get("cy_bounds", [-50.0, 50.0]))
+        k1_bounds = tuple(phys_config.get("k1_bounds", [-0.35, -0.15]))
+        k2_bounds = tuple(phys_config.get("k2_bounds", [-0.05, 0.10]))
+        k3_bounds = tuple(phys_config.get("k3_bounds", [-0.05, 0.05]))
+    else:
+        eps = 0.01
+        f_profile = float(K[0, 0])
+        k1_profile = float(dist_coeffs[0])
+        k2_profile = float(dist_coeffs[1])
+        k3_profile = float(dist_coeffs[4]) if len(dist_coeffs) > 4 else 0.0
+        focal_bounds = (f_profile - eps, f_profile + eps)
+        cx_bounds = (-eps, eps)
+        cy_bounds = (-eps, eps)
+        k1_bounds = (k1_profile - eps * 0.001, k1_profile + eps * 0.001)
+        k2_bounds = (k2_profile - eps * 0.001, k2_profile + eps * 0.001)
+        k3_bounds = (k3_profile - eps * 0.001, k3_profile + eps * 0.001)
+        print("  Intrinsics locked at profile values (joint_optimize=false)")
+
     calibrator = PhysicalCalibrator(
         K=K,
         dist_coeffs=dist_coeffs,
@@ -230,12 +254,15 @@ def run_stage1_physical(
         ransac_reproj_error=phys_config.get("ransac_reproj_error", 15.0),
         line_weight=phys_config.get("line_weight", 1.0),
         line_sample_points=phys_config.get("line_sample_points", 20),
-        focal_bounds=tuple(phys_config.get("focal_bounds", [1200.0, 2200.0])),
-        cx_bounds=tuple(phys_config.get("cx_bounds", [-100.0, 100.0])),
-        cy_bounds=tuple(phys_config.get("cy_bounds", [-50.0, 50.0])),
-        k1_bounds=tuple(phys_config.get("k1_bounds", [-0.35, -0.15])),
+        focal_bounds=focal_bounds,
+        cx_bounds=cx_bounds,
+        cy_bounds=cy_bounds,
+        k1_bounds=k1_bounds,
+        k2_bounds=k2_bounds,
+        k3_bounds=k3_bounds,
         intrinsic_reg_weight=phys_config.get("intrinsic_reg_weight", 0.0),
         world_residual_weight=phys_config.get("world_residual_weight", 0.0),
+        world_error_threshold=phys_config.get("world_error_threshold", 5.0),
     )
 
     # Initialize temporal tracker
@@ -265,11 +292,12 @@ def run_stage1_physical(
     for d in [vis_kp_dir, vis_line_dir, vis_calib_dir]:
         d.mkdir(exist_ok=True)
 
-    # Process frames
+    # Process frames — Pass 1: per-frame calibration to collect initial estimates
     calibrated_count = 0
     vis_interval = max(1, len(sampler) // 100)
+    joint_frame_data = []  # Collect data for cross-frame joint intrinsic optimization
 
-    for idx, frame_idx in enumerate(tqdm(sampler, desc="Stage 1 (Physical): Calibrating")):
+    for idx, frame_idx in enumerate(tqdm(sampler, desc="Stage 1 (Physical): Pass 1 - Per-frame")):
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
         if not ret:
@@ -313,6 +341,22 @@ def run_stage1_physical(
             }
             calibrated_count += 1
 
+            # Collect frame data for joint intrinsic optimization
+            joint_frame_data.append({
+                "frame_idx": frame_idx,
+                "rvec": result["camera_params"]["rvec"].ravel(),
+                "tvec": result["camera_params"]["tvec"].ravel(),
+                "img_pts": result["img_pts"],
+                "world_pts": result["world_pts"],
+                "line_constraints": result.get("line_constraints", []),
+                "f": result["camera_params"]["focal_length"],
+                "cx": float(result["camera_params"]["K"][0, 2]),
+                "cy": float(result["camera_params"]["K"][1, 2]),
+                "k1": float(result["camera_params"]["dist_coeffs"][0]),
+                "k2": float(result["camera_params"]["dist_coeffs"][1]),
+                "k3": float(result["camera_params"]["dist_coeffs"][4]) if len(result["camera_params"]["dist_coeffs"]) > 4 else 0.0,
+            })
+
             # Update temporal tracker
             tracker.update(
                 result["camera_params"]["rvec"],
@@ -349,7 +393,169 @@ def run_stage1_physical(
             with open(vis_calib_dir / json_fname, "w") as jf:
                 jf.write(json_str)
 
-    cap.release()
+    # === Cross-frame joint intrinsic optimization ===
+    joint_result = None
+    if do_joint and len(joint_frame_data) >= 2:
+        # Filter out high-error frames — they have bad detections that would corrupt joint optimization
+        # Use per-frame reprojection error to filter (computed in Pass 1)
+        good_frame_data = []
+        for fd in joint_frame_data:
+            finfo = calibration_results["frames"].get(fd["frame_idx"], {})
+            px_err = finfo.get("reprojection_error", 999)
+            n_inliers = finfo.get("inliers", 0)
+            if px_err < 80 and n_inliers >= 5:
+                good_frame_data.append(fd)
+        print(f"\n  Joint optimization: {len(good_frame_data)}/{len(joint_frame_data)} frames (filtered by error<80px, inliers>=5)...")
+        print(f"  Profile intrinsics: f={K[0,0]:.1f}, cx={K[0,2]:.1f}, cy={K[1,2]:.1f}, k1={dist_coeffs[0]:.4f}, k2={dist_coeffs[1]:.4f}, k3={dist_coeffs[4] if len(dist_coeffs) > 4 else 0:.4f}")
+
+        # Seed joint optimization with median of Pass 1 per-frame intrinsics
+        if good_frame_data:
+            med_f = float(np.median([fd["f"] for fd in good_frame_data]))
+            med_cx = float(np.median([fd["cx"] for fd in good_frame_data]))
+            med_cy = float(np.median([fd["cy"] for fd in good_frame_data]))
+            med_k1 = float(np.median([fd["k1"] for fd in good_frame_data]))
+            med_k2 = float(np.median([fd["k2"] for fd in good_frame_data]))
+            med_k3 = float(np.median([fd["k3"] for fd in good_frame_data]))
+            calibrator.K[0, 0] = med_f
+            calibrator.K[1, 1] = med_f
+            calibrator.K[0, 2] = med_cx
+            calibrator.K[1, 2] = med_cy
+            calibrator.dist_coeffs = np.array([med_k1, med_k2, 0.0, 0.0, med_k3], dtype=np.float64)
+            print(f"  Median intrinsics:  f={med_f:.1f}, cx={med_cx:.1f}, cy={med_cy:.1f}, k1={med_k1:.4f}, k2={med_k2:.4f}, k3={med_k3:.4f}")
+
+        joint_result = calibrator.joint_optimize_intrinsics(good_frame_data)
+        if joint_result is not None:
+            print(f"  Joint intrinsics:   f={joint_result['f']:.1f}, cx={joint_result['cx']:.1f}, cy={joint_result['cy']:.1f}, k1={joint_result['k1']:.4f}, k2={joint_result['k2']:.4f}, k3={joint_result['k3']:.4f}")
+            print(f"  Joint cost: {joint_result['cost']:.2f}")
+
+            # Update calibrator with jointly optimized intrinsics and lock them
+            calibrator.K = joint_result["K"].copy()
+            calibrator.dist_coeffs = joint_result["dist_coeffs"].copy()
+            # Tighten bounds to effectively fix intrinsics in Pass 2
+            eps = 0.01
+            calibrator.focal_bounds = (joint_result["f"] - eps, joint_result["f"] + eps)
+            calibrator.cx_bounds = (-eps, eps)
+            calibrator.cy_bounds = (-eps, eps)
+            calibrator.k1_bounds = (joint_result["k1"] - eps * 0.001, joint_result["k1"] + eps * 0.001)
+            calibrator.k2_bounds = (joint_result["k2"] - eps * 0.001, joint_result["k2"] + eps * 0.001)
+            calibrator.k3_bounds = (joint_result["k3"] - eps * 0.001, joint_result["k3"] + eps * 0.001)
+
+            # === Pass 2: Re-run per-frame calibration with fixed joint intrinsics ===
+            print(f"\n  Pass 2: Re-calibrating {len(sampler)} frames with joint intrinsics...")
+            cap = cv2.VideoCapture(str(video_path))
+            tracker2 = CameraStateTracker(
+                max_reproj_error=phys_config.get("max_reproj_error", 15.0),
+            )
+
+            # Build lookup from joint result per-frame extrinsics for warm-starting
+            joint_extrinsics = {}
+            for i, fd in enumerate(good_frame_data):
+                joint_extrinsics[fd["frame_idx"]] = (
+                    joint_result["per_frame"][i]["rvec"],
+                    joint_result["per_frame"][i]["tvec"],
+                )
+
+            calibrated_count = 0
+            calibration_results["frames"] = {}
+            homographies = {}
+            camera_poses = {}
+
+            for idx, frame_idx in enumerate(tqdm(sampler, desc="Stage 1 (Physical): Pass 2 - Joint intrinsics")):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                keypoints = kp_detector.detect(frame, convert_to_soccernet=False)
+                lines = line_detector.detect(frame) if line_detector is not None else []
+                calibrator.update(keypoints, lines)
+
+                # Warm-start: prefer joint extrinsics, then temporal tracker
+                if frame_idx in joint_extrinsics:
+                    init_rvec = joint_extrinsics[frame_idx][0].copy()
+                    init_tvec = joint_extrinsics[frame_idx][1].copy()
+                else:
+                    init_rvec, init_tvec = tracker2.get_initial_guess()
+
+                result = calibrator.calibrate(
+                    keypoint_mapper,
+                    line_mapper if use_line_model else None,
+                    min_confidence=pnl_config.get("keypoint_threshold", 0.3434),
+                    initial_rvec=init_rvec,
+                    initial_tvec=init_tvec,
+                )
+
+                if result is not None:
+                    homographies[frame_idx] = result["homography"]
+                    camera_poses[frame_idx] = result["camera_pose"]
+                    calibration_results["frames"][frame_idx] = {
+                        "calibrated": True,
+                        "num_keypoints": result["num_keypoints"],
+                        "num_lines": result["num_lines"],
+                        "num_intersections": result["num_intersections"],
+                        "total_points": result["total_points"],
+                        "inliers": result["inliers"],
+                        "reprojection_error": result["final_error"],
+                        "world_error": result.get("world_error"),
+                        "world_error_all": result.get("world_error_all"),
+                        "line_constraints": result["line_constraints_count"],
+                        "warm_start": init_rvec is not None,
+                    }
+                    calibrated_count += 1
+                    tracker2.update(
+                        result["camera_params"]["rvec"],
+                        result["camera_params"]["tvec"],
+                        result["final_error"],
+                    )
+                else:
+                    calibration_results["frames"][frame_idx] = {"calibrated": False}
+                    tracker2.last_rvec = None
+                    tracker2.last_tvec = None
+
+                # Save visualizations (Pass 2 overwrites Pass 1)
+                if idx % vis_interval == 0:
+                    fname = f"frame_{frame_idx:05d}.jpg"
+                    json_fname = f"frame_{frame_idx:05d}.json"
+                    cv2.imwrite(str(vis_kp_dir / fname), draw_vis_keypoints(frame, keypoints))
+                    cv2.imwrite(str(vis_line_dir / fname), draw_vis_lines(frame, lines))
+                    vis = _draw_physical_calibration(
+                        frame, keypoints, lines, result, pitch_template,
+                        keypoint_mapper, calibrator,
+                    )
+                    cv2.imwrite(str(vis_calib_dir / fname), vis)
+                    frame_info = _build_frame_json(
+                        frame_idx, keypoints, lines, result,
+                        warm_start=init_rvec is not None,
+                        debug_info=calibrator._last_debug if result is None else None,
+                        image_size=(width, height),
+                    )
+                    json_str = json.dumps(frame_info, indent=2, default=_json_default)
+                    with open(vis_calib_dir / json_fname, "w") as jf:
+                        jf.write(json_str)
+
+            cap.release()
+            tracker = tracker2
+        else:
+            print("  Joint optimization failed.")
+            cap.release()
+    else:
+        if not do_joint:
+            print(f"\n  Joint optimization disabled (joint_optimize=false). Using profile intrinsics directly.")
+        else:
+            print(f"\n  Skipping joint optimization (only {len(joint_frame_data)} calibrated frames)")
+        cap.release()
+
+    # Store joint intrinsics in results
+    if joint_result is not None:
+        calibration_results["joint_intrinsics"] = {
+            "f": joint_result["f"],
+            "cx": joint_result["cx"],
+            "cy": joint_result["cy"],
+            "k1": joint_result["k1"],
+            "k2": joint_result["k2"],
+            "cost": joint_result["cost"],
+            "n_frames": joint_result["n_frames"],
+        }
 
     # Save results
     with open(output_dir / "calibration_metadata.json", "w") as f:
@@ -406,6 +612,8 @@ def run_stage1_physical(
         print(f"  Median world error (detected): {stats['median_world_error']:.2f} m")
     if world_errors_all:
         print(f"  Median world error (all 57):   {stats['median_world_error_all']:.2f} m")
+    if joint_result is not None:
+        print(f"  Joint intrinsics: f={joint_result['f']:.1f}, cx={joint_result['cx']:.1f}, cy={joint_result['cy']:.1f}, k1={joint_result['k1']:.4f}, k2={joint_result['k2']:.4f}, k3={joint_result['k3']:.4f}")
 
     return stats
 
@@ -737,12 +945,34 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
                 color = (0, 255, 0) if is_inlier else (0, 0, 255)
                 cv2.circle(vis, (x, y), 5, color, -1)
 
-        # Draw detected lines (cyan)
-        for line in lines:
-            if line.get("confidence", 0) >= 0.15:
-                x1, y1 = int(line["x1"]), int(line["y1"])
-                x2, y2 = int(line["x2"]), int(line["y2"])
-                cv2.line(vis, (x1, y1), (x2, y2), (255, 255, 0), 1)
+        # Draw derived line constraints
+        lc_list = result.get("line_constraints", [])
+        if lc_list:
+            for lc in lc_list:
+                img_samples = lc["img_samples"]
+                # Detected image line (red) — connects detected keypoints on this line
+                p1 = (int(img_samples[0][0]), int(img_samples[0][1]))
+                p2 = (int(img_samples[-1][0]), int(img_samples[-1][1]))
+                cv2.line(vis, p1, p2, (0, 0, 255), 1)
+
+                # Projected world line samples (orange) — where the model projects them
+                ws = np.array(lc["world_samples"])
+                proj, _ = cv2.projectPoints(
+                    ws.reshape(-1, 1, 3),
+                    camera_params["rvec"], camera_params["tvec"],
+                    camera_params["K"], camera_params["dist_coeffs"],
+                )
+                proj = proj.reshape(-1, 2)
+                for i in range(len(proj) - 1):
+                    px1 = (int(proj[i][0]), int(proj[i][1]))
+                    px2 = (int(proj[i + 1][0]), int(proj[i + 1][1]))
+                    p1_ok = -margin < px1[0] < w + margin and -margin < px1[1] < h + margin
+                    p2_ok = -margin < px2[0] < w + margin and -margin < px2[1] < h + margin
+                    if p1_ok or p2_ok:
+                        clamp = w + h
+                        c1 = (max(-clamp, min(clamp, px1[0])), max(-clamp, min(clamp, px1[1])))
+                        c2 = (max(-clamp, min(clamp, px2[0])), max(-clamp, min(clamp, px2[1])))
+                        cv2.line(vis, c1, c2, (0, 165, 255), 1)
 
         # Draw projected template keypoints (yellow, matching pitch lines)
         from .field_registration.pnlcalib import KeypointMapper
