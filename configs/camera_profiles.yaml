@@ -6,13 +6,23 @@
 # then add a named entry below.
 
 profiles:
-  veo_1080p:
+  # Original profile from factory calibration grid
+  veo_1080p_factory:
     image_size: [1920, 1080]
     K:
       - [1728.25, 0.0, 960.0]
       - [0.0, 1728.25, 540.0]
       - [0.0, 0.0, 1.0]
     dist_coeffs: [-0.2375, 0.0167, 0.0, 0.0, 0.0]
+
+  # Refined via cross-frame joint optimization on football_sunday_output_000
+  veo_1080p:
+    image_size: [1920, 1080]
+    K:
+      - [1724.3, 0.0, 960.4]
+      - [0.0, 1724.3, 534.7]
+      - [0.0, 0.0, 1.0]
+    dist_coeffs: [-0.376, 0.0572, 0.0, 0.0, 0.0]
 
   broadcast_1080p:
     image_size: [1920, 1080]
