@@ -124,20 +124,22 @@ def _load_camera_profile(config: dict, video_width: int, video_height: int):
     if expected_size[0] != video_width or expected_size[1] != video_height:
         logger.warning(
             "Video resolution %dx%d doesn't match profile '%s' expected %dx%d. "
-            "Scaling intrinsics.",
+            "Scaling focal length.",
             video_width, video_height, profile_name,
             expected_size[0], expected_size[1],
         )
         sx = video_width / expected_size[0]
-        sy = video_height / expected_size[1]
         K[0, 0] *= sx
-        K[0, 2] *= sx
-        K[1, 1] *= sy
-        K[1, 2] *= sy
+        K[1, 1] *= sx
+
+    # Fix principal point to image geometric center, zero distortion
+    K[0, 2] = video_width / 2.0
+    K[1, 2] = video_height / 2.0
+    dist_coeffs = np.zeros(5, dtype=np.float64)
 
     print(f"  Camera profile: {profile_name}")
-    print(f"  K: fx={K[0,0]:.1f}, fy={K[1,1]:.1f}, cx={K[0,2]:.1f}, cy={K[1,2]:.1f}")
-    print(f"  Distortion: {dist_coeffs.tolist()}")
+    print(f"  K: f={K[0,0]:.1f}, cx={K[0,2]:.1f} (center), cy={K[1,2]:.1f} (center)")
+    print(f"  Distortion: disabled (images assumed undistorted)")
 
     return K, dist_coeffs
 
@@ -222,47 +224,36 @@ def run_stage1_physical(
     print("Stage 1 (Physical): Loading camera profile...")
     K, dist_coeffs = _load_camera_profile(config, width, height)
 
-    # Initialize calibrator with fixed intrinsics
+    # Initialize calibrator (7-DOF: rvec, tvec, f)
     do_joint = phys_config.get("joint_optimize", True)
+    focal_bounds = tuple(phys_config.get("focal_bounds", [1200.0, 2200.0]))
 
-    # When joint_optimize=false, lock intrinsics at profile values (only optimize 6-DOF extrinsics)
-    if do_joint:
-        focal_bounds = tuple(phys_config.get("focal_bounds", [1200.0, 2200.0]))
-        cx_bounds = tuple(phys_config.get("cx_bounds", [-100.0, 100.0]))
-        cy_bounds = tuple(phys_config.get("cy_bounds", [-50.0, 50.0]))
-        k1_bounds = tuple(phys_config.get("k1_bounds", [-0.35, -0.15]))
-        k2_bounds = tuple(phys_config.get("k2_bounds", [-0.05, 0.10]))
-        k3_bounds = tuple(phys_config.get("k3_bounds", [-0.05, 0.05]))
-    else:
-        eps = 0.01
-        f_profile = float(K[0, 0])
-        k1_profile = float(dist_coeffs[0])
-        k2_profile = float(dist_coeffs[1])
-        k3_profile = float(dist_coeffs[4]) if len(dist_coeffs) > 4 else 0.0
-        focal_bounds = (f_profile - eps, f_profile + eps)
-        cx_bounds = (-eps, eps)
-        cy_bounds = (-eps, eps)
-        k1_bounds = (k1_profile - eps * 0.001, k1_profile + eps * 0.001)
-        k2_bounds = (k2_profile - eps * 0.001, k2_profile + eps * 0.001)
-        k3_bounds = (k3_profile - eps * 0.001, k3_profile + eps * 0.001)
-        print("  Intrinsics locked at profile values (joint_optimize=false)")
+    if not do_joint:
+        print("  Joint optimization disabled — per-frame f optimization only")
+
+    camera_position = phys_config.get("camera_position", None)
+    if camera_position is not None:
+        camera_position = tuple(camera_position)
+        print(f"  Camera position constraint: ({camera_position[0]}, {camera_position[1]}, {camera_position[2]})")
+
+    pitch_length = phys_config.get("pitch_length", 105.0)
+    pitch_width = phys_config.get("pitch_width", 68.0)
+    if pitch_length != 105.0 or pitch_width != 68.0:
+        print(f"  Custom pitch dimensions: {pitch_length}×{pitch_width}m")
 
     calibrator = PhysicalCalibrator(
         K=K,
-        dist_coeffs=dist_coeffs,
         image_size=(width, height),
         ransac_reproj_error=phys_config.get("ransac_reproj_error", 15.0),
         line_weight=phys_config.get("line_weight", 1.0),
         line_sample_points=phys_config.get("line_sample_points", 20),
         focal_bounds=focal_bounds,
-        cx_bounds=cx_bounds,
-        cy_bounds=cy_bounds,
-        k1_bounds=k1_bounds,
-        k2_bounds=k2_bounds,
-        k3_bounds=k3_bounds,
-        intrinsic_reg_weight=phys_config.get("intrinsic_reg_weight", 0.0),
         world_residual_weight=phys_config.get("world_residual_weight", 0.0),
         world_error_threshold=phys_config.get("world_error_threshold", 5.0),
+        camera_position=camera_position,
+        position_weight=phys_config.get("position_weight", 50.0),
+        pitch_length=pitch_length,
+        pitch_width=pitch_width,
     )
 
     # Initialize temporal tracker
@@ -350,11 +341,6 @@ def run_stage1_physical(
                 "world_pts": result["world_pts"],
                 "line_constraints": result.get("line_constraints", []),
                 "f": result["camera_params"]["focal_length"],
-                "cx": float(result["camera_params"]["K"][0, 2]),
-                "cy": float(result["camera_params"]["K"][1, 2]),
-                "k1": float(result["camera_params"]["dist_coeffs"][0]),
-                "k2": float(result["camera_params"]["dist_coeffs"][1]),
-                "k3": float(result["camera_params"]["dist_coeffs"][4]) if len(result["camera_params"]["dist_coeffs"]) > 4 else 0.0,
             })
 
             # Update temporal tracker
@@ -379,6 +365,7 @@ def run_stage1_physical(
             vis = _draw_physical_calibration(
                 frame, keypoints, lines, result, pitch_template,
                 keypoint_mapper, calibrator,
+                pitch_length=pitch_length, pitch_width=pitch_width,
             )
             cv2.imwrite(str(vis_calib_dir / fname), vis)
 
@@ -406,39 +393,23 @@ def run_stage1_physical(
             if px_err < 80 and n_inliers >= 5:
                 good_frame_data.append(fd)
         print(f"\n  Joint optimization: {len(good_frame_data)}/{len(joint_frame_data)} frames (filtered by error<80px, inliers>=5)...")
-        print(f"  Profile intrinsics: f={K[0,0]:.1f}, cx={K[0,2]:.1f}, cy={K[1,2]:.1f}, k1={dist_coeffs[0]:.4f}, k2={dist_coeffs[1]:.4f}, k3={dist_coeffs[4] if len(dist_coeffs) > 4 else 0:.4f}")
+        print(f"  Profile f={K[0,0]:.1f}, cx={K[0,2]:.1f} (center), cy={K[1,2]:.1f} (center)")
 
-        # Seed joint optimization with median of Pass 1 per-frame intrinsics
+        # Seed joint optimization with median focal length from Pass 1
         if good_frame_data:
             med_f = float(np.median([fd["f"] for fd in good_frame_data]))
-            med_cx = float(np.median([fd["cx"] for fd in good_frame_data]))
-            med_cy = float(np.median([fd["cy"] for fd in good_frame_data]))
-            med_k1 = float(np.median([fd["k1"] for fd in good_frame_data]))
-            med_k2 = float(np.median([fd["k2"] for fd in good_frame_data]))
-            med_k3 = float(np.median([fd["k3"] for fd in good_frame_data]))
             calibrator.K[0, 0] = med_f
             calibrator.K[1, 1] = med_f
-            calibrator.K[0, 2] = med_cx
-            calibrator.K[1, 2] = med_cy
-            calibrator.dist_coeffs = np.array([med_k1, med_k2, 0.0, 0.0, med_k3], dtype=np.float64)
-            print(f"  Median intrinsics:  f={med_f:.1f}, cx={med_cx:.1f}, cy={med_cy:.1f}, k1={med_k1:.4f}, k2={med_k2:.4f}, k3={med_k3:.4f}")
+            print(f"  Median f={med_f:.1f}")
 
         joint_result = calibrator.joint_optimize_intrinsics(good_frame_data)
         if joint_result is not None:
-            print(f"  Joint intrinsics:   f={joint_result['f']:.1f}, cx={joint_result['cx']:.1f}, cy={joint_result['cy']:.1f}, k1={joint_result['k1']:.4f}, k2={joint_result['k2']:.4f}, k3={joint_result['k3']:.4f}")
-            print(f"  Joint cost: {joint_result['cost']:.2f}")
+            print(f"  Joint f={joint_result['f']:.1f}, cost={joint_result['cost']:.2f}")
 
-            # Update calibrator with jointly optimized intrinsics and lock them
+            # Update calibrator with jointly optimized focal length and lock it
             calibrator.K = joint_result["K"].copy()
-            calibrator.dist_coeffs = joint_result["dist_coeffs"].copy()
-            # Tighten bounds to effectively fix intrinsics in Pass 2
             eps = 0.01
             calibrator.focal_bounds = (joint_result["f"] - eps, joint_result["f"] + eps)
-            calibrator.cx_bounds = (-eps, eps)
-            calibrator.cy_bounds = (-eps, eps)
-            calibrator.k1_bounds = (joint_result["k1"] - eps * 0.001, joint_result["k1"] + eps * 0.001)
-            calibrator.k2_bounds = (joint_result["k2"] - eps * 0.001, joint_result["k2"] + eps * 0.001)
-            calibrator.k3_bounds = (joint_result["k3"] - eps * 0.001, joint_result["k3"] + eps * 0.001)
 
             # === Pass 2: Re-run per-frame calibration with fixed joint intrinsics ===
             print(f"\n  Pass 2: Re-calibrating {len(sampler)} frames with joint intrinsics...")
@@ -521,6 +492,7 @@ def run_stage1_physical(
                     vis = _draw_physical_calibration(
                         frame, keypoints, lines, result, pitch_template,
                         keypoint_mapper, calibrator,
+                        pitch_length=pitch_length, pitch_width=pitch_width,
                     )
                     cv2.imwrite(str(vis_calib_dir / fname), vis)
                     frame_info = _build_frame_json(
@@ -551,8 +523,6 @@ def run_stage1_physical(
             "f": joint_result["f"],
             "cx": joint_result["cx"],
             "cy": joint_result["cy"],
-            "k1": joint_result["k1"],
-            "k2": joint_result["k2"],
             "cost": joint_result["cost"],
             "n_frames": joint_result["n_frames"],
         }
@@ -613,7 +583,7 @@ def run_stage1_physical(
     if world_errors_all:
         print(f"  Median world error (all 57):   {stats['median_world_error_all']:.2f} m")
     if joint_result is not None:
-        print(f"  Joint intrinsics: f={joint_result['f']:.1f}, cx={joint_result['cx']:.1f}, cy={joint_result['cy']:.1f}, k1={joint_result['k1']:.4f}, k2={joint_result['k2']:.4f}, k3={joint_result['k3']:.4f}")
+        print(f"  Joint f={joint_result['f']:.1f}")
 
     return stats
 
@@ -698,17 +668,42 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
         cam = result.get("camera_params", {})
         if cam:
             init = result.get("intrinsics_init", {})
-            info["camera"] = {
+            cam_info = {
                 "focal_length_init": init.get("f"),
                 "focal_length": float(cam.get("focal_length", 0)),
                 "cx_init": init.get("cx"),
                 "cy_init": init.get("cy"),
-                "k1_init": init.get("k1"),
                 "K": cam["K"].tolist() if "K" in cam else None,
                 "rvec": cam["rvec"].flatten().tolist() if "rvec" in cam else None,
                 "tvec": cam["tvec"].flatten().tolist() if "tvec" in cam else None,
                 "dist_coeffs": cam["dist_coeffs"].tolist() if "dist_coeffs" in cam else None,
             }
+
+            # Compute camera world position and orientation angles
+            if "rvec" in cam and "tvec" in cam:
+                R_mat, _ = cv2.Rodrigues(cam["rvec"].reshape(3, 1))
+                cam_pos = -R_mat.T @ cam["tvec"].ravel()
+                cam_info["camera_height"] = round(float(cam_pos[2]), 2)
+                cam_info["camera_position"] = {
+                    "x": round(float(cam_pos[0]), 2),
+                    "y": round(float(cam_pos[1]), 2),
+                    "z": round(float(cam_pos[2]), 2),
+                }
+                # Camera orientation: pitch (tilt), yaw (pan), roll
+                # R maps world→camera; R.T maps camera→world
+                # Camera forward direction in world = R.T @ [0,0,1]
+                fwd = R_mat.T @ np.array([0, 0, 1.0])
+                right = R_mat.T @ np.array([1.0, 0, 0])
+                pitch_deg = float(np.degrees(np.arcsin(-fwd[2])))  # angle below horizon
+                yaw_deg = float(np.degrees(np.arctan2(fwd[0], fwd[1])))
+                roll_deg = float(np.degrees(np.arctan2(right[2], np.sqrt(right[0]**2 + right[1]**2))))
+                cam_info["camera_angles"] = {
+                    "pitch_deg": round(pitch_deg, 2),
+                    "yaw_deg": round(yaw_deg, 2),
+                    "roll_deg": round(roll_deg, 2),
+                }
+
+            info["camera"] = cam_info
 
         # RANSAC filtering info
         ransac = result.get("ransac_info")
@@ -811,7 +806,7 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
 
             for i in range(len(img_pts)):
                 detail = {
-                    "kp_id": int(kp_ids[i]) if i < len(kp_ids) else -1,
+                    "kp_id": kp_ids[i] if i < len(kp_ids) else -1,
                     "img_x": float(img_pts[i][0]),
                     "img_y": float(img_pts[i][1]),
                     "is_inlier": bool(inlier_mask[i]),
@@ -905,7 +900,8 @@ def _json_default(obj):
 
 
 def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
-                                keypoint_mapper, calibrator):
+                                keypoint_mapper, calibrator,
+                                pitch_length=105.0, pitch_width=68.0):
     """Draw calibration visualization: camera view + top-down pitch diagram."""
     h, w = frame.shape[:2]
     vis = frame.copy()
@@ -976,7 +972,7 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
 
         # Draw projected template keypoints (yellow, matching pitch lines)
         from .field_registration.pnlcalib import KeypointMapper
-        all_world = KeypointMapper.PNLCALIB_WORLD_COORDS_2D
+        all_world = calibrator._field_world_coords
         non_ground = KeypointMapper.NON_GROUND_KEYPOINTS
         for kid, (wx, wy) in enumerate(all_world):
             if kid in non_ground:
@@ -1013,7 +1009,8 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
         image_size = (w, h)
     pitch_h = h
     pitch_w = int(pitch_h * 1.5)
-    pitch = _draw_topdown_pitch(pitch_h, pitch_w, result, keypoints, _Stub(), keypoint_mapper)
+    pitch = _draw_topdown_pitch(pitch_h, pitch_w, result, keypoints, _Stub(), keypoint_mapper,
+                               pitch_length=pitch_length, pitch_width=pitch_width)
 
     # Combine side-by-side
     combined = np.hstack([vis, pitch])
