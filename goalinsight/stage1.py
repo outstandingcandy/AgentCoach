@@ -43,10 +43,25 @@ PITCH_LINE_KEYPOINTS = [
 ]
 
 
-def get_pitch_template_points():
-    """Get key points on the pitch template for visualization."""
-    half_l = PITCH_LENGTH / 2
-    half_w = PITCH_WIDTH / 2
+def get_pitch_template_points(pitch_length=None, pitch_width=None):
+    """Get key points on the pitch template for visualization.
+
+    Args:
+        pitch_length: Pitch length in meters (default: PITCH_LENGTH=105).
+        pitch_width: Pitch width in meters (default: PITCH_WIDTH=68).
+    """
+    pl = pitch_length or PITCH_LENGTH
+    pw = pitch_width or PITCH_WIDTH
+    half_l = pl / 2
+    half_w = pw / 2
+
+    # FIFA standard marking dimensions (fixed regardless of pitch size)
+    PA_DEPTH = 16.5
+    PA_HW = 20.16   # penalty area half-width
+    GA_DEPTH = 5.5
+    GA_HW = 9.16    # goal area half-width
+    PS_DIST = 11.0   # penalty spot distance from goal line
+    CR = 9.15        # center circle radius
 
     return {
         'pitch_outline': [
@@ -55,19 +70,23 @@ def get_pitch_template_points():
         ],
         'center_line': [(0, -half_w), (0, half_w)],
         'center_circle': [
-            (9.15 * np.cos(a), 9.15 * np.sin(a))
+            (CR * np.cos(a), CR * np.sin(a))
             for a in np.linspace(0, 2*np.pi, 36)
         ],
-        'left_penalty': [(-half_l, -20.16), (-36, -20.16), (-36, 20.16), (-half_l, 20.16)],
-        'right_penalty': [(half_l, -20.16), (36, -20.16), (36, 20.16), (half_l, 20.16)],
-        'left_goal_area': [(-half_l, -9.16), (-47, -9.16), (-47, 9.16), (-half_l, 9.16)],
-        'right_goal_area': [(half_l, -9.16), (47, -9.16), (47, 9.16), (half_l, 9.16)],
+        'left_penalty': [(-half_l, -PA_HW), (-half_l + PA_DEPTH, -PA_HW),
+                         (-half_l + PA_DEPTH, PA_HW), (-half_l, PA_HW)],
+        'right_penalty': [(half_l, -PA_HW), (half_l - PA_DEPTH, -PA_HW),
+                          (half_l - PA_DEPTH, PA_HW), (half_l, PA_HW)],
+        'left_goal_area': [(-half_l, -GA_HW), (-half_l + GA_DEPTH, -GA_HW),
+                           (-half_l + GA_DEPTH, GA_HW), (-half_l, GA_HW)],
+        'right_goal_area': [(half_l, -GA_HW), (half_l - GA_DEPTH, -GA_HW),
+                            (half_l - GA_DEPTH, GA_HW), (half_l, GA_HW)],
         'left_penalty_arc': [
-            (-half_l + 11 + 9.15 * np.cos(a), 9.15 * np.sin(a))
-            for a in np.linspace(-0.93, 0.93, 20)  # ~53 degrees, outside penalty area
+            (-half_l + PS_DIST + CR * np.cos(a), CR * np.sin(a))
+            for a in np.linspace(-0.93, 0.93, 20)
         ],
         'right_penalty_arc': [
-            (half_l - 11 - 9.15 * np.cos(a), 9.15 * np.sin(a))
+            (half_l - PS_DIST - CR * np.cos(a), CR * np.sin(a))
             for a in np.linspace(-0.93, 0.93, 20)
         ],
     }

@@ -205,8 +205,6 @@ def run_stage1_physical(
     else:
         print("Stage 1 (Physical): Deriving lines from keypoints (no line model)")
 
-    pitch_template = get_pitch_template_points()
-
     # Open video
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -240,6 +238,7 @@ def run_stage1_physical(
     pitch_width = phys_config.get("pitch_width", 68.0)
     if pitch_length != 105.0 or pitch_width != 68.0:
         print(f"  Custom pitch dimensions: {pitch_length}×{pitch_width}m")
+    pitch_template = get_pitch_template_points(pitch_length, pitch_width)
 
     calibrator = PhysicalCalibrator(
         K=K,
