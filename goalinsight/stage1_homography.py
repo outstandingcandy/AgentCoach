@@ -72,8 +72,6 @@ def run_stage1_homography(
     kp_detector.load_model()
     keypoint_mapper = KeypointMapper()
 
-    pitch_template = get_pitch_template_points()
-
     # Open video
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -89,6 +87,7 @@ def run_stage1_homography(
 
     pitch_length = homog_config.get("pitch_length", 105.0)
     pitch_width = homog_config.get("pitch_width", 68.0)
+    pitch_template = get_pitch_template_points(pitch_length, pitch_width)
     if pitch_length != 105.0 or pitch_width != 68.0:
         print(f"  Custom pitch dimensions: {pitch_length}×{pitch_width}m")
 
