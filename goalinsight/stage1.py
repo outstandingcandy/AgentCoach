@@ -326,20 +326,50 @@ def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_m
                     cv2.line(pitch, pt1, pt2, (0, 255, 255), max(1, lw))
 
     else:
-        # No camera params — draw detected keypoints at true world positions
+        # No camera params — use homography (if available) or true world positions
+        H = result.get("homography") if result is not None else None
+        H_inv = None
+        if H is not None:
+            try:
+                H_inv = np.linalg.inv(H)
+            except np.linalg.LinAlgError:
+                H_inv = None
+
+        def _img_to_world_h(img_x, img_y):
+            """Back-project image point to world via H_inv."""
+            if H_inv is None:
+                return None
+            pt_h = H_inv @ np.array([img_x, img_y, 1.0])
+            if abs(pt_h[2]) < 1e-6:
+                return None
+            wx, wy = pt_h[0] / pt_h[2], pt_h[1] / pt_h[2]
+            if abs(wx) > 200 or abs(wy) > 200:
+                return None
+            return (wx, wy)
+
+        non_ground = KeypointMapper.NON_GROUND_KEYPOINTS
+        detected_topdown = {}
         for kp in keypoints:
             if kp.get("confidence", 0) < 0.3:
                 continue
             kp_id = kp["id"]
-            if kp_id in KeypointMapper.NON_GROUND_KEYPOINTS:
+            if kp_id in non_ground:
                 continue
             world_xy = keypoint_mapper.get_world_coordinates(kp_id)
             if world_xy is None:
                 continue
             wx, wy = world_xy
-            px, py = w2p(wx, wy)
+
+            # Back-project via homography if available
+            bp = _img_to_world_h(kp["x"], kp["y"])
+            if bp is not None:
+                px, py = w2p(bp[0], bp[1])
+            else:
+                px, py = w2p(wx, wy)
+            detected_topdown[kp_id] = (px, py)
             if not (0 <= px < width and 0 <= py < height):
                 continue
+
             kp_key = (round(float(kp["x"]), 1), round(float(kp["y"]), 1))
             if inlier_img_set and kp_key in inlier_img_set:
                 cv2.circle(pitch, (px, py), r, (0, 255, 0), -1)
@@ -347,6 +377,15 @@ def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_m
                 cv2.circle(pitch, (px, py), r, (0, 0, 255), 2)
             cv2.circle(pitch, (px, py), r, (0, 0, 0), 1)
             cv2.putText(pitch, str(kp_id), (px + r + 2, py + 3), font, 0.35, (255, 255, 255), 1)
+
+        # Draw yellow lines connecting back-projected keypoints
+        if H_inv is not None:
+            for kp_ids_line in PITCH_LINE_KEYPOINTS:
+                for i in range(len(kp_ids_line) - 1):
+                    if kp_ids_line[i] in detected_topdown and kp_ids_line[i + 1] in detected_topdown:
+                        pt1 = detected_topdown[kp_ids_line[i]]
+                        pt2 = detected_topdown[kp_ids_line[i + 1]]
+                        cv2.line(pitch, pt1, pt2, (0, 255, 255), max(1, lw))
 
     return pitch
 
