@@ -665,7 +665,7 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
         info["line_constraints_count"] = result.get("line_constraints_count", 0)
 
         # Full camera parameters
-        cam = result.get("camera_params", {})
+        cam = result.get("camera_params") or {}
         if cam:
             init = result.get("intrinsics_init", {})
             cam_info = {
@@ -790,7 +790,7 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
             inlier_mask = result["inlier_mask"]
             world_pts = result.get("world_pts")
             kp_ids = result.get("kp_ids", [])
-            cam = result.get("camera_params", {})
+            cam = result.get("camera_params") or {}
 
             keypoint_details = []
             projected = None
