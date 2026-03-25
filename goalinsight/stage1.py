@@ -127,7 +127,8 @@ def _project_with_camera_model(template_points, camera_params):
     return projected
 
 
-def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_mapper):
+def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_mapper,
+                        pitch_length=None, pitch_width=None):
     """Draw top-down pitch diagram with keypoints at their known world positions.
 
     The y-axis uses a fixed orientation matching the reference image
@@ -140,23 +141,28 @@ def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_m
         keypoints: Detected keypoints list.
         calibrator: FramebyFrameCalib instance.
         keypoint_mapper: KeypointMapper instance for world coordinate lookup.
+        pitch_length: Pitch length in meters (default: module-level PITCH_LENGTH).
+        pitch_width: Pitch width in meters (default: module-level PITCH_WIDTH).
 
     Returns:
         Top-down pitch image (BGR).
     """
     from .field_registration.pnlcalib import KeypointMapper
 
+    pl = pitch_length if pitch_length is not None else PITCH_LENGTH
+    pw = pitch_width if pitch_width is not None else PITCH_WIDTH
+
     pitch = np.zeros((height, width, 3), dtype=np.uint8)
     pitch[:] = (34, 139, 34)  # Forest green background
 
-    half_l = PITCH_LENGTH / 2  # 52.5
-    half_w = PITCH_WIDTH / 2   # 34.0
+    half_l = pl / 2
+    half_w = pw / 2
 
     # Pitch coordinate -> pixel mapping (with margin)
     margin = 8  # meters of margin around pitch
     scale = min(
-        (width - 2) / (PITCH_LENGTH + 2 * margin),
-        (height - 2) / (PITCH_WIDTH + 2 * margin),
+        (width - 2) / (pl + 2 * margin),
+        (height - 2) / (pw + 2 * margin),
     )
     ox = width / 2   # pixel center
     oy = height / 2

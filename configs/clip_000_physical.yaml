@@ -2,7 +2,7 @@
 # Uses fixed camera intrinsics and 6-DOF extrinsic optimization
 
 video:
-  process_fps: 2
+  process_fps: 0.5
 
 field_registration:
   backend: "physical"
@@ -10,20 +10,18 @@ field_registration:
   physical:
     camera_profile: "veo_1080p"
     ransac_reproj_error: 30.0
-    line_weight: 0.0
+    line_weight: 1.0
     line_sample_points: 20
     max_reproj_error: 15.0
     use_line_model: false
-    focal_bounds: [1528.0, 1928.0]
-    cx_bounds: [-50.0, 50.0]
-    cy_bounds: [-50.0, 50.0]
-    k1_bounds: [-0.55, -0.05]
-    k2_bounds: [-0.30, 0.30]
-    k3_bounds: [-0.10, 0.10]
-    intrinsic_reg_weight: 0.0
+    focal_bounds: [400.0, 3500.0]
     world_residual_weight: 0.0
-    joint_optimize: true # true = run 2-pass joint intrinsic estimation; false = use profile directly
-    world_error_threshold: .inf
+    joint_optimize: false
+    world_error_threshold: 5.0
+    camera_position: [0.0, -32.0, 6.3]
+    position_weight: 200.0
+    pitch_length: 91.0
+    pitch_width: 55.0
 
   pnlcalib:
     # keypoint_weights: "SV_kp"
