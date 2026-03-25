@@ -101,20 +101,21 @@ class HomographyCalibrator:
             logger.debug("Too few ground keypoints (%d < 4), skipping", len(kp_ids))
             return None
 
-        # Step 3: Compute homography (world→image) via RANSAC
+        # Step 3: Compute initial homography via LMEDS (robust median estimator)
+        # LMEDS minimizes the median error and handles up to 50% outliers without
+        # needing a reproj threshold — avoids biased fits from clustered point subsets.
         H, mask = cv2.findHomography(
             world_pts_2d.reshape(-1, 1, 2),
             img_pts.reshape(-1, 1, 2),
-            cv2.RANSAC,
-            self.ransac_reproj_error,
+            cv2.LMEDS,
         )
         if H is None:
-            logger.debug("findHomography failed")
+            logger.debug("findHomography (LMEDS) failed")
             return None
 
         inlier_mask = mask.ravel().astype(bool)
 
-        # Step 4: Iterative world-error outlier rejection
+        # Step 4: Iterative world-error outlier rejection + RANSAC refinement
         if np.isfinite(self.world_error_threshold):
             for _ in range(3):
                 world_errs = self._per_point_world_error(H, img_pts, world_pts_2d)
@@ -131,13 +132,24 @@ class HomographyCalibrator:
                 H_new, mask_new = cv2.findHomography(
                     world_pts_2d.reshape(-1, 1, 2),
                     img_pts.reshape(-1, 1, 2),
-                    cv2.RANSAC,
-                    self.ransac_reproj_error,
+                    cv2.LMEDS,
                 )
                 if H_new is None:
                     break
                 H = H_new
                 inlier_mask = mask_new.ravel().astype(bool)
+
+        # Final RANSAC refinement on cleaned points for optimal fit
+        if len(img_pts) >= 4:
+            H_refined, mask_refined = cv2.findHomography(
+                world_pts_2d.reshape(-1, 1, 2),
+                img_pts.reshape(-1, 1, 2),
+                cv2.RANSAC,
+                self.ransac_reproj_error,
+            )
+            if H_refined is not None:
+                H = H_refined
+                inlier_mask = mask_refined.ravel().astype(bool)
 
         # Normalize homography
         if abs(H[2, 2]) > 1e-10:
