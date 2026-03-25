@@ -597,6 +597,9 @@ def run_stage1(video_path: Path, output_dir: Path, config: dict | None = None):
     elif backend == "physical":
         from .stage1_physical import run_stage1_physical
         return run_stage1_physical(video_path, output_dir, vis_dir, config, process_fps)
+    elif backend == "homography":
+        from .stage1_homography import run_stage1_homography
+        return run_stage1_homography(video_path, output_dir, vis_dir, config, process_fps)
     else:
         return _run_stage1_pnlcalib(video_path, output_dir, vis_dir, config, process_fps)
 
