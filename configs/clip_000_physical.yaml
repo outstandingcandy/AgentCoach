@@ -18,10 +18,10 @@ field_registration:
     world_residual_weight: 0.0
     joint_optimize: false
     world_error_threshold: 5.0
-    camera_position: [0.0, -32.0, 6.3]
+    camera_position: [0.0, -31.0, 6.6]
     position_weight: 200.0
-    pitch_length: 91.0
-    pitch_width: 55.0
+    pitch_length: 89.7
+    pitch_width: 56.5
 
   pnlcalib:
     # keypoint_weights: "SV_kp"
