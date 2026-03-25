@@ -115,11 +115,19 @@ class HomographyCalibrator:
 
         inlier_mask = mask.ravel().astype(bool)
 
-        # Step 4: Iterative world-error outlier rejection + RANSAC refinement
+        # Step 4: Iterative world-error outlier rejection with adaptive threshold.
+        # Points near the vanishing point have high H_inv magnification, so a small
+        # pixel error becomes a large world error. Scale the threshold per-point by
+        # the local magnification factor to avoid rejecting valid far-field points.
         if np.isfinite(self.world_error_threshold):
             for _ in range(3):
                 world_errs = self._per_point_world_error(H, img_pts, world_pts_2d)
-                keep = world_errs < self.world_error_threshold
+                magnification = self._local_magnification(H, img_pts)
+                median_mag = max(np.median(magnification), 1e-6)
+                adaptive_thresh = self.world_error_threshold * np.maximum(
+                    magnification / median_mag, 1.0
+                )
+                keep = world_errs < adaptive_thresh
                 n_removed = int(np.sum(~keep))
                 if n_removed == 0:
                     break
@@ -139,17 +147,16 @@ class HomographyCalibrator:
                 H = H_new
                 inlier_mask = mask_new.ravel().astype(bool)
 
-        # Final RANSAC refinement on cleaned points for optimal fit
+        # Final least-squares refinement using ALL cleaned points (no filtering)
         if len(img_pts) >= 4:
-            H_refined, mask_refined = cv2.findHomography(
+            H_refined, _ = cv2.findHomography(
                 world_pts_2d.reshape(-1, 1, 2),
                 img_pts.reshape(-1, 1, 2),
-                cv2.RANSAC,
-                self.ransac_reproj_error,
+                0,  # method=0: regular DLT least-squares, uses all points
             )
             if H_refined is not None:
                 H = H_refined
-                inlier_mask = mask_refined.ravel().astype(bool)
+                inlier_mask = np.ones(len(img_pts), dtype=bool)
 
         # Normalize homography
         if abs(H[2, 2]) > 1e-10:
@@ -287,6 +294,34 @@ class HomographyCalibrator:
             np.array(int_world, dtype=np.float64),
             int_ids,
         )
+
+    @staticmethod
+    def _local_magnification(H, img_pts):
+        """Compute local meters-per-pixel magnification of H_inv at each image point.
+
+        Returns an array of magnification factors (one per point). Points near the
+        vanishing point will have large values, meaning small pixel errors produce
+        large world-coordinate errors.
+        """
+        H_inv = np.linalg.inv(H)
+        h = H_inv
+        mags = np.empty(len(img_pts))
+        for i, (u, v) in enumerate(img_pts):
+            d = h[2, 0] * u + h[2, 1] * v + h[2, 2]
+            if abs(d) < 1e-10:
+                mags[i] = 1e6
+                continue
+            d2 = d * d
+            # Jacobian of H_inv: d(world)/d(pixel)
+            # J = [[dx/du, dx/dv], [dy/du, dy/dv]]
+            dxdu = (h[0, 0] * d - h[2, 0] * (h[0, 0] * u + h[0, 1] * v + h[0, 2])) / d2
+            dxdv = (h[0, 1] * d - h[2, 1] * (h[0, 0] * u + h[0, 1] * v + h[0, 2])) / d2
+            dydu = (h[1, 0] * d - h[2, 0] * (h[1, 0] * u + h[1, 1] * v + h[1, 2])) / d2
+            dydv = (h[1, 1] * d - h[2, 1] * (h[1, 0] * u + h[1, 1] * v + h[1, 2])) / d2
+            # Magnification = sqrt(|det(J)|), i.e. local area scale
+            det_j = abs(dxdu * dydv - dxdv * dydu)
+            mags[i] = max(det_j ** 0.5, 1e-6)
+        return mags
 
     @staticmethod
     def _reprojection_error(H, img_pts, world_pts_2d):
