@@ -135,6 +135,43 @@ def _filter_by_pitch_undistorted(
     return filtered
 
 
+# ---------------------------------------------------------------------------
+# Jersey color histogram extraction for team classification
+# ---------------------------------------------------------------------------
+
+def _extract_jersey_color_hist(crop: np.ndarray, h_bins: int = 30, s_bins: int = 32) -> np.ndarray | None:
+    """Extract HSV color histogram from upper body (jersey) region.
+
+    Takes the top 50% of the crop (torso area), converts to HSV, and computes
+    a normalized H+S histogram. Ignores V channel for illumination invariance.
+
+    Returns:
+        Flattened, L2-normalized histogram vector, or None if crop is too small.
+    """
+    h, w = crop.shape[:2]
+    if h < 10 or w < 5:
+        return None
+
+    # Upper 50% = jersey/torso area (skip head ~top 15%)
+    y_top = max(0, int(h * 0.15))
+    y_bot = int(h * 0.65)
+    jersey = crop[y_top:y_bot, :]
+
+    if jersey.size == 0:
+        return None
+
+    hsv = cv2.cvtColor(jersey, cv2.COLOR_BGR2HSV)
+
+    # 2D histogram on H and S channels
+    hist = cv2.calcHist([hsv], [0, 1], None, [h_bins, s_bins],
+                        [0, 180, 0, 256])
+    hist = hist.flatten().astype(np.float32)
+    norm = np.linalg.norm(hist)
+    if norm > 1e-6:
+        hist /= norm
+    return hist
+
+
 # Team colors for visualization
 TEAM_COLORS = {
     "team_A": (0, 0, 255),     # Red
@@ -153,6 +190,131 @@ def get_color_for_track(track_id: int, team: str | None = None) -> tuple[int, in
     import random
     random.seed(track_id * 7)
     return (random.randint(50, 255), random.randint(50, 255), random.randint(50, 255))
+
+
+def draw_topdown_pitch(
+    height: int,
+    tracks: list[dict],
+    team_assignments: dict[int, str],
+    ball_track: dict | None = None,
+    pitch_length: float = 105.0,
+    pitch_width: float = 68.0,
+) -> np.ndarray:
+    """Draw top-down pitch diagram with player and ball positions.
+
+    Args:
+        height: Output image height (matches camera frame height).
+        tracks: List of track dicts with pitch_position, track_id, role.
+        team_assignments: Dict of track_id -> team label.
+        ball_track: Ball track dict with pitch_position (optional).
+        pitch_length: Pitch length in meters.
+        pitch_width: Pitch width in meters.
+
+    Returns:
+        Top-down pitch image (BGR).
+    """
+    width = int(height * 0.75)  # 3:4 aspect for pitch
+    pitch = np.zeros((height, width, 3), dtype=np.uint8)
+    pitch[:] = (34, 139, 34)
+
+    half_l = pitch_length / 2
+    half_w = pitch_width / 2
+    margin = 6
+    scale = min(
+        (width - 2) / (pitch_length + 2 * margin),
+        (height - 2) / (pitch_width + 2 * margin),
+    )
+    ox = width / 2
+    oy = height / 2
+
+    def w2p(wx, wy):
+        px = int(ox + wx * scale)
+        py = int(oy - wy * scale)
+        return (px, py)
+
+    lc = (255, 255, 255)
+    lw = max(1, int(scale * 0.25))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # Pitch markings
+    cv2.rectangle(pitch, w2p(-half_l, half_w), w2p(half_l, -half_w), lc, lw)
+    cv2.line(pitch, w2p(0, half_w), w2p(0, -half_w), lc, lw)
+    cv2.circle(pitch, w2p(0, 0), int(9.15 * scale), lc, lw)
+    cv2.circle(pitch, w2p(0, 0), max(2, int(0.3 * scale)), lc, -1)
+    # Penalty areas
+    pa_w = min(20.16, half_w)
+    pa_d = min(16.5, half_l * 0.35)
+    cv2.rectangle(pitch, w2p(-half_l, pa_w), w2p(-half_l + pa_d, -pa_w), lc, lw)
+    cv2.rectangle(pitch, w2p(half_l - pa_d, pa_w), w2p(half_l, -pa_w), lc, lw)
+    # Goal areas
+    ga_w = min(9.16, half_w * 0.5)
+    ga_d = min(5.5, half_l * 0.12)
+    cv2.rectangle(pitch, w2p(-half_l, ga_w), w2p(-half_l + ga_d, -ga_w), lc, lw)
+    cv2.rectangle(pitch, w2p(half_l - ga_d, ga_w), w2p(half_l, -ga_w), lc, lw)
+
+    # Role-specific markers
+    ROLE_SHAPES = {
+        "goalkeeper": "diamond",
+        "referee": "triangle",
+        "player": "circle",
+    }
+
+    r = max(5, int(1.2 * scale))
+    for track in tracks:
+        pos = track.get("pitch_position")
+        if pos is None:
+            continue
+
+        tid = track["track_id"]
+        team = team_assignments.get(tid, track.get("team", "unknown"))
+        role = track.get("role", "player")
+        color = get_color_for_track(tid, team)
+
+        px, py = w2p(pos[0], pos[1])
+        if not (-50 < px < width + 50 and -50 < py < height + 50):
+            continue
+
+        shape = ROLE_SHAPES.get(role, "circle")
+        if shape == "diamond":
+            pts = np.array([
+                [px, py - r], [px + r, py], [px, py + r], [px - r, py]
+            ], dtype=np.int32)
+            cv2.fillPoly(pitch, [pts], color)
+            cv2.polylines(pitch, [pts], True, (255, 255, 255), 1)
+        elif shape == "triangle":
+            pts = np.array([
+                [px, py - r], [px + r, py + r], [px - r, py + r]
+            ], dtype=np.int32)
+            cv2.fillPoly(pitch, [pts], color)
+            cv2.polylines(pitch, [pts], True, (255, 255, 255), 1)
+        else:
+            cv2.circle(pitch, (px, py), r, color, -1)
+            cv2.circle(pitch, (px, py), r, (255, 255, 255), 1)
+
+        # Label
+        label = f"{tid}"
+        if role == "goalkeeper":
+            label = f"GK{tid}"
+        cv2.putText(pitch, label, (px + r + 2, py + 3), font, 0.35, (255, 255, 255), 1)
+
+    # Ball
+    if ball_track and ball_track.get("pitch_position"):
+        bx, by = ball_track["pitch_position"]
+        bpx, bpy = w2p(bx, by)
+        cv2.circle(pitch, (bpx, bpy), max(4, int(0.6 * scale)), TEAM_COLORS["ball"], -1)
+        cv2.circle(pitch, (bpx, bpy), max(4, int(0.6 * scale)), (255, 255, 255), 1)
+
+    # Legend
+    y_leg = 20
+    for label, col in [("team_A", TEAM_COLORS["team_A"]),
+                        ("team_B", TEAM_COLORS["team_B"]),
+                        ("referee", TEAM_COLORS["referee"]),
+                        ("GK", TEAM_COLORS["team_A"])]:
+        cv2.rectangle(pitch, (5, y_leg - 10), (15, y_leg), col, -1)
+        cv2.putText(pitch, label, (18, y_leg), font, 0.35, (255, 255, 255), 1)
+        y_leg += 18
+
+    return pitch
 
 
 def draw_tracks(
@@ -188,17 +350,13 @@ def draw_tracks(
         cv2.rectangle(vis, (x1, y1 - th - 4), (x1 + tw + 4, y1), color, -1)
         cv2.putText(vis, label, (x1 + 2, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        # Draw trajectory (shorter for cleaner visualization)
+        # Track history (kept for potential future use, not drawn on camera view)
         center = ((x1 + x2) // 2, y2)
         if track_id not in track_history:
             track_history[track_id] = []
         track_history[track_id].append(center)
-        if len(track_history[track_id]) > 15:  # Shorter trajectory
+        if len(track_history[track_id]) > 15:
             track_history[track_id] = track_history[track_id][-15:]
-
-        for i in range(1, len(track_history[track_id])):
-            alpha = i / len(track_history[track_id])  # Fade effect
-            cv2.line(vis, track_history[track_id][i-1], track_history[track_id][i], color, 2)
 
     # Draw legend
     y_offset = 30
@@ -227,16 +385,6 @@ def draw_ball_track(
     center = ball_track.get("center", [0, 0])
     cx, cy = int(center[0]), int(center[1])
 
-    # Draw trajectory with fade effect
-    if ball_trajectory and len(ball_trajectory) > 1:
-        for i in range(1, len(ball_trajectory)):
-            alpha = i / len(ball_trajectory)
-            color = (int(128 + 127 * alpha), int(200 - 35 * alpha), 255)
-            pt1 = (int(ball_trajectory[i-1][0]), int(ball_trajectory[i-1][1]))
-            pt2 = (int(ball_trajectory[i][0]), int(ball_trajectory[i][1]))
-            thickness = max(1, int(3 * alpha))
-            cv2.line(vis, pt1, pt2, color, thickness)
-
     # Draw ball with outline
     radius = 10
     cv2.circle(vis, (cx, cy), radius, TEAM_COLORS["ball"], -1)
@@ -247,7 +395,9 @@ def draw_ball_track(
         vx, vy = ball_track["velocity"]
         speed = (vx**2 + vy**2) ** 0.5
         if speed > 2.0:
-            scale = 4.0
+            # Cap arrow length to 60px
+            max_len = 60.0
+            scale = min(4.0, max_len / speed)
             end_x = int(cx + vx * scale)
             end_y = int(cy + vy * scale)
             cv2.arrowedLine(vis, (cx, cy), (end_x, end_y), (0, 200, 255), 2, tipLength=0.25)
@@ -352,7 +502,11 @@ def run_stage2(
     tc_backend = config.get("team_classification", {}).get("backend", "kmeans")
     print(f"Stage 2: Initializing team classifier ({tc_backend})...")
     team_classifier = get_team_classifier(config)
-    gk_detector = GoalkeeperDetector()
+    fr_config = config.get("field_registration", {})
+    phys_config = fr_config.get("physical", {})
+    pitch_length = phys_config.get("pitch_length", 105.0)
+    pitch_width = phys_config.get("pitch_width", 68.0)
+    gk_detector = GoalkeeperDetector(pitch_length=pitch_length, pitch_width=pitch_width)
 
     # Initialize ball detection and tracking
     ball_config = config.get("ball_detection", {})
@@ -376,14 +530,17 @@ def run_stage2(
     print(f"Video: {total_frames} frames @ {fps:.1f} fps, {width}x{height}")
     print(f"Processing {len(sampler)} frames ({max_duration_sec}s) at {process_fps or fps} fps")
 
-    # Output video
+    # Output video (camera view + top-down pitch side-by-side)
     output_fps = process_fps if process_fps and process_fps < fps else fps
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(str(output_dir / "tracking.mp4"), fourcc, output_fps, (width, height))
+    topdown_w = int(height * 0.75)
+    combined_w = width + topdown_w
+    out = cv2.VideoWriter(str(output_dir / "tracking.mp4"), fourcc, output_fps, (combined_w, height))
 
     # Storage
     all_tracks = {}
     track_features = {}  # track_id -> list of features
+    track_color_hists = {}  # track_id -> list of jersey color histograms
     track_positions = {}  # track_id -> list of positions
     track_history = {}  # For visualization
     team_assignments = {}  # track_id -> team
@@ -473,12 +630,23 @@ def run_stage2(
             # Store features and positions for team classification
             if track_id not in track_features:
                 track_features[track_id] = []
+                track_color_hists[track_id] = []
                 track_positions[track_id] = []
 
             # Get feature from tracker (keep all features for trajectory averaging)
             tracker_features = tracker.get_track_features()
             if track_id in tracker_features and tracker_features[track_id] is not None:
                 track_features[track_id].append(tracker_features[track_id])
+
+            # Extract jersey color histogram for team classification
+            bx1, by1, bx2, by2 = map(int, track["bbox"])
+            bx1, by1 = max(0, bx1), max(0, by1)
+            bx2, by2 = min(width, bx2), min(height, by2)
+            if bx2 > bx1 and by2 > by1:
+                crop = frame[by1:by2, bx1:bx2]
+                color_hist = _extract_jersey_color_hist(crop)
+                if color_hist is not None:
+                    track_color_hists[track_id].append(color_hist)
 
             if pitch_pos:
                 track_positions[track_id].append(pitch_pos)
@@ -533,40 +701,58 @@ def run_stage2(
 
     cap.release()
 
-    # Final team classification using trajectory-averaged features
-    print("\nFinalizing team assignments using trajectory-averaged features...")
-    print(f"  Computing mean features for {len(track_features)} tracks...")
+    # Final team classification using jersey color histograms
+    print("\nFinalizing team assignments using jersey color histograms...")
 
-    # Compute trajectory-averaged ReID features
-    mean_features = {}
-    for tid, feats in track_features.items():
-        if feats:
-            mean_features[tid] = np.mean(feats, axis=0)
+    # Compute trajectory-averaged color histograms
+    mean_color_features = {}
+    for tid, hists in track_color_hists.items():
+        if hists:
+            mean_color_features[tid] = np.mean(hists, axis=0)
 
-    # Compute mean pitch positions
+    # Compute median pitch positions (robust to projection outliers)
     mean_positions = {}
     for tid, poss in track_positions.items():
         if poss:
-            mean_positions[tid] = np.mean(poss, axis=0).tolist()
+            mean_positions[tid] = np.median(poss, axis=0).tolist()
 
-    print(f"  Tracks with features: {len(mean_features)}")
+    print(f"  Tracks with color features: {len(mean_color_features)}")
     print(f"  Tracks with positions: {len(mean_positions)}")
 
-    if len(mean_features) >= 6:
-        team_assignments = team_classifier.fit(mean_features, mean_positions)
+    if len(mean_color_features) >= 6:
+        team_assignments = team_classifier.fit(mean_color_features, mean_positions)
         print(f"  Team assignments: {len(team_assignments)} tracks classified")
     else:
         print("  Warning: Not enough tracks for team classification")
 
-    # Update all tracks with final team assignments
+    # Role refinement: linesman + goalkeeper detection by position
+    goalkeeper_tracks = set()
+    if mean_positions:
+        print("  Refining roles by position...")
+        team_assignments, goalkeeper_tracks = gk_detector.refine_roles(
+            team_assignments, mean_positions
+        )
+
+    # Update all tracks with final team assignments and roles
     for frame_idx in all_tracks:
         for track in all_tracks[frame_idx]:
-            track["team"] = team_assignments.get(track["track_id"], "unknown")
+            tid = track["track_id"]
+            track["team"] = team_assignments.get(tid, "unknown")
+            if tid in goalkeeper_tracks:
+                track["role"] = "goalkeeper"
+            elif track["team"] == "referee":
+                track["role"] = "referee"
+            else:
+                track["role"] = "player"
 
     # Generate visualization with final team assignments
     print("\nGenerating visualization with final team assignments...")
     cap = cv2.VideoCapture(str(video_path))
     track_history = {}  # Reset for visualization
+
+    # Create per-frame output directories
+    vis_frames_dir = output_dir / "frames"
+    vis_frames_dir.mkdir(exist_ok=True)
 
     for idx, frame_idx in enumerate(tqdm(sampler, desc="Stage 2: Rendering")):
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -581,18 +767,38 @@ def run_stage2(
         vis = draw_tracks(frame, frame_tracks, track_history, team_assignments)
 
         # Draw ball if available
+        ball_track_this = None
         if ball_enabled and frame_idx in all_ball_tracks:
-            ball_track = all_ball_tracks[frame_idx]
+            ball_track_this = all_ball_tracks[frame_idx]
             # Get trajectory up to this frame
             traj = [all_ball_tracks[fi]["center"] for fi in sorted(all_ball_tracks.keys()) if fi <= frame_idx]
             traj = traj[-30:]  # Last 30 frames
-            vis = draw_ball_track(vis, ball_track, traj)
+            vis = draw_ball_track(vis, ball_track_this, traj)
 
-        out.write(vis)
+        # Draw top-down pitch diagram
+        topdown = draw_topdown_pitch(
+            height, frame_tracks, team_assignments,
+            ball_track=ball_track_this,
+            pitch_length=pitch_length,
+            pitch_width=pitch_width,
+        )
+        combined = np.hstack([vis, topdown])
 
-        # Save sample frames
-        if idx % max(1, len(sampler) // 50) == 0:
-            cv2.imwrite(str(output_dir / f"frame_{frame_idx:05d}.jpg"), vis)
+        out.write(combined)
+
+        # Save per-frame visualization image and JSON
+        fname = f"frame_{frame_idx:05d}"
+        cv2.imwrite(str(vis_frames_dir / f"{fname}.jpg"), combined)
+
+        frame_json = {
+            "frame_idx": int(frame_idx),
+            "timestamp_sec": round(frame_idx / fps, 3),
+            "num_tracks": len(frame_tracks),
+            "tracks": frame_tracks,
+            "ball": ball_track_this,
+        }
+        with open(vis_frames_dir / f"{fname}.json", "w") as jf:
+            json.dump(frame_json, jf, indent=2, default=_json_default)
 
     cap.release()
     out.release()
@@ -647,6 +853,19 @@ def run_stage2(
     print(f"  Output: {output_dir}")
 
     return stats
+
+
+def _json_default(obj):
+    """JSON serializer fallback for numpy types."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
 def main():

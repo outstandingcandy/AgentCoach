@@ -2,7 +2,7 @@
 # Uses fixed camera intrinsics and 6-DOF extrinsic optimization
 
 video:
-  process_fps: 0.5
+  process_fps: 5
 
 field_registration:
   backend: "physical"

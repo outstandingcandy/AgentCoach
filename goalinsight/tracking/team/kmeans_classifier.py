@@ -108,36 +108,41 @@ class KMeansTeamClassifier(BaseTeamClassifier):
                 track_ids = valid_ids
                 features_norm = combined
 
-        # Use 3 clusters: team_A, team_B, and referees/others
-        n_clusters = 3
-        if len(track_ids) < n_clusters:
-            n_clusters = max(2, len(track_ids))
+        # Use 2 clusters for two teams; referee detection is position-based
+        n_clusters = min(2, len(track_ids))
 
         self.kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         labels = self.kmeans.fit_predict(features_norm)
         self.team_centers = self.kmeans.cluster_centers_
 
-        # Count cluster sizes
+        # Map clusters to teams by size (larger cluster = team_A)
         cluster_counts = {}
         for label in labels:
             cluster_counts[label] = cluster_counts.get(label, 0) + 1
-
-        # Sort clusters by size (largest first)
         sorted_clusters = sorted(cluster_counts.items(), key=lambda x: -x[1])
 
-        # Map: largest two clusters are teams, smallest is referee/other
         cluster_to_team = {}
-        if len(sorted_clusters) >= 2:
+        if len(sorted_clusters) >= 1:
             cluster_to_team[sorted_clusters[0][0]] = "team_A"
+        if len(sorted_clusters) >= 2:
             cluster_to_team[sorted_clusters[1][0]] = "team_B"
-        if len(sorted_clusters) >= 3:
-            cluster_to_team[sorted_clusters[2][0]] = "referee"
 
-        # Assign teams
+        # Detect color outliers as referees: tracks far from both cluster centers
+        distances = self.kmeans.transform(features_norm)  # (N, 2) distances
+        min_dists = distances.min(axis=1)  # distance to nearest center
+        dist_threshold = np.percentile(min_dists, 85)  # top 15% are outliers
+
         assignments = {}
+        referee_count = 0
         for i, tid in enumerate(track_ids):
-            cluster = labels[i]
-            assignments[tid] = cluster_to_team.get(cluster, "unknown")
+            if min_dists[i] > dist_threshold and min_dists[i] > np.median(min_dists) * 1.5:
+                assignments[tid] = "referee"
+                referee_count += 1
+            else:
+                assignments[tid] = cluster_to_team.get(labels[i], "unknown")
+
+        if referee_count:
+            print(f"  Color outlier referees: {referee_count} (dist > {dist_threshold:.3f})")
 
         self._is_fitted = True
         return assignments
@@ -226,52 +231,91 @@ class GoalkeeperDetector:
         self.goal_area_depth = goal_area_depth
 
     def is_goalkeeper(self, position: list[float]) -> bool:
-        """Check if position is in goalkeeper area.
-
-        Args:
-            position: [x, y] pitch position.
-
-        Returns:
-            True if likely goalkeeper position.
-        """
+        """Check if position is in goalkeeper area."""
         if position is None:
             return False
 
         x, y = position
-
-        # Check if in left or right goal area
-        in_left_goal_area = (
-            x < -self.half_length + self.goal_area_depth and
-            abs(y) < 20  # Roughly within goal area width
+        in_left = (
+            x < -self.half_length + self.goal_area_depth
+            and abs(y) < self.half_width * 0.6
         )
-        in_right_goal_area = (
-            x > self.half_length - self.goal_area_depth and
-            abs(y) < 20
+        in_right = (
+            x > self.half_length - self.goal_area_depth
+            and abs(y) < self.half_width * 0.6
         )
+        return in_left or in_right
 
-        return in_left_goal_area or in_right_goal_area
+    def is_linesman(self, position: list[float], margin: float = 2.0) -> bool:
+        """Check if position is outside pitch boundary (assistant referee)."""
+        if position is None:
+            return False
+        return abs(position[1]) > self.half_width - margin
 
     def classify_role(
         self,
         position: list[float],
         team: str | None = None,
     ) -> str:
-        """Classify role based on position.
-
-        Args:
-            position: [x, y] pitch position.
-            team: Team assignment.
-
-        Returns:
-            Role: "goalkeeper", "player", or "referee"
-        """
+        """Classify role based on position and team."""
         if team == "referee":
             return "referee"
-
         if self.is_goalkeeper(position):
             return "goalkeeper"
-
         return "player"
+
+    def refine_roles(
+        self,
+        team_assignments: dict[int, str],
+        mean_positions: dict[int, list[float]],
+    ) -> tuple[dict[int, str], set[int]]:
+        """Post-pass role refinement using mean track positions.
+
+        1. Linesman detection: tracks with mean |y| near/beyond sideline -> referee
+        2. Goalkeeper detection: per team, track deepest in goal area -> goalkeeper
+
+        Args:
+            team_assignments: Dict of track_id -> team label (modified in-place).
+            mean_positions: Dict of track_id -> [x, y] mean pitch position.
+
+        Returns:
+            (updated team_assignments, set of goalkeeper track_ids)
+        """
+        # 1. Linesman detection
+        linesman_count = 0
+        for tid, pos in mean_positions.items():
+            if self.is_linesman(pos):
+                team_assignments[tid] = "referee"
+                linesman_count += 1
+
+        if linesman_count:
+            print(f"  Linesmen detected: {linesman_count} (|y| > {self.half_width - 2.0:.1f}m)")
+
+        # 2. Goalkeeper detection: per team, find the track significantly
+        #    deeper than teammates (closest to goal line)
+        goalkeeper_tracks = set()
+        for team in ["team_A", "team_B"]:
+            team_tids = [
+                t for t, tm in team_assignments.items()
+                if tm == team and t in mean_positions
+            ]
+            if len(team_tids) < 2:
+                continue
+
+            # Sort by |x| descending
+            sorted_by_x = sorted(team_tids, key=lambda t: abs(mean_positions[t][0]), reverse=True)
+            deepest = sorted_by_x[0]
+            second = sorted_by_x[1]
+            deepest_x = abs(mean_positions[deepest][0])
+            second_x = abs(mean_positions[second][0])
+
+            # Goalkeeper must be significantly deeper than second-deepest teammate
+            # and beyond the midfield area
+            if deepest_x > second_x + 5.0 and deepest_x > self.half_length * 0.3:
+                goalkeeper_tracks.add(deepest)
+                print(f"  Goalkeeper: T{deepest} ({team}, |x|={deepest_x:.1f}m, gap={deepest_x - second_x:.1f}m)")
+
+        return team_assignments, goalkeeper_tracks
 
 
 # Backwards compatibility alias
