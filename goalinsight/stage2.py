@@ -12,8 +12,11 @@ Supports configurable backends via factory functions:
 - Team classification: KMeans (default) or Tracklet clustering
 """
 
+import bisect
 import json
 import pickle
+import threading
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +38,7 @@ from .tracking import (
     BallDetector,
     BallTracker,
 )
+from .tracking.ball_trajectory import BallTrajectory3D
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +87,7 @@ def _filter_by_pitch_undistorted(
     detections: list[dict],
     pose: dict,
     margin: float = 5.0,
+    use_center: bool = False,
 ) -> list[dict]:
     """Filter detections by pitch boundary using undistorted projection.
 
@@ -90,6 +95,7 @@ def _filter_by_pitch_undistorted(
         detections: List of detection dicts with 'bbox' key.
         pose: Physical camera pose dict.
         margin: Extra meters beyond pitch boundary to allow.
+        use_center: If True, use bbox center instead of foot point (for ball).
 
     Returns:
         Filtered detection list.
@@ -107,16 +113,19 @@ def _filter_by_pitch_undistorted(
     except np.linalg.LinAlgError:
         return detections
 
-    # Extract foot points from all detections
-    foot_pts = []
+    # Extract projection points from all detections
+    proj_pts = []
     for det in detections:
         bbox = det["bbox"]
-        foot_x = (bbox[0] + bbox[2]) / 2
-        foot_y = bbox[3]
-        foot_pts.append([foot_x, foot_y])
+        px = (bbox[0] + bbox[2]) / 2
+        if use_center:
+            py = (bbox[1] + bbox[3]) / 2
+        else:
+            py = bbox[3]  # foot point
+        proj_pts.append([px, py])
 
-    foot_pts = np.array(foot_pts, dtype=np.float64).reshape(-1, 1, 2)
-    foot_undist = cv2.undistortPoints(foot_pts, K, dist, P=K).reshape(-1, 2)
+    proj_pts = np.array(proj_pts, dtype=np.float64).reshape(-1, 1, 2)
+    proj_undist = cv2.undistortPoints(proj_pts, K, dist, P=K).reshape(-1, 2)
 
     # Project to world and filter by pitch boundary
     filtered = []
@@ -124,7 +133,7 @@ def _filter_by_pitch_undistorted(
     y_lim = _PITCH_HALF_WIDTH + margin
 
     for i, det in enumerate(detections):
-        pt = foot_undist[i]
+        pt = proj_undist[i]
         ph = H_inv @ np.array([pt[0], pt[1], 1.0])
         if abs(ph[2]) < 1e-6:
             continue
@@ -133,6 +142,53 @@ def _filter_by_pitch_undistorted(
             filtered.append(det)
 
     return filtered
+
+
+# ---------------------------------------------------------------------------
+# Camera pose interpolation (for stage2 running at higher fps than stage1)
+# ---------------------------------------------------------------------------
+
+def _interpolate_camera_poses(
+    camera_poses: dict[int, dict],
+    target_frame_indices: list[int],
+) -> dict[int, dict]:
+    """Interpolate camera poses for frames not calibrated in stage1.
+
+    Uses nearest-neighbor for rvec/tvec/K/dist_coeffs. Linear interpolation
+    of rotation vectors can cause issues, so nearest is safest.
+
+    Args:
+        camera_poses: Dict of frame_idx -> pose from stage1.
+        target_frame_indices: Frame indices needed by stage2.
+
+    Returns:
+        Expanded camera_poses dict covering all target frames.
+    """
+    if not camera_poses:
+        return camera_poses
+
+    calibrated_indices = sorted(camera_poses.keys())
+    expanded = dict(camera_poses)  # Keep originals
+
+    for fidx in target_frame_indices:
+        if fidx in expanded:
+            continue
+
+        # Find nearest calibrated frame (binary search)
+        pos = bisect.bisect_left(calibrated_indices, fidx)
+
+        if pos == 0:
+            nearest = calibrated_indices[0]
+        elif pos >= len(calibrated_indices):
+            nearest = calibrated_indices[-1]
+        else:
+            left = calibrated_indices[pos - 1]
+            right = calibrated_indices[pos]
+            nearest = left if (fidx - left) <= (right - fidx) else right
+
+        expanded[fidx] = camera_poses[nearest]
+
+    return expanded
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +228,27 @@ def _extract_jersey_color_hist(crop: np.ndarray, h_bins: int = 30, s_bins: int =
     return hist
 
 
+def _extract_jersey_mean_saturation(crop: np.ndarray) -> float | None:
+    """Extract mean saturation of jersey region. Low saturation = achromatic (black/white/grey).
+
+    Returns:
+        Mean saturation (0-255), or None if crop is too small.
+    """
+    h, w = crop.shape[:2]
+    if h < 10 or w < 5:
+        return None
+
+    y_top = max(0, int(h * 0.15))
+    y_bot = int(h * 0.65)
+    jersey = crop[y_top:y_bot, :]
+
+    if jersey.size == 0:
+        return None
+
+    hsv = cv2.cvtColor(jersey, cv2.COLOR_BGR2HSV)
+    return float(hsv[:, :, 1].mean())
+
+
 # Team colors for visualization
 TEAM_COLORS = {
     "team_A": (0, 0, 255),     # Red
@@ -197,6 +274,7 @@ def draw_topdown_pitch(
     tracks: list[dict],
     team_assignments: dict[int, str],
     ball_track: dict | None = None,
+    ball_trajectory_world: list[list[float]] | None = None,
     pitch_length: float = 105.0,
     pitch_width: float = 68.0,
 ) -> np.ndarray:
@@ -297,12 +375,24 @@ def draw_topdown_pitch(
             label = f"GK{tid}"
         cv2.putText(pitch, label, (px + r + 2, py + 3), font, 0.35, (255, 255, 255), 1)
 
-    # Ball
+    # Ball trajectory trail on pitch
+    if ball_trajectory_world and len(ball_trajectory_world) > 1:
+        n = len(ball_trajectory_world)
+        for i in range(1, n):
+            alpha = i / n
+            color = (0, int(100 + 65 * alpha), int(180 + 75 * alpha))
+            thickness = max(1, int(2 * alpha))
+            p1 = w2p(ball_trajectory_world[i - 1][0], ball_trajectory_world[i - 1][1])
+            p2 = w2p(ball_trajectory_world[i][0], ball_trajectory_world[i][1])
+            cv2.line(pitch, p1, p2, color, thickness)
+
+    # Ball current position
     if ball_track and ball_track.get("pitch_position"):
         bx, by = ball_track["pitch_position"]
         bpx, bpy = w2p(bx, by)
-        cv2.circle(pitch, (bpx, bpy), max(4, int(0.6 * scale)), TEAM_COLORS["ball"], -1)
-        cv2.circle(pitch, (bpx, bpy), max(4, int(0.6 * scale)), (255, 255, 255), 1)
+        ball_r = max(6, int(1.0 * scale))
+        cv2.circle(pitch, (bpx, bpy), ball_r, TEAM_COLORS["ball"], -1)
+        cv2.circle(pitch, (bpx, bpy), ball_r, (255, 255, 255), 2)
 
     # Legend
     y_leg = 20
@@ -385,6 +475,17 @@ def draw_ball_track(
     center = ball_track.get("center", [0, 0])
     cx, cy = int(center[0]), int(center[1])
 
+    # Draw trajectory trail (fading from old to new)
+    if ball_trajectory and len(ball_trajectory) > 1:
+        n = len(ball_trajectory)
+        for i in range(1, n):
+            alpha = i / n  # 0→1 as we approach current frame
+            color = (0, int(100 + 65 * alpha), int(180 + 75 * alpha))  # Fading orange
+            thickness = max(1, int(2 * alpha))
+            pt1 = (int(ball_trajectory[i - 1][0]), int(ball_trajectory[i - 1][1]))
+            pt2 = (int(ball_trajectory[i][0]), int(ball_trajectory[i][1]))
+            cv2.line(vis, pt1, pt2, color, thickness)
+
     # Draw ball with outline
     radius = 10
     cv2.circle(vis, (cx, cy), radius, TEAM_COLORS["ball"], -1)
@@ -395,23 +496,78 @@ def draw_ball_track(
         vx, vy = ball_track["velocity"]
         speed = (vx**2 + vy**2) ** 0.5
         if speed > 2.0:
-            # Cap arrow length to 60px
             max_len = 60.0
-            scale = min(4.0, max_len / speed)
-            end_x = int(cx + vx * scale)
-            end_y = int(cy + vy * scale)
+            arrow_scale = min(4.0, max_len / speed)
+            end_x = int(cx + vx * arrow_scale)
+            end_y = int(cy + vy * arrow_scale)
             cv2.arrowedLine(vis, (cx, cy), (end_x, end_y), (0, 200, 255), 2, tipLength=0.25)
 
-    # Draw label
+    # Draw label with height info
     conf = ball_track.get("confidence", 0.0)
     status = ball_track.get("status", "unknown")
     label = f"Ball {conf:.2f}"
     if status == "confirmed":
         label += " [OK]"
+    height_m = ball_track.get("height", 0.0)
+    if height_m and height_m > 0.3:
+        label += f" h={height_m:.1f}m"
     cv2.putText(vis, label, (cx + 15, cy + 5),
                cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEAM_COLORS["ball"], 1)
 
     return vis
+
+
+class _FramePrefetcher:
+    """Read video frames in a background thread to overlap IO with GPU inference."""
+
+    def __init__(self, video_path: str | Path, frame_indices: list[int], prefetch_size: int = 4):
+        self._cap = cv2.VideoCapture(str(video_path))
+        self._frame_indices = frame_indices
+        self._buffer: dict[int, np.ndarray] = {}
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._prefetch_size = prefetch_size
+        self._done = False
+
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
+
+    def _reader_loop(self):
+        for fidx in self._frame_indices:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+            ret, frame = self._cap.read()
+            if not ret:
+                frame = None
+
+            with self._cond:
+                # Wait if buffer is full
+                while len(self._buffer) >= self._prefetch_size and not self._done:
+                    self._cond.wait(timeout=1.0)
+                if self._done:
+                    break
+                self._buffer[fidx] = frame
+                self._cond.notify_all()
+
+        with self._cond:
+            self._done = True
+            self._cond.notify_all()
+        self._cap.release()
+
+    def get(self, frame_idx: int, timeout: float = 30.0) -> np.ndarray | None:
+        with self._cond:
+            while frame_idx not in self._buffer:
+                if self._done and frame_idx not in self._buffer:
+                    return None
+                self._cond.wait(timeout=timeout)
+            frame = self._buffer.pop(frame_idx)
+            self._cond.notify_all()  # Unblock reader if waiting on full buffer
+            return frame
+
+    def shutdown(self):
+        with self._cond:
+            self._done = True
+            self._cond.notify_all()
+        self._thread.join(timeout=5)
 
 
 def run_stage2(
@@ -436,7 +592,9 @@ def run_stage2(
     # Load configuration
     if config is None:
         config = get_default_config()
-    process_fps = get_process_fps_from_config(config)
+    # Stage 2 uses tracking_fps if set, otherwise falls back to process_fps
+    tracking_fps = config.get("video", {}).get("tracking_fps")
+    process_fps = tracking_fps or get_process_fps_from_config(config)
 
     # Load calibration data (supports both physical camera poses and legacy homographies)
     homographies = {}
@@ -482,12 +640,17 @@ def run_stage2(
 
     # Initialize StrongSORT tracker
     print("Stage 2: Initializing StrongSORT tracker...")
+    # Frame interval: native_fps / process_fps (e.g., 30/10 = 3.0)
+    # Scales Kalman noise so gating works correctly at lower fps
+    effective_fps = process_fps if process_fps and process_fps < fps else fps
+    frame_interval = fps / effective_fps if effective_fps > 0 else 1.0
     tracker = StrongSORTTracker({
         "max_age": 50,
         "n_init": 3,
         "max_iou_distance": 0.7,
         "max_cosine_distance": 0.3,  # Tighter cosine distance
         "feature_alpha": 0.9,
+        "frame_interval": frame_interval,
     })
     tracker.img_w = width
     tracker.img_h = height
@@ -508,6 +671,11 @@ def run_stage2(
     pitch_width = phys_config.get("pitch_width", 68.0)
     gk_detector = GoalkeeperDetector(pitch_length=pitch_length, pitch_width=pitch_width)
 
+    # Update module-level pitch dimensions for filtering
+    global _PITCH_HALF_LENGTH, _PITCH_HALF_WIDTH
+    _PITCH_HALF_LENGTH = pitch_length / 2
+    _PITCH_HALF_WIDTH = pitch_width / 2
+
     # Initialize ball detection and tracking
     ball_config = config.get("ball_detection", {})
     ball_tracking_config = config.get("ball_tracking", {})
@@ -515,11 +683,22 @@ def run_stage2(
 
     ball_detector = None
     ball_tracker = None
+    ball_trajectory_3d = None
     if ball_enabled:
         print("Stage 2: Initializing ball detector and tracker...")
         ball_detector = BallDetector(ball_config)
         ball_detector.load_model()
+        # Inject runtime parameters for fps-aware max_age and bounds checking
+        ball_tracking_config["fps"] = effective_fps
+        ball_tracking_config["frame_width"] = width
+        ball_tracking_config["frame_height"] = height
         ball_tracker = BallTracker(ball_tracking_config)
+        # 3D trajectory estimator (physics-based)
+        traj3d_config = ball_tracking_config.get("trajectory_3d", {})
+        traj3d_config["pitch_half_length"] = pitch_length / 2
+        traj3d_config["pitch_half_width"] = pitch_width / 2
+        if traj3d_config.get("enabled", True):
+            ball_trajectory_3d = BallTrajectory3D(traj3d_config)
 
     # Limit to 1 minute of video for faster testing
     max_duration_sec = 60
@@ -529,6 +708,21 @@ def run_stage2(
     sampler = FrameSampler(effective_frames, fps, process_fps)
     print(f"Video: {total_frames} frames @ {fps:.1f} fps, {width}x{height}")
     print(f"Processing {len(sampler)} frames ({max_duration_sec}s) at {process_fps or fps} fps")
+
+    # Interpolate camera poses for frames not in stage1 (when tracking_fps > calibration_fps)
+    if camera_poses and len(sampler) > len(camera_poses):
+        camera_poses = _interpolate_camera_poses(camera_poses, list(sampler))
+        # Re-compute homographies for interpolated poses
+        homographies = {}
+        for fidx, pose in camera_poses.items():
+            R, _ = cv2.Rodrigues(np.array(pose["rvec"], dtype=np.float64))
+            K = np.array(pose["K"], dtype=np.float64)
+            tvec = np.array(pose["tvec"], dtype=np.float64).flatten()
+            H = K @ np.column_stack([R[:, 0], R[:, 1], tvec])
+            if abs(H[2, 2]) > 1e-10:
+                H = H / H[2, 2]
+            homographies[fidx] = H
+        print(f"  Interpolated camera poses: {len(camera_poses)} (from stage1 calibration)")
 
     # Output video (camera view + top-down pitch side-by-side)
     output_fps = process_fps if process_fps and process_fps < fps else fps
@@ -541,9 +735,11 @@ def run_stage2(
     all_tracks = {}
     track_features = {}  # track_id -> list of features
     track_color_hists = {}  # track_id -> list of jersey color histograms
+    track_saturations = {}  # track_id -> list of mean saturation values
     track_positions = {}  # track_id -> list of positions
     track_history = {}  # For visualization
     team_assignments = {}  # track_id -> team
+    tentative_buffer = {}  # track_id -> list of (frame_idx, track_dict) for backfill
 
     # Ball tracking storage
     all_ball_tracks = {}  # frame_idx -> ball track dict
@@ -554,10 +750,13 @@ def run_stage2(
     # Team classification will be done AFTER all tracking is complete
     # This ensures we use trajectory-averaged features for robust clustering
 
+    # Start background frame reader to overlap IO with GPU inference
+    prefetcher = _FramePrefetcher(video_path, list(sampler), prefetch_size=4)
+    cap.release()  # Prefetcher manages its own VideoCapture
+
     for idx, frame_idx in enumerate(tqdm(sampler, desc="Stage 2: Tracking")):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = cap.read()
-        if not ret:
+        frame = prefetcher.get(frame_idx)
+        if frame is None:
             break
 
         # Get homography for this frame (Stage 1 stores world->image, we need image->world)
@@ -601,25 +800,68 @@ def run_stage2(
                     crops.append(np.zeros((64, 32, 3), dtype=np.uint8))
             embeddings = reid_extractor.extract(crops)
 
-        # Update tracker
+        # Update tracker (returns both confirmed and tentative tracks)
         tracks = tracker.update(detections, embeddings)
+        confirmed_tracks = [t for t in tracks if t.get("confirmed", True)]
+        tentative_tracks_now = [t for t in tracks if not t.get("confirmed", True)]
 
-        # Store track info
+        # Buffer tentative tracks for potential backfill
+        for t in tentative_tracks_now:
+            tid = t["track_id"]
+            tentative_buffer.setdefault(tid, []).append((frame_idx, t))
+
+        # Backfill: when a track just got confirmed, insert its buffered frames
+        for t in confirmed_tracks:
+            tid = t["track_id"]
+            if tid in tentative_buffer:
+                for buf_fidx, buf_track in tentative_buffer.pop(tid):
+                    # Compute pitch position from bbox + camera pose
+                    buf_pitch_pos = None
+                    buf_H = homographies.get(buf_fidx)
+                    if buf_fidx in camera_poses:
+                        foot_x = (buf_track["bbox"][0] + buf_track["bbox"][2]) / 2
+                        foot_y = buf_track["bbox"][3]
+                        buf_pitch_pos = _undistort_and_project_to_pitch(
+                            np.array([[foot_x, foot_y]]), camera_poses[buf_fidx]
+                        )
+                    elif buf_H is not None:
+                        foot_x = (buf_track["bbox"][0] + buf_track["bbox"][2]) / 2
+                        foot_y = buf_track["bbox"][3]
+                        try:
+                            H_inv = np.linalg.inv(buf_H)
+                            ph = H_inv @ np.array([foot_x, foot_y, 1.0])
+                            if abs(ph[2]) > 1e-6:
+                                buf_pitch_pos = [float(ph[0] / ph[2]), float(ph[1] / ph[2])]
+                        except np.linalg.LinAlgError:
+                            pass
+
+                    buf_entry = {
+                        "track_id": tid,
+                        "bbox": buf_track["bbox"],
+                        "confidence": buf_track.get("confidence", 1.0),
+                        "pitch_position": buf_pitch_pos,
+                        "team": "unknown",  # Will be updated in final assignment pass
+                        "role": "player",
+                    }
+                    all_tracks.setdefault(buf_fidx, []).append(buf_entry)
+
+                    if buf_pitch_pos:
+                        track_positions.setdefault(tid, []).append(buf_pitch_pos)
+
+        # Store confirmed track info
         frame_tracks = []
-        for i, track in enumerate(tracks):
+        for i, track in enumerate(confirmed_tracks):
             track_id = track["track_id"]
 
             # Compute pitch position
             pitch_pos = None
             if frame_idx in camera_poses:
-                # Physical camera path: undistort pixel coords before projection
                 foot_x = (track["bbox"][0] + track["bbox"][2]) / 2
                 foot_y = track["bbox"][3]
                 pitch_pos = _undistort_and_project_to_pitch(
                     np.array([[foot_x, foot_y]]), camera_poses[frame_idx]
                 )
             elif H is not None:
-                # Legacy homography path (no undistortion)
                 foot_x = (track["bbox"][0] + track["bbox"][2]) / 2
                 foot_y = track["bbox"][3]
                 pt_h = np.array([foot_x, foot_y, 1.0])
@@ -631,9 +873,9 @@ def run_stage2(
             if track_id not in track_features:
                 track_features[track_id] = []
                 track_color_hists[track_id] = []
-                track_positions[track_id] = []
+                track_positions.setdefault(track_id, [])
 
-            # Get feature from tracker (keep all features for trajectory averaging)
+            # Get feature from tracker
             tracker_features = tracker.get_track_features()
             if track_id in tracker_features and tracker_features[track_id] is not None:
                 track_features[track_id].append(tracker_features[track_id])
@@ -647,6 +889,9 @@ def run_stage2(
                 color_hist = _extract_jersey_color_hist(crop)
                 if color_hist is not None:
                     track_color_hists[track_id].append(color_hist)
+                mean_sat = _extract_jersey_mean_saturation(crop)
+                if mean_sat is not None:
+                    track_saturations.setdefault(track_id, []).append(mean_sat)
 
             if pitch_pos:
                 track_positions[track_id].append(pitch_pos)
@@ -676,22 +921,55 @@ def run_stage2(
             ball_detections = ball_detector.detect(frame)
             ball_detections = ball_detector.filter_by_size(ball_detections)
 
-            # Filter by pitch if calibration available
-            if frame_idx in camera_poses:
-                ball_detections = _filter_by_pitch_undistorted(
-                    ball_detections, camera_poses[frame_idx], margin=5.0
-                )
-            elif H is not None:
-                ball_detections = ball_detector.filter_by_pitch(ball_detections, H)
+            # NOTE: No pitch boundary filter for ball — ground-plane projection
+            # gives wildly wrong results for airborne balls. Size filter + tracker
+            # Kalman filter are sufficient to reject false positives.
 
             # Update ball tracker
             ball_tracks = ball_tracker.update(ball_detections)
             primary_ball = ball_tracker.get_primary_ball()
 
-            if primary_ball:
+            if primary_ball and not primary_ball.get("predicted", False):
+                # Compute ball world position
+                ball_center = primary_ball["center"]
+                time_sec = frame_idx / fps if fps > 0 else 0.0
+
+                if ball_trajectory_3d and frame_idx in camera_poses:
+                    # Feed observation to 3D trajectory estimator
+                    ball_bbox = tuple(primary_ball["bbox"]) if "bbox" in primary_ball else None
+                    ball_trajectory_3d.add_observation(
+                        time_sec, tuple(ball_center), camera_poses[frame_idx],
+                        bbox=ball_bbox,
+                    )
+                    traj_result = ball_trajectory_3d.estimate()
+                    if traj_result:
+                        primary_ball["pitch_position"] = traj_result["pitch_position"]
+                        primary_ball["height"] = traj_result["height"]
+                        primary_ball["position_3d"] = traj_result["position_3d"]
+                        primary_ball["on_ground"] = traj_result["on_ground"]
+
+                # Fallback to ground plane projection
+                if primary_ball.get("pitch_position") is None:
+                    if frame_idx in camera_poses:
+                        from .tracking.ball_trajectory import project_to_ground
+                        ground = project_to_ground(tuple(ball_center), camera_poses[frame_idx])
+                        if ground:
+                            primary_ball["pitch_position"] = ground
+                            primary_ball["height"] = 0.0
+                            primary_ball["on_ground"] = True
+                    elif H is not None:
+                        pt_h = np.array([ball_center[0], ball_center[1], 1.0])
+                        world_h = H @ pt_h
+                        if abs(world_h[2]) > 1e-6:
+                            primary_ball["pitch_position"] = [
+                                float(world_h[0] / world_h[2]),
+                                float(world_h[1] / world_h[2]),
+                            ]
+                            primary_ball["height"] = 0.0
+                            primary_ball["on_ground"] = True
+
                 all_ball_tracks[frame_idx] = primary_ball
-                ball_trajectory_history.append(tuple(primary_ball["center"]))
-                # Limit trajectory history length
+                ball_trajectory_history.append(tuple(ball_center))
                 max_traj_len = ball_tracking_config.get("trajectory_length", 30)
                 if len(ball_trajectory_history) > max_traj_len:
                     ball_trajectory_history = ball_trajectory_history[-max_traj_len:]
@@ -699,7 +977,7 @@ def run_stage2(
         # Note: Team classification is deferred until all tracking is complete
         # This allows using trajectory-averaged features for better clustering
 
-    cap.release()
+    prefetcher.shutdown()
 
     # Final team classification using jersey color histograms
     print("\nFinalizing team assignments using jersey color histograms...")
@@ -719,8 +997,38 @@ def run_stage2(
     print(f"  Tracks with color features: {len(mean_color_features)}")
     print(f"  Tracks with positions: {len(mean_positions)}")
 
+    # Compute median bbox heights per track (for filtering noisy small tracks)
+    track_bbox_heights_all = {}
+    for frame_idx in all_tracks:
+        for track in all_tracks[frame_idx]:
+            tid = track["track_id"]
+            bbox = track["bbox"]
+            h = bbox[3] - bbox[1]
+            track_bbox_heights_all.setdefault(tid, []).append(h)
+    median_bbox_heights = {
+        tid: float(np.median(hs)) for tid, hs in track_bbox_heights_all.items()
+    }
+
+    # Frame counts per track (for filtering short-lived tracks in referee detection)
+    track_frame_counts = {}
+    for frame_idx in all_tracks:
+        for track in all_tracks[frame_idx]:
+            tid = track["track_id"]
+            track_frame_counts[tid] = track_frame_counts.get(tid, 0) + 1
+
+    # Compute mean saturation per track (for achromatic referee detection)
+    mean_saturations = {}
+    for tid, sats in track_saturations.items():
+        if sats:
+            mean_saturations[tid] = float(np.mean(sats))
+
     if len(mean_color_features) >= 6:
-        team_assignments = team_classifier.fit(mean_color_features, mean_positions)
+        team_assignments = team_classifier.fit(
+            mean_color_features, mean_positions,
+            track_bbox_heights=median_bbox_heights,
+            track_frame_counts=track_frame_counts,
+            track_mean_saturations=mean_saturations,
+        )
         print(f"  Team assignments: {len(team_assignments)} tracks classified")
     else:
         print("  Warning: Not enough tracks for team classification")
@@ -730,11 +1038,29 @@ def run_stage2(
     if mean_positions:
         print("  Refining roles by position...")
         team_assignments, goalkeeper_tracks = gk_detector.refine_roles(
-            team_assignments, mean_positions
+            team_assignments, mean_positions, all_positions=track_positions
         )
+
+    # Filter out off-field tracks (substitutes, coaches, spectators)
+    # A track is off-field if its median position is outside the pitch boundary
+    half_l = pitch_length / 2
+    half_w = pitch_width / 2
+    off_field_margin = 0.5  # meters beyond pitch boundary to still include
+    off_field_tracks = set()
+    for tid, pos in mean_positions.items():
+        if abs(pos[0]) > half_l + off_field_margin or abs(pos[1]) > half_w + off_field_margin:
+            off_field_tracks.add(tid)
+    if off_field_tracks:
+        print(f"  Off-field tracks removed: {sorted(off_field_tracks)}")
+        for tid in off_field_tracks:
+            team_assignments.pop(tid, None)
 
     # Update all tracks with final team assignments and roles
     for frame_idx in all_tracks:
+        all_tracks[frame_idx] = [
+            track for track in all_tracks[frame_idx]
+            if track["track_id"] not in off_field_tracks
+        ]
         for track in all_tracks[frame_idx]:
             tid = track["track_id"]
             track["team"] = team_assignments.get(tid, "unknown")
@@ -747,7 +1073,7 @@ def run_stage2(
 
     # Generate visualization with final team assignments
     print("\nGenerating visualization with final team assignments...")
-    cap = cv2.VideoCapture(str(video_path))
+    render_prefetcher = _FramePrefetcher(video_path, list(sampler), prefetch_size=4)
     track_history = {}  # Reset for visualization
 
     # Create per-frame output directories
@@ -755,9 +1081,8 @@ def run_stage2(
     vis_frames_dir.mkdir(exist_ok=True)
 
     for idx, frame_idx in enumerate(tqdm(sampler, desc="Stage 2: Rendering")):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = cap.read()
-        if not ret:
+        frame = render_prefetcher.get(frame_idx)
+        if frame is None:
             break
 
         # Get tracks for this frame with updated team assignments
@@ -768,17 +1093,26 @@ def run_stage2(
 
         # Draw ball if available
         ball_track_this = None
+        ball_traj_world = None
         if ball_enabled and frame_idx in all_ball_tracks:
             ball_track_this = all_ball_tracks[frame_idx]
-            # Get trajectory up to this frame
+            # Get pixel trajectory up to this frame (for camera view)
             traj = [all_ball_tracks[fi]["center"] for fi in sorted(all_ball_tracks.keys()) if fi <= frame_idx]
-            traj = traj[-30:]  # Last 30 frames
+            traj = traj[-30:]
             vis = draw_ball_track(vis, ball_track_this, traj)
+            # Get world trajectory (for top-down view)
+            ball_traj_world = [
+                all_ball_tracks[fi]["pitch_position"]
+                for fi in sorted(all_ball_tracks.keys())
+                if fi <= frame_idx and all_ball_tracks[fi].get("pitch_position")
+            ]
+            ball_traj_world = ball_traj_world[-30:]
 
         # Draw top-down pitch diagram
         topdown = draw_topdown_pitch(
             height, frame_tracks, team_assignments,
             ball_track=ball_track_this,
+            ball_trajectory_world=ball_traj_world,
             pitch_length=pitch_length,
             pitch_width=pitch_width,
         )
@@ -800,7 +1134,7 @@ def run_stage2(
         with open(vis_frames_dir / f"{fname}.json", "w") as jf:
             json.dump(frame_json, jf, indent=2, default=_json_default)
 
-    cap.release()
+    render_prefetcher.shutdown()
     out.release()
 
     # Save results
@@ -820,7 +1154,23 @@ def run_stage2(
 
     # Save ball tracks
     if ball_enabled and all_ball_tracks:
-        serializable_ball_tracks = {str(k): v for k, v in all_ball_tracks.items()}
+        def _sanitize(obj):
+            """Convert numpy types to native Python for JSON serialization."""
+            if isinstance(obj, dict):
+                return {k: _sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_sanitize(v) for v in obj]
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, (np.bool_,)):
+                return bool(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return obj
+
+        serializable_ball_tracks = {str(k): _sanitize(v) for k, v in all_ball_tracks.items()}
         with open(output_dir / "ball_tracks.json", "w") as f:
             json.dump(serializable_ball_tracks, f, indent=2)
         print(f"  Saved {len(all_ball_tracks)} ball detections")

@@ -150,15 +150,19 @@ class DetectionPrefetcher:
             self._results[frame_idx] = (frame, keypoints, lines)
             self._ready.notify_all()
 
-    def get(self, frame_idx: int, timeout: float = 30.0) -> tuple[np.ndarray, list, list]:
-        """Get detection results for a frame, blocking until ready."""
+    def get(self, frame_idx: int, timeout: float = 30.0) -> tuple[np.ndarray, list, list] | None:
+        """Get detection results for a frame, blocking until ready.
+
+        Returns None if the frame could not be read (e.g. video shorter than
+        reported by CAP_PROP_FRAME_COUNT).
+        """
         with self._lock:
             while frame_idx not in self._results:
                 if self._done and frame_idx not in self._results:
-                    raise RuntimeError(f"Frame {frame_idx} not available")
+                    return None
                 self._ready.wait(timeout=timeout)
                 if frame_idx not in self._results and self._done:
-                    raise RuntimeError(f"Frame {frame_idx} not available (timeout)")
+                    return None
             result = self._results.pop(frame_idx)
             return result
 
@@ -402,7 +406,10 @@ def run_stage1_physical(
 
     for idx, frame_idx in enumerate(tqdm(sampler, desc="Stage 1 (Physical): Pass 1 - Per-frame")):
         # Get pre-detected frame from background workers
-        frame, keypoints, lines = prefetcher.get(frame_idx)
+        result = prefetcher.get(frame_idx)
+        if result is None:
+            break  # Video shorter than reported — stop processing
+        frame, keypoints, lines = result
 
         # Update calibrator with detections
         calibrator.update(keypoints, lines)
@@ -548,7 +555,10 @@ def run_stage1_physical(
             )
 
             for idx, frame_idx in enumerate(tqdm(sampler, desc="Stage 1 (Physical): Pass 2 - Joint intrinsics")):
-                frame, keypoints, lines = prefetcher2.get(frame_idx)
+                result = prefetcher2.get(frame_idx)
+                if result is None:
+                    break
+                frame, keypoints, lines = result
                 calibrator.update(keypoints, lines)
 
                 # Warm-start: prefer joint extrinsics, then temporal tracker

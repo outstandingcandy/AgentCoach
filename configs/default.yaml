@@ -112,10 +112,17 @@ ball_detection:
 # Ball Tracking
 ball_tracking:
   enabled: true
-  max_age: 60                # Frames to keep lost track (longer for occlusions)
+  max_age: 1.5               # Seconds to keep lost track (converted to frames using fps)
   n_init: 2                  # Detections to confirm track (faster confirmation)
   max_position_distance: 200 # Max distance for matching (pixels)
   trajectory_length: 30      # Frames of trajectory history
+  # 3D trajectory estimation (physics-based parabolic model)
+  trajectory_3d:
+    enabled: true
+    window_size: 15           # Max observations in sliding window
+    min_observations: 4       # Minimum frames to attempt 3D fit
+    gravity: 9.81             # m/s²
+    ball_real_diameter: 0.22  # FIFA size 5 ball diameter in meters
 
 tracking:
   algorithm: "strongsort"
