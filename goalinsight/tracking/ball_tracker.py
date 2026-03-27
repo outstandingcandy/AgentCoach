@@ -206,16 +206,18 @@ class BallTrack:
             Track information dictionary.
         """
         pos = self.kf.position
-        vel = self.kf.velocity
+        predicted = self.time_since_update > 0
 
         return {
             "track_id": self.track_id,
             "center": list(pos),
             "bbox": self.last_detection.get("bbox", [pos[0]-10, pos[1]-10, pos[0]+10, pos[1]+10]),
-            "confidence": self.last_detection.get("confidence", 0.0),
+            "confidence": 0.0 if predicted else self.last_detection.get("confidence", 0.0),
             "status": self.status.value,
-            "velocity": list(vel),
+            "velocity": [0.0, 0.0] if predicted else list(self.kf.velocity),
             "pitch_position": self.last_detection.get("pitch_position"),
+            "predicted": predicted,
+            "time_since_update": self.time_since_update,
         }
 
     def get_trajectory(self, num_frames: int = 30) -> list[tuple[float, float]]:
@@ -245,13 +247,23 @@ class BallTracker:
         """Initialize ball tracker.
 
         Args:
-            config: Tracker configuration.
+            config: Tracker configuration. max_age is in seconds and converted
+                to frames using the fps value from config.
         """
         self.config = config or {}
-        self.max_age = self.config.get("max_age", 60)
+
+        # Convert max_age from seconds to frames
+        fps = self.config.get("fps", 10)
+        max_age_sec = self.config.get("max_age", 1.5)
+        self.max_age = max(1, int(max_age_sec * fps))
+
         self.n_init = self.config.get("n_init", 2)
         self.max_position_distance = self.config.get("max_position_distance", 200)
         self.trajectory_length = self.config.get("trajectory_length", 30)
+
+        # Frame bounds for out-of-bounds detection
+        self.frame_width = self.config.get("frame_width", 1920)
+        self.frame_height = self.config.get("frame_height", 1080)
 
         self.tracks: list[BallTrack] = []
         self.next_id = 1
@@ -265,10 +277,13 @@ class BallTracker:
         Returns:
             List of active track dictionaries.
         """
-        # Predict existing tracks
+        # Predict existing tracks, mark out-of-bounds as lost
         predicted_positions = []
         for track in self.tracks:
             pos = track.predict()
+            if (pos[0] < -50 or pos[0] > self.frame_width + 50
+                    or pos[1] < -50 or pos[1] > self.frame_height + 50):
+                track.mark_lost()
             predicted_positions.append(pos)
 
         # Match detections to tracks

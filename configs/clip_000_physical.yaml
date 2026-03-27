@@ -2,7 +2,8 @@
 # Uses fixed camera intrinsics and 6-DOF extrinsic optimization
 
 video:
-  process_fps: 5
+  process_fps: 5        # Stage 1 calibration fps
+  tracking_fps: 10      # Stage 2 tracking fps (interpolates camera poses)
 
 field_registration:
   backend: "physical"
@@ -29,3 +30,6 @@ field_registration:
     # keypoint_model_path: "data/pretrain_models/SV_kp"
     keypoint_threshold: 0.3434
     # keypoint_threshold: 0.15
+
+ball_detection:
+  confidence_threshold: 0.15  # Lower threshold; tracker Kalman filter handles false positives

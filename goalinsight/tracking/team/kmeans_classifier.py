@@ -62,6 +62,9 @@ class KMeansTeamClassifier(BaseTeamClassifier):
         self,
         track_features: dict[int, np.ndarray],
         track_positions: dict[int, list[float]] | None = None,
+        track_bbox_heights: dict[int, float] | None = None,
+        track_frame_counts: dict[int, int] | None = None,
+        track_mean_saturations: dict[int, float] | None = None,
     ) -> dict[int, str]:
         """Fit classifier and assign teams to tracks.
 
@@ -127,22 +130,85 @@ class KMeansTeamClassifier(BaseTeamClassifier):
         if len(sorted_clusters) >= 2:
             cluster_to_team[sorted_clusters[1][0]] = "team_B"
 
-        # Detect color outliers as referees: tracks far from both cluster centers
-        distances = self.kmeans.transform(features_norm)  # (N, 2) distances
-        min_dists = distances.min(axis=1)  # distance to nearest center
-        dist_threshold = np.percentile(min_dists, 85)  # top 15% are outliers
+        # Detect referees by low saturation (achromatic = black/white/grey kit)
+        # This is more reliable than color-distance outlier detection because
+        # black referee kits have near-zero saturation in HS space, making them
+        # indistinguishable from dark team jerseys by histogram distance alone.
+        referee_set = set()
+        min_referee_bbox_h = 40.0
+        min_referee_frames = 15
+        sideline_y_threshold = 23.0
+        max_color_refs = 2
+
+        if track_mean_saturations:
+            # Compute team saturation baseline: median saturation of all tracks
+            all_sats = list(track_mean_saturations.values())
+            median_sat = np.median(all_sats)
+            # Referee threshold: significantly below median (achromatic/dark kit)
+            sat_threshold = median_sat * 0.7
+
+            sat_candidates = []
+            for tid in track_ids:
+                if tid not in track_mean_saturations:
+                    continue
+                sat = track_mean_saturations[tid]
+                if sat >= sat_threshold:
+                    continue
+                # Apply same filters: min bbox height, min frames, exclude sideline
+                if track_bbox_heights and tid in track_bbox_heights:
+                    if track_bbox_heights[tid] < min_referee_bbox_h:
+                        continue
+                if track_frame_counts and tid in track_frame_counts:
+                    if track_frame_counts[tid] < min_referee_frames:
+                        continue
+                if track_positions and tid in track_positions:
+                    if abs(track_positions[tid][1]) > sideline_y_threshold:
+                        continue
+                sat_candidates.append((tid, sat))
+
+            sat_candidates.sort(key=lambda x: x[1])  # lowest saturation first
+            referee_set = {tid for tid, _ in sat_candidates[:max_color_refs]}
+
+            # Debug
+            print(f"  Saturation: median={median_sat:.1f}, threshold={sat_threshold:.1f}")
+            for tid, sat in sat_candidates:
+                marker = " ← REFEREE" if tid in referee_set else ""
+                print(f"    T{tid}: sat={sat:.1f}{marker}")
+
+        # Fallback: color-distance outlier detection (if saturation didn't find any)
+        if not referee_set:
+            distances = self.kmeans.transform(features_norm)  # (N, 2) distances
+            min_dists = distances.min(axis=1)
+            dist_threshold = np.percentile(min_dists, 85)
+            median_dist = np.median(min_dists)
+            outlier_candidates = []
+            for i, tid in enumerate(track_ids):
+                if min_dists[i] > dist_threshold and min_dists[i] > median_dist * 1.5:
+                    if track_bbox_heights and tid in track_bbox_heights:
+                        if track_bbox_heights[tid] < min_referee_bbox_h:
+                            continue
+                    if track_frame_counts and tid in track_frame_counts:
+                        if track_frame_counts[tid] < min_referee_frames:
+                            continue
+                    if track_positions and tid in track_positions:
+                        if abs(track_positions[tid][1]) > sideline_y_threshold:
+                            continue
+                    outlier_candidates.append((i, tid, min_dists[i]))
+
+            outlier_candidates.sort(key=lambda x: -x[2])
+            referee_set = {tid for _, tid, _ in outlier_candidates[:max_color_refs]}
+            if referee_set:
+                print(f"  Color outlier referees: {referee_set}")
 
         assignments = {}
-        referee_count = 0
         for i, tid in enumerate(track_ids):
-            if min_dists[i] > dist_threshold and min_dists[i] > np.median(min_dists) * 1.5:
+            if tid in referee_set:
                 assignments[tid] = "referee"
-                referee_count += 1
             else:
                 assignments[tid] = cluster_to_team.get(labels[i], "unknown")
 
-        if referee_count:
-            print(f"  Color outlier referees: {referee_count} (dist > {dist_threshold:.3f})")
+        if referee_set:
+            print(f"  Referees detected: {referee_set}")
 
         self._is_fitted = True
         return assignments
@@ -268,28 +334,52 @@ class GoalkeeperDetector:
         self,
         team_assignments: dict[int, str],
         mean_positions: dict[int, list[float]],
+        all_positions: dict[int, list[list[float]]] | None = None,
     ) -> tuple[dict[int, str], set[int]]:
         """Post-pass role refinement using mean track positions.
 
-        1. Linesman detection: tracks with mean |y| near/beyond sideline -> referee
+        1. Linesman detection: tracks frequently outside sideline -> referee
         2. Goalkeeper detection: per team, track deepest in goal area -> goalkeeper
 
         Args:
             team_assignments: Dict of track_id -> team label (modified in-place).
             mean_positions: Dict of track_id -> [x, y] mean pitch position.
+            all_positions: Dict of track_id -> list of [x, y] positions (all frames).
 
         Returns:
             (updated team_assignments, set of goalkeeper track_ids)
         """
-        # 1. Linesman detection
+        # 1. Linesman detection: use frequency of being outside sideline
         linesman_count = 0
-        for tid, pos in mean_positions.items():
-            if self.is_linesman(pos):
-                team_assignments[tid] = "referee"
-                linesman_count += 1
+        sideline_threshold = self.half_width  # actual sideline, not inside it
+        min_outside_ratio = 0.50  # at least 50% of frames outside sideline
+
+        if all_positions:
+            # Max plausible coordinate: positions beyond this are calibration errors
+            max_plausible = self.half_length + 10.0
+            for tid, positions in all_positions.items():
+                if len(positions) < 10:
+                    continue
+                # Filter out calibration artifacts (physically impossible positions)
+                valid = [p for p in positions
+                         if abs(p[0]) < max_plausible and abs(p[1]) < max_plausible]
+                if len(valid) < 10:
+                    continue
+                outside_count = sum(1 for p in valid if abs(p[1]) > sideline_threshold)
+                ratio = outside_count / len(valid)
+                if ratio >= min_outside_ratio:
+                    team_assignments[tid] = "referee"
+                    linesman_count += 1
+                    print(f"  Linesman: T{tid} (outside sideline {ratio:.0%} of frames)")
+        else:
+            # Fallback to mean position
+            for tid, pos in mean_positions.items():
+                if self.is_linesman(pos):
+                    team_assignments[tid] = "referee"
+                    linesman_count += 1
 
         if linesman_count:
-            print(f"  Linesmen detected: {linesman_count} (|y| > {self.half_width - 2.0:.1f}m)")
+            print(f"  Linesmen detected: {linesman_count}")
 
         # 2. Goalkeeper detection: per team, find the track significantly
         #    deeper than teammates (closest to goal line)

@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any
 
 import numpy as np
+import scipy.linalg
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 
@@ -78,29 +79,36 @@ class Track:
         return np.mean(self.features, axis=0)
 
 
+# Chi-squared inverse CDF at 95% confidence for 1-9 degrees of freedom
+chi2inv95 = {1: 3.8415, 2: 5.9915, 3: 7.8147, 4: 9.4877,
+             5: 11.070, 6: 12.592, 7: 14.067, 8: 15.507, 9: 16.919}
+
+
 class KalmanFilter:
-    """Simple Kalman filter for bounding box tracking."""
+    """Kalman filter for bounding box tracking with height-dependent noise.
 
-    def __init__(self):
-        # Motion model: constant velocity
-        self.dt = 1.0
+    Following DeepSORT/StrongSORT: process and measurement noise scale with
+    target height so that the covariance is properly calibrated for
+    Mahalanobis distance gating.
 
-        # State transition matrix
-        self.F = np.eye(8)
-        self.F[0, 4] = self.dt  # cx += vx * dt
-        self.F[1, 5] = self.dt  # cy += vy * dt
-        self.F[2, 6] = self.dt  # a += va * dt
-        self.F[3, 7] = self.dt  # h += vh * dt
+    State: [cx, cy, aspect_ratio, height, vx, vy, va, vh]
+    """
+
+    def __init__(self, frame_interval: float = 1.0):
+        ndim = 4
+
+        # State transition matrix (constant velocity model)
+        self.F = np.eye(2 * ndim)
+        for i in range(ndim):
+            self.F[i, ndim + i] = frame_interval
 
         # Observation matrix (we observe cx, cy, a, h)
-        self.H = np.eye(4, 8)
+        self.H = np.eye(ndim, 2 * ndim)
 
-        # Process noise
-        self.Q = np.eye(8) * 0.01
-        self.Q[4:, 4:] *= 10  # Higher noise for velocities
-
-        # Measurement noise
-        self.R = np.eye(4) * 1.0
+        # Noise weights (relative to target height), scaled by frame interval
+        # Base values from DeepSORT assume 30fps (dt=1); scale for actual dt
+        self._std_weight_position = (1.0 / 20) * frame_interval
+        self._std_weight_velocity = (1.0 / 160) * frame_interval
 
     def initiate(self, bbox: list) -> KalmanState:
         """Initialize state from bounding box [x1, y1, x2, y2]."""
@@ -108,20 +116,58 @@ class KalmanFilter:
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
         w = x2 - x1
-        h = y2 - y1
-        a = w / h if h > 0 else 1.0
+        h = max(y2 - y1, 1.0)
+        a = w / h
 
-        mean = np.array([cx, cy, a, h, 0, 0, 0, 0])
-        covariance = np.eye(8) * 10
-        covariance[4:, 4:] *= 100  # Higher uncertainty for velocities
-
+        mean = np.array([cx, cy, a, h, 0.0, 0.0, 0.0, 0.0])
+        std = [
+            2 * self._std_weight_position * h,
+            2 * self._std_weight_position * h,
+            1e-2,
+            2 * self._std_weight_position * h,
+            10 * self._std_weight_velocity * h,
+            10 * self._std_weight_velocity * h,
+            1e-5,
+            10 * self._std_weight_velocity * h,
+        ]
+        covariance = np.diag(np.square(std))
         return KalmanState(mean=mean, covariance=covariance)
 
     def predict(self, state: KalmanState) -> KalmanState:
-        """Predict next state."""
+        """Predict next state with height-dependent process noise."""
+        h = state.mean[3]
+        std_pos = [
+            self._std_weight_position * h,
+            self._std_weight_position * h,
+            1e-2,
+            self._std_weight_position * h,
+        ]
+        std_vel = [
+            self._std_weight_velocity * h,
+            self._std_weight_velocity * h,
+            1e-5,
+            self._std_weight_velocity * h,
+        ]
+        motion_cov = np.diag(np.square(np.r_[std_pos, std_vel]))
+
         mean = self.F @ state.mean
-        covariance = self.F @ state.covariance @ self.F.T + self.Q
+        covariance = self.F @ state.covariance @ self.F.T + motion_cov
         return KalmanState(mean=mean, covariance=covariance)
+
+    def _project(self, state: KalmanState):
+        """Project state to measurement space."""
+        h = state.mean[3]
+        std = [
+            self._std_weight_position * h,
+            self._std_weight_position * h,
+            1e-1,
+            self._std_weight_position * h,
+        ]
+        innovation_cov = np.diag(np.square(std))
+
+        mean = self.H @ state.mean
+        covariance = self.H @ state.covariance @ self.H.T + innovation_cov
+        return mean, covariance
 
     def update(self, state: KalmanState, bbox: list) -> KalmanState:
         """Update state with measurement."""
@@ -129,19 +175,25 @@ class KalmanFilter:
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
         w = x2 - x1
-        h = y2 - y1
-        a = w / h if h > 0 else 1.0
+        h = max(y2 - y1, 1.0)
+        a = w / h
 
         measurement = np.array([cx, cy, a, h])
+        projected_mean, projected_cov = self._project(state)
 
-        # Kalman update
-        S = self.H @ state.covariance @ self.H.T + self.R
-        K = state.covariance @ self.H.T @ np.linalg.inv(S)
-
-        mean = state.mean + K @ (measurement - self.H @ state.mean)
+        K = state.covariance @ self.H.T @ np.linalg.inv(projected_cov)
+        mean = state.mean + K @ (measurement - projected_mean)
         covariance = (np.eye(8) - K @ self.H) @ state.covariance
 
         return KalmanState(mean=mean, covariance=covariance)
+
+    def gating_distance(self, state: KalmanState, measurement: np.ndarray) -> float:
+        """Compute squared Mahalanobis distance between predicted state and measurement."""
+        projected_mean, projected_cov = self._project(state)
+        diff = measurement - projected_mean
+        chol = np.linalg.cholesky(projected_cov)
+        z = scipy.linalg.solve_triangular(chol, diff, lower=True)
+        return float(z @ z)
 
     def state_to_bbox(self, state: KalmanState, img_w: int = 1920, img_h: int = 1080) -> list:
         """Convert state to bounding box with bounds checking."""
@@ -194,7 +246,8 @@ class StrongSORTTracker:
         self.max_cosine_distance = config.get("max_cosine_distance", 0.3)
         self.feature_alpha = config.get("feature_alpha", 0.9)
 
-        self.kalman = KalmanFilter()
+        frame_interval = config.get("frame_interval", 1.0)
+        self.kalman = KalmanFilter(frame_interval=frame_interval)
         self.tracks: list[Track] = []
         self.next_id = 1
         self.img_w = 1920  # Default, can be updated
@@ -213,6 +266,11 @@ class StrongSORTTracker:
                 track.bbox = self.kalman.state_to_bbox(
                     track.kalman_state, self.img_w, self.img_h
                 )
+
+                # Mark tracks as deleted if predicted center is outside frame
+                cx, cy = track.kalman_state.mean[0], track.kalman_state.mean[1]
+                if cx < 0 or cx > self.img_w or cy < 0 or cy > self.img_h:
+                    track.status = TrackStatus.DELETED
 
     def update(
         self,
@@ -258,6 +316,42 @@ class StrongSORTTracker:
 
                 # Apply threshold
                 cost_matrix[cost_matrix > self.max_cosine_distance] = 1e5
+
+                # Gate by Mahalanobis distance: reject matches where detection
+                # falls outside 95% confidence region of Kalman prediction.
+                # For tracks with large time_since_update, also enforce a hard
+                # pixel distance cap — their inflated covariance makes
+                # Mahalanobis gating alone ineffective.
+                gating_threshold = chi2inv95[4]  # 4-dim observation space
+                stale_age = 10  # frames without update before applying pixel cap
+                max_pixel_dist_sq = 400.0 ** 2  # hard cap for stale tracks
+                for ri in range(len(valid_track_idx)):
+                    t = confirmed_tracks[valid_track_idx[ri]]
+                    if t.kalman_state is None:
+                        continue
+                    is_stale = t.time_since_update > stale_age
+                    pred_cx, pred_cy = t.kalman_state.mean[0], t.kalman_state.mean[1]
+                    for ci in range(len(detections)):
+                        if cost_matrix[ri, ci] >= 1e5:
+                            continue  # Already rejected by cosine threshold
+                        d = detections[ci]
+                        x1, y1, x2, y2 = d["bbox"]
+                        dcx = (x1 + x2) / 2
+                        dcy = (y1 + y2) / 2
+                        # Hard pixel cap for stale tracks (inflated covariance)
+                        if is_stale:
+                            pixel_dist_sq = (dcx - pred_cx) ** 2 + (dcy - pred_cy) ** 2
+                            if pixel_dist_sq > max_pixel_dist_sq:
+                                cost_matrix[ri, ci] = 1e5
+                                continue
+                        dw = x2 - x1
+                        dh = y2 - y1
+                        meas = np.array([dcx, dcy, dw / dh if dh > 0 else 1.0, dh])
+                        if self.kalman.gating_distance(t.kalman_state, meas) > gating_threshold:
+                            cost_matrix[ri, ci] = 1e5
+                # Debug stats (uncomment to monitor gating behavior)
+                # if gated_count and total_pairs:
+                #     self._gating_stats = (gated_count, total_pairs)
 
                 # Hungarian matching
                 if cost_matrix.size > 0:
@@ -389,20 +483,21 @@ class StrongSORTTracker:
 
         self.tracks = [t for t in self.tracks if t.status != TrackStatus.DELETED]
 
-        # Return confirmed tracks
-        return [
-            {
-                "track_id": t.track_id,
-                "bbox": t.bbox,
-                "confidence": t.confidence,
-                "class_id": t.class_id,
-                "team": t.team,
-                "jersey_number": t.jersey_number,
-                "role": t.role,
-            }
-            for t in self.tracks
-            if t.status == TrackStatus.CONFIRMED
-        ]
+        # Return confirmed + tentative tracks (tentative flagged for backfill)
+        result = []
+        for t in self.tracks:
+            if t.status in (TrackStatus.CONFIRMED, TrackStatus.TENTATIVE):
+                result.append({
+                    "track_id": t.track_id,
+                    "bbox": t.bbox,
+                    "confidence": t.confidence,
+                    "class_id": t.class_id,
+                    "team": t.team,
+                    "jersey_number": t.jersey_number,
+                    "role": t.role,
+                    "confirmed": t.status == TrackStatus.CONFIRMED,
+                })
+        return result
 
     def _compute_iou_matrix(
         self,
