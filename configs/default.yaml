@@ -90,7 +90,8 @@ field_registration:
 
 # Stage 2: Tracking and Identification
 detection:
-  model: "yolov8x"        # YOLOv8 variant (n, s, m, l, x)
+  model: "yolov8x"        # YOLO model name (yolov8x, yolo11x, etc.)
+  # model_path: null       # Optional: explicit path to .pt weights file
   confidence_threshold: 0.5
   iou_threshold: 0.45
   classes: [0]            # Person class only
@@ -99,15 +100,29 @@ detection:
 # Ball Detection (sports ball class 32 in COCO)
 ball_detection:
   enabled: true
-  model: "yolov8x"
+  model: "yolov8x"           # YOLO model name (yolov8x, yolo11x, etc.)
+  # model_path: null          # Optional: explicit path to .pt weights file
   confidence_threshold: 0.3  # Lower threshold for small object
   iou_threshold: 0.45
   classes: [32]              # Sports ball class
   imgsz: 1920                # Higher resolution for small ball
-  min_size: 5                # Minimum bbox dimension in pixels
+  min_size: 3                # Minimum bbox dimension in pixels
   max_size: 100              # Maximum bbox dimension in pixels
   min_aspect_ratio: 0.5      # Ball should be roughly circular
   max_aspect_ratio: 2.0
+  # SAHI sliced inference for improved small ball detection
+  use_sahi: false # SAHI is slower and produces more false positives; disable by default
+  sahi_slice_size: 640                    # Slice dimensions (pixels)
+  sahi_overlap_ratio: 0.2                 # Overlap between adjacent slices
+  sahi_perform_standard_pred: true        # Also run full-frame inference (catches large balls)
+  sahi_postprocess_type: "GREEDYNMM"     # "NMS", "NMM", or "GREEDYNMM"
+  sahi_postprocess_match_threshold: 0.5
+  # Two-pass detection: scan whole video first, then crop+enlarge missed frames
+  two_pass: true                          # Enable two-pass ball detection
+  pass1_confidence_threshold: 0.5         # High threshold for anchor detections in pass 1
+  crop_size: 300                          # Crop region size around interpolated position (pixels)
+  crop_enlarge_to: 640                    # Resize crop to this before detection
+  max_interpolation_gap: 30               # Max frames to interpolate across (skip if gap is larger)
 
 # Ball Tracking
 ball_tracking:
@@ -123,6 +138,7 @@ ball_tracking:
     min_observations: 4       # Minimum frames to attempt 3D fit
     gravity: 9.81             # m/s²
     ball_real_diameter: 0.22  # FIFA size 5 ball diameter in meters
+    bbox_padding: 1.0        # Pixels to subtract from YOLO bbox for size estimation
 
 tracking:
   algorithm: "strongsort"

@@ -145,6 +145,310 @@ def _filter_by_pitch_undistorted(
 
 
 # ---------------------------------------------------------------------------
+# Ball anchor filtering (for two-pass ball detection)
+# ---------------------------------------------------------------------------
+
+def _find_static_positions(
+    anchors: dict[int, tuple[float, float]],
+    static_radius: float = 40.0,
+    min_cluster_size: int = 5,
+    max_displacement_per_frame: float = 0.5,
+) -> list[tuple[float, float]]:
+    """Find positions of static objects (spare balls, watermarks) in anchors.
+
+    Groups anchors by spatial proximity and identifies clusters with low
+    average displacement per frame (static objects).
+
+    Returns:
+        List of (cx, cy) centroid positions of static object clusters.
+    """
+    if len(anchors) < min_cluster_size:
+        return []
+
+    sorted_frames = sorted(anchors.keys())
+
+    # Cluster anchors by spatial proximity
+    clusters: list[list[int]] = []
+    visited = set()
+
+    for fidx in sorted_frames:
+        if fidx in visited:
+            continue
+        cluster = [fidx]
+        visited.add(fidx)
+        cx, cy = anchors[fidx]
+
+        for fidx2 in sorted_frames:
+            if fidx2 in visited:
+                continue
+            cx2, cy2 = anchors[fidx2]
+            dist = ((cx2 - cx) ** 2 + (cy2 - cy) ** 2) ** 0.5
+            if dist <= static_radius:
+                cluster.append(fidx2)
+                visited.add(fidx2)
+
+        clusters.append(cluster)
+
+    # Identify static clusters
+    static_centroids = []
+    for cluster in clusters:
+        if len(cluster) < min_cluster_size:
+            continue
+        cluster_sorted = sorted(cluster)
+        total_disp = 0.0
+        total_gap = 0
+        for i in range(1, len(cluster_sorted)):
+            f1, f2 = cluster_sorted[i - 1], cluster_sorted[i]
+            dx = anchors[f2][0] - anchors[f1][0]
+            dy = anchors[f2][1] - anchors[f1][1]
+            total_disp += (dx ** 2 + dy ** 2) ** 0.5
+            total_gap += f2 - f1
+
+        avg_disp = total_disp / max(total_gap, 1)
+        if avg_disp < max_displacement_per_frame:
+            # Compute centroid of this static cluster
+            mean_x = sum(anchors[f][0] for f in cluster) / len(cluster)
+            mean_y = sum(anchors[f][1] for f in cluster) / len(cluster)
+            static_centroids.append((mean_x, mean_y))
+
+    return static_centroids
+
+
+def _near_any_static(
+    center: tuple[float, float],
+    static_positions: list[tuple[float, float]],
+    radius: float = 60.0,
+) -> bool:
+    """Check if a detection center is near any known static object position."""
+    for sx, sy in static_positions:
+        dist = ((center[0] - sx) ** 2 + (center[1] - sy) ** 2) ** 0.5
+        if dist <= radius:
+            return True
+    return False
+
+
+def _filter_anchor_outliers(
+    anchors: dict[int, tuple[float, float]],
+    max_displacement: float = 600.0,
+    min_segment_size: int = 3,
+) -> list[int]:
+    """Find anchor frames that belong to false trajectory segments.
+
+    Splits anchors into segments at edges where total displacement exceeds
+    max_displacement pixels. Removes segments smaller than min_segment_size.
+
+    Returns:
+        List of outlier frame indices to remove.
+    """
+    if len(anchors) < 5:
+        return []
+
+    sorted_frames = sorted(anchors.keys())
+    n = len(sorted_frames)
+
+    # Compute total displacement for each consecutive pair
+    displacements = []
+    for i in range(n - 1):
+        f1, f2 = sorted_frames[i], sorted_frames[i + 1]
+        dx = anchors[f2][0] - anchors[f1][0]
+        dy = anchors[f2][1] - anchors[f1][1]
+        displacements.append((dx ** 2 + dy ** 2) ** 0.5)
+
+    # Split into segments at large jumps
+    segments: list[list[int]] = [[sorted_frames[0]]]
+    for i in range(n - 1):
+        if displacements[i] > max_displacement:
+            segments.append([])
+        segments[-1].append(sorted_frames[i + 1])
+
+    if len(segments) <= 1:
+        return []
+
+    # Keep the largest segment plus any segment with >= min_segment_size
+    # that is at least 20% of total anchors. Remove the rest.
+    largest_size = max(len(s) for s in segments)
+    size_threshold = max(min_segment_size, int(0.2 * len(anchors)))
+    outliers = []
+    for seg in segments:
+        if len(seg) < size_threshold and len(seg) < largest_size:
+            outliers.extend(seg)
+
+    return outliers
+
+
+# Ball position interpolation (for two-pass ball detection)
+# ---------------------------------------------------------------------------
+
+def _interpolate_ball_position(
+    frame_idx: int,
+    anchor_indices: list[int],
+    anchors: dict[int, tuple[float, float]],
+    max_gap: int = 30,
+) -> tuple[float, float] | None:
+    """Interpolate ball position from nearest anchor frames.
+
+    Args:
+        frame_idx: Target frame index.
+        anchor_indices: Sorted list of frame indices with anchor detections.
+        anchors: {frame_idx: (cx, cy)} anchor positions.
+        max_gap: Maximum frame gap for interpolation.
+
+    Returns:
+        Interpolated (cx, cy) or None if no anchors within range.
+    """
+    import bisect
+
+    pos = bisect.bisect_left(anchor_indices, frame_idx)
+
+    before_idx = anchor_indices[pos - 1] if pos > 0 else None
+    after_idx = anchor_indices[pos] if pos < len(anchor_indices) else None
+
+    # Check gap constraints
+    if before_idx is not None and frame_idx - before_idx > max_gap:
+        before_idx = None
+    if after_idx is not None and after_idx - frame_idx > max_gap:
+        after_idx = None
+
+    if before_idx is not None and after_idx is not None:
+        # Linear interpolation
+        t = (frame_idx - before_idx) / (after_idx - before_idx)
+        bx, by = anchors[before_idx]
+        ax, ay = anchors[after_idx]
+        return (bx + t * (ax - bx), by + t * (ay - by))
+    elif before_idx is not None:
+        return anchors[before_idx]
+    elif after_idx is not None:
+        return anchors[after_idx]
+    else:
+        return None
+
+
+# Ball detection diagnostic visualization
+# ---------------------------------------------------------------------------
+
+# Color scheme:  pass1=green, pass2=blue, static=red, outlier=orange, filtered=gray
+_BALL_DIAG_COLORS = {
+    "pass1": (0, 220, 0),       # green
+    "pass2": (255, 180, 0),     # cyan-ish (BGR)
+    "static": (0, 0, 255),      # red
+    "outlier": (0, 140, 255),   # orange (BGR)
+    "filtered": (160, 160, 160),  # gray
+}
+_BALL_DIAG_LABELS = {
+    "pass1": "Pass1",
+    "pass2": "Pass2 (crop)",
+    "static": "Static (removed)",
+    "outlier": "Outlier (removed)",
+    "filtered": "Trajectory filter",
+}
+
+
+def _render_ball_detection_diag(
+    video_path: Path | str,
+    sampler,
+    all_ball_dets_diag: dict[int, list[dict]],
+    pass1_anchors: dict[int, tuple[float, float]],
+    static_positions: list[tuple[float, float]],
+    output_dir: Path,
+) -> None:
+    """Render per-frame diagnostic images showing ball detection sources.
+
+    Each detection is drawn as a circle with color indicating its source:
+      green = pass1 (SAHI), blue = pass2 (crop+enlarge),
+      red = static object (removed), gray = trajectory-filtered.
+    """
+    diag_dir = output_dir / "ball_detection_diag"
+    diag_dir.mkdir(exist_ok=True)
+
+    cap = cv2.VideoCapture(str(video_path))
+    frame_indices = list(sampler)
+
+    # Count stats
+    counts = {"pass1": 0, "pass2": 0, "static": 0, "outlier": 0, "filtered": 0}
+    for dets in all_ball_dets_diag.values():
+        for d in dets:
+            src = d.get("source", "pass1")
+            counts[src] = counts.get(src, 0) + 1
+
+    print(f"\nGenerating ball detection diagnostic visualization...")
+    print(f"  pass1={counts['pass1']}  pass2={counts['pass2']}  "
+          f"static={counts['static']}  outlier={counts['outlier']}  "
+          f"filtered={counts['filtered']}")
+
+    for fidx in tqdm(frame_indices, desc="  Ball diag"):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        dets = all_ball_dets_diag.get(fidx, [])
+        is_anchor = fidx in pass1_anchors
+
+        # Draw each detection
+        for d in dets:
+            src = d.get("source", "pass1")
+            color = _BALL_DIAG_COLORS.get(src, (255, 255, 255))
+            cx, cy = int(d["center"][0]), int(d["center"][1])
+            conf = d["confidence"]
+            bbox = d["bbox"]
+            bx1, by1, bx2, by2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+
+            # Draw bbox
+            thickness = 2 if src in ("pass1", "pass2") else 1
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), color, thickness)
+
+            # Draw center circle
+            radius = 12 if src in ("pass1", "pass2") else 8
+            cv2.circle(frame, (cx, cy), radius, color, 2)
+            if src in ("pass1", "pass2"):
+                cv2.circle(frame, (cx, cy), 3, color, -1)
+
+            # Label
+            label = f"{_BALL_DIAG_LABELS.get(src, src)} {conf:.2f}"
+            label_y = max(by1 - 8, 15)
+            cv2.putText(frame, label, (bx1, label_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+        # Draw anchor marker if this frame is an anchor
+        if is_anchor:
+            ax, ay = int(pass1_anchors[fidx][0]), int(pass1_anchors[fidx][1])
+            # Diamond marker for anchor
+            pts = np.array([
+                [ax, ay - 18], [ax + 12, ay], [ax, ay + 18], [ax - 12, ay]
+            ], dtype=np.int32)
+            cv2.polylines(frame, [pts], True, (0, 255, 255), 2)  # yellow diamond
+
+        # Draw static zone circles (dashed-style with thin line)
+        for sx, sy in static_positions:
+            cv2.circle(frame, (int(sx), int(sy)), 60, (0, 0, 200), 1)
+            cv2.putText(frame, "STATIC", (int(sx) - 25, int(sy) - 65),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 200), 1, cv2.LINE_AA)
+
+        # Frame info overlay (top-left)
+        n_dets = len(dets)
+        sources = [d.get("source", "?") for d in dets]
+        info = f"Frame {fidx}  |  {n_dets} det(s): {', '.join(sources) if sources else 'none'}"
+        if is_anchor:
+            info += "  [ANCHOR]"
+        cv2.rectangle(frame, (0, 0), (len(info) * 9 + 10, 28), (0, 0, 0), -1)
+        cv2.putText(frame, info, (5, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Legend (bottom-left)
+        legend_y = frame.shape[0] - 100
+        cv2.rectangle(frame, (0, legend_y - 5), (220, frame.shape[0]), (0, 0, 0), -1)
+        for i, (src, color) in enumerate(_BALL_DIAG_COLORS.items()):
+            ly = legend_y + i * 22 + 15
+            cv2.circle(frame, (15, ly - 4), 6, color, -1)
+            cv2.putText(frame, _BALL_DIAG_LABELS[src], (30, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+        cv2.imwrite(str(diag_dir / f"frame_{fidx:05d}.jpg"), frame)
+
+    cap.release()
+    print(f"  Saved to {diag_dir}/")
+
+
 # Camera pose interpolation (for stage2 running at higher fps than stage1)
 # ---------------------------------------------------------------------------
 
@@ -154,8 +458,9 @@ def _interpolate_camera_poses(
 ) -> dict[int, dict]:
     """Interpolate camera poses for frames not calibrated in stage1.
 
-    Uses nearest-neighbor for rvec/tvec/K/dist_coeffs. Linear interpolation
-    of rotation vectors can cause issues, so nearest is safest.
+    Uses linear interpolation on rvec, tvec, and K matrix between the two
+    nearest calibrated frames.  Falls back to nearest-neighbor when the
+    target frame is before the first or after the last calibrated frame.
 
     Args:
         camera_poses: Dict of frame_idx -> pose from stage1.
@@ -174,19 +479,40 @@ def _interpolate_camera_poses(
         if fidx in expanded:
             continue
 
-        # Find nearest calibrated frame (binary search)
         pos = bisect.bisect_left(calibrated_indices, fidx)
 
         if pos == 0:
-            nearest = calibrated_indices[0]
+            # Before first calibrated frame — use nearest
+            expanded[fidx] = camera_poses[calibrated_indices[0]]
         elif pos >= len(calibrated_indices):
-            nearest = calibrated_indices[-1]
+            # After last calibrated frame — use nearest
+            expanded[fidx] = camera_poses[calibrated_indices[-1]]
         else:
-            left = calibrated_indices[pos - 1]
-            right = calibrated_indices[pos]
-            nearest = left if (fidx - left) <= (right - fidx) else right
+            # Between two calibrated frames — linear interpolation
+            left_idx = calibrated_indices[pos - 1]
+            right_idx = calibrated_indices[pos]
+            t = (fidx - left_idx) / (right_idx - left_idx)
 
-        expanded[fidx] = camera_poses[nearest]
+            left_pose = camera_poses[left_idx]
+            right_pose = camera_poses[right_idx]
+
+            interp_pose = {}
+            for key in ("rvec", "tvec"):
+                lv = np.array(left_pose[key], dtype=np.float64)
+                rv = np.array(right_pose[key], dtype=np.float64)
+                interp_pose[key] = (lv + t * (rv - lv)).tolist()
+
+            # Interpolate K (focal length changes with Veo digital zoom)
+            lK = np.array(left_pose["K"], dtype=np.float64)
+            rK = np.array(right_pose["K"], dtype=np.float64)
+            interp_pose["K"] = (lK + t * (rK - lK)).tolist()
+
+            # Interpolate dist_coeffs
+            ld = np.array(left_pose["dist_coeffs"], dtype=np.float64)
+            rd = np.array(right_pose["dist_coeffs"], dtype=np.float64)
+            interp_pose["dist_coeffs"] = (ld + t * (rd - ld)).tolist()
+
+            expanded[fidx] = interp_pose
 
     return expanded
 
@@ -710,7 +1036,7 @@ def run_stage2(
     print(f"Processing {len(sampler)} frames ({max_duration_sec}s) at {process_fps or fps} fps")
 
     # Interpolate camera poses for frames not in stage1 (when tracking_fps > calibration_fps)
-    if camera_poses and len(sampler) > len(camera_poses):
+    if camera_poses and any(f not in camera_poses for f in sampler):
         camera_poses = _interpolate_camera_poses(camera_poses, list(sampler))
         # Re-compute homographies for interpolated poses
         homographies = {}
@@ -744,6 +1070,174 @@ def run_stage2(
     # Ball tracking storage
     all_ball_tracks = {}  # frame_idx -> ball track dict
     ball_trajectory_history = []  # For visualization
+
+    # === Two-pass ball detection ===
+    # Pre-scan entire video for ball positions, then crop+enlarge missed frames.
+    # Results stored in all_ball_detections: {frame_idx: list[detection_dict]}
+    all_ball_detections = {}
+    two_pass_enabled = ball_config.get("two_pass", False) and ball_detector is not None
+    if two_pass_enabled:
+        pass1_conf = ball_config.get("pass1_confidence_threshold", 0.5)
+        crop_size = ball_config.get("crop_size", 300)
+        crop_enlarge_to = ball_config.get("crop_enlarge_to", 640)
+        max_gap = ball_config.get("max_interpolation_gap", 30)
+        frame_indices = list(sampler)
+
+        # Pass 1: scan all frames, collect high-confidence anchors
+        print("\nBall detection pass 1: scanning all frames...")
+        pass1_anchors = {}  # {frame_idx: (cx, cy)}
+        ball_cap = cv2.VideoCapture(str(video_path))
+        for fidx in tqdm(frame_indices, desc="  Ball pass 1"):
+            ball_cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+            ret, frame = ball_cap.read()
+            if not ret:
+                continue
+            dets = ball_detector.detect(frame)
+            dets = ball_detector.filter_by_size(dets)
+            best = ball_detector.get_best_detection(dets)
+            if best and best["confidence"] >= pass1_conf:
+                pass1_anchors[fidx] = tuple(best["center"])
+            # Always store all detections from pass 1 (even low-conf ones)
+            for d in dets:
+                d["source"] = "pass1"
+            all_ball_detections[fidx] = dets
+
+        print(f"  Pass 1: {len(pass1_anchors)} raw anchor frames out of {len(frame_indices)}")
+
+        static_positions: list[tuple[float, float]] = []
+        static_ball_dets: dict[int, list[dict]] = {}
+
+        # Pass 2: crop+enlarge on ALL frames (supplements pass 1)
+        if pass1_anchors:
+            print(f"Ball detection pass 2: crop+enlarge on {len(frame_indices)} frames...")
+            anchor_indices = sorted(pass1_anchors.keys())
+            pass2_count = 0
+            for fidx in tqdm(frame_indices, desc="  Ball pass 2"):
+                # Find nearest anchors before and after
+                center = _interpolate_ball_position(fidx, anchor_indices, pass1_anchors, max_gap)
+                if center is None:
+                    continue
+                ball_cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+                ret, frame = ball_cap.read()
+                if not ret:
+                    continue
+                crop_dets = ball_detector.detect_crop(frame, center, crop_size, crop_enlarge_to)
+                crop_dets = ball_detector.filter_by_size(crop_dets)
+                if crop_dets:
+                    for d in crop_dets:
+                        d["source"] = "pass2"
+                    # Merge with any pass 1 detections for this frame
+                    existing = all_ball_detections.get(fidx, [])
+                    all_ball_detections[fidx] = existing + crop_dets
+                    pass2_count += 1
+
+            print(f"  Pass 2: found ball in {pass2_count} additional frames")
+
+        ball_cap.release()
+
+        # ---- Post-hoc filtering (after both passes complete) ----
+        raw_anchor_count = len(pass1_anchors)
+
+        # 1. Static object filter
+        if len(pass1_anchors) >= 3:
+            static_positions = _find_static_positions(pass1_anchors)
+            if static_positions:
+                pass1_anchors = {f: c for f, c in pass1_anchors.items()
+                                 if not _near_any_static(c, static_positions)}
+                for fidx in list(all_ball_detections.keys()):
+                    kept = []
+                    for d in all_ball_detections[fidx]:
+                        if _near_any_static(tuple(d["center"]), static_positions):
+                            d["source"] = "static"
+                            static_ball_dets.setdefault(fidx, []).append(d)
+                        else:
+                            kept.append(d)
+                    all_ball_detections[fidx] = kept
+                print(f"  Post-filter: removed {len(static_positions)} static object region(s)")
+
+        # 2. Trajectory outlier filter
+        if len(pass1_anchors) >= 3:
+            outlier_frames = _filter_anchor_outliers(pass1_anchors)
+            if outlier_frames:
+                for fidx in outlier_frames:
+                    if fidx in all_ball_detections:
+                        for d in all_ball_detections[fidx]:
+                            d["source"] = "outlier"
+                            static_ball_dets.setdefault(fidx, []).append(d)
+                        all_ball_detections[fidx] = []
+                    if fidx in pass1_anchors:
+                        del pass1_anchors[fidx]
+                print(f"  Post-filter: removed {len(outlier_frames)} trajectory outlier anchor(s)")
+
+        print(f"  Post-filter: {len(pass1_anchors)} anchors remain (from {raw_anchor_count} raw)")
+
+        # Save all detections (before trajectory filter) for diagnostic vis.
+        # Includes pass1, pass2, and static-tagged detections.
+        all_ball_dets_diag: dict[int, list[dict]] = {}
+        for fidx, dets in all_ball_detections.items():
+            all_ball_dets_diag[fidx] = [
+                {
+                    "center": list(d["center"]),
+                    "bbox": list(d["bbox"]),
+                    "confidence": d["confidence"],
+                    "source": d.get("source", "pass1"),
+                }
+                for d in dets
+            ]
+        # Merge removed detections (static + outlier) back in for visualization
+        for fidx, dets in static_ball_dets.items():
+            diag_list = all_ball_dets_diag.setdefault(fidx, [])
+            for d in dets:
+                diag_list.append({
+                    "center": list(d["center"]),
+                    "bbox": list(d["bbox"]),
+                    "confidence": d["confidence"],
+                    "source": d.get("source", "static"),
+                })
+
+        # Filter: for each frame, keep only the detection closest to the
+        # anchor-interpolated trajectory.  This prevents far-off false
+        # positives (watermark, spare ball) from being fed to the tracker.
+        if pass1_anchors:
+            anchor_indices = sorted(pass1_anchors.keys())
+            for fidx in list(all_ball_detections.keys()):
+                dets = all_ball_detections[fidx]
+                if not dets:
+                    continue
+                # Get expected position from anchors
+                expected = _interpolate_ball_position(
+                    fidx, anchor_indices, pass1_anchors, max_gap
+                )
+                if expected is None:
+                    # No nearby anchor — discard all detections for this frame
+                    all_ball_detections[fidx] = []
+                    continue
+                # Keep only the detection closest to expected position
+                def _dist(d: dict) -> float:
+                    c = d["center"]
+                    return ((c[0] - expected[0]) ** 2 + (c[1] - expected[1]) ** 2) ** 0.5
+                best_det = min(dets, key=_dist)
+                # Only keep if reasonably close (within crop_size radius)
+                if _dist(best_det) <= crop_size:
+                    all_ball_detections[fidx] = [best_det]
+                else:
+                    all_ball_detections[fidx] = []
+
+        # Build set of kept detection centers for tagging filtered ones
+        kept_centers: set[tuple[float, float]] = set()
+        for dets in all_ball_detections.values():
+            for d in dets:
+                kept_centers.add((round(d["center"][0], 2), round(d["center"][1], 2)))
+
+        # Tag filtered detections in diagnostic data
+        for fidx, dets in all_ball_dets_diag.items():
+            for d in dets:
+                key = (round(d["center"][0], 2), round(d["center"][1], 2))
+                if d["source"] not in ("static", "outlier") and key not in kept_centers:
+                    d["source"] = "filtered"
+
+        print(f"  Total frames with ball detections: "
+              f"{sum(1 for d in all_ball_detections.values() if d)}/{len(frame_indices)}")
 
     # Process frames
     print("\nStage 2: Processing frames...")
@@ -918,12 +1412,12 @@ def run_stage2(
 
         # Ball detection and tracking
         if ball_detector and ball_tracker:
-            ball_detections = ball_detector.detect(frame)
-            ball_detections = ball_detector.filter_by_size(ball_detections)
-
-            # NOTE: No pitch boundary filter for ball — ground-plane projection
-            # gives wildly wrong results for airborne balls. Size filter + tracker
-            # Kalman filter are sufficient to reject false positives.
+            if two_pass_enabled:
+                # Use pre-computed detections from two-pass scan
+                ball_detections = all_ball_detections.get(frame_idx, [])
+            else:
+                ball_detections = ball_detector.detect(frame)
+                ball_detections = ball_detector.filter_by_size(ball_detections)
 
             # Update ball tracker
             ball_tracks = ball_tracker.update(ball_detections)
@@ -943,13 +1437,17 @@ def run_stage2(
                     )
                     traj_result = ball_trajectory_3d.estimate()
                     if traj_result:
-                        primary_ball["pitch_position"] = traj_result["pitch_position"]
-                        primary_ball["height"] = traj_result["height"]
-                        primary_ball["position_3d"] = traj_result["position_3d"]
-                        primary_ball["on_ground"] = traj_result["on_ground"]
+                        if traj_result.get("rejected"):
+                            # False positive detected — suppress this ball entirely
+                            primary_ball = None
+                        else:
+                            primary_ball["pitch_position"] = traj_result["pitch_position"]
+                            primary_ball["height"] = traj_result["height"]
+                            primary_ball["position_3d"] = traj_result["position_3d"]
+                            primary_ball["on_ground"] = traj_result["on_ground"]
 
                 # Fallback to ground plane projection
-                if primary_ball.get("pitch_position") is None:
+                if primary_ball is not None and primary_ball.get("pitch_position") is None:
                     if frame_idx in camera_poses:
                         from .tracking.ball_trajectory import project_to_ground
                         ground = project_to_ground(tuple(ball_center), camera_poses[frame_idx])
@@ -968,11 +1466,12 @@ def run_stage2(
                             primary_ball["height"] = 0.0
                             primary_ball["on_ground"] = True
 
-                all_ball_tracks[frame_idx] = primary_ball
-                ball_trajectory_history.append(tuple(ball_center))
-                max_traj_len = ball_tracking_config.get("trajectory_length", 30)
-                if len(ball_trajectory_history) > max_traj_len:
-                    ball_trajectory_history = ball_trajectory_history[-max_traj_len:]
+                if primary_ball is not None:
+                    all_ball_tracks[frame_idx] = primary_ball
+                    ball_trajectory_history.append(tuple(ball_center))
+                    max_traj_len = ball_tracking_config.get("trajectory_length", 30)
+                    if len(ball_trajectory_history) > max_traj_len:
+                        ball_trajectory_history = ball_trajectory_history[-max_traj_len:]
 
         # Note: Team classification is deferred until all tracking is complete
         # This allows using trajectory-averaged features for better clustering
@@ -1174,6 +1673,13 @@ def run_stage2(
         with open(output_dir / "ball_tracks.json", "w") as f:
             json.dump(serializable_ball_tracks, f, indent=2)
         print(f"  Saved {len(all_ball_tracks)} ball detections")
+
+    # Diagnostic visualization: ball detection two-pass results
+    if two_pass_enabled and all_ball_dets_diag:
+        _render_ball_detection_diag(
+            video_path, sampler, all_ball_dets_diag,
+            pass1_anchors, static_positions, output_dir,
+        )
 
     # Statistics
     unique_tracks = set()
