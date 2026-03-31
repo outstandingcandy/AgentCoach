@@ -5,6 +5,7 @@ transformers>=4.40.0
 
 # Detection & Tracking
 ultralytics>=8.0.0        # YOLOv8
+sahi>=0.11.0              # Sliced Aided Hyper Inference for small object detection
 deep-sort-realtime        # Multi-object tracking (StrongSORT compatible)
 
 # ReID

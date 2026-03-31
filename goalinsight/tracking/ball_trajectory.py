@@ -162,6 +162,12 @@ class BallTrajectory3D:
         self.pitch_half_length = config.get("pitch_half_length", 52.5)
         self.pitch_half_width = config.get("pitch_half_width", 34.0)
         self.ball_real_diameter = config.get("ball_real_diameter", 0.22)
+        # YOLO bbox regression adds ~1px padding around small objects.
+        # For a 7px ball this is a 15% size error → 15% distance error.
+        self.bbox_padding = config.get("bbox_padding", 1.0)
+        # Max ball speed for false-positive rejection (m/s). A powerful shot
+        # reaches ~40 m/s; add margin for projection noise.
+        self.max_ball_speed = config.get("max_ball_speed", 50.0)
 
         self.observations: deque[tuple[float, tuple[float, float], dict, tuple | None]] = deque(
             maxlen=self.window_size
@@ -211,6 +217,20 @@ class BallTrajectory3D:
         if x0 is None:
             return self._fallback_projection()
 
+        # Compute size-based 3D anchors for depth-constraining the optimizer.
+        # Single-camera reprojection alone cannot resolve depth (position
+        # along the ray), so we add size-based distance estimates as soft
+        # constraints.  This keeps the optimizer's parabolic trajectory
+        # physically grounded while letting it extrapolate beyond the range
+        # where size estimation breaks down (tiny balls at distance).
+        size_anchors = []  # list of (dt, (x,y,z)) for frames with size estimate
+        median_d = self._get_median_pixel_diameter()
+        for t, pixel, pose, bbox in obs_list:
+            pos = self._size_estimate_position(pixel, bbox, pose,
+                                               pixel_diameter_override=median_d)
+            if pos is not None:
+                size_anchors.append((t - t_ref, pos))
+
         # Tighten bounds to pitch dimensions
         margin = 10.0
         half_l = self.pitch_half_length + margin
@@ -225,7 +245,7 @@ class BallTrajectory3D:
             result = least_squares(
                 self._residuals,
                 x0,
-                args=(t_ref, obs_list),
+                args=(t_ref, obs_list, size_anchors),
                 method="trf",
                 loss="cauchy",
                 f_scale=5.0,
@@ -237,21 +257,23 @@ class BallTrajectory3D:
 
         params = result.x
 
-        # Always use size-based position for the latest frame.
-        # The optimizer is poorly constrained with a single fixed camera and
-        # produces noisy positions; size-based distance estimation uses the
-        # ball's known physical diameter (22cm) to determine depth directly.
-        _, latest_pixel, latest_pose, latest_bbox = obs_list[-1]
-        ray_pos = self._size_estimate_position(latest_pixel, latest_bbox, latest_pose)
-        if ray_pos is not None:
-            x, y, z = ray_pos
-        else:
-            # Fallback to optimizer result
-            t_latest = obs_list[-1][0]
-            dt = t_latest - t_ref
-            x = params[0] + params[3] * dt
-            y = params[1] + params[4] * dt
-            z = max(0.0, params[2] + params[5] * dt - 0.5 * self.gravity * dt * dt)
+        # Evaluate the optimizer's parabolic trajectory at the latest frame.
+        t_latest = obs_list[-1][0]
+        dt = t_latest - t_ref
+        x = params[0] + params[3] * dt
+        y = params[1] + params[4] * dt
+        z = max(0.0, params[2] + params[5] * dt - 0.5 * self.gravity * dt * dt)
+
+        # Reject if position jumped too far from last result (false positive).
+        if self._last_result is not None:
+            prev = self._last_result["position_3d"]
+            t_prev = self._last_result.get("_time", obs_list[-1][0])
+            dt_since = max(obs_list[-1][0] - t_prev, 1e-3)
+            dx = ((x - prev[0]) ** 2 + (y - prev[1]) ** 2) ** 0.5
+            if dx / dt_since > self.max_ball_speed:
+                # Likely false positive — discard latest observation
+                self.observations.pop()
+                return {**self._last_result, "rejected": True}
 
         self._last_result = {
             "position_3d": [float(x), float(y), float(z)],
@@ -259,6 +281,7 @@ class BallTrajectory3D:
             "pitch_position": [float(x), float(y)],
             "height": float(z),
             "on_ground": bool(z < self.ground_threshold),
+            "_time": obs_list[-1][0],
         }
         return self._last_result
 
@@ -272,8 +295,16 @@ class BallTrajectory3D:
         params: np.ndarray,
         t_ref: float,
         obs_list: list,
+        size_anchors: list | None = None,
     ) -> np.ndarray:
-        """Compute reprojection residuals for all observations."""
+        """Compute reprojection + depth-anchor residuals.
+
+        Reprojection residuals constrain the angular position (direction from
+        camera).  Size-based depth anchors constrain the distance along the
+        ray, which is otherwise unresolvable from a single camera.  The
+        depth anchor weight is set so that a 1m 3D error contributes roughly
+        the same as a 1px reprojection error.
+        """
         x0, y0, z0, vx, vy, vz = params
         residuals = []
 
@@ -291,19 +322,53 @@ class BallTrajectory3D:
             residuals.append(pred_2d[0] - pixel_center[0])
             residuals.append(pred_2d[1] - pixel_center[1])
 
+        # Size-based depth anchors: penalize deviation of optimizer position
+        # from the size-estimated 3D position.  Weight chosen so that depth
+        # errors are treated comparably to pixel reprojection errors.
+        if size_anchors:
+            depth_weight = 1.0  # 1m error ≈ 1px reprojection error
+            for dt, (sx, sy, sz) in size_anchors:
+                px = x0 + vx * dt
+                py = y0 + vy * dt
+                pz = z0 + vz * dt - 0.5 * self.gravity * dt * dt
+                residuals.append(depth_weight * (px - sx))
+                residuals.append(depth_weight * (py - sy))
+                residuals.append(depth_weight * (pz - sz))
+
         return np.array(residuals)
+
+    def _get_median_pixel_diameter(self) -> float | None:
+        """Compute median ball pixel diameter from observation window.
+
+        Smooths out YOLO bbox noise — a 1px fluctuation on a 6px ball
+        causes ~17% distance error, so median filtering is essential.
+        """
+        diameters = []
+        for _, _, _, bbox in self.observations:
+            if bbox is not None:
+                w = bbox[2] - bbox[0]
+                h = bbox[3] - bbox[1]
+                diameters.append(min(w, h) - self.bbox_padding)
+        if not diameters:
+            return None
+        return float(np.median(diameters))
 
     def _size_estimate_position(
         self,
         pixel: tuple[float, float],
         bbox: tuple[float, float, float, float] | None,
         pose: dict,
+        pixel_diameter_override: float | None = None,
     ) -> tuple[float, float, float] | None:
         """Estimate 3D position using ball's apparent pixel size.
 
         Uses the known real ball diameter and the YOLO bbox to compute
         distance along the camera ray. Falls back to ray-z search if
         bbox is unavailable or the result fails validation.
+
+        Args:
+            pixel_diameter_override: If provided, use this smoothed diameter
+                instead of computing from bbox. Used for temporal smoothing.
         """
         ray = pixel_to_ray(pixel, pose)
         if ray is None:
@@ -314,11 +379,15 @@ class BallTrajectory3D:
         x_lim = self.pitch_half_length + margin
         y_lim = self.pitch_half_width + margin
 
-        if bbox is not None:
+        pixel_diameter = pixel_diameter_override
+        if pixel_diameter is None and bbox is not None:
             w = bbox[2] - bbox[0]
             h = bbox[3] - bbox[1]
-            # Use min dimension — less affected by motion blur / YOLO padding
-            pixel_diameter = min(w, h)
+            # Use min dimension — less affected by motion blur / YOLO padding.
+            # Subtract bbox_padding to correct for YOLO's bbox regression padding.
+            pixel_diameter = min(w, h) - self.bbox_padding
+
+        if pixel_diameter is not None:
             dist = estimate_distance_from_size(
                 pixel_diameter, pose, self.ball_real_diameter
             )
@@ -407,25 +476,36 @@ class BallTrajectory3D:
             return None
 
         _, pixel_center, pose, bbox = self.observations[-1]
+        median_d = self._get_median_pixel_diameter()
 
-        pos = self._size_estimate_position(pixel_center, bbox, pose)
+        pos = self._size_estimate_position(
+            pixel_center, bbox, pose, pixel_diameter_override=median_d
+        )
         if pos is None:
             # Last resort: ground projection
             ground = project_to_ground(pixel_center, pose)
             if ground is None:
                 return None
-            return {
-                "position_3d": [ground[0], ground[1], 0.0],
-                "velocity_3d": [0.0, 0.0, 0.0],
-                "pitch_position": ground,
-                "height": 0.0,
-                "on_ground": True,
-            }
+            pos = (ground[0], ground[1], 0.0)
 
-        return {
+        # Reject if position jumped too far (false positive)
+        t_now = self.observations[-1][0]
+        if self._last_result is not None:
+            prev = self._last_result["position_3d"]
+            t_prev = self._last_result.get("_time", t_now)
+            dt_since = max(t_now - t_prev, 1e-3)
+            dx = ((pos[0] - prev[0]) ** 2 + (pos[1] - prev[1]) ** 2) ** 0.5
+            if dx / dt_since > self.max_ball_speed:
+                self.observations.pop()
+                return {**self._last_result, "rejected": True}
+
+        result = {
             "position_3d": [pos[0], pos[1], pos[2]],
             "velocity_3d": [0.0, 0.0, 0.0],
             "pitch_position": [pos[0], pos[1]],
             "height": pos[2],
             "on_ground": bool(pos[2] < self.ground_threshold),
+            "_time": t_now,
         }
+        self._last_result = result
+        return result

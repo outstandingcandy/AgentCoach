@@ -145,201 +145,301 @@ def _filter_by_pitch_undistorted(
 
 
 # ---------------------------------------------------------------------------
-# Ball anchor filtering (for two-pass ball detection)
+# Ball trajectory filtering helpers
 # ---------------------------------------------------------------------------
 
-def _find_static_positions(
-    anchors: dict[int, tuple[float, float]],
-    static_radius: float = 40.0,
-    min_cluster_size: int = 5,
-    max_displacement_per_frame: float = 0.5,
-) -> list[tuple[float, float]]:
-    """Find positions of static objects (spare balls, watermarks) in anchors.
-
-    Groups anchors by spatial proximity and identifies clusters with low
-    average displacement per frame (static objects).
-
-    Returns:
-        List of (cx, cy) centroid positions of static object clusters.
-    """
-    if len(anchors) < min_cluster_size:
-        return []
-
-    sorted_frames = sorted(anchors.keys())
-
-    # Cluster anchors by spatial proximity
-    clusters: list[list[int]] = []
-    visited = set()
-
-    for fidx in sorted_frames:
-        if fidx in visited:
-            continue
-        cluster = [fidx]
-        visited.add(fidx)
-        cx, cy = anchors[fidx]
-
-        for fidx2 in sorted_frames:
-            if fidx2 in visited:
-                continue
-            cx2, cy2 = anchors[fidx2]
-            dist = ((cx2 - cx) ** 2 + (cy2 - cy) ** 2) ** 0.5
-            if dist <= static_radius:
-                cluster.append(fidx2)
-                visited.add(fidx2)
-
-        clusters.append(cluster)
-
-    # Identify static clusters
-    static_centroids = []
-    for cluster in clusters:
-        if len(cluster) < min_cluster_size:
-            continue
-        cluster_sorted = sorted(cluster)
-        total_disp = 0.0
-        total_gap = 0
-        for i in range(1, len(cluster_sorted)):
-            f1, f2 = cluster_sorted[i - 1], cluster_sorted[i]
-            dx = anchors[f2][0] - anchors[f1][0]
-            dy = anchors[f2][1] - anchors[f1][1]
-            total_disp += (dx ** 2 + dy ** 2) ** 0.5
-            total_gap += f2 - f1
-
-        avg_disp = total_disp / max(total_gap, 1)
-        if avg_disp < max_displacement_per_frame:
-            # Compute centroid of this static cluster
-            mean_x = sum(anchors[f][0] for f in cluster) / len(cluster)
-            mean_y = sum(anchors[f][1] for f in cluster) / len(cluster)
-            static_centroids.append((mean_x, mean_y))
-
-    return static_centroids
-
-
-def _near_any_static(
-    center: tuple[float, float],
-    static_positions: list[tuple[float, float]],
-    radius: float = 60.0,
-) -> bool:
-    """Check if a detection center is near any known static object position."""
-    for sx, sy in static_positions:
-        dist = ((center[0] - sx) ** 2 + (center[1] - sy) ** 2) ** 0.5
-        if dist <= radius:
-            return True
-    return False
-
-
-def _filter_anchor_outliers(
-    anchors: dict[int, tuple[float, float]],
-    max_displacement: float = 600.0,
-    min_segment_size: int = 3,
-) -> list[int]:
-    """Find anchor frames that belong to false trajectory segments.
-
-    Splits anchors into segments at edges where total displacement exceeds
-    max_displacement pixels. Removes segments smaller than min_segment_size.
-
-    Returns:
-        List of outlier frame indices to remove.
-    """
-    if len(anchors) < 5:
-        return []
-
-    sorted_frames = sorted(anchors.keys())
-    n = len(sorted_frames)
-
-    # Compute total displacement for each consecutive pair
-    displacements = []
-    for i in range(n - 1):
-        f1, f2 = sorted_frames[i], sorted_frames[i + 1]
-        dx = anchors[f2][0] - anchors[f1][0]
-        dy = anchors[f2][1] - anchors[f1][1]
-        displacements.append((dx ** 2 + dy ** 2) ** 0.5)
-
-    # Split into segments at large jumps
-    segments: list[list[int]] = [[sorted_frames[0]]]
-    for i in range(n - 1):
-        if displacements[i] > max_displacement:
-            segments.append([])
-        segments[-1].append(sorted_frames[i + 1])
-
-    if len(segments) <= 1:
-        return []
-
-    # Keep the largest segment plus any segment with >= min_segment_size
-    # that is at least 20% of total anchors. Remove the rest.
-    largest_size = max(len(s) for s in segments)
-    size_threshold = max(min_segment_size, int(0.2 * len(anchors)))
-    outliers = []
-    for seg in segments:
-        if len(seg) < size_threshold and len(seg) < largest_size:
-            outliers.extend(seg)
-
-    return outliers
-
-
-# Ball position interpolation (for two-pass ball detection)
-# ---------------------------------------------------------------------------
-
-def _interpolate_ball_position(
+def _find_nearest_detection_center(
     frame_idx: int,
-    anchor_indices: list[int],
-    anchors: dict[int, tuple[float, float]],
+    all_ball_detections: dict[int, list[dict]],
     max_gap: int = 30,
 ) -> tuple[float, float] | None:
-    """Interpolate ball position from nearest anchor frames.
+    """Find the nearest frame with detections and return the best detection center.
 
-    Args:
-        frame_idx: Target frame index.
-        anchor_indices: Sorted list of frame indices with anchor detections.
-        anchors: {frame_idx: (cx, cy)} anchor positions.
-        max_gap: Maximum frame gap for interpolation.
+    Searches forward and backward from frame_idx within max_gap frames.
 
     Returns:
-        Interpolated (cx, cy) or None if no anchors within range.
+        (cx, cy) of the highest-confidence detection in the nearest frame, or None.
     """
-    import bisect
+    best_dist = max_gap + 1
+    best_center = None
 
-    pos = bisect.bisect_left(anchor_indices, frame_idx)
+    for fidx, dets in all_ball_detections.items():
+        if not dets:
+            continue
+        dist = abs(fidx - frame_idx)
+        if dist < best_dist:
+            best_dist = dist
+            best_det = max(dets, key=lambda d: d.get("confidence", 0))
+            best_center = tuple(best_det["center"])
 
-    before_idx = anchor_indices[pos - 1] if pos > 0 else None
-    after_idx = anchor_indices[pos] if pos < len(anchor_indices) else None
+    return best_center if best_dist <= max_gap else None
 
-    # Check gap constraints
-    if before_idx is not None and frame_idx - before_idx > max_gap:
-        before_idx = None
-    if after_idx is not None and after_idx - frame_idx > max_gap:
-        after_idx = None
 
-    if before_idx is not None and after_idx is not None:
+def _interpolate_tracked_position(
+    frame_idx: int,
+    tracked_positions: dict[int, tuple[float, float]],
+    max_gap: int = 30,
+) -> tuple[float, float] | None:
+    """Interpolate ball position from the nearest tracked positions.
+
+    Finds the closest tracked frame before and after *frame_idx* and linearly
+    interpolates.  Falls back to the single nearest tracked position if the
+    frame is at the start/end of a tracked segment.
+
+    Returns:
+        (cx, cy) interpolated pixel position, or None if no tracked frame
+        is within *max_gap*.
+    """
+    before_fidx: int | None = None
+    after_fidx: int | None = None
+
+    for fidx in tracked_positions:
+        dist = abs(fidx - frame_idx)
+        if dist > max_gap:
+            continue
+        if fidx < frame_idx:
+            if before_fidx is None or fidx > before_fidx:
+                before_fidx = fidx
+        elif fidx > frame_idx:
+            if after_fidx is None or fidx < after_fidx:
+                after_fidx = fidx
+
+    if before_fidx is not None and after_fidx is not None:
         # Linear interpolation
-        t = (frame_idx - before_idx) / (after_idx - before_idx)
-        bx, by = anchors[before_idx]
-        ax, ay = anchors[after_idx]
+        t = (frame_idx - before_fidx) / (after_fidx - before_fidx)
+        bx, by = tracked_positions[before_fidx]
+        ax, ay = tracked_positions[after_fidx]
         return (bx + t * (ax - bx), by + t * (ay - by))
-    elif before_idx is not None:
-        return anchors[before_idx]
-    elif after_idx is not None:
-        return anchors[after_idx]
-    else:
+
+    # Only one side available — use nearest
+    nearest = before_fidx if before_fidx is not None else after_fidx
+    if nearest is not None:
+        return tracked_positions[nearest]
+
+    return None
+
+
+def _filter_trajectories_field_space(
+    trajectory_field_data: dict[int, list[tuple]],
+    fps: float,
+    config: dict,
+) -> dict[int, list[tuple]]:
+    """Filter trajectories based on physical constraints in field space.
+
+    Each entry in trajectory_field_data is:
+        track_id -> list of (frame_idx, (wx, wy), (px, py), confidence)
+
+    Filters:
+    1. Minimum length: discard short tracks
+    2. Position bounds: discard if majority of points outside pitch + margin
+    3. Speed: discard if too many inter-frame speeds exceed max
+    4. Smoothness: discard if direction changes are too erratic
+
+    Returns:
+        Filtered dict with invalid trajectories removed.
+    """
+    max_speed = config.get("max_speed_ms", 40.0)
+    margin = config.get("position_margin", 8.0)
+    min_len = config.get("min_trajectory_length", 3)
+    smooth_thresh = config.get("smoothness_threshold", 0.6)
+    speed_viol_ratio = config.get("speed_violation_ratio", 0.2)
+
+    pitch_half_length = _PITCH_HALF_LENGTH + margin
+    pitch_half_width = _PITCH_HALF_WIDTH + margin
+
+    filtered = {}
+
+    for tid, points in trajectory_field_data.items():
+        # Filter 1: minimum length
+        if len(points) < min_len:
+            continue
+
+        # Filter 2: position bounds
+        in_bounds = sum(
+            1 for _, (wx, wy), _, _ in points
+            if abs(wx) <= pitch_half_length and abs(wy) <= pitch_half_width
+        )
+        bounds_ok = in_bounds / len(points) >= 0.5
+
+        # Filter 3: speed constraint
+        violation_count = 0
+        pair_count = 0
+        for i in range(1, len(points)):
+            fidx_prev, (wx_prev, wy_prev), _, _ = points[i - 1]
+            fidx_curr, (wx_curr, wy_curr), _, _ = points[i]
+            dt = (fidx_curr - fidx_prev) / fps if fps > 0 else 0
+            if dt < 1e-6:
+                continue
+            dist = ((wx_curr - wx_prev) ** 2 + (wy_curr - wy_prev) ** 2) ** 0.5
+            speed = dist / dt
+            pair_count += 1
+            if speed > max_speed:
+                violation_count += 1
+
+        speed_ok = pair_count == 0 or violation_count / pair_count <= speed_viol_ratio
+
+        # Filter 4: smoothness in field space (direction consistency)
+        angles = []
+        for i in range(2, len(points)):
+            v1x = points[i - 1][1][0] - points[i - 2][1][0]
+            v1y = points[i - 1][1][1] - points[i - 2][1][1]
+            v2x = points[i][1][0] - points[i - 1][1][0]
+            v2y = points[i][1][1] - points[i - 1][1][1]
+            mag1 = (v1x ** 2 + v1y ** 2) ** 0.5
+            mag2 = (v2x ** 2 + v2y ** 2) ** 0.5
+            if mag1 < 0.1 or mag2 < 0.1:
+                continue
+            cos_angle = (v1x * v2x + v1y * v2y) / (mag1 * mag2)
+            cos_angle = max(-1.0, min(1.0, cos_angle))
+            angles.append(cos_angle)
+
+        field_smooth_ok = not angles or sum(angles) / len(angles) >= smooth_thresh
+
+        if bounds_ok and speed_ok and field_smooth_ok:
+            filtered[tid] = points
+            continue
+
+        # Pixel-space fallback: when the ball is airborne, ground-plane
+        # projection is unreliable (positions overshoot, speeds explode).
+        # Accept the trajectory if it is smooth and consistent in pixel space.
+        px_angles = []
+        for i in range(2, len(points)):
+            v1x = points[i - 1][2][0] - points[i - 2][2][0]
+            v1y = points[i - 1][2][1] - points[i - 2][2][1]
+            v2x = points[i][2][0] - points[i - 1][2][0]
+            v2y = points[i][2][1] - points[i - 1][2][1]
+            mag1 = (v1x ** 2 + v1y ** 2) ** 0.5
+            mag2 = (v2x ** 2 + v2y ** 2) ** 0.5
+            if mag1 < 1.0 or mag2 < 1.0:
+                continue
+            cos_a = (v1x * v2x + v1y * v2y) / (mag1 * mag2)
+            cos_a = max(-1.0, min(1.0, cos_a))
+            px_angles.append(cos_a)
+
+        px_smooth = (not px_angles or
+                     sum(px_angles) / len(px_angles) >= smooth_thresh)
+
+        # Also check pixel-space speed is reasonable (not teleporting)
+        max_px_speed = 300.0  # pixels per frame at process_fps
+        px_speed_ok = True
+        for i in range(1, len(points)):
+            fidx_prev = points[i - 1][0]
+            fidx_curr = points[i][0]
+            dt_frames = (fidx_curr - fidx_prev) / max(fps / 10.0, 1.0)
+            dx = points[i][2][0] - points[i - 1][2][0]
+            dy = points[i][2][1] - points[i - 1][2][1]
+            px_dist = (dx ** 2 + dy ** 2) ** 0.5
+            if dt_frames > 0 and px_dist / dt_frames > max_px_speed:
+                px_speed_ok = False
+                break
+
+        if px_smooth and px_speed_ok and len(points) >= min_len:
+            filtered[tid] = points
+
+    return filtered
+
+
+def _remove_merge_outliers(
+    all_ball_tracks: dict[int, dict],
+    fps: float,
+    max_deviation: float = 5.0,
+) -> int:
+    """Remove spatial outliers from the merged ball track.
+
+    After merging multiple trajectories, some frames may come from a secondary
+    trajectory that is spatially inconsistent with the surrounding frames
+    (e.g., a fence detection filling a 1-frame gap in the main ball track).
+
+    For each frame, we check deviation from the linearly interpolated position
+    between the nearest previous and next frames.  If the deviation exceeds
+    *max_deviation* meters **and** the neighbors are mutually consistent
+    (their interpolated speed < 30 m/s), the frame is an outlier and removed.
+
+    Returns:
+        Number of outlier frames removed.
+    """
+    sorted_frames = sorted(all_ball_tracks.keys())
+    if len(sorted_frames) < 3:
+        return 0
+
+    to_remove: list[int] = []
+
+    for i in range(1, len(sorted_frames) - 1):
+        f_prev = sorted_frames[i - 1]
+        f_curr = sorted_frames[i]
+        f_next = sorted_frames[i + 1]
+
+        pp_prev = all_ball_tracks[f_prev].get("pitch_position")
+        pp_curr = all_ball_tracks[f_curr].get("pitch_position")
+        pp_next = all_ball_tracks[f_next].get("pitch_position")
+
+        if not pp_prev or not pp_curr or not pp_next:
+            continue
+
+        # Check that neighbors are mutually consistent (low speed)
+        dt_pn = (f_next - f_prev) / fps if fps > 0 else 0
+        if dt_pn < 1e-6:
+            continue
+        dist_pn = ((pp_next[0] - pp_prev[0]) ** 2 + (pp_next[1] - pp_prev[1]) ** 2) ** 0.5
+        speed_pn = dist_pn / dt_pn
+        if speed_pn > 30.0:
+            # Neighbors themselves are inconsistent — can't judge the middle point
+            continue
+
+        # Interpolate expected position at f_curr
+        t_ratio = (f_curr - f_prev) / (f_next - f_prev)
+        interp_x = pp_prev[0] + t_ratio * (pp_next[0] - pp_prev[0])
+        interp_y = pp_prev[1] + t_ratio * (pp_next[1] - pp_prev[1])
+
+        deviation = ((pp_curr[0] - interp_x) ** 2 + (pp_curr[1] - interp_y) ** 2) ** 0.5
+
+        if deviation > max_deviation:
+            to_remove.append(f_curr)
+
+    for fidx in to_remove:
+        del all_ball_tracks[fidx]
+
+    return len(to_remove)
+
+
+def _select_best_trajectory(
+    filtered_trajectories: dict[int, list[tuple]],
+) -> int | None:
+    """Select the single best trajectory from filtered candidates.
+
+    Scoring: 60% length + 25% mean confidence + 15% coverage density.
+
+    Returns:
+        track_id of the best trajectory, or None.
+    """
+    if not filtered_trajectories:
         return None
+
+    max_len = max(len(pts) for pts in filtered_trajectories.values())
+
+    scores = {}
+    for tid, points in filtered_trajectories.items():
+        length_score = len(points) / max(max_len, 1)
+        conf_score = sum(p[3] for p in points) / len(points)
+        span = points[-1][0] - points[0][0] + 1
+        density_score = len(points) / max(span, 1)
+        scores[tid] = length_score * 0.6 + conf_score * 0.25 + density_score * 0.15
+
+    return max(scores, key=scores.get)
 
 
 # Ball detection diagnostic visualization
 # ---------------------------------------------------------------------------
 
-# Color scheme:  pass1=green, pass2=blue, static=red, outlier=orange, filtered=gray
 _BALL_DIAG_COLORS = {
     "pass1": (0, 220, 0),       # green
     "pass2": (255, 180, 0),     # cyan-ish (BGR)
-    "static": (0, 0, 255),      # red
-    "outlier": (0, 140, 255),   # orange (BGR)
-    "filtered": (160, 160, 160),  # gray
+    "rejected": (0, 0, 255),    # red (trajectory rejected by field filter)
 }
 _BALL_DIAG_LABELS = {
     "pass1": "Pass1",
     "pass2": "Pass2 (crop)",
-    "static": "Static (removed)",
-    "outlier": "Outlier (removed)",
-    "filtered": "Trajectory filter",
+    "rejected": "Rejected trajectory",
 }
 
 
@@ -347,42 +447,70 @@ def _render_ball_detection_diag(
     video_path: Path | str,
     sampler,
     all_ball_dets_diag: dict[int, list[dict]],
-    pass1_anchors: dict[int, tuple[float, float]],
-    static_positions: list[tuple[float, float]],
     output_dir: Path,
 ) -> None:
     """Render per-frame diagnostic images showing ball detection sources.
 
     Each detection is drawn as a circle with color indicating its source:
-      green = pass1 (SAHI), blue = pass2 (crop+enlarge),
-      red = static object (removed), gray = trajectory-filtered.
+      green = pass1, blue = pass2 (crop+enlarge),
+      red = rejected trajectory.
+
+    Uses a 3-stage pipeline: reader thread -> annotate -> writer thread pool
     """
+    import threading
+    import queue as _queue
+    from concurrent.futures import ThreadPoolExecutor
+
     diag_dir = output_dir / "ball_detection_diag"
     diag_dir.mkdir(exist_ok=True)
 
-    cap = cv2.VideoCapture(str(video_path))
     frame_indices = list(sampler)
 
     # Count stats
-    counts = {"pass1": 0, "pass2": 0, "static": 0, "outlier": 0, "filtered": 0}
+    counts: dict[str, int] = {}
     for dets in all_ball_dets_diag.values():
         for d in dets:
             src = d.get("source", "pass1")
             counts[src] = counts.get(src, 0) + 1
 
     print(f"\nGenerating ball detection diagnostic visualization...")
-    print(f"  pass1={counts['pass1']}  pass2={counts['pass2']}  "
-          f"static={counts['static']}  outlier={counts['outlier']}  "
-          f"filtered={counts['filtered']}")
+    print(f"  " + "  ".join(f"{k}={v}" for k, v in sorted(counts.items())))
 
-    for fidx in tqdm(frame_indices, desc="  Ball diag"):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-        ret, frame = cap.read()
-        if not ret:
-            continue
+    # --- Stage 1: reader thread ---
+    read_q: _queue.Queue = _queue.Queue(maxsize=8)
+
+    def _reader() -> None:
+        cap = cv2.VideoCapture(str(video_path))
+        prev_fidx = -1
+        for fidx in frame_indices:
+            gap = fidx - prev_fidx - 1
+            if prev_fidx >= 0 and 0 <= gap <= 8:
+                for _ in range(gap):
+                    cap.grab()
+            else:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+            ret, frame = cap.read()
+            prev_fidx = fidx
+            if ret:
+                read_q.put((fidx, frame))
+        read_q.put(None)
+        cap.release()
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+
+    # --- Stage 3: writer thread pool (imwrite is I/O-bound) ---
+    writer_pool = ThreadPoolExecutor(max_workers=4)
+    write_futures = []
+
+    # --- Stage 2: annotate on main thread ---
+    for _ in tqdm(frame_indices, desc="  Ball diag"):
+        item = read_q.get()
+        if item is None:
+            break
+        fidx, frame = item
 
         dets = all_ball_dets_diag.get(fidx, [])
-        is_anchor = fidx in pass1_anchors
 
         # Draw each detection
         for d in dets:
@@ -393,49 +521,27 @@ def _render_ball_detection_diag(
             bbox = d["bbox"]
             bx1, by1, bx2, by2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
 
-            # Draw bbox
             thickness = 2 if src in ("pass1", "pass2") else 1
             cv2.rectangle(frame, (bx1, by1), (bx2, by2), color, thickness)
 
-            # Draw center circle
             radius = 12 if src in ("pass1", "pass2") else 8
             cv2.circle(frame, (cx, cy), radius, color, 2)
             if src in ("pass1", "pass2"):
                 cv2.circle(frame, (cx, cy), 3, color, -1)
 
-            # Label
             label = f"{_BALL_DIAG_LABELS.get(src, src)} {conf:.2f}"
             label_y = max(by1 - 8, 15)
             cv2.putText(frame, label, (bx1, label_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
-        # Draw anchor marker if this frame is an anchor
-        if is_anchor:
-            ax, ay = int(pass1_anchors[fidx][0]), int(pass1_anchors[fidx][1])
-            # Diamond marker for anchor
-            pts = np.array([
-                [ax, ay - 18], [ax + 12, ay], [ax, ay + 18], [ax - 12, ay]
-            ], dtype=np.int32)
-            cv2.polylines(frame, [pts], True, (0, 255, 255), 2)  # yellow diamond
-
-        # Draw static zone circles (dashed-style with thin line)
-        for sx, sy in static_positions:
-            cv2.circle(frame, (int(sx), int(sy)), 60, (0, 0, 200), 1)
-            cv2.putText(frame, "STATIC", (int(sx) - 25, int(sy) - 65),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 200), 1, cv2.LINE_AA)
-
-        # Frame info overlay (top-left)
         n_dets = len(dets)
         sources = [d.get("source", "?") for d in dets]
         info = f"Frame {fidx}  |  {n_dets} det(s): {', '.join(sources) if sources else 'none'}"
-        if is_anchor:
-            info += "  [ANCHOR]"
         cv2.rectangle(frame, (0, 0), (len(info) * 9 + 10, 28), (0, 0, 0), -1)
         cv2.putText(frame, info, (5, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # Legend (bottom-left)
-        legend_y = frame.shape[0] - 100
+        legend_y = frame.shape[0] - 80
         cv2.rectangle(frame, (0, legend_y - 5), (220, frame.shape[0]), (0, 0, 0), -1)
         for i, (src, color) in enumerate(_BALL_DIAG_COLORS.items()):
             ly = legend_y + i * 22 + 15
@@ -443,9 +549,15 @@ def _render_ball_detection_diag(
             cv2.putText(frame, _BALL_DIAG_LABELS[src], (30, ly),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
-        cv2.imwrite(str(diag_dir / f"frame_{fidx:05d}.jpg"), frame)
+        # Submit write to thread pool (JPEG encoding + disk I/O)
+        out_path = str(diag_dir / f"frame_{fidx:05d}.jpg")
+        write_futures.append(writer_pool.submit(cv2.imwrite, out_path, frame))
 
-    cap.release()
+    reader.join()
+    # Wait for all writes to finish
+    for fut in write_futures:
+        fut.result()
+    writer_pool.shutdown(wait=False)
     print(f"  Saved to {diag_dir}/")
 
 
@@ -1068,7 +1180,11 @@ def run_stage2(
     tentative_buffer = {}  # track_id -> list of (frame_idx, track_dict) for backfill
 
     # Ball tracking storage
-    all_ball_tracks = {}  # frame_idx -> ball track dict
+    all_ball_tracks = {}  # frame_idx -> ball track dict (final selected trajectory)
+    all_ball_track_candidates = {}  # frame_idx -> list of all track dicts
+    ball_track_histories = {}  # track_id -> list of (frame_idx, track_dict)
+    ball_debug_log: dict[int, dict] = {}  # frame_idx -> debug info
+    all_ball_dets_diag: dict[int, list[dict]] = {}  # diagnostic visualization data
     ball_trajectory_history = []  # For visualization
 
     # === Two-pass ball detection ===
@@ -1077,102 +1193,188 @@ def run_stage2(
     all_ball_detections = {}
     two_pass_enabled = ball_config.get("two_pass", False) and ball_detector is not None
     if two_pass_enabled:
-        pass1_conf = ball_config.get("pass1_confidence_threshold", 0.5)
         crop_size = ball_config.get("crop_size", 300)
         crop_enlarge_to = ball_config.get("crop_enlarge_to", 640)
         max_gap = ball_config.get("max_interpolation_gap", 30)
         frame_indices = list(sampler)
 
-        # Pass 1: scan all frames, collect high-confidence anchors
-        print("\nBall detection pass 1: scanning all frames...")
-        pass1_anchors = {}  # {frame_idx: (cx, cy)}
-        ball_cap = cv2.VideoCapture(str(video_path))
-        for fidx in tqdm(frame_indices, desc="  Ball pass 1"):
-            ball_cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-            ret, frame = ball_cap.read()
-            if not ret:
-                continue
-            dets = ball_detector.detect(frame)
-            dets = ball_detector.filter_by_size(dets)
-            best = ball_detector.get_best_detection(dets)
-            if best and best["confidence"] >= pass1_conf:
-                pass1_anchors[fidx] = tuple(best["center"])
-            # Always store all detections from pass 1 (even low-conf ones)
-            for d in dets:
-                d["source"] = "pass1"
-            all_ball_detections[fidx] = dets
+        # ---- Helper: threaded frame reader for pipelining I/O with GPU ----
+        import threading
+        import queue as _queue
 
-        print(f"  Pass 1: {len(pass1_anchors)} raw anchor frames out of {len(frame_indices)}")
-
-        static_positions: list[tuple[float, float]] = []
-        static_ball_dets: dict[int, list[dict]] = {}
-
-        # Pass 2: crop+enlarge on ALL frames (supplements pass 1)
-        if pass1_anchors:
-            print(f"Ball detection pass 2: crop+enlarge on {len(frame_indices)} frames...")
-            anchor_indices = sorted(pass1_anchors.keys())
-            pass2_count = 0
-            for fidx in tqdm(frame_indices, desc="  Ball pass 2"):
-                # Find nearest anchors before and after
-                center = _interpolate_ball_position(fidx, anchor_indices, pass1_anchors, max_gap)
-                if center is None:
-                    continue
-                ball_cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-                ret, frame = ball_cap.read()
+        def _batch_reader_full(
+            video_path: str | Path,
+            tasks: list[int],
+            batch_size: int,
+            out_queue: _queue.Queue,
+        ) -> None:
+            """Read full frames in batches and push to queue."""
+            cap = cv2.VideoCapture(str(video_path))
+            prev_fidx = -1
+            batch_fidxs: list[int] = []
+            batch_frames: list[np.ndarray] = []
+            for fidx in tasks:
+                # Sequential grab is much faster than seek for nearby frames
+                gap = fidx - prev_fidx - 1
+                if prev_fidx >= 0 and 0 <= gap <= 8:
+                    for _ in range(gap):
+                        cap.grab()
+                else:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+                ret, frame = cap.read()
+                prev_fidx = fidx
                 if not ret:
                     continue
-                crop_dets = ball_detector.detect_crop(frame, center, crop_size, crop_enlarge_to)
-                crop_dets = ball_detector.filter_by_size(crop_dets)
-                if crop_dets:
-                    for d in crop_dets:
-                        d["source"] = "pass2"
-                    # Merge with any pass 1 detections for this frame
-                    existing = all_ball_detections.get(fidx, [])
-                    all_ball_detections[fidx] = existing + crop_dets
-                    pass2_count += 1
+                batch_fidxs.append(fidx)
+                batch_frames.append(frame)
+                if len(batch_fidxs) >= batch_size:
+                    out_queue.put((batch_fidxs, batch_frames))
+                    batch_fidxs, batch_frames = [], []
+            if batch_fidxs:
+                out_queue.put((batch_fidxs, batch_frames))
+            out_queue.put(None)  # sentinel
+            cap.release()
+
+        def _batch_reader_crop(
+            video_path: str | Path,
+            tasks: list[tuple[int, tuple[float, float]]],
+            batch_size: int,
+            detector: object,
+            crop_sz: int,
+            enlarge_to: int,
+            out_queue: _queue.Queue,
+        ) -> None:
+            """Read frames, crop+enlarge, and push batches to queue."""
+            cap = cv2.VideoCapture(str(video_path))
+            prev_fidx = -1
+            batch_fidxs: list[int] = []
+            batch_images: list[np.ndarray] = []
+            batch_metas: list[dict] = []
+            for fidx, center in tasks:
+                gap = fidx - prev_fidx - 1
+                if prev_fidx >= 0 and 0 <= gap <= 8:
+                    for _ in range(gap):
+                        cap.grab()
+                else:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+                ret, frame = cap.read()
+                prev_fidx = fidx
+                if not ret:
+                    continue
+                img, meta = detector.prepare_crop(frame, center, crop_sz, enlarge_to)
+                if img is None:
+                    continue
+                batch_fidxs.append(fidx)
+                batch_images.append(img)
+                batch_metas.append(meta)
+                if len(batch_fidxs) >= batch_size:
+                    out_queue.put((batch_fidxs, batch_images, batch_metas))
+                    batch_fidxs, batch_images, batch_metas = [], [], []
+            if batch_fidxs:
+                out_queue.put((batch_fidxs, batch_images, batch_metas))
+            out_queue.put(None)  # sentinel
+            cap.release()
+
+        # Pass 1: scan all frames, keep ALL detections (no anchor filtering)
+        print("\nBall detection pass 1: scanning all frames...")
+        pass1_batch_size = ball_config.get("pass1_batch_size", 8)
+        num_batches = (len(frame_indices) + pass1_batch_size - 1) // pass1_batch_size
+
+        read_q: _queue.Queue = _queue.Queue(maxsize=2)
+        reader = threading.Thread(
+            target=_batch_reader_full,
+            args=(video_path, frame_indices, pass1_batch_size, read_q),
+            daemon=True,
+        )
+        reader.start()
+
+        pbar = tqdm(total=num_batches, desc="  Ball pass 1")
+        while True:
+            item = read_q.get()
+            if item is None:
+                break
+            batch_fidxs, batch_frames = item
+
+            if ball_detector.use_sahi:
+                batch_dets_list = [ball_detector.detect(f) for f in batch_frames]
+            else:
+                batch_dets_list = ball_detector.detect_batch(batch_frames)
+
+            for fidx, dets in zip(batch_fidxs, batch_dets_list):
+                dets = ball_detector.filter_by_size(dets)
+                for d in dets:
+                    d["source"] = "pass1"
+                all_ball_detections[fidx] = dets
+            pbar.update(1)
+        pbar.close()
+        reader.join()
+
+        pass1_det_frames = sum(1 for d in all_ball_detections.values() if d)
+        print(f"  Pass 1: {pass1_det_frames} frames with detections out of {len(frame_indices)}")
+
+        # Pass 2: crop+enlarge using preliminary tracker predictions
+        # Run a preliminary tracker pass on Pass 1 detections to get
+        # tracked positions, then use those for crop centers.
+        prelim_tracker = BallTracker(ball_tracking_config)
+        prelim_positions: dict[int, tuple[float, float]] = {}
+
+        for fidx in sorted(frame_indices):
+            dets = all_ball_detections.get(fidx, [])
+            tracks = prelim_tracker.update(dets)
+            for t in tracks:
+                if not t.get("predicted", False):
+                    prelim_positions[fidx] = tuple(t["center"])
+                    break  # use first active track
+
+        pass2_tasks: list[tuple[int, tuple[float, float]]] = []
+        for fidx in frame_indices:
+            if fidx in prelim_positions:
+                continue  # tracker successfully tracked ball at this frame
+            # Tracker lost ball — interpolate crop center from nearest tracked frames
+            center = _interpolate_tracked_position(fidx, prelim_positions, max_gap)
+            if center is not None:
+                pass2_tasks.append((fidx, center))
+
+        if pass2_tasks:
+            print(f"Ball detection pass 2: crop+enlarge on {len(pass2_tasks)} frames...")
+            pass2_count = 0
+            pass2_batch_size = ball_config.get("pass2_batch_size", 32)
+
+            num_batches2 = (len(pass2_tasks) + pass2_batch_size - 1) // pass2_batch_size
+            read_q2: _queue.Queue = _queue.Queue(maxsize=2)
+            reader2 = threading.Thread(
+                target=_batch_reader_crop,
+                args=(video_path, pass2_tasks, pass2_batch_size,
+                      ball_detector, crop_size, crop_enlarge_to, read_q2),
+                daemon=True,
+            )
+            reader2.start()
+
+            pbar2 = tqdm(total=num_batches2, desc="  Ball pass 2")
+            while True:
+                item = read_q2.get()
+                if item is None:
+                    break
+                batch_fidxs, batch_images, batch_metas = item
+
+                batch_results = ball_detector.detect_crop_batch(
+                    batch_images, batch_metas, enlarge_to=crop_enlarge_to)
+
+                for fidx, crop_dets in zip(batch_fidxs, batch_results):
+                    crop_dets = ball_detector.filter_by_size(crop_dets)
+                    if crop_dets:
+                        for d in crop_dets:
+                            d["source"] = "pass2"
+                        existing = all_ball_detections.get(fidx, [])
+                        all_ball_detections[fidx] = existing + crop_dets
+                        pass2_count += 1
+                pbar2.update(1)
+            pbar2.close()
+            reader2.join()
 
             print(f"  Pass 2: found ball in {pass2_count} additional frames")
 
-        ball_cap.release()
-
-        # ---- Post-hoc filtering (after both passes complete) ----
-        raw_anchor_count = len(pass1_anchors)
-
-        # 1. Static object filter
-        if len(pass1_anchors) >= 3:
-            static_positions = _find_static_positions(pass1_anchors)
-            if static_positions:
-                pass1_anchors = {f: c for f, c in pass1_anchors.items()
-                                 if not _near_any_static(c, static_positions)}
-                for fidx in list(all_ball_detections.keys()):
-                    kept = []
-                    for d in all_ball_detections[fidx]:
-                        if _near_any_static(tuple(d["center"]), static_positions):
-                            d["source"] = "static"
-                            static_ball_dets.setdefault(fidx, []).append(d)
-                        else:
-                            kept.append(d)
-                    all_ball_detections[fidx] = kept
-                print(f"  Post-filter: removed {len(static_positions)} static object region(s)")
-
-        # 2. Trajectory outlier filter
-        if len(pass1_anchors) >= 3:
-            outlier_frames = _filter_anchor_outliers(pass1_anchors)
-            if outlier_frames:
-                for fidx in outlier_frames:
-                    if fidx in all_ball_detections:
-                        for d in all_ball_detections[fidx]:
-                            d["source"] = "outlier"
-                            static_ball_dets.setdefault(fidx, []).append(d)
-                        all_ball_detections[fidx] = []
-                    if fidx in pass1_anchors:
-                        del pass1_anchors[fidx]
-                print(f"  Post-filter: removed {len(outlier_frames)} trajectory outlier anchor(s)")
-
-        print(f"  Post-filter: {len(pass1_anchors)} anchors remain (from {raw_anchor_count} raw)")
-
-        # Save all detections (before trajectory filter) for diagnostic vis.
-        # Includes pass1, pass2, and static-tagged detections.
+        # Save diagnostic data (all detections from both passes)
         all_ball_dets_diag: dict[int, list[dict]] = {}
         for fidx, dets in all_ball_detections.items():
             all_ball_dets_diag[fidx] = [
@@ -1184,60 +1386,9 @@ def run_stage2(
                 }
                 for d in dets
             ]
-        # Merge removed detections (static + outlier) back in for visualization
-        for fidx, dets in static_ball_dets.items():
-            diag_list = all_ball_dets_diag.setdefault(fidx, [])
-            for d in dets:
-                diag_list.append({
-                    "center": list(d["center"]),
-                    "bbox": list(d["bbox"]),
-                    "confidence": d["confidence"],
-                    "source": d.get("source", "static"),
-                })
 
-        # Filter: for each frame, keep only the detection closest to the
-        # anchor-interpolated trajectory.  This prevents far-off false
-        # positives (watermark, spare ball) from being fed to the tracker.
-        if pass1_anchors:
-            anchor_indices = sorted(pass1_anchors.keys())
-            for fidx in list(all_ball_detections.keys()):
-                dets = all_ball_detections[fidx]
-                if not dets:
-                    continue
-                # Get expected position from anchors
-                expected = _interpolate_ball_position(
-                    fidx, anchor_indices, pass1_anchors, max_gap
-                )
-                if expected is None:
-                    # No nearby anchor — discard all detections for this frame
-                    all_ball_detections[fidx] = []
-                    continue
-                # Keep only the detection closest to expected position
-                def _dist(d: dict) -> float:
-                    c = d["center"]
-                    return ((c[0] - expected[0]) ** 2 + (c[1] - expected[1]) ** 2) ** 0.5
-                best_det = min(dets, key=_dist)
-                # Only keep if reasonably close (within crop_size radius)
-                if _dist(best_det) <= crop_size:
-                    all_ball_detections[fidx] = [best_det]
-                else:
-                    all_ball_detections[fidx] = []
-
-        # Build set of kept detection centers for tagging filtered ones
-        kept_centers: set[tuple[float, float]] = set()
-        for dets in all_ball_detections.values():
-            for d in dets:
-                kept_centers.add((round(d["center"][0], 2), round(d["center"][1], 2)))
-
-        # Tag filtered detections in diagnostic data
-        for fidx, dets in all_ball_dets_diag.items():
-            for d in dets:
-                key = (round(d["center"][0], 2), round(d["center"][1], 2))
-                if d["source"] not in ("static", "outlier") and key not in kept_centers:
-                    d["source"] = "filtered"
-
-        print(f"  Total frames with ball detections: "
-              f"{sum(1 for d in all_ball_detections.values() if d)}/{len(frame_indices)}")
+        total_det_frames = sum(1 for d in all_ball_detections.values() if d)
+        print(f"  Total frames with ball detections: {total_det_frames}/{len(frame_indices)}")
 
     # Process frames
     print("\nStage 2: Processing frames...")
@@ -1410,73 +1561,179 @@ def run_stage2(
 
         all_tracks[frame_idx] = frame_tracks
 
-        # Ball detection and tracking
+        # Ball detection and tracking — collect ALL tracks for post-loop filtering
         if ball_detector and ball_tracker:
             if two_pass_enabled:
-                # Use pre-computed detections from two-pass scan
                 ball_detections = all_ball_detections.get(frame_idx, [])
             else:
                 ball_detections = ball_detector.detect(frame)
                 ball_detections = ball_detector.filter_by_size(ball_detections)
 
-            # Update ball tracker
             ball_tracks = ball_tracker.update(ball_detections)
-            primary_ball = ball_tracker.get_primary_ball()
 
-            if primary_ball and not primary_ball.get("predicted", False):
-                # Compute ball world position
-                ball_center = primary_ball["center"]
-                time_sec = frame_idx / fps if fps > 0 else 0.0
+            # Record debug info for every frame
+            ball_debug_log[frame_idx] = {
+                "detections": [
+                    {"center": list(d["center"]), "confidence": d.get("confidence", 0),
+                     "bbox": list(d.get("bbox", [])), "source": d.get("source", "pass1")}
+                    for d in ball_detections
+                ],
+                "tracker_output": [
+                    {"track_id": t["track_id"], "center": list(t["center"]),
+                     "confidence": t["confidence"], "predicted": t.get("predicted", False)}
+                    for t in ball_tracks
+                ],
+            }
 
-                if ball_trajectory_3d and frame_idx in camera_poses:
-                    # Feed observation to 3D trajectory estimator
-                    ball_bbox = tuple(primary_ball["bbox"]) if "bbox" in primary_ball else None
-                    ball_trajectory_3d.add_observation(
-                        time_sec, tuple(ball_center), camera_poses[frame_idx],
-                        bbox=ball_bbox,
-                    )
-                    traj_result = ball_trajectory_3d.estimate()
-                    if traj_result:
-                        if traj_result.get("rejected"):
-                            # False positive detected — suppress this ball entirely
-                            primary_ball = None
-                        else:
-                            primary_ball["pitch_position"] = traj_result["pitch_position"]
-                            primary_ball["height"] = traj_result["height"]
-                            primary_ball["position_3d"] = traj_result["position_3d"]
-                            primary_ball["on_ground"] = traj_result["on_ground"]
-
-                # Fallback to ground plane projection
-                if primary_ball is not None and primary_ball.get("pitch_position") is None:
-                    if frame_idx in camera_poses:
-                        from .tracking.ball_trajectory import project_to_ground
-                        ground = project_to_ground(tuple(ball_center), camera_poses[frame_idx])
-                        if ground:
-                            primary_ball["pitch_position"] = ground
-                            primary_ball["height"] = 0.0
-                            primary_ball["on_ground"] = True
-                    elif H is not None:
-                        pt_h = np.array([ball_center[0], ball_center[1], 1.0])
-                        world_h = H @ pt_h
-                        if abs(world_h[2]) > 1e-6:
-                            primary_ball["pitch_position"] = [
-                                float(world_h[0] / world_h[2]),
-                                float(world_h[1] / world_h[2]),
-                            ]
-                            primary_ball["height"] = 0.0
-                            primary_ball["on_ground"] = True
-
-                if primary_ball is not None:
-                    all_ball_tracks[frame_idx] = primary_ball
-                    ball_trajectory_history.append(tuple(ball_center))
-                    max_traj_len = ball_tracking_config.get("trajectory_length", 30)
-                    if len(ball_trajectory_history) > max_traj_len:
-                        ball_trajectory_history = ball_trajectory_history[-max_traj_len:]
+            # Store all active tracks per frame; accumulate per-track histories
+            all_ball_track_candidates[frame_idx] = ball_tracks
+            for t in ball_tracks:
+                tid = t["track_id"]
+                ball_track_histories.setdefault(tid, []).append((frame_idx, t))
 
         # Note: Team classification is deferred until all tracking is complete
         # This allows using trajectory-averaged features for better clustering
 
     prefetcher.shutdown()
+
+    # Save ball tracking debug log
+    if ball_debug_log:
+        debug_path = output_dir / "ball_debug_log.json"
+        with open(debug_path, "w") as f:
+            json.dump({str(k): v for k, v in sorted(ball_debug_log.items())}, f, indent=1)
+        print(f"  Ball debug log saved to {debug_path}")
+
+    # === Field-space trajectory projection and filtering ===
+    if ball_detector and ball_tracker and ball_track_histories:
+        print("\nProjecting ball trajectories to field space...")
+        trajectory_field_data: dict[int, list[tuple]] = {}
+
+        for tid, history in ball_track_histories.items():
+            field_points = []
+            for fidx, track_dict in history:
+                if track_dict.get("predicted", False):
+                    continue
+                pixel_center = track_dict["center"]
+                conf = track_dict.get("confidence", 0.0)
+
+                if fidx not in camera_poses:
+                    continue
+                field_pos = _undistort_and_project_to_pitch(
+                    np.array([[pixel_center[0], pixel_center[1]]]),
+                    camera_poses[fidx],
+                )
+                if field_pos is None:
+                    raise RuntimeError(
+                        f"Failed to project ball at frame {fidx} "
+                        f"pixel=({pixel_center[0]:.1f}, {pixel_center[1]:.1f}) "
+                        f"using camera pose"
+                    )
+
+                field_points.append((fidx, tuple(field_pos), tuple(pixel_center), conf))
+
+            if field_points:
+                trajectory_field_data[tid] = field_points
+
+        print(f"  Total trajectories: {len(trajectory_field_data)}")
+        for tid, pts in trajectory_field_data.items():
+            print(f"    Track {tid}: {len(pts)} projected points "
+                  f"(frames {pts[0][0]}-{pts[-1][0]})")
+
+        # Apply field-space filtering
+        field_filter_config = ball_config.get("field_filter", {})
+        if field_filter_config.get("enabled", True):
+            filtered_trajectories = _filter_trajectories_field_space(
+                trajectory_field_data, fps, field_filter_config,
+            )
+            n_rejected = len(trajectory_field_data) - len(filtered_trajectories)
+            print(f"  Field filter: {len(filtered_trajectories)} trajectories pass, "
+                  f"{n_rejected} rejected")
+        else:
+            filtered_trajectories = trajectory_field_data
+
+        # Use ALL valid trajectories (they cover different time ranges)
+        # For frames with overlapping tracks, pick the one with higher confidence
+        if filtered_trajectories:
+            # Build field_pos lookup from all valid trajectories
+            field_lookup: dict[int, tuple] = {}
+            for tid, points in filtered_trajectories.items():
+                for fidx, field_pos, _, _ in points:
+                    field_lookup[fidx] = field_pos
+
+            # Populate all_ball_tracks from all valid trajectories
+            # Sort by trajectory score so higher-scoring tracks take priority on overlap
+            scored_tids = []
+            max_len = max(len(pts) for pts in filtered_trajectories.values())
+            for tid, points in filtered_trajectories.items():
+                score = len(points) / max(max_len, 1) * 0.6 + \
+                    sum(p[3] for p in points) / len(points) * 0.25 + \
+                    len(points) / max(points[-1][0] - points[0][0] + 1, 1) * 0.15
+                scored_tids.append((score, tid))
+            scored_tids.sort(reverse=True)
+
+            for _, tid in scored_tids:
+                for fidx, track_dict in ball_track_histories[tid]:
+                    if track_dict.get("predicted", False):
+                        continue
+                    if fidx in all_ball_tracks:
+                        continue  # Higher-scored track already owns this frame
+                    entry = dict(track_dict)
+                    if fidx in field_lookup:
+                        entry["pitch_position"] = list(field_lookup[fidx])
+                        entry["height"] = 0.0
+                        entry["on_ground"] = True
+                    all_ball_tracks[fidx] = entry
+                    ball_trajectory_history.append(tuple(track_dict["center"]))
+
+            # Run BallTrajectory3D on all valid trajectories for 3D height estimation
+            if ball_trajectory_3d:
+                for _, tid in scored_tids:
+                    ball_trajectory_3d.clear()
+                    for fidx, track_dict in ball_track_histories[tid]:
+                        if track_dict.get("predicted", False):
+                            continue
+                        if fidx not in camera_poses:
+                            continue
+                        time_sec = fidx / fps if fps > 0 else 0.0
+                        ball_bbox = tuple(track_dict["bbox"]) if "bbox" in track_dict else None
+                        ball_trajectory_3d.add_observation(
+                            time_sec, tuple(track_dict["center"]),
+                            camera_poses[fidx], bbox=ball_bbox,
+                        )
+                        traj_result = ball_trajectory_3d.estimate()
+                        if traj_result and not traj_result.get("rejected"):
+                            if fidx in all_ball_tracks:
+                                all_ball_tracks[fidx]["pitch_position"] = traj_result["pitch_position"]
+                                all_ball_tracks[fidx]["height"] = traj_result["height"]
+                                all_ball_tracks[fidx]["position_3d"] = traj_result["position_3d"]
+                                all_ball_tracks[fidx]["on_ground"] = traj_result["on_ground"]
+
+            # Remove spatial outliers from the merged track
+            n_outliers = _remove_merge_outliers(all_ball_tracks, fps)
+            if n_outliers > 0:
+                print(f"  Removed {n_outliers} merge outlier(s)")
+
+            print(f"  Ball tracked in {len(all_ball_tracks)}/{len(frame_indices)} frames "
+                  f"(from {len(filtered_trajectories)} valid trajectories)")
+
+            # Tag rejected trajectory detections in diagnostic data
+            rejected_tids = set(trajectory_field_data.keys()) - set(filtered_trajectories.keys())
+            for tid in rejected_tids:
+                for fidx, track_dict in ball_track_histories.get(tid, []):
+                    if fidx in all_ball_dets_diag:
+                        for d in all_ball_dets_diag[fidx]:
+                            tc = track_dict["center"]
+                            dc = d["center"]
+                            if abs(dc[0] - tc[0]) < 2 and abs(dc[1] - tc[1]) < 2:
+                                d["source"] = "rejected"
+        else:
+            print("  No valid ball trajectory found after filtering")
+
+        # Render diagnostic visualization
+        if all_ball_dets_diag:
+            _render_ball_detection_diag(
+                video_path, sampler, all_ball_dets_diag, output_dir,
+            )
 
     # Final team classification using jersey color histograms
     print("\nFinalizing team assignments using jersey color histograms...")
@@ -1673,13 +1930,6 @@ def run_stage2(
         with open(output_dir / "ball_tracks.json", "w") as f:
             json.dump(serializable_ball_tracks, f, indent=2)
         print(f"  Saved {len(all_ball_tracks)} ball detections")
-
-    # Diagnostic visualization: ball detection two-pass results
-    if two_pass_enabled and all_ball_dets_diag:
-        _render_ball_detection_diag(
-            video_path, sampler, all_ball_dets_diag,
-            pass1_anchors, static_positions, output_dir,
-        )
 
     # Statistics
     unique_tracks = set()

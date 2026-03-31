@@ -123,14 +123,33 @@ ball_detection:
   crop_size: 300                          # Crop region size around interpolated position (pixels)
   crop_enlarge_to: 640                    # Resize crop to this before detection
   max_interpolation_gap: 30               # Max frames to interpolate across (skip if gap is larger)
+  pass1_batch_size: 8                     # Batch size for pass 1 GPU inference (full-res, needs more VRAM)
+  pass2_batch_size: 32                    # Batch size for pass 2 GPU inference (640x640 crops, lighter)
+  # Field-space trajectory filtering (applied after tracking)
+  field_filter:
+    enabled: true
+    max_speed_ms: 40.0            # Max realistic ball speed (m/s)
+    position_margin: 8.0           # Meters beyond pitch boundary to allow
+    min_trajectory_length: 3       # Minimum observations per trajectory
+    smoothness_threshold: 0.6      # Min average cosine of direction changes
+    speed_violation_ratio: 0.2     # Max fraction of frames exceeding speed limit
 
-# Ball Tracking
+# Ball Tracking (ByteTrack / BoT-SORT)
 ball_tracking:
   enabled: true
-  max_age: 1.5               # Seconds to keep lost track (converted to frames using fps)
-  n_init: 2                  # Detections to confirm track (faster confirmation)
-  max_position_distance: 200 # Max distance for matching (pixels)
-  trajectory_length: 30      # Frames of trajectory history
+  tracker_type: botsort       # "bytetrack" or "botsort"
+  track_high_thresh: 0.4     # High-confidence threshold for first-stage matching
+  track_low_thresh: 0.1      # Low-confidence threshold for second-stage IoU rescue
+  track_buffer: 15           # Frames to keep lost tracks (1.5s at 10fps)
+  match_thresh: 0.8          # Distance threshold for matching (normalized center distance)
+  new_track_thresh: 0.3      # Min confidence for new track initialization
+  max_position_distance: 200  # Max pixel distance for center-distance matching
+  fuse_score: true            # Fuse detection score into distance matrix
+  # BoT-SORT specific (ignored when tracker_type=bytetrack)
+  gmc_method: "none"          # Camera motion compensation: "sparseOptFlow", "orb", "none"
+  with_reid: false            # Ball appearance is uniform, ReID not useful
+  proximity_thresh: 0.5       # Spatial proximity threshold
+  appearance_thresh: 0.25     # Appearance similarity threshold
   # 3D trajectory estimation (physics-based parabolic model)
   trajectory_3d:
     enabled: true
