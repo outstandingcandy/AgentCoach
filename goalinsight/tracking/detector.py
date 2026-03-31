@@ -13,7 +13,7 @@ except ImportError:
 
 
 class PlayerDetector:
-    """Detect players in soccer video frames using YOLOv8."""
+    """Detect players in soccer video frames using YOLO."""
 
     def __init__(self, config: dict[str, Any] | None = None):
         """Initialize player detector.
@@ -26,6 +26,7 @@ class PlayerDetector:
 
         self.config = config or {}
         self.model_name = self.config.get("model", "yolov8x")
+        self.model_path = self.config.get("model_path", None)
         # Lower threshold to 0.4 to match official sn-gamestate baseline
         self.confidence_threshold = self.config.get("confidence_threshold", 0.4)
         self.iou_threshold = self.config.get("iou_threshold", 0.45)
@@ -36,13 +37,15 @@ class PlayerDetector:
         self.model = None
 
     def load_model(self, model_path: str | Path | None = None) -> None:
-        """Load YOLOv8 model.
+        """Load YOLO model.
 
         Args:
-            model_path: Path to model weights. If None, downloads from ultralytics hub.
+            model_path: Path to model weights. If None, uses config model_path
+                or downloads from ultralytics hub based on model name.
         """
-        if model_path:
-            self.model = YOLO(str(model_path))
+        path = model_path or self.model_path
+        if path:
+            self.model = YOLO(str(path))
         else:
             # Auto-download from ultralytics hub
             self.model = YOLO(f"{self.model_name}.pt")

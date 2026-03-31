@@ -7,7 +7,7 @@ from .role_classifier import RoleClassifier
 
 # Ball detection and tracking
 from .ball_detector import BallDetector
-from .ball_tracker import BallTracker, BallTrack, BallStatus, BallKalmanFilter
+from .ball_tracker import BallTracker
 
 # Import from new locations (with backwards compatibility aliases)
 from .reid.osnet_extractor import OSNetExtractor, ReIDGallery
@@ -32,9 +32,6 @@ __all__ = [
     # Ball tracking
     "BallDetector",
     "BallTracker",
-    "BallTrack",
-    "BallStatus",
-    "BallKalmanFilter",
     # New names
     "OSNetExtractor",
     "KMeansTeamClassifier",

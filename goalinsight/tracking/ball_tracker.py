@@ -1,517 +1,268 @@
-"""Ball tracking using Kalman filter.
+"""Ball tracking using ByteTrack or BoT-SORT.
 
-Specialized tracker for soccer ball with:
-- Position and velocity state model
-- No ReID features (ball has uniform appearance)
-- Longer max_age for occlusion handling
-- Trajectory history and velocity estimation
+Wraps ultralytics BYTETracker / BOTSORT for multi-object ball tracking with:
+- Two-threshold matching (high-conf first, low-conf center-distance rescue)
+- Center-distance matching instead of IoU in BOTH stages (better for tiny ball bboxes)
+- Hard distance gate that fuse_score cannot bypass
+- Kalman filter motion prediction
+- Multi-track output for trajectory-based filtering
+
+Tracker type is selected via config["tracker_type"]: "bytetrack" or "botsort".
 """
 
-from collections import deque
-from enum import Enum
+from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 
-
-class BallStatus(Enum):
-    """Ball track status."""
-    TENTATIVE = "tentative"
-    CONFIRMED = "confirmed"
-    LOST = "lost"
+from ultralytics.trackers.byte_tracker import BYTETracker, STrack
+from ultralytics.trackers.bot_sort import BOTSORT, BOTrack
+from ultralytics.trackers.utils import matching
 
 
-class BallKalmanFilter:
-    """Kalman filter for ball tracking with position and velocity.
+class _DetectionAdapter:
+    """Adapts a list of detection dicts to the interface BYTETracker.update() expects.
 
-    State vector: [x, y, vx, vy]
-    Measurement vector: [x, y]
+    BYTETracker expects an object with .conf, .xywh, .cls attributes and
+    supports boolean/integer array indexing and len().
     """
 
-    def __init__(self, initial_position: tuple[float, float]):
-        """Initialize Kalman filter with initial position.
+    def __init__(self, detections: list[dict[str, Any]]):
+        n = len(detections)
+        self._xywh = np.zeros((n, 4), dtype=np.float32)
+        self._conf = np.zeros(n, dtype=np.float32)
+        self._cls = np.zeros(n, dtype=np.float32)
 
-        Args:
-            initial_position: (x, y) initial ball position.
-        """
-        # State: [x, y, vx, vy]
-        self.state = np.array([
-            initial_position[0],
-            initial_position[1],
-            0.0,  # vx
-            0.0,  # vy
-        ], dtype=np.float64)
-
-        # State transition matrix (constant velocity model)
-        self.F = np.array([
-            [1, 0, 1, 0],
-            [0, 1, 0, 1],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1],
-        ], dtype=np.float64)
-
-        # Measurement matrix (observe position only)
-        self.H = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0],
-        ], dtype=np.float64)
-
-        # Process noise covariance (tuned for ball motion)
-        q_pos = 5.0  # Position uncertainty
-        q_vel = 10.0  # Velocity uncertainty (ball can accelerate quickly)
-        self.Q = np.diag([q_pos, q_pos, q_vel, q_vel])
-
-        # Measurement noise covariance
-        r = 5.0  # Detection position uncertainty
-        self.R = np.diag([r, r])
-
-        # Initial state covariance
-        self.P = np.diag([10.0, 10.0, 100.0, 100.0])
-
-    def predict(self) -> np.ndarray:
-        """Predict next state.
-
-        Returns:
-            Predicted position [x, y].
-        """
-        # State prediction
-        self.state = self.F @ self.state
-        # Covariance prediction
-        self.P = self.F @ self.P @ self.F.T + self.Q
-
-        return self.state[:2].copy()
-
-    def update(self, measurement: tuple[float, float]) -> np.ndarray:
-        """Update state with measurement.
-
-        Args:
-            measurement: Observed position (x, y).
-
-        Returns:
-            Updated position [x, y].
-        """
-        z = np.array(measurement, dtype=np.float64)
-
-        # Innovation
-        y = z - self.H @ self.state
-
-        # Innovation covariance
-        S = self.H @ self.P @ self.H.T + self.R
-
-        # Kalman gain
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-
-        # State update
-        self.state = self.state + K @ y
-
-        # Covariance update
-        I = np.eye(4)
-        self.P = (I - K @ self.H) @ self.P
-
-        return self.state[:2].copy()
+        for i, det in enumerate(detections):
+            bbox = det["bbox"]  # [x1, y1, x2, y2]
+            x1, y1, x2, y2 = bbox[0], bbox[1], bbox[2], bbox[3]
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            w = x2 - x1
+            h = y2 - y1
+            self._xywh[i] = [cx, cy, w, h]
+            self._conf[i] = det.get("confidence", 0.0)
+            self._cls[i] = det.get("class", 32)  # sports ball
 
     @property
-    def position(self) -> tuple[float, float]:
-        """Get current position estimate."""
-        return (float(self.state[0]), float(self.state[1]))
+    def xywh(self) -> np.ndarray:
+        return self._xywh
 
     @property
-    def velocity(self) -> tuple[float, float]:
-        """Get current velocity estimate."""
-        return (float(self.state[2]), float(self.state[3]))
+    def conf(self) -> np.ndarray:
+        return self._conf
+
+    @property
+    def cls(self) -> np.ndarray:
+        return self._cls
+
+    @property
+    def xyxy(self) -> np.ndarray:
+        xyxy = np.zeros_like(self._xywh)
+        xyxy[:, 0] = self._xywh[:, 0] - self._xywh[:, 2] / 2
+        xyxy[:, 1] = self._xywh[:, 1] - self._xywh[:, 3] / 2
+        xyxy[:, 2] = self._xywh[:, 0] + self._xywh[:, 2] / 2
+        xyxy[:, 3] = self._xywh[:, 1] + self._xywh[:, 3] / 2
+        return xyxy
+
+    def __len__(self) -> int:
+        return len(self._conf)
+
+    def __getitem__(self, idx):
+        new = _DetectionAdapter.__new__(_DetectionAdapter)
+        new._xywh = self._xywh[idx]
+        new._conf = self._conf[idx]
+        new._cls = self._cls[idx]
+        return new
 
 
-class BallTrack:
-    """Single ball track."""
+def _center_distance_matrix(
+    tracks: list,
+    detections: list,
+    max_distance: float,
+) -> np.ndarray:
+    """Compute normalized center-distance matrix with hard gate.
 
-    def __init__(
-        self,
-        track_id: int,
-        initial_detection: dict[str, Any],
-        max_age: int = 60,
-        n_init: int = 2,
-    ):
-        """Initialize ball track.
+    Returns:
+        (dists, hard_mask) — dists[i,j] in [0,1], hard_mask[i,j]=True means
+        the pair is gated out regardless of score fusion.
+    """
+    if len(tracks) == 0 or len(detections) == 0:
+        empty = np.zeros((len(tracks), len(detections)), dtype=np.float32)
+        return empty, np.zeros_like(empty, dtype=bool)
 
-        Args:
-            track_id: Unique track identifier.
-            initial_detection: First detection dict with 'center', 'bbox'.
-            max_age: Maximum frames to keep track without detection.
-            n_init: Number of detections to confirm track.
-        """
-        self.track_id = track_id
-        self.max_age = max_age
-        self.n_init = n_init
+    track_centers = np.array([t.xywh[:2] for t in tracks], dtype=np.float32)
+    det_centers = np.array([d.xywh[:2] for d in detections], dtype=np.float32)
 
-        # Initialize Kalman filter
-        center = initial_detection["center"]
-        self.kf = BallKalmanFilter((center[0], center[1]))
+    diff = track_centers[:, None, :] - det_centers[None, :, :]
+    dists = np.sqrt((diff ** 2).sum(axis=2))
 
-        # Track state
-        self.status = BallStatus.TENTATIVE
-        self.hits = 1
-        self.age = 0
-        self.time_since_update = 0
+    dists = np.minimum(dists / max_distance, 1.0)
 
-        # Store last detection
-        self.last_detection = initial_detection.copy()
+    hard_mask = dists >= 1.0
 
-        # Trajectory history (for visualization)
-        self.trajectory: deque[tuple[float, float]] = deque(maxlen=60)
-        self.trajectory.append((center[0], center[1]))
+    return dists, hard_mask
 
-    def predict(self) -> tuple[float, float]:
-        """Predict next position.
 
-        Returns:
-            Predicted (x, y) position.
-        """
-        predicted_pos = self.kf.predict()
-        self.age += 1
-        self.time_since_update += 1
-        return (float(predicted_pos[0]), float(predicted_pos[1]))
+def _center_distance_as_iou(max_distance: float):
+    """Return a function with the same signature as matching.iou_distance
+    but using center-distance instead of IoU."""
+    def _iou_replacement(tracks, detections):
+        dists, _ = _center_distance_matrix(tracks, detections, max_distance)
+        return dists
+    return _iou_replacement
 
-    def update(self, detection: dict[str, Any]) -> None:
-        """Update track with new detection.
 
-        Args:
-            detection: Detection dict with 'center', 'bbox'.
-        """
-        center = detection["center"]
-        self.kf.update((center[0], center[1]))
+@contextmanager
+def _patch_second_stage(max_distance: float):
+    """Temporarily replace matching functions used by the second stage.
 
-        self.hits += 1
-        self.time_since_update = 0
-        self.last_detection = detection.copy()
+    BYTETracker.update() hardcodes ``matching.iou_distance`` and
+    ``matching.fuse_score`` for the second-stage (low-confidence) association.
 
-        # Update trajectory
-        self.trajectory.append((center[0], center[1]))
+    Problems for tiny-ball tracking:
+    1. IoU is useless for 10-30px bboxes → swap with center-distance.
+    2. ``fuse_score`` computes ``1 - (1-dist)*score``.  With the second-stage
+       threshold hardcoded at 0.5, any detection with score < 0.5 can NEVER
+       match (the fused cost is always > 0.5).  Since the second stage by
+       definition only sees low-score detections, fuse_score must be disabled.
+    """
+    orig_iou = matching.iou_distance
+    orig_fuse = matching.fuse_score
+    matching.iou_distance = _center_distance_as_iou(max_distance)
+    matching.fuse_score = lambda cost, dets: cost  # no-op
+    try:
+        yield
+    finally:
+        matching.iou_distance = orig_iou
+        matching.fuse_score = orig_fuse
 
-        # Update status
-        if self.status == BallStatus.TENTATIVE and self.hits >= self.n_init:
-            self.status = BallStatus.CONFIRMED
 
-    def mark_lost(self) -> None:
-        """Mark track as lost."""
-        self.status = BallStatus.LOST
+class _BallBYTETracker(BYTETracker):
+    """BYTETracker subclass that uses center-distance instead of IoU for matching.
 
-    def is_expired(self) -> bool:
-        """Check if track should be deleted."""
-        return self.time_since_update > self.max_age
+    Overrides get_dists() for first-stage matching and patches
+    matching.iou_distance during update() so the second-stage (low-confidence
+    rescue) also uses center-distance instead of IoU.
+    """
 
-    def to_dict(self) -> dict[str, Any]:
-        """Convert track to dictionary.
+    def __init__(self, args, frame_rate: int = 30, max_distance: float = 200.0):
+        super().__init__(args, frame_rate=frame_rate)
+        self.max_distance = max_distance
 
-        Returns:
-            Track information dictionary.
-        """
-        pos = self.kf.position
-        predicted = self.time_since_update > 0
+    def get_dists(self, tracks: list[STrack], detections: list[STrack]) -> np.ndarray:
+        """Center-distance matrix normalized to [0, 1] range with hard gate."""
+        dists, hard_mask = _center_distance_matrix(tracks, detections, self.max_distance)
 
-        return {
-            "track_id": self.track_id,
-            "center": list(pos),
-            "bbox": self.last_detection.get("bbox", [pos[0]-10, pos[1]-10, pos[0]+10, pos[1]+10]),
-            "confidence": 0.0 if predicted else self.last_detection.get("confidence", 0.0),
-            "status": self.status.value,
-            "velocity": [0.0, 0.0] if predicted else list(self.kf.velocity),
-            "pitch_position": self.last_detection.get("pitch_position"),
-            "predicted": predicted,
-            "time_since_update": self.time_since_update,
-        }
+        if self.args.fuse_score:
+            det_scores = np.array([d.score for d in detections], dtype=np.float32)
+            dists = dists * (1.0 - det_scores[None, :])
 
-    def get_trajectory(self, num_frames: int = 30) -> list[tuple[float, float]]:
-        """Get recent trajectory points.
+        dists[hard_mask] = 1.0
 
-        Args:
-            num_frames: Number of recent frames to return.
+        return dists
 
-        Returns:
-            List of (x, y) positions.
-        """
-        traj = list(self.trajectory)
-        return traj[-num_frames:]
+    def update(self, results, img=None, feats=None):
+        with _patch_second_stage(self.max_distance):
+            return super().update(results, img=img, feats=feats)
+
+
+class _BallBOTSORTTracker(BOTSORT):
+    """BOTSORT subclass that uses center-distance instead of IoU for matching.
+
+    Same center-distance + hard gate logic as _BallBYTETracker, but inherits
+    BOTSORT's additional features:
+    - KalmanFilterXYWH (center+width+height) — better for ball tracking than
+      BYTETracker's KalmanFilterXYAH (center+aspect+height)
+    - GMC camera motion compensation (optional, set gmc_method="none" to disable)
+    - BOTrack with EMA feature smoothing (for future ReID support)
+    """
+
+    def __init__(self, args, frame_rate: int = 30, max_distance: float = 200.0):
+        super().__init__(args, frame_rate=frame_rate)
+        self.max_distance = max_distance
+
+    def get_dists(self, tracks: list[BOTrack], detections: list[BOTrack]) -> np.ndarray:
+        """Center-distance matrix normalized to [0, 1] range with hard gate."""
+        dists, hard_mask = _center_distance_matrix(tracks, detections, self.max_distance)
+
+        if self.args.fuse_score:
+            det_scores = np.array([d.score for d in detections], dtype=np.float32)
+            dists = dists * (1.0 - det_scores[None, :])
+
+        dists[hard_mask] = 1.0
+
+        return dists
+
+    def update(self, results, img=None, feats=None):
+        with _patch_second_stage(self.max_distance):
+            return super().update(results, img=img, feats=feats)
 
 
 class BallTracker:
-    """Multi-object tracker specialized for soccer ball.
+    """Multi-object ball tracker wrapping BYTETracker or BOTSORT.
 
-    Features:
-    - Kalman filter based motion prediction
-    - No ReID (ball appearance is uniform)
-    - Hungarian matching by position distance
-    - Single primary ball selection
+    Converts between our detection dict format and the tracker's internal
+    format, preserving the same update() -> list[dict] API.
+
+    Config key ``tracker_type`` selects the backend:
+    - ``"bytetrack"`` — BYTETracker with center-distance matching
+    - ``"botsort"``   — BOTSORT with center-distance matching + GMC + XYWH Kalman
     """
 
     def __init__(self, config: dict[str, Any] | None = None):
-        """Initialize ball tracker.
-
-        Args:
-            config: Tracker configuration. max_age is in seconds and converted
-                to frames using the fps value from config.
-        """
         self.config = config or {}
 
-        # Convert max_age from seconds to frames
+        tracker_type = self.config.get("tracker_type", "botsort")
         fps = self.config.get("fps", 10)
-        max_age_sec = self.config.get("max_age", 1.5)
-        self.max_age = max(1, int(max_age_sec * fps))
+        max_distance = self.config.get("max_position_distance", 200.0)
 
-        self.n_init = self.config.get("n_init", 2)
-        self.max_position_distance = self.config.get("max_position_distance", 200)
-        self.trajectory_length = self.config.get("trajectory_length", 30)
+        # Common args shared by both trackers
+        args = SimpleNamespace(
+            track_high_thresh=self.config.get("track_high_thresh", 0.4),
+            track_low_thresh=self.config.get("track_low_thresh", 0.1),
+            track_buffer=self.config.get("track_buffer", 15),
+            match_thresh=self.config.get("match_thresh", 0.8),
+            new_track_thresh=self.config.get("new_track_thresh", 0.3),
+            fuse_score=self.config.get("fuse_score", True),
+        )
 
-        # Frame bounds for out-of-bounds detection
-        self.frame_width = self.config.get("frame_width", 1920)
-        self.frame_height = self.config.get("frame_height", 1080)
-
-        self.tracks: list[BallTrack] = []
-        self.next_id = 1
+        if tracker_type == "botsort":
+            args.gmc_method = self.config.get("gmc_method", "none")
+            args.proximity_thresh = self.config.get("proximity_thresh", 0.5)
+            args.appearance_thresh = self.config.get("appearance_thresh", 0.25)
+            args.with_reid = self.config.get("with_reid", False)
+            args.model = self.config.get("reid_model", "auto")
+            self._tracker = _BallBOTSORTTracker(args, frame_rate=fps, max_distance=max_distance)
+        else:
+            self._tracker = _BallBYTETracker(args, frame_rate=fps, max_distance=max_distance)
 
     def update(self, detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Update tracker with new detections.
-
-        Args:
-            detections: List of ball detections with 'center', 'bbox'.
-
-        Returns:
-            List of active track dictionaries.
-        """
-        # Predict existing tracks, mark out-of-bounds as lost
-        predicted_positions = []
-        for track in self.tracks:
-            pos = track.predict()
-            if (pos[0] < -50 or pos[0] > self.frame_width + 50
-                    or pos[1] < -50 or pos[1] > self.frame_height + 50):
-                track.mark_lost()
-            predicted_positions.append(pos)
-
-        # Match detections to tracks
-        if self.tracks and detections:
-            cost_matrix = self._compute_cost_matrix(
-                predicted_positions, detections
-            )
-            matches, unmatched_tracks, unmatched_detections = self._hungarian_match(
-                cost_matrix
-            )
+        """Update tracker with new detections."""
+        if not detections:
+            adapter = _DetectionAdapter([])
         else:
-            matches = []
-            unmatched_tracks = list(range(len(self.tracks)))
-            unmatched_detections = list(range(len(detections)))
+            adapter = _DetectionAdapter(detections)
 
-        # Update matched tracks
-        for track_idx, det_idx in matches:
-            self.tracks[track_idx].update(detections[det_idx])
+        results = self._tracker.update(adapter)
 
-        # Create new tracks for unmatched detections
-        for det_idx in unmatched_detections:
-            self._create_track(detections[det_idx])
+        tracks = []
+        for row in results:
+            x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+            track_id = int(row[4])
+            score = float(row[5])
 
-        # Mark unmatched tracks
-        for track_idx in unmatched_tracks:
-            if self.tracks[track_idx].time_since_update > self.max_age // 2:
-                self.tracks[track_idx].mark_lost()
+            tracks.append({
+                "track_id": track_id,
+                "center": [(x1 + x2) / 2, (y1 + y2) / 2],
+                "bbox": [x1, y1, x2, y2],
+                "confidence": score,
+                "predicted": False,
+            })
 
-        # Remove expired tracks
-        self.tracks = [t for t in self.tracks if not t.is_expired()]
-
-        # Return active tracks
-        return [t.to_dict() for t in self.tracks if t.status != BallStatus.LOST]
-
-    def _compute_cost_matrix(
-        self,
-        predicted_positions: list[tuple[float, float]],
-        detections: list[dict[str, Any]],
-    ) -> np.ndarray:
-        """Compute cost matrix for Hungarian matching.
-
-        Args:
-            predicted_positions: List of predicted (x, y) positions.
-            detections: List of detections.
-
-        Returns:
-            Cost matrix (tracks x detections).
-        """
-        n_tracks = len(predicted_positions)
-        n_dets = len(detections)
-        cost_matrix = np.full((n_tracks, n_dets), self.max_position_distance * 2)
-
-        for i, pred_pos in enumerate(predicted_positions):
-            for j, det in enumerate(detections):
-                det_pos = det["center"]
-                dist = np.sqrt(
-                    (pred_pos[0] - det_pos[0]) ** 2 +
-                    (pred_pos[1] - det_pos[1]) ** 2
-                )
-                if dist < self.max_position_distance:
-                    cost_matrix[i, j] = dist
-
-        return cost_matrix
-
-    def _hungarian_match(
-        self,
-        cost_matrix: np.ndarray,
-    ) -> tuple[list[tuple[int, int]], list[int], list[int]]:
-        """Perform Hungarian matching.
-
-        Args:
-            cost_matrix: Cost matrix (tracks x detections).
-
-        Returns:
-            Tuple of (matches, unmatched_tracks, unmatched_detections).
-        """
-        try:
-            from scipy.optimize import linear_sum_assignment
-        except ImportError:
-            # Fallback to greedy matching
-            return self._greedy_match(cost_matrix)
-
-        n_tracks, n_dets = cost_matrix.shape
-        if n_tracks == 0 or n_dets == 0:
-            return [], list(range(n_tracks)), list(range(n_dets))
-
-        row_indices, col_indices = linear_sum_assignment(cost_matrix)
-
-        matches = []
-        unmatched_tracks = list(range(n_tracks))
-        unmatched_detections = list(range(n_dets))
-
-        for row, col in zip(row_indices, col_indices):
-            if cost_matrix[row, col] < self.max_position_distance:
-                matches.append((row, col))
-                unmatched_tracks.remove(row)
-                unmatched_detections.remove(col)
-
-        return matches, unmatched_tracks, unmatched_detections
-
-    def _greedy_match(
-        self,
-        cost_matrix: np.ndarray,
-    ) -> tuple[list[tuple[int, int]], list[int], list[int]]:
-        """Greedy matching fallback when scipy not available."""
-        n_tracks, n_dets = cost_matrix.shape
-        matches = []
-        matched_tracks = set()
-        matched_dets = set()
-
-        # Sort by cost
-        indices = np.argsort(cost_matrix.flatten())
-        for idx in indices:
-            row = idx // n_dets
-            col = idx % n_dets
-
-            if row in matched_tracks or col in matched_dets:
-                continue
-            if cost_matrix[row, col] >= self.max_position_distance:
-                break
-
-            matches.append((row, col))
-            matched_tracks.add(row)
-            matched_dets.add(col)
-
-        unmatched_tracks = [i for i in range(n_tracks) if i not in matched_tracks]
-        unmatched_dets = [i for i in range(n_dets) if i not in matched_dets]
-
-        return matches, unmatched_tracks, unmatched_dets
-
-    def _create_track(self, detection: dict[str, Any]) -> None:
-        """Create new track from detection.
-
-        Args:
-            detection: Detection dict.
-        """
-        track = BallTrack(
-            track_id=self.next_id,
-            initial_detection=detection,
-            max_age=self.max_age,
-            n_init=self.n_init,
-        )
-        self.tracks.append(track)
-        self.next_id += 1
-
-    def get_primary_ball(self) -> dict[str, Any] | None:
-        """Get the primary (most confident) ball track.
-
-        Returns:
-            Primary ball track dict or None.
-        """
-        confirmed = [t for t in self.tracks if t.status == BallStatus.CONFIRMED]
-        if not confirmed:
-            # Fall back to tentative tracks
-            confirmed = [t for t in self.tracks if t.status != BallStatus.LOST]
-
-        if not confirmed:
-            return None
-
-        # Select by most recent update and highest confidence
-        def score(track: BallTrack) -> float:
-            recency = 1.0 / (1.0 + track.time_since_update)
-            conf = track.last_detection.get("confidence", 0.5)
-            return recency * 0.6 + conf * 0.4
-
-        best = max(confirmed, key=score)
-        return best.to_dict()
-
-    def get_ball_trajectory(self, num_frames: int = 30) -> list[tuple[float, float]]:
-        """Get trajectory of primary ball.
-
-        Args:
-            num_frames: Number of recent frames.
-
-        Returns:
-            List of (x, y) positions.
-        """
-        primary = self.get_primary_ball()
-        if not primary:
-            return []
-
-        for track in self.tracks:
-            if track.track_id == primary["track_id"]:
-                return track.get_trajectory(num_frames)
-
-        return []
-
-    def get_ball_velocity(self) -> tuple[float, float] | None:
-        """Get velocity of primary ball.
-
-        Returns:
-            (vx, vy) velocity or None.
-        """
-        primary = self.get_primary_ball()
-        if not primary or "velocity" not in primary:
-            return None
-
-        return tuple(primary["velocity"])
-
-    def get_pitch_position(self, homography: np.ndarray | None = None) -> tuple[float, float] | None:
-        """Get pitch position of primary ball.
-
-        Args:
-            homography: Image -> world homography (optional, uses stored if available).
-
-        Returns:
-            (x, y) pitch position in meters or None.
-        """
-        primary = self.get_primary_ball()
-        if not primary:
-            return None
-
-        # Use stored pitch position if available
-        if primary.get("pitch_position"):
-            return tuple(primary["pitch_position"])
-
-        # Compute if homography provided
-        if homography is not None:
-            center = primary["center"]
-            pt_h = np.array([center[0], center[1], 1.0])
-            world_h = homography @ pt_h
-
-            if abs(world_h[2]) > 1e-6:
-                return (float(world_h[0] / world_h[2]), float(world_h[1] / world_h[2]))
-
-        return None
+        return tracks
 
     def reset(self) -> None:
         """Reset tracker state."""
-        self.tracks = []
-        self.next_id = 1
+        self._tracker.reset()
