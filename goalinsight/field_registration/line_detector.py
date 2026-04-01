@@ -198,6 +198,79 @@ class LineDetector:
 
         return lines
 
+    def detect_batch(
+        self,
+        frames: list[np.ndarray],
+        batch_size: int = 8,
+    ) -> list[list[dict[str, Any]]]:
+        """Detect lines in multiple frames using batched GPU inference.
+
+        Args:
+            frames: List of input frames (BGR format).
+            batch_size: Max frames per GPU forward pass.
+
+        Returns:
+            List of line lists, one per input frame.
+        """
+        if self.backend != "pnlcalib" or self.model is None:
+            return [self.detect(f) for f in frames]
+
+        all_results = []
+        for start in range(0, len(frames), batch_size):
+            chunk = frames[start : start + batch_size]
+            chunk_results = self._detect_batch_chunk_pnlcalib(chunk)
+            all_results.extend(chunk_results)
+        return all_results
+
+    def _detect_batch_chunk_pnlcalib(
+        self,
+        frames: list[np.ndarray],
+    ) -> list[list[dict[str, Any]]]:
+        """Run batched PnLCalib line inference on a chunk of frames."""
+        from .pnlcalib import get_lines_from_heatmap_maxpool
+        from .pnlcalib.hrnet_line import HRNetLineModel
+
+        tensors = [self.preprocess(f) for f in frames]
+        batch = torch.stack(tensors, dim=0).to(self.device)
+
+        with torch.no_grad():
+            heatmaps = self.model(batch)  # (B, C, H', W')
+
+        results = []
+        for i, frame in enumerate(frames):
+            h, w = frame.shape[:2]
+            hm = heatmaps[i : i + 1]
+
+            hm_for_extraction = hm[:, :-1, :, :]
+            hm_h, hm_w = hm.shape[2], hm.shape[3]
+            scale_x = w / hm_w
+            scale_y = h / hm_h
+
+            lines = get_lines_from_heatmap_maxpool(
+                hm_for_extraction,
+                scale=1,
+                threshold=self.confidence_threshold,
+            )
+
+            for line in lines:
+                line["x1"] = line["x1"] * scale_x
+                line["y1"] = line["y1"] * scale_y
+                line["x2"] = line["x2"] * scale_x
+                line["y2"] = line["y2"] * scale_y
+                line["length"] = float(np.sqrt(
+                    (line["x2"] - line["x1"])**2 + (line["y2"] - line["y1"])**2
+                ))
+
+            for line in lines:
+                dx = line["x2"] - line["x1"]
+                dy = line["y2"] - line["y1"]
+                line["angle"] = float(np.arctan2(dy, dx) * 180 / np.pi)
+                line["class_name"] = HRNetLineModel.get_line_class_name(line["id"])
+
+            results.append(lines)
+
+        return results
+
     def _detect_hough(self, frame: np.ndarray) -> list[dict[str, Any]]:
         """Detect lines using Hough transform.
 

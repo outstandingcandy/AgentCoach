@@ -20,13 +20,10 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from .stage1 import (
-    get_pitch_template_points,
-    project_pitch_to_image,
-    draw_vis_keypoints,
-    _draw_topdown_pitch,
-)
-from .utils.config import get_default_config, get_process_fps_from_config, FrameSampler
+from ..utils.pitch import get_pitch_template_points, project_pitch_to_image, _draw_topdown_pitch
+from ._shared_vis import draw_vis_keypoints
+from ..utils.config import get_default_config, get_process_fps_from_config, FrameSampler
+from ..utils.serialization import json_default as _json_default
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +47,9 @@ def run_stage1_homography(
     Returns:
         Dict with calibration statistics.
     """
-    from .field_registration import KeypointDetector
-    from .field_registration.pnlcalib import KeypointMapper
-    from .field_registration.homography_calibrator import HomographyCalibrator
+    from ..field_registration import KeypointDetector
+    from ..field_registration.pnlcalib import KeypointMapper
+    from ..field_registration.homography_calibrator import HomographyCalibrator
 
     fr_config = config.get("field_registration", {})
     pnl_config = fr_config.get("pnlcalib", {})
@@ -238,19 +235,6 @@ def _build_frame_json(frame_idx, keypoints, result):
         info["inliers"] = result.get("inliers", 0)
         info["homography"] = result["homography"].tolist()
     return info
-
-
-def _json_default(obj):
-    """JSON serializer fallback for numpy types."""
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return float(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
 def _draw_homography_calibration(frame, keypoints, result, pitch_template,

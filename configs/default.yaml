@@ -49,6 +49,7 @@ field_registration:
   physical:
     camera_profile: "veo_1080p"        # Profile name from camera_profiles.yaml
     camera_profiles_path: null          # Path to camera_profiles.yaml (null = auto)
+    detection_batch_size: 8
     ransac_reproj_error: 15.0           # PnP RANSAC reprojection threshold (px)
     line_weight: 1.0                    # Weight for line residuals vs point residuals
     line_sample_points: 20              # Points sampled along each line
@@ -133,17 +134,19 @@ ball_detection:
     min_trajectory_length: 3       # Minimum observations per trajectory
     smoothness_threshold: 0.6      # Min average cosine of direction changes
     speed_violation_ratio: 0.2     # Max fraction of frames exceeding speed limit
+    min_displacement: 1.0          # Min total displacement (meters) between first and last point
+    merge_max_distance: 15.0       # Max pitch distance (m) to nearest existing frame when merging trajectories
 
 # Ball Tracking (ByteTrack / BoT-SORT)
 ball_tracking:
   enabled: true
   tracker_type: botsort       # "bytetrack" or "botsort"
-  track_high_thresh: 0.4     # High-confidence threshold for first-stage matching
+  track_high_thresh: 0.15    # High-confidence threshold for first-stage matching
   track_low_thresh: 0.1      # Low-confidence threshold for second-stage IoU rescue
   track_buffer: 15           # Frames to keep lost tracks (1.5s at 10fps)
   match_thresh: 0.8          # Distance threshold for matching (normalized center distance)
-  new_track_thresh: 0.3      # Min confidence for new track initialization
-  max_position_distance: 200  # Max pixel distance for center-distance matching
+  new_track_thresh: 0.4      # Min confidence for new track initialization (higher than track_high to avoid false positives)
+  max_position_distance: 120  # Max pixel distance for center-distance matching
   fuse_score: true            # Fuse detection score into distance matrix
   # BoT-SORT specific (ignored when tracker_type=bytetrack)
   gmc_method: "none"          # Camera motion compensation: "sparseOptFlow", "orb", "none"
