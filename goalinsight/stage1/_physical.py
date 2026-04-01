@@ -14,9 +14,6 @@ Output format is compatible with Stage 2/3. Produces both:
 import json
 import logging
 import pickle
-import threading
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -24,15 +21,10 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 
-from .stage1 import (
-    get_pitch_template_points,
-    project_pitch_to_image,
-    draw_vis_keypoints,
-    draw_vis_lines,
-    _draw_topdown_pitch,
-)
-from .utils.config import get_default_config, get_process_fps_from_config, FrameSampler
-
+from ..utils.pitch import get_pitch_template_points, project_pitch_to_image, _draw_topdown_pitch
+from ._shared_vis import draw_vis_keypoints, draw_vis_lines
+from ..utils.config import get_default_config, get_process_fps_from_config, FrameSampler
+from ..utils.serialization import json_default as _json_default
 logger = logging.getLogger(__name__)
 
 
@@ -71,104 +63,6 @@ class CameraStateTracker:
 
     def needs_reinit(self) -> bool:
         return self.last_rvec is None
-
-
-class DetectionPrefetcher:
-    """Prefetch frames and run keypoint/line detection in background threads.
-
-    Overlaps I/O + detection with calibration on the main thread.
-    Uses a dedicated video reader thread and a pool for detection.
-    """
-
-    def __init__(
-        self,
-        video_path: str,
-        frame_indices: list[int],
-        kp_detector,
-        line_detector,
-        num_workers: int = 2,
-        prefetch_size: int = 4,
-    ):
-        self.frame_indices = frame_indices
-        self.kp_detector = kp_detector
-        self.line_detector = line_detector
-        self.prefetch_size = prefetch_size
-
-        # Results queue (ordered dict-like)
-        self._results: dict[int, tuple] = {}
-        self._lock = threading.Lock()
-        self._ready = threading.Condition(self._lock)
-        self._done = False
-
-        # Start background pipeline
-        self._executor = ThreadPoolExecutor(max_workers=num_workers)
-        self._reader_thread = threading.Thread(
-            target=self._reader_loop,
-            args=(str(video_path),),
-            daemon=True,
-        )
-        self._reader_thread.start()
-
-    def _reader_loop(self, video_path: str):
-        """Read frames and submit detection jobs."""
-        cap = cv2.VideoCapture(video_path)
-        pending = deque()  # Track pending futures to limit prefetch
-
-        for frame_idx in self.frame_indices:
-            # Limit prefetch depth
-            while len(pending) >= self.prefetch_size:
-                # Wait for oldest to complete
-                oldest_idx, oldest_future = pending[0]
-                oldest_future.result()  # Block until done
-                pending.popleft()
-
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            future = self._executor.submit(
-                self._detect_frame, frame_idx, frame,
-            )
-            pending.append((frame_idx, future))
-
-        # Wait for all remaining
-        for idx, future in pending:
-            future.result()
-
-        cap.release()
-        with self._lock:
-            self._done = True
-            self._ready.notify_all()
-
-    def _detect_frame(self, frame_idx: int, frame: np.ndarray):
-        """Run detection on a single frame."""
-        keypoints = self.kp_detector.detect(frame, convert_to_soccernet=False)
-        lines = self.line_detector.detect(frame) if self.line_detector is not None else []
-
-        with self._lock:
-            self._results[frame_idx] = (frame, keypoints, lines)
-            self._ready.notify_all()
-
-    def get(self, frame_idx: int, timeout: float = 30.0) -> tuple[np.ndarray, list, list] | None:
-        """Get detection results for a frame, blocking until ready.
-
-        Returns None if the frame could not be read (e.g. video shorter than
-        reported by CAP_PROP_FRAME_COUNT).
-        """
-        with self._lock:
-            while frame_idx not in self._results:
-                if self._done and frame_idx not in self._results:
-                    return None
-                self._ready.wait(timeout=timeout)
-                if frame_idx not in self._results and self._done:
-                    return None
-            result = self._results.pop(frame_idx)
-            return result
-
-    def shutdown(self):
-        self._reader_thread.join(timeout=5)
-        self._executor.shutdown(wait=True)
 
 
 def _load_camera_profile(config: dict, video_width: int, video_height: int):
@@ -264,9 +158,9 @@ def run_stage1_physical(
     Returns:
         Dict with calibration statistics.
     """
-    from .field_registration import KeypointDetector
-    from .field_registration.pnlcalib import KeypointMapper, LineMapper
-    from .field_registration.physical_calibrator import PhysicalCalibrator
+    from ..field_registration import KeypointDetector
+    from ..field_registration.pnlcalib import KeypointMapper, LineMapper
+    from ..field_registration.physical_calibrator import PhysicalCalibrator
 
     fr_config = config.get("field_registration", {})
     pnl_config = fr_config.get("pnlcalib", {})
@@ -292,7 +186,7 @@ def run_stage1_physical(
     line_mapper = LineMapper()
 
     if use_line_model:
-        from .field_registration import LineDetector
+        from ..field_registration import LineDetector
         print("Stage 1 (Physical): Initializing line detector...")
         line_config = {
             "backend": "pnlcalib",
@@ -385,39 +279,33 @@ def run_stage1_physical(
     for d in [vis_kp_dir, vis_line_dir, vis_calib_dir]:
         d.mkdir(exist_ok=True)
 
-    # Process frames — Pass 1: per-frame calibration to collect initial estimates
-    calibrated_count = 0
-    vis_interval = max(1, len(sampler) // 100)
-    joint_frame_data = []  # Collect data for cross-frame joint intrinsic optimization
+    # ===== Two-phase pipeline: GPU detection then CPU calibration =====
+    # Phase A: Read all frames and batch-detect keypoints/lines (GPU-saturated)
+    # Phase B: Calibrate from cached detections (CPU-only, no GPU contention)
 
-    # Use prefetcher to overlap frame reading + detection with calibration
-    num_workers = phys_config.get("num_workers", 2)
-    prefetch_size = phys_config.get("prefetch_size", 4)
-    print(f"  Detection prefetch: {num_workers} workers, buffer={prefetch_size}")
+    batch_size = phys_config.get("detection_batch_size", 32)
+    print(f"  Batch detection: batch_size={batch_size}")
 
-    prefetcher = DetectionPrefetcher(
-        video_path=str(video_path),
-        frame_indices=list(sampler),
-        kp_detector=kp_detector,
-        line_detector=line_detector,
-        num_workers=num_workers,
-        prefetch_size=prefetch_size,
+    frame_indices = list(sampler)
+    detections = _batch_detect_all_frames(
+        video_path, frame_indices, kp_detector, line_detector,
+        batch_size=batch_size,
     )
 
-    for idx, frame_idx in enumerate(tqdm(sampler, desc="Stage 1 (Physical): Pass 1 - Per-frame")):
-        # Get pre-detected frame from background workers
-        result = prefetcher.get(frame_idx)
-        if result is None:
-            break  # Video shorter than reported — stop processing
-        frame, keypoints, lines = result
+    # Phase B: Per-frame calibration (CPU only)
+    calibrated_count = 0
+    vis_interval = max(1, len(sampler) // 100)
+    joint_frame_data = []
 
-        # Update calibrator with detections
+    for idx, frame_idx in enumerate(tqdm(frame_indices, desc="Stage 1 (Physical): Pass 1 - Per-frame")):
+        det = detections.get(frame_idx)
+        if det is None:
+            continue
+        frame, keypoints, lines = det
+
         calibrator.update(keypoints, lines)
-
-        # Get warm-start from temporal tracker
         init_rvec, init_tvec = tracker.get_initial_guess()
 
-        # Run calibration
         result = calibrator.calibrate(
             keypoint_mapper,
             line_mapper if use_line_model else None,
@@ -445,7 +333,6 @@ def run_stage1_physical(
             }
             calibrated_count += 1
 
-            # Collect frame data for joint intrinsic optimization
             joint_frame_data.append({
                 "frame_idx": frame_idx,
                 "rvec": result["camera_params"]["rvec"].ravel(),
@@ -456,7 +343,6 @@ def run_stage1_physical(
                 "f": result["camera_params"]["focal_length"],
             })
 
-            # Update temporal tracker
             tracker.update(
                 result["camera_params"]["rvec"],
                 result["camera_params"]["tvec"],
@@ -464,11 +350,9 @@ def run_stage1_physical(
             )
         else:
             calibration_results["frames"][frame_idx] = {"calibrated": False}
-            # Reset tracker on failure
             tracker.last_rvec = None
             tracker.last_tvec = None
 
-        # Save visualizations and detailed JSON periodically
         if idx % vis_interval == 0:
             fname = f"frame_{frame_idx:05d}.jpg"
             json_fname = f"frame_{frame_idx:05d}.json"
@@ -482,7 +366,6 @@ def run_stage1_physical(
             )
             cv2.imwrite(str(vis_calib_dir / fname), vis)
 
-            # Save detailed per-frame JSON
             frame_info = _build_frame_json(
                 frame_idx, keypoints, lines, result,
                 warm_start=init_rvec is not None,
@@ -492,8 +375,6 @@ def run_stage1_physical(
             json_str = json.dumps(frame_info, indent=2, default=_json_default)
             with open(vis_calib_dir / json_fname, "w") as jf:
                 jf.write(json_str)
-
-    prefetcher.shutdown()
 
     # === Cross-frame joint intrinsic optimization ===
     joint_result = None
@@ -545,20 +426,12 @@ def run_stage1_physical(
             homographies = {}
             camera_poses = {}
 
-            prefetcher2 = DetectionPrefetcher(
-                video_path=str(video_path),
-                frame_indices=list(sampler),
-                kp_detector=kp_detector,
-                line_detector=line_detector,
-                num_workers=num_workers,
-                prefetch_size=prefetch_size,
-            )
-
-            for idx, frame_idx in enumerate(tqdm(sampler, desc="Stage 1 (Physical): Pass 2 - Joint intrinsics")):
-                result = prefetcher2.get(frame_idx)
-                if result is None:
-                    break
-                frame, keypoints, lines = result
+            # Reuse cached detections from Phase A (same frames, same models)
+            for idx, frame_idx in enumerate(tqdm(frame_indices, desc="Stage 1 (Physical): Pass 2 - Joint intrinsics")):
+                det = detections.get(frame_idx)
+                if det is None:
+                    continue
+                frame, keypoints, lines = det
                 calibrator.update(keypoints, lines)
 
                 # Warm-start: prefer joint extrinsics, then temporal tracker
@@ -625,7 +498,6 @@ def run_stage1_physical(
                     with open(vis_calib_dir / json_fname, "w") as jf:
                         jf.write(json_str)
 
-            prefetcher2.shutdown()
             tracker = tracker2
         else:
             print("  Joint optimization failed.")
@@ -725,6 +597,177 @@ def run_stage1_physical(
         print(f"  Joint f={joint_result['f']:.1f}")
 
     return stats
+
+
+def _batch_detect_all_frames(
+    video_path: Path,
+    frame_indices: list[int],
+    kp_detector,
+    line_detector,
+    batch_size: int = 8,
+) -> dict[int, tuple[np.ndarray, list, list]]:
+    """Read frames and batch-detect keypoints/lines with pipelined I/O.
+
+    Uses a thread pool for parallel frame reading + preprocessing (CPU),
+    while the main thread runs GPU inference. This keeps the GPU saturated.
+
+    Returns:
+        Dict mapping frame_idx -> (frame, keypoints, lines).
+    """
+    import threading
+    import queue
+    from concurrent.futures import ThreadPoolExecutor
+    import torch
+
+    detections: dict[int, tuple[np.ndarray, list, list]] = {}
+    use_lines = line_detector is not None
+    n_total = len(frame_indices)
+    num_readers = 8  # Parallel video readers
+
+    # Split frame_indices into batch-sized chunks
+    batch_chunks = [
+        frame_indices[i : i + batch_size]
+        for i in range(0, n_total, batch_size)
+    ]
+
+    # --- Worker: read frame + preprocess to tensor (CPU-heavy, parallelized) ---
+    def _read_and_preprocess(args):
+        """Read a single frame and preprocess to tensors. Each call uses its own cap."""
+        fidx, vid_path = args
+        cap = cv2.VideoCapture(str(vid_path))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            return None
+        kp_tensor = kp_detector.preprocess(frame)
+        line_tensor = line_detector.preprocess(frame) if use_lines else None
+        return (fidx, frame, kp_tensor, line_tensor)
+
+    # Pipeline: thread pool reads+preprocesses frames, delivers ready batches
+    # to main thread which only does GPU forward + post-process.
+    batch_queue: queue.Queue = queue.Queue(maxsize=3)
+
+    def _loader_thread():
+        pool = ThreadPoolExecutor(max_workers=num_readers)
+        for chunk_indices in batch_chunks:
+            futures = [
+                pool.submit(_read_and_preprocess, (fidx, video_path))
+                for fidx in chunk_indices
+            ]
+            results = [f.result() for f in futures]
+            # Filter None (failed reads), keep order
+            valid = [r for r in results if r is not None]
+            batch_queue.put(valid)
+        batch_queue.put(None)  # Sentinel
+        pool.shutdown(wait=False)
+
+    loader = threading.Thread(target=_loader_thread, daemon=True)
+    loader.start()
+
+    # --- Main thread: GPU forward pass only ---
+    pbar = tqdm(total=len(batch_chunks), desc="Stage 1 (Physical): Batch detect")
+    while True:
+        item = batch_queue.get()
+        if item is None:
+            break
+        if not item:
+            pbar.update(1)
+            continue
+
+        valid_indices = [r[0] for r in item]
+        raw_frames = [r[1] for r in item]
+        kp_tensors = [r[2] for r in item]
+        line_tensors = [r[3] for r in item] if use_lines else None
+
+        # Keypoint detection: stack pre-built tensors → GPU forward → post-process
+        kp_batch = torch.stack(kp_tensors, dim=0).to(kp_detector.device)
+        with torch.no_grad():
+            kp_heatmaps = kp_detector.model(kp_batch)
+        batch_kps = _postprocess_kp_batch(kp_detector, kp_heatmaps, raw_frames)
+
+        # Line detection
+        if use_lines and line_tensors is not None:
+            line_batch = torch.stack(line_tensors, dim=0).to(line_detector.device)
+            with torch.no_grad():
+                line_heatmaps = line_detector.model(line_batch)
+            batch_lines = _postprocess_line_batch(line_detector, line_heatmaps, raw_frames)
+        else:
+            batch_lines = [[] for _ in raw_frames]
+
+        for i, fidx in enumerate(valid_indices):
+            detections[fidx] = (raw_frames[i], batch_kps[i], batch_lines[i])
+
+        pbar.update(1)
+
+    pbar.close()
+    loader.join()
+    return detections
+
+
+def _postprocess_kp_batch(kp_detector, heatmaps, frames):
+    """Post-process keypoint heatmaps for a batch of frames."""
+    from ..field_registration.pnlcalib import get_keypoints_from_heatmap_maxpool
+
+    results = []
+    for i, frame in enumerate(frames):
+        h, w = frame.shape[:2]
+        hm = heatmaps[i : i + 1]
+
+        if kp_detector.backend == "pnlcalib":
+            hm_for_extraction = hm[:, :-1, :, :]
+            hm_h, hm_w = hm.shape[2], hm.shape[3]
+            scale_x = w / hm_w
+            scale_y = h / hm_h
+
+            keypoints = get_keypoints_from_heatmap_maxpool(
+                hm_for_extraction, scale=1, max_keypoints=1,
+                threshold=kp_detector.confidence_threshold,
+            )
+            for kp in keypoints:
+                kp["x"] = kp["x"] * scale_x
+                kp["y"] = kp["y"] * scale_y
+        else:
+            keypoints = kp_detector._extract_keypoints_from_heatmaps(
+                hm[0].cpu().numpy(), original_size=(w, h),
+            )
+        results.append(keypoints)
+    return results
+
+
+def _postprocess_line_batch(line_detector, heatmaps, frames):
+    """Post-process line heatmaps for a batch of frames."""
+    from ..field_registration.pnlcalib import get_lines_from_heatmap_maxpool
+    from ..field_registration.pnlcalib.hrnet_line import HRNetLineModel
+
+    results = []
+    for i, frame in enumerate(frames):
+        h, w = frame.shape[:2]
+        hm = heatmaps[i : i + 1]
+
+        hm_for_extraction = hm[:, :-1, :, :]
+        hm_h, hm_w = hm.shape[2], hm.shape[3]
+        scale_x = w / hm_w
+        scale_y = h / hm_h
+
+        lines = get_lines_from_heatmap_maxpool(
+            hm_for_extraction, scale=1, threshold=line_detector.confidence_threshold,
+        )
+        for line in lines:
+            line["x1"] *= scale_x
+            line["y1"] *= scale_y
+            line["x2"] *= scale_x
+            line["y2"] *= scale_y
+            line["length"] = float(np.sqrt(
+                (line["x2"] - line["x1"])**2 + (line["y2"] - line["y1"])**2
+            ))
+        for line in lines:
+            dx = line["x2"] - line["x1"]
+            dy = line["y2"] - line["y1"]
+            line["angle"] = float(np.arctan2(dy, dx) * 180 / np.pi)
+            line["class_name"] = HRNetLineModel.get_line_class_name(line["id"])
+        results.append(lines)
+    return results
 
 
 def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, debug_info=None, image_size=None):
@@ -970,7 +1013,7 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
         # with detected keypoints to find phantom/missing projections
         if cam and "rvec" in cam and "tvec" in cam:
             import cv2 as _cv2
-            from .field_registration.pnlcalib import KeypointMapper
+            from ..field_registration.pnlcalib import KeypointMapper
 
             all_world = KeypointMapper.PNLCALIB_WORLD_COORDS_2D
             non_ground = KeypointMapper.NON_GROUND_KEYPOINTS
@@ -1023,19 +1066,6 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
             }
 
     return info
-
-
-def _json_default(obj):
-    """JSON serializer fallback for numpy types."""
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return float(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
 def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
@@ -1110,7 +1140,7 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
                         cv2.line(vis, c1, c2, (0, 165, 255), 1)
 
         # Draw projected template keypoints (yellow, matching pitch lines)
-        from .field_registration.pnlcalib import KeypointMapper
+        from ..field_registration.pnlcalib import KeypointMapper
         all_world = calibrator._field_world_coords
         non_ground = KeypointMapper.NON_GROUND_KEYPOINTS
         for kid, (wx, wy) in enumerate(all_world):

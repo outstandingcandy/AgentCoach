@@ -16,6 +16,15 @@ from .config import (
 )
 from .visualization import Visualizer
 from .io import AnnotationIO
+from .serialization import json_default, sanitize_for_json
+from .prefetcher import FramePrefetcher, DetectionPrefetcher
+from .pitch import (
+    PITCH_LENGTH,
+    PITCH_WIDTH,
+    PITCH_LINE_KEYPOINTS,
+    get_pitch_template_points,
+    project_pitch_to_image,
+)
 
 __all__ = [
     "load_config",
@@ -32,4 +41,14 @@ __all__ = [
     "get_team_classifier",
     "get_visualizer",
     "get_side_labeler",
+    # Shared utilities
+    "json_default",
+    "sanitize_for_json",
+    "FramePrefetcher",
+    "DetectionPrefetcher",
+    "PITCH_LENGTH",
+    "PITCH_WIDTH",
+    "PITCH_LINE_KEYPOINTS",
+    "get_pitch_template_points",
+    "project_pitch_to_image",
 ]

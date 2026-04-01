@@ -336,6 +336,79 @@ class KeypointDetector:
         """
         return self._keypoint_mapper
 
+    def detect_batch(
+        self,
+        frames: list[np.ndarray],
+        convert_to_soccernet: bool = True,
+        batch_size: int = 8,
+    ) -> list[list[dict[str, Any]]]:
+        """Detect keypoints in multiple frames using batched GPU inference.
+
+        Args:
+            frames: List of input frames (BGR format).
+            convert_to_soccernet: If True and using pnlcalib backend, convert
+                                 keypoint IDs to SoccerNet-GSR format.
+            batch_size: Max frames per GPU forward pass.
+
+        Returns:
+            List of keypoint lists, one per input frame.
+        """
+        if self.model is None:
+            return [self._detect_fallback(f) for f in frames]
+
+        all_results = []
+        for start in range(0, len(frames), batch_size):
+            chunk = frames[start : start + batch_size]
+            chunk_results = self._detect_batch_chunk(chunk, convert_to_soccernet)
+            all_results.extend(chunk_results)
+        return all_results
+
+    def _detect_batch_chunk(
+        self,
+        frames: list[np.ndarray],
+        convert_to_soccernet: bool,
+    ) -> list[list[dict[str, Any]]]:
+        """Run batched inference on a chunk of frames."""
+        # Preprocess and stack
+        tensors = [self.preprocess(f) for f in frames]
+        batch = torch.stack(tensors, dim=0).to(self.device)
+
+        with torch.no_grad():
+            heatmaps = self.model(batch)  # (B, num_keypoints, H', W')
+
+        results = []
+        for i, frame in enumerate(frames):
+            h, w = frame.shape[:2]
+            hm = heatmaps[i : i + 1]  # Keep batch dim: (1, C, H', W')
+
+            if self.backend == "pnlcalib":
+                from .pnlcalib import get_keypoints_from_heatmap_maxpool
+
+                hm_for_extraction = hm[:, :-1, :, :]
+                hm_h, hm_w = hm.shape[2], hm.shape[3]
+                scale_x = w / hm_w
+                scale_y = h / hm_h
+
+                keypoints = get_keypoints_from_heatmap_maxpool(
+                    hm_for_extraction,
+                    scale=1,
+                    max_keypoints=1,
+                    threshold=self.confidence_threshold,
+                )
+                for kp in keypoints:
+                    kp["x"] = kp["x"] * scale_x
+                    kp["y"] = kp["y"] * scale_y
+
+                if convert_to_soccernet and self._keypoint_mapper is not None:
+                    keypoints = self._keypoint_mapper.pnlcalib_to_soccernet(keypoints)
+            else:
+                keypoints = self._extract_keypoints_from_heatmaps(
+                    hm[0].cpu().numpy(), original_size=(w, h),
+                )
+            results.append(keypoints)
+
+        return results
+
     def detect_pnlcalib_raw(self, frame: np.ndarray) -> list[dict[str, Any]]:
         """Detect keypoints and return in raw PnLCalib format (58 keypoints).
 
