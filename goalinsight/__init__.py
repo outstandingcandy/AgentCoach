@@ -17,6 +17,7 @@ from .stage1 import run_stage1
 from .stage2 import run_stage2
 from .stage3 import run_stage3
 from .video_processor import VideoProcessor, VideoSampler
+from .highlights import run_highlights
 
 # Factory functions for creating components
 from .utils.config import (
@@ -44,4 +45,5 @@ __all__ = [
     "get_team_classifier",
     "get_visualizer",
     "get_side_labeler",
+    "run_highlights",
 ]

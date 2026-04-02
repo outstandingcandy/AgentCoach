@@ -381,29 +381,75 @@ class GoalkeeperDetector:
         if linesman_count:
             print(f"  Linesmen detected: {linesman_count}")
 
-        # 2. Goalkeeper detection: per team, find the track significantly
-        #    deeper than teammates (closest to goal line)
+        # 2. Goalkeeper detection: find the player closest to each goal line
+        #    across ALL teams (not within a single team), then assign the
+        #    correct team based on which goal they defend.
+        #
+        #    This fixes the common problem where KMeans misclassifies a
+        #    goalkeeper because their jersey color differs from teammates.
         goalkeeper_tracks = set()
-        for team in ["team_A", "team_B"]:
-            team_tids = [
-                t for t, tm in team_assignments.items()
-                if tm == team and t in mean_positions
-            ]
-            if len(team_tids) < 2:
-                continue
 
-            # Sort by |x| descending
-            sorted_by_x = sorted(team_tids, key=lambda t: abs(mean_positions[t][0]), reverse=True)
-            deepest = sorted_by_x[0]
-            second = sorted_by_x[1]
-            deepest_x = abs(mean_positions[deepest][0])
-            second_x = abs(mean_positions[second][0])
+        # Collect all non-referee tracks with positions
+        field_tids = [
+            t for t, tm in team_assignments.items()
+            if tm in ("team_A", "team_B") and t in mean_positions
+        ]
+        if len(field_tids) >= 4:
+            # Determine which team defends which side:
+            # the team with lower mean |x| on each side is defending there
+            team_mean_x: dict[str, float] = {}
+            for team in ["team_A", "team_B"]:
+                xs = [
+                    mean_positions[t][0]
+                    for t in field_tids
+                    if team_assignments[t] == team
+                ]
+                if xs:
+                    team_mean_x[team] = float(np.mean(xs))
 
-            # Goalkeeper must be significantly deeper than second-deepest teammate
-            # and beyond the midfield area
-            if deepest_x > second_x + 5.0 and deepest_x > self.half_length * 0.3:
-                goalkeeper_tracks.add(deepest)
-                print(f"  Goalkeeper: T{deepest} ({team}, |x|={deepest_x:.1f}m, gap={deepest_x - second_x:.1f}m)")
+            # For each goal (left and right), find the nearest player
+            for goal_sign, goal_label in [(-1, "left"), (1, "right")]:
+                goal_x = goal_sign * self.half_length
+                # Sort ALL field players by distance to this goal line
+                by_dist = sorted(
+                    field_tids,
+                    key=lambda t: abs(mean_positions[t][0] - goal_x),
+                )
+                if len(by_dist) < 2:
+                    continue
+                candidate = by_dist[0]
+                second = by_dist[1]
+                cand_dist = abs(mean_positions[candidate][0] - goal_x)
+                second_dist = abs(mean_positions[second][0] - goal_x)
+
+                # Goalkeeper must be significantly closer to goal line
+                # than anyone else, and within the penalty area depth
+                if (second_dist - cand_dist > 5.0
+                        and cand_dist < self.goal_area_depth):
+                    goalkeeper_tracks.add(candidate)
+
+                    # Correct team assignment: the goalkeeper defends this
+                    # goal, so they belong to the team whose field players
+                    # are on THIS side (center of mass closer to this goal)
+                    if len(team_mean_x) == 2:
+                        defending_team = min(
+                            team_mean_x,
+                            key=lambda tm: abs(team_mean_x[tm] - goal_x),
+                        )
+                        old_team = team_assignments.get(candidate, "unknown")
+                        if old_team != defending_team:
+                            team_assignments[candidate] = defending_team
+                            print(
+                                f"  Goalkeeper team corrected: T{candidate} "
+                                f"{old_team} → {defending_team} "
+                                f"(defends {goal_label} goal)"
+                            )
+                    print(
+                        f"  Goalkeeper: T{candidate} "
+                        f"({team_assignments[candidate]}, "
+                        f"dist_to_{goal_label}_goal={cand_dist:.1f}m, "
+                        f"gap={second_dist - cand_dist:.1f}m)"
+                    )
 
         return team_assignments, goalkeeper_tracks
 
