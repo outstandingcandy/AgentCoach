@@ -249,6 +249,33 @@ postprocess:
     max_gap_frames: 30    # Max frames gap for merging
     require_same_jersey: true
 
+# Stage 4: Highlight Clipping (agent-based)
+highlights:
+  enabled: false
+  output_fps: 25.0
+  crossfade_frames: 4
+  closeup:
+    output_size: [640, 360]       # Close-up crop resolution (w, h)
+    padding_factor: 2.0           # How much to expand bbox for close-up
+    smooth_alpha: 0.3             # EMA alpha for crop center smoothing
+    medium_padding_factor: 4.0    # Padding for "medium" view type
+  temporal:
+    buildup_max_seconds: 10.0     # Max lookback for build-up start
+    buildup_padding_seconds: 2.0  # Extra padding before build-up start
+    celebration_seconds: 4.0      # Duration of celebration segment
+    goal_moment_seconds: 2.0      # Duration of goal moment close-up
+  overlays:
+    enabled: true
+    show_event_label: true
+    show_timestamp: true
+  goal_detection:
+    min_confidence: 0.15
+  recipes:
+    - name: "goal_highlight"
+      detector: "goal"
+      analyzer: "scorer"
+      composer: "segment"
+
 # Output
 output:
   format: "json"          # Output format
