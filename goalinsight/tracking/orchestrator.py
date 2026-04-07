@@ -573,56 +573,93 @@ def run_tracking(
     # Team classification will be done AFTER all tracking is complete
     # This ensures we use trajectory-averaged features for robust clustering
 
-    # Pre-compute filtered detections + ReID embeddings for all frames (batched GPU)
-    print("  Pre-computing ReID embeddings...")
+    # Pre-batch YOLO detection + filtering + crop/color extraction.
+    # Frames are NOT cached (saves ~40GB for long videos); rendering re-reads via FramePrefetcher.
+    import queue as _queue2
+    yolo_batch_size = config.get("detection", {}).get("batch_size", 32)
+    _frame_indices_list = list(sampler)
+
+    print(f"  Pre-detecting players: {len(_frame_indices_list)} frames, batch_size={yolo_batch_size}")
+    _det_read_q: _queue2.Queue = _queue2.Queue(maxsize=3)
+    _det_reader = threading.Thread(
+        target=_batch_reader_full,
+        args=(video_path, _frame_indices_list, yolo_batch_size, _det_read_q),
+        daemon=True,
+    )
+    _det_reader.start()
+
     _filtered_dets: dict[int, list] = {}
-    _precomputed_embeds: dict[int, Any] = {}
-
-    # Step 1: filter detections and collect crops (CPU)
     _all_crops: list[np.ndarray] = []
-    _crop_map: list[tuple[int, int]] = []  # (frame_idx, crop_index_in_frame)
     _crops_per_frame: dict[int, int] = {}
+    _det_color_hists: dict[int, list] = {}   # frame_idx -> per-detection color hists
+    _det_saturations: dict[int, list] = {}   # frame_idx -> per-detection saturations
+    _precomputed_ball_dets: dict[int, list] = {}  # non-two-pass ball detections
 
-    for frame_idx in _frame_indices_list:
-        frame = _precomputed_frames.get(frame_idx)
-        if frame is None:
-            continue
+    _det_pbar = tqdm(total=len(_frame_indices_list), desc="  YOLO batch detect")
+    while True:
+        _det_item = _det_read_q.get()
+        if _det_item is None:
+            break
+        _batch_fidxs, _batch_frames = _det_item
+        _batch_dets_list = detector.detect_batch(_batch_frames)
+        for _i, _fidx in enumerate(_batch_fidxs):
+            _frame = _batch_frames[_i]
 
-        detections = _precomputed_dets.get(frame_idx, [])
-        detections = detector.filter_by_size(
-            detections, min_height=25, max_height=350,
-            min_aspect_ratio=0.25, max_aspect_ratio=1.0,
-        )
+            # Filter detections by size and pitch
+            detections = detector.filter_by_size(
+                _batch_dets_list[_i], min_height=25, max_height=350,
+                min_aspect_ratio=0.25, max_aspect_ratio=1.0,
+            )
+            _H_world2img = homographies.get(_fidx)
+            _H_inv = None
+            if _H_world2img is not None:
+                try:
+                    _H_inv = np.linalg.inv(_H_world2img)
+                except np.linalg.LinAlgError:
+                    pass
+            if _fidx in camera_poses:
+                detections = _filter_by_pitch_undistorted(detections, camera_poses[_fidx], margin=5.0)
+            elif _H_inv is not None:
+                detections = detector.filter_by_pitch(detections, _H_inv, margin=5.0)
+            _filtered_dets[_fidx] = detections
 
-        H_world2img = homographies.get(frame_idx)
-        H = None
-        if H_world2img is not None:
-            try:
-                H = np.linalg.inv(H_world2img)
-            except np.linalg.LinAlgError:
-                H = None
+            # Extract ReID crops + jersey color features from each detection
+            n_crops = 0
+            frame_hists = []
+            frame_sats = []
+            for det in detections:
+                x1, y1, x2, y2 = map(int, det["bbox"])
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(width, x2), min(height, y2)
+                if x2 > x1 and y2 > y1:
+                    crop = _frame[y1:y2, x1:x2]
+                    _all_crops.append(crop)
+                    frame_hists.append(_extract_jersey_color_hist(crop))
+                    frame_sats.append(_extract_jersey_mean_saturation(crop))
+                else:
+                    _all_crops.append(np.zeros((64, 32, 3), dtype=np.uint8))
+                    frame_hists.append(None)
+                    frame_sats.append(None)
+                n_crops += 1
+            _crops_per_frame[_fidx] = n_crops
+            _det_color_hists[_fidx] = frame_hists
+            _det_saturations[_fidx] = frame_sats
 
-        if frame_idx in camera_poses:
-            detections = _filter_by_pitch_undistorted(detections, camera_poses[frame_idx], margin=5.0)
-        elif H is not None:
-            detections = detector.filter_by_pitch(detections, H, margin=5.0)
+            # Ball detection (non-two-pass mode)
+            if ball_detector and not two_pass_enabled:
+                _ball_dets = ball_detector.detect(_frame)
+                _ball_dets = ball_detector.filter_by_size(_ball_dets)
+                _precomputed_ball_dets[_fidx] = _ball_dets
 
-        _filtered_dets[frame_idx] = detections
+        _det_pbar.update(len(_batch_fidxs))
+    _det_pbar.close()
+    _det_reader.join()
+    cap.release()
 
-        n_crops = 0
-        for det in detections:
-            x1, y1, x2, y2 = map(int, det["bbox"])
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(width, x2), min(height, y2)
-            if x2 > x1 and y2 > y1:
-                _all_crops.append(frame[y1:y2, x1:x2])
-            else:
-                _all_crops.append(np.zeros((64, 32, 3), dtype=np.uint8))
-            _crop_map.append((frame_idx, n_crops))
-            n_crops += 1
-        _crops_per_frame[frame_idx] = n_crops
+    print(f"  Pre-detected {len(_filtered_dets)} frames")
 
-    # Step 2: streaming ReID extraction (GPU, chunked to limit peak memory)
+    # Batch ReID extraction (GPU-saturated)
+    _precomputed_embeds: dict[int, Any] = {}
     if _all_crops:
         reid_chunk_size = 2048
         n_total_crops = len(_all_crops)
@@ -634,7 +671,6 @@ def run_tracking(
         all_embeddings = np.concatenate(embed_chunks, axis=0)
         del embed_chunks
 
-        # Split embeddings back per frame
         offset = 0
         for frame_idx in _frame_indices_list:
             n = _crops_per_frame.get(frame_idx, 0)
@@ -642,14 +678,28 @@ def run_tracking(
                 _precomputed_embeds[frame_idx] = all_embeddings[offset : offset + n]
                 offset += n
 
-    del _all_crops, _crop_map, _crops_per_frame
+    del _all_crops, _crops_per_frame
     print(f"  ReID done: {len(_precomputed_embeds)} frames with embeddings")
 
-    # Tracking loop — now pure CPU
+    # Helper: match a track bbox to its source detection by IoU
+    def _match_track_to_det(track_bbox, dets):
+        best_idx, best_iou = -1, 0.3
+        tx1, ty1, tx2, ty2 = track_bbox
+        for i, det in enumerate(dets):
+            dx1, dy1, dx2, dy2 = det["bbox"]
+            ix1, iy1 = max(tx1, dx1), max(ty1, dy1)
+            ix2, iy2 = min(tx2, dx2), min(ty2, dy2)
+            if ix2 > ix1 and iy2 > iy1:
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                union = (tx2 - tx1) * (ty2 - ty1) + (dx2 - dx1) * (dy2 - dy1) - inter
+                iou = inter / union if union > 0 else 0
+                if iou > best_iou:
+                    best_iou = iou
+                    best_idx = i
+        return best_idx
+
+    # Tracking loop — pure CPU, no frame data needed
     for idx, frame_idx in enumerate(tqdm(_frame_indices_list, desc="Stage 2: Tracking")):
-        frame = _precomputed_frames.get(frame_idx)
-        if frame is None:
-            break
 
         H_world2img = homographies.get(frame_idx)
         H = None
@@ -742,18 +792,15 @@ def run_tracking(
             if track_id in tracker_features and tracker_features[track_id] is not None:
                 track_features[track_id].append(tracker_features[track_id])
 
-            # Extract jersey color histogram for team classification
-            bx1, by1, bx2, by2 = map(int, track["bbox"])
-            bx1, by1 = max(0, bx1), max(0, by1)
-            bx2, by2 = min(width, bx2), min(height, by2)
-            if bx2 > bx1 and by2 > by1:
-                crop = frame[by1:by2, bx1:bx2]
-                color_hist = _extract_jersey_color_hist(crop)
-                if color_hist is not None:
-                    track_color_hists[track_id].append(color_hist)
-                mean_sat = _extract_jersey_mean_saturation(crop)
-                if mean_sat is not None:
-                    track_saturations.setdefault(track_id, []).append(mean_sat)
+            # Use pre-computed jersey color features (extracted during YOLO batch phase)
+            _det_idx = _match_track_to_det(track["bbox"], detections)
+            if _det_idx >= 0:
+                _hists = _det_color_hists.get(frame_idx, [])
+                _sats = _det_saturations.get(frame_idx, [])
+                if _det_idx < len(_hists) and _hists[_det_idx] is not None:
+                    track_color_hists[track_id].append(_hists[_det_idx])
+                if _det_idx < len(_sats) and _sats[_det_idx] is not None:
+                    track_saturations.setdefault(track_id, []).append(_sats[_det_idx])
 
             if pitch_pos:
                 track_positions[track_id].append(pitch_pos)
@@ -783,8 +830,7 @@ def run_tracking(
             if two_pass_enabled:
                 ball_detections = all_ball_detections.get(frame_idx, [])
             else:
-                ball_detections = ball_detector.detect(frame)
-                ball_detections = ball_detector.filter_by_size(ball_detections)
+                ball_detections = _precomputed_ball_dets.get(frame_idx, [])
 
             ball_tracks = ball_tracker.update(ball_detections)
 
@@ -811,8 +857,8 @@ def run_tracking(
         # Note: Team classification is deferred until all tracking is complete
         # This allows using trajectory-averaged features for better clustering
 
-    # Free pre-computed detection cache
-    del _precomputed_dets
+    # Free pre-computed detection/feature caches
+    del _det_color_hists, _det_saturations, _precomputed_ball_dets
 
     # Save ball tracking debug log
     if ball_debug_log:
@@ -1075,10 +1121,8 @@ def run_tracking(
     # Generate visualization with final team assignments
     print("\nGenerating visualization with final team assignments...")
 
-    # Reuse pre-computed frames if available, otherwise read from video
-    _have_cached_frames = bool(_precomputed_frames)
-    if not _have_cached_frames:
-        render_prefetcher = _FramePrefetcher(video_path, list(sampler), prefetch_size=4)
+    # Re-read frames for rendering (frames are not cached to save memory)
+    render_prefetcher = _FramePrefetcher(video_path, list(sampler), prefetch_size=4)
 
     track_history = {}  # Reset for visualization
 
@@ -1111,10 +1155,7 @@ def run_tracking(
     _writer.start()
 
     for idx, frame_idx in enumerate(tqdm(list(sampler), desc="Stage 2: Rendering")):
-        if _have_cached_frames:
-            frame = _precomputed_frames.get(frame_idx)
-        else:
-            frame = render_prefetcher.get(frame_idx)
+        frame = render_prefetcher.get(frame_idx)
         if frame is None:
             break
 
@@ -1182,8 +1223,7 @@ def run_tracking(
     _write_queue.put(None)
     _writer.join()
 
-    if not _have_cached_frames:
-        render_prefetcher.shutdown()
+    render_prefetcher.shutdown()
     out.release()
 
     # Save results
