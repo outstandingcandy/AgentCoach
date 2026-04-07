@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 3: Post-processing Refinement - Improve tracking quality.
+"""Post-processing Refinement - Improve tracking quality.
 
-This stage:
+This module:
 1. SAM2-based segmentation to recover missed detections and fix ID switches
 2. Majority voting for temporal consistency of attributes
 3. Tracklet merging using ReID features and jersey number consistency
@@ -201,7 +201,7 @@ def apply_temporal_consistency(
     return updated_tracks
 
 
-def run_stage3(
+def run_refinement(
     tracking_dir: Path,
     output_dir: Path,
     config: dict | None = None,
@@ -357,7 +357,7 @@ def main():
     tracking_dir = Path("data/processed/stage2_tracking")
     output_dir = Path("data/processed/stage3_postprocess")
 
-    run_stage3(
+    run_refinement(
         tracking_dir,
         output_dir,
         enable_sam2=False,

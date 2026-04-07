@@ -28,28 +28,26 @@ from ..utils.config import (
     get_default_config,
     get_process_fps_from_config,
     FrameSampler,
-    get_reid_extractor,
-    get_team_classifier,
 )
+from ..utils.factories import get_reid_extractor, get_team_classifier
 from ..utils.serialization import json_default as _json_default_impl, sanitize_for_json
 from ..utils.prefetcher import FramePrefetcher
-from ..tracking import (
-    PlayerDetector,
-    StrongSORTTracker,
-    GoalkeeperDetector,
-    BallDetector,
-    BallTracker,
-)
-from ..tracking.ball_trajectory import BallTrajectory3D
+from .detector import PlayerDetector
+from .strongsort_tracker import StrongSORTTracker
+from .team.kmeans_classifier import GoalkeeperDetector
+from .ball_detector import BallDetector
+from .ball_tracker import BallTracker
+from .unified_detector import UnifiedDetector
+from .ball_trajectory import BallTrajectory3D
 
-from ._pitch_projection import (
+from .pitch_projection import (
     _PITCH_HALF_LENGTH,
     _PITCH_HALF_WIDTH,
     _undistort_and_project_to_pitch,
     _filter_by_pitch_undistorted,
     _interpolate_camera_poses,
 )
-from ._ball_pipeline import (
+from .ball_pipeline import (
     _find_nearest_detection_center,
     _interpolate_tracked_position,
     _filter_trajectories_field_space,
@@ -57,11 +55,11 @@ from ._ball_pipeline import (
     _select_best_trajectory,
     _render_ball_detection_diag,
 )
-from ._feature_extraction import (
+from .feature_extraction import (
     _extract_jersey_color_hist,
     _extract_jersey_mean_saturation,
 )
-from ._visualization import (
+from .tracking_visualization import (
     TEAM_COLORS,
     get_color_for_track,
     draw_topdown_pitch,
@@ -106,7 +104,7 @@ def _batch_reader_full(
     cap.release()
 
 
-def run_stage2(
+def run_tracking(
     video_path: Path,
     output_dir: Path,
     calibration_dir: Path | None = None,
@@ -156,16 +154,52 @@ def run_stage2(
                 homographies = pickle.load(f)
             print(f"  Loaded {len(homographies)} homographies")
 
-    # Initialize detector
-    print("Stage 2: Initializing YOLOv8 detector...")
-    detector = PlayerDetector({
-        "model": "yolov8x",
-        "confidence_threshold": 0.5,
-        "iou_threshold": 0.45,
-        "classes": [0],  # Person class
-        "imgsz": 1280,
-    })
-    detector.load_model()
+    # Initialize detectors — unified mode fuses player + ball into one YOLO pass
+    det_config = config.get("detection", {})
+    ball_config = config.get("ball_detection", {})
+    ball_tracking_config = config.get("ball_tracking", {})
+    ball_enabled = ball_config.get("enabled", True)
+    unified_config = config.get("unified_detection", {})
+
+    # Determine if unified detection can be used
+    unified_enabled = unified_config.get("enabled", True) and ball_enabled
+    if unified_enabled and ball_config.get("use_sahi", False):
+        unified_enabled = False  # SAHI needs a different inference path
+    if unified_enabled:
+        det_model = det_config.get("model_path") or det_config.get("model", "yolov8x")
+        ball_model = ball_config.get("model_path") or ball_config.get("model", "yolov8x")
+        if det_model != ball_model:
+            unified_enabled = False  # Different models, can't fuse
+
+    unified_det = None
+    if unified_enabled:
+        print("Stage 2: Initializing unified detector (player + ball)...")
+        unified_det = UnifiedDetector({
+            "model": unified_config.get("model", det_config.get("model", "yolov8x")),
+            "model_path": unified_config.get("model_path", det_config.get("model_path")),
+            "confidence_threshold": unified_config.get("confidence_threshold", 0.3),
+            "iou_threshold": unified_config.get("iou_threshold", 0.45),
+            "imgsz": unified_config.get("imgsz", 1920),
+        })
+        unified_det.load_model()
+        # PlayerDetector still needed for filter methods but does not load its own model
+        detector = PlayerDetector({
+            "model": "yolov8x",
+            "confidence_threshold": det_config.get("confidence_threshold", 0.5),
+            "iou_threshold": 0.45,
+            "classes": [0],
+            "imgsz": 1280,
+        })
+    else:
+        print("Stage 2: Initializing YOLOv8 detector...")
+        detector = PlayerDetector({
+            "model": "yolov8x",
+            "confidence_threshold": det_config.get("confidence_threshold", 0.5),
+            "iou_threshold": 0.45,
+            "classes": [0],
+            "imgsz": 1280,
+        })
+        detector.load_model()
 
     # Open video first to get dimensions
     cap = cv2.VideoCapture(str(video_path))
@@ -213,17 +247,17 @@ def run_stage2(
     _pp_mod._PITCH_HALF_WIDTH = pitch_width / 2
 
     # Initialize ball detection and tracking
-    ball_config = config.get("ball_detection", {})
-    ball_tracking_config = config.get("ball_tracking", {})
-    ball_enabled = ball_config.get("enabled", True)
-
     ball_detector = None
     ball_tracker = None
     ball_trajectory_3d = None
     if ball_enabled:
         print("Stage 2: Initializing ball detector and tracker...")
         ball_detector = BallDetector(ball_config)
-        ball_detector.load_model()
+        if unified_det is not None:
+            # Share model weights — no second GPU load
+            ball_detector.model = unified_det.model
+        else:
+            ball_detector.load_model()
         # Inject runtime parameters for fps-aware max_age and bounds checking
         ball_tracking_config["fps"] = effective_fps
         ball_tracking_config["frame_width"] = width
@@ -280,104 +314,190 @@ def run_stage2(
     all_ball_dets_diag: dict[int, list[dict]] = {}  # diagnostic visualization data
     ball_trajectory_history = []  # For visualization
 
-    # === Two-pass ball detection ===
-    # Pre-scan entire video for ball positions, then crop+enlarge missed frames.
-    # Results stored in all_ball_detections: {frame_idx: list[detection_dict]}
-    all_ball_detections = {}
+    # === Detection: unified (fused) or legacy (separate) ===
+    all_ball_detections: dict[int, list] = {}
     two_pass_enabled = ball_config.get("two_pass", False) and ball_detector is not None
-    if two_pass_enabled:
-        crop_size = ball_config.get("crop_size", 300)
-        crop_enlarge_to = ball_config.get("crop_enlarge_to", 640)
-        max_gap = ball_config.get("max_interpolation_gap", 30)
-        frame_indices = list(sampler)
+    import queue as _queue
 
-        # ---- Helper: threaded frame reader for pipelining I/O with GPU ----
-        import queue as _queue
-
-        def _batch_reader_crop(
-            video_path: str | Path,
-            tasks: list[tuple[int, tuple[float, float]]],
-            batch_size: int,
-            detector: object,
-            crop_sz: int,
-            enlarge_to: int,
-            out_queue: _queue.Queue,
-        ) -> None:
-            """Read frames, crop+enlarge, and push batches to queue."""
-            cap = cv2.VideoCapture(str(video_path))
-            prev_fidx = -1
-            batch_fidxs: list[int] = []
-            batch_images: list[np.ndarray] = []
-            batch_metas: list[dict] = []
-            for fidx, center in tasks:
-                gap = fidx - prev_fidx - 1
-                if prev_fidx >= 0 and 0 <= gap <= 8:
-                    for _ in range(gap):
-                        cap.grab()
-                else:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-                ret, frame = cap.read()
-                prev_fidx = fidx
-                if not ret:
-                    continue
-                img, meta = detector.prepare_crop(frame, center, crop_sz, enlarge_to)
-                if img is None:
-                    continue
-                batch_fidxs.append(fidx)
-                batch_images.append(img)
-                batch_metas.append(meta)
-                if len(batch_fidxs) >= batch_size:
-                    out_queue.put((batch_fidxs, batch_images, batch_metas))
-                    batch_fidxs, batch_images, batch_metas = [], [], []
-            if batch_fidxs:
+    # Helper for ball pass 2 crop+enlarge (used by both unified and legacy paths)
+    def _batch_reader_crop(
+        video_path: str | Path,
+        tasks: list[tuple[int, tuple[float, float]]],
+        batch_size: int,
+        det: object,
+        crop_sz: int,
+        enlarge_to: int,
+        out_queue: _queue.Queue,
+    ) -> None:
+        """Read frames, crop+enlarge, and push batches to queue."""
+        _cap = cv2.VideoCapture(str(video_path))
+        prev_fidx = -1
+        batch_fidxs: list[int] = []
+        batch_images: list[np.ndarray] = []
+        batch_metas: list[dict] = []
+        for fidx, center in tasks:
+            gap = fidx - prev_fidx - 1
+            if prev_fidx >= 0 and 0 <= gap <= 8:
+                for _ in range(gap):
+                    _cap.grab()
+            else:
+                _cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+            ret, frame = _cap.read()
+            prev_fidx = fidx
+            if not ret:
+                continue
+            img, meta = det.prepare_crop(frame, center, crop_sz, enlarge_to)
+            if img is None:
+                continue
+            batch_fidxs.append(fidx)
+            batch_images.append(img)
+            batch_metas.append(meta)
+            if len(batch_fidxs) >= batch_size:
                 out_queue.put((batch_fidxs, batch_images, batch_metas))
-            out_queue.put(None)  # sentinel
-            cap.release()
+                batch_fidxs, batch_images, batch_metas = [], [], []
+        if batch_fidxs:
+            out_queue.put((batch_fidxs, batch_images, batch_metas))
+        out_queue.put(None)  # sentinel
+        _cap.release()
 
-        # Pass 1: scan all frames, keep ALL detections (no anchor filtering)
-        print("\nBall detection pass 1: scanning all frames...")
-        pass1_batch_size = ball_config.get("pass1_batch_size", 8)
-        num_batches = (len(frame_indices) + pass1_batch_size - 1) // pass1_batch_size
+    _frame_indices_list = list(sampler)
+    _precomputed_frames: dict[int, np.ndarray] = {}
+    _precomputed_dets: dict[int, list] = {}
+
+    if unified_det is not None:
+        # ---- Fused detection pass: player + ball in one YOLO call ----
+        fused_batch_size = unified_config.get("batch_size", 8)
+        player_conf_thresh = unified_config.get(
+            "player_confidence_threshold",
+            det_config.get("confidence_threshold", 0.5),
+        )
+        num_batches = (len(_frame_indices_list) + fused_batch_size - 1) // fused_batch_size
+
+        print(f"\nFused detection pass: {len(_frame_indices_list)} frames, "
+              f"batch_size={fused_batch_size}, imgsz={unified_det.imgsz}")
 
         read_q: _queue.Queue = _queue.Queue(maxsize=2)
         reader = threading.Thread(
             target=_batch_reader_full,
-            args=(video_path, frame_indices, pass1_batch_size, read_q),
+            args=(video_path, _frame_indices_list, fused_batch_size, read_q),
             daemon=True,
         )
         reader.start()
 
-        pbar = tqdm(total=num_batches, desc="  Ball pass 1")
+        pbar = tqdm(total=num_batches, desc="  Fused detect")
         while True:
             item = read_q.get()
             if item is None:
                 break
             batch_fidxs, batch_frames = item
 
-            if ball_detector.use_sahi:
-                batch_dets_list = [ball_detector.detect(f) for f in batch_frames]
-            else:
-                batch_dets_list = ball_detector.detect_batch(batch_frames)
+            batch_all_dets = unified_det.detect_batch(batch_frames)
 
-            for fidx, dets in zip(batch_fidxs, batch_dets_list):
-                dets = ball_detector.filter_by_size(dets)
-                for d in dets:
-                    d["source"] = "pass1"
-                all_ball_detections[fidx] = dets
+            for i, fidx in enumerate(batch_fidxs):
+                players, balls = UnifiedDetector.split_by_class(batch_all_dets[i])
+
+                # Player pipeline: apply conf threshold post-hoc
+                players = [d for d in players if d["confidence"] >= player_conf_thresh]
+                _precomputed_frames[fidx] = batch_frames[i]
+                _precomputed_dets[fidx] = players
+
+                # Ball pipeline: apply size filter
+                if ball_detector is not None:
+                    balls = ball_detector.filter_by_size(balls)
+                    for d in balls:
+                        d["source"] = "pass1"
+                    all_ball_detections[fidx] = balls
+
             pbar.update(1)
         pbar.close()
         reader.join()
 
-        pass1_det_frames = sum(1 for d in all_ball_detections.values() if d)
-        print(f"  Pass 1: {pass1_det_frames} frames with detections out of {len(frame_indices)}")
+        print(f"  Pre-detected {len(_precomputed_dets)} frames (player + ball)")
+        if ball_detector is not None:
+            pass1_det_frames = sum(1 for d in all_ball_detections.values() if d)
+            print(f"  Ball pass 1: {pass1_det_frames} frames with detections")
+            # Unified pass pre-computes ball detections, so treat as two-pass
+            two_pass_enabled = True
 
-        # Pass 2: crop+enlarge using preliminary tracker predictions
-        # Run a preliminary tracker pass on Pass 1 detections to get
-        # tracked positions, then use those for crop centers.
+    else:
+        # ---- Legacy: separate ball pass 1 + player pre-detection ----
+        if two_pass_enabled:
+            frame_indices = list(sampler)
+            print("\nBall detection pass 1: scanning all frames...")
+            pass1_batch_size = ball_config.get("pass1_batch_size", 8)
+            num_batches = (len(frame_indices) + pass1_batch_size - 1) // pass1_batch_size
+
+            read_q_ball: _queue.Queue = _queue.Queue(maxsize=2)
+            reader_ball = threading.Thread(
+                target=_batch_reader_full,
+                args=(video_path, frame_indices, pass1_batch_size, read_q_ball),
+                daemon=True,
+            )
+            reader_ball.start()
+
+            pbar = tqdm(total=num_batches, desc="  Ball pass 1")
+            while True:
+                item = read_q_ball.get()
+                if item is None:
+                    break
+                batch_fidxs, batch_frames = item
+
+                if ball_detector.use_sahi:
+                    batch_dets_list = [ball_detector.detect(f) for f in batch_frames]
+                else:
+                    batch_dets_list = ball_detector.detect_batch(batch_frames)
+
+                for fidx, dets in zip(batch_fidxs, batch_dets_list):
+                    dets = ball_detector.filter_by_size(dets)
+                    for d in dets:
+                        d["source"] = "pass1"
+                    all_ball_detections[fidx] = dets
+                pbar.update(1)
+            pbar.close()
+            reader_ball.join()
+
+            pass1_det_frames = sum(1 for d in all_ball_detections.values() if d)
+            print(f"  Pass 1: {pass1_det_frames} frames with detections out of {len(frame_indices)}")
+
+        # Legacy player pre-detection
+        print("\nStage 2: Processing frames...")
+        yolo_batch_size = det_config.get("batch_size", 32)
+        print(f"  Pre-detecting players: {len(_frame_indices_list)} frames, batch_size={yolo_batch_size}")
+        _det_read_q: _queue.Queue = _queue.Queue(maxsize=3)
+        _det_reader = threading.Thread(
+            target=_batch_reader_full,
+            args=(video_path, _frame_indices_list, yolo_batch_size, _det_read_q),
+            daemon=True,
+        )
+        _det_reader.start()
+
+        _det_pbar = tqdm(total=len(_frame_indices_list), desc="  YOLO batch detect")
+        while True:
+            _det_item = _det_read_q.get()
+            if _det_item is None:
+                break
+            _batch_fidxs, _batch_frames = _det_item
+            _batch_dets_list = detector.detect_batch(_batch_frames)
+            for _i, _fidx in enumerate(_batch_fidxs):
+                _precomputed_frames[_fidx] = _batch_frames[_i]
+                _precomputed_dets[_fidx] = _batch_dets_list[_i]
+            _det_pbar.update(len(_batch_fidxs))
+        _det_pbar.close()
+        _det_reader.join()
+        print(f"  Pre-detected {len(_precomputed_dets)} frames")
+
+    cap.release()
+
+    # Ball pass 2: crop+enlarge on frames where pass 1 missed the ball
+    if two_pass_enabled and ball_detector is not None:
+        crop_size = ball_config.get("crop_size", 300)
+        crop_enlarge_to = ball_config.get("crop_enlarge_to", 640)
+        max_gap = ball_config.get("max_interpolation_gap", 30)
+
         prelim_tracker = BallTracker(ball_tracking_config)
         prelim_positions: dict[int, tuple[float, float]] = {}
 
-        for fidx in sorted(frame_indices):
+        for fidx in sorted(_frame_indices_list):
             dets = all_ball_detections.get(fidx, [])
             tracks = prelim_tracker.update(dets)
             for t in tracks:
@@ -386,10 +506,9 @@ def run_stage2(
                     break  # use first active track
 
         pass2_tasks: list[tuple[int, tuple[float, float]]] = []
-        for fidx in frame_indices:
+        for fidx in _frame_indices_list:
             if fidx in prelim_positions:
-                continue  # tracker successfully tracked ball at this frame
-            # Tracker lost ball -- interpolate crop center from nearest tracked frames
+                continue
             center = _interpolate_tracked_position(fidx, prelim_positions, max_gap)
             if center is not None:
                 pass2_tasks.append((fidx, center))
@@ -433,8 +552,8 @@ def run_stage2(
 
             print(f"  Pass 2: found ball in {pass2_count} additional frames")
 
-        # Save diagnostic data (all detections from both passes)
-        all_ball_dets_diag: dict[int, list[dict]] = {}
+    # Save ball diagnostic data (all detections from both passes)
+    if all_ball_detections:
         for fidx, dets in all_ball_detections.items():
             all_ball_dets_diag[fidx] = [
                 {
@@ -447,46 +566,12 @@ def run_stage2(
             ]
 
         total_det_frames = sum(1 for d in all_ball_detections.values() if d)
-        print(f"  Total frames with ball detections: {total_det_frames}/{len(frame_indices)}")
+        print(f"  Total frames with ball detections: {total_det_frames}/{len(_frame_indices_list)}")
 
     # Process frames
     print("\nStage 2: Processing frames...")
     # Team classification will be done AFTER all tracking is complete
     # This ensures we use trajectory-averaged features for robust clustering
-
-    # Pre-batch YOLO detection: read all frames + run batched GPU inference,
-    # so the tracking loop only does ReID (small crops) on GPU.
-    import queue as _queue2
-    yolo_batch_size = config.get("detection", {}).get("batch_size", 32)
-    _frame_indices_list = list(sampler)
-
-    print(f"  Pre-detecting players: {len(_frame_indices_list)} frames, batch_size={yolo_batch_size}")
-    _det_read_q: _queue2.Queue = _queue2.Queue(maxsize=3)
-    _det_reader = threading.Thread(
-        target=_batch_reader_full,
-        args=(video_path, _frame_indices_list, yolo_batch_size, _det_read_q),
-        daemon=True,
-    )
-    _det_reader.start()
-
-    _precomputed_frames: dict[int, np.ndarray] = {}
-    _precomputed_dets: dict[int, list] = {}
-    _det_pbar = tqdm(total=len(_frame_indices_list), desc="  YOLO batch detect")
-    while True:
-        _det_item = _det_read_q.get()
-        if _det_item is None:
-            break
-        _batch_fidxs, _batch_frames = _det_item
-        _batch_dets_list = detector.detect_batch(_batch_frames)
-        for _i, _fidx in enumerate(_batch_fidxs):
-            _precomputed_frames[_fidx] = _batch_frames[_i]
-            _precomputed_dets[_fidx] = _batch_dets_list[_i]
-        _det_pbar.update(len(_batch_fidxs))
-    _det_pbar.close()
-    _det_reader.join()
-    cap.release()
-
-    print(f"  Pre-detected {len(_precomputed_dets)} frames")
 
     # Pre-compute filtered detections + ReID embeddings for all frames (batched GPU)
     print("  Pre-computing ReID embeddings...")
@@ -537,10 +622,17 @@ def run_stage2(
             n_crops += 1
         _crops_per_frame[frame_idx] = n_crops
 
-    # Step 2: batch ReID extraction (GPU-saturated)
+    # Step 2: streaming ReID extraction (GPU, chunked to limit peak memory)
     if _all_crops:
-        print(f"  ReID batch extract: {len(_all_crops)} crops")
-        all_embeddings = reid_extractor.extract(_all_crops)
+        reid_chunk_size = 2048
+        n_total_crops = len(_all_crops)
+        print(f"  ReID streaming extract: {n_total_crops} crops (chunks of {reid_chunk_size})")
+        embed_chunks = []
+        for chunk_start in range(0, n_total_crops, reid_chunk_size):
+            chunk = _all_crops[chunk_start : chunk_start + reid_chunk_size]
+            embed_chunks.append(reid_extractor.extract(chunk))
+        all_embeddings = np.concatenate(embed_chunks, axis=0)
+        del embed_chunks
 
         # Split embeddings back per frame
         offset = 0
@@ -866,7 +958,7 @@ def run_stage2(
                                 all_ball_tracks[fidx]["position_3d"] = traj_result["position_3d"]
                                 all_ball_tracks[fidx]["on_ground"] = traj_result["on_ground"]
 
-            print(f"  Ball tracked in {len(all_ball_tracks)}/{len(frame_indices)} frames "
+            print(f"  Ball tracked in {len(all_ball_tracks)}/{len(_frame_indices_list)} frames "
                   f"(from {len(filtered_trajectories)} valid trajectories)")
 
             # Tag rejected trajectory detections in diagnostic data
@@ -1154,7 +1246,7 @@ def main():
     output_dir = Path("data/processed/stage2_tracking")
     calibration_dir = Path("data/processed/stage1_field_registration")
 
-    run_stage2(video_path, output_dir, calibration_dir)
+    run_tracking(video_path, output_dir, calibration_dir)
 
 
 if __name__ == "__main__":

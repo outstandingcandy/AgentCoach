@@ -4,68 +4,133 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GoalInsight is a multi-stage soccer video analysis pipeline: field registration (camera calibration), player tracking/identification, and post-processing refinement.
+GoalInsight is a soccer video analysis pipeline: field registration (camera calibration), player tracking/identification, ball tracking with 3D trajectory estimation, goal detection, and post-processing refinement.
 
 ## Environment & Running
 
 ```bash
 source venv/bin/activate  # NOT .venv
+pip install -e .           # editable install via pyproject.toml
 
-# Full pipeline
-python scripts/run_full_pipeline.py \
+# CLI entry point (installed via pyproject.toml)
+goalinsight \
   --video data/raw_videos/football_sunday_output_000.mp4 \
   --output output/ \
   --config configs/clip_000_finetuned.yaml \
-  --stages 1,2,3
+  --stages field_registration,tracking,post_processing
+
+# Or via script
+python scripts/run_full_pipeline.py [same args]
 
 # Quick run scripts
 bash scripts/pipeline.sh            # PnLCalib (finetuned)
 bash scripts/pipeline_broadtrack.sh # BroadTrack backend
+bash scripts/pipeline_physical.sh   # Physical calibration
 ```
 
-Python 3.12, dependencies in `requirements.txt`.
+Python 3.12, dependencies in `requirements.txt`, packaging in `pyproject.toml`.
 
 ## Architecture
 
-### Pipeline Stages
+### Pipeline Framework
 
-- **Stage 0** (`stage0.py`): Shot detection & video segmentation into continuous clips
-- **Stage 1** (`stage1.py`, `stage1_broadtrack.py`): Field registration — detects soccer field keypoints via HRNet, solves camera pose via PnP/PnL optimization, outputs per-frame homographies
-- **Stage 2** (`stage2.py`): YOLOv8 detection + StrongSORT tracking + ReID (OSNet) + team classification (KMeans) + optional jersey recognition (Qwen VL or MMOCR)
-- **Stage 3** (`stage3.py`): SAM2 segmentation for missed detections, majority voting for temporal consistency, tracklet merging
+The pipeline is config-driven via `goalinsight/pipeline/`. Stages are registered by name and executed in order:
 
-### Two Calibration Backends (Stage 1)
+```yaml
+# configs/default.yaml
+pipeline:
+  stages:
+    - field_registration
+    - tracking
+    - post_processing
+```
 
-**PnLCalib** (default, `field_registration/pnlcalib/frame_calibrator.py`):
-- Iterative PnP with multi-candidate sweep: 6 focal lengths x 3 distortion priors
-- Each candidate: up to 5 iterations of LM optimize (12 params) → undistort → re-RANSAC
-- 57 keypoints including 4 non-ground crossbar points (IDs {12,14,16,18} at z=-2.44m)
-- Full 5-param distortion model [k1, k2, p1, p2, k3]
+Available stages: `shot_detection`, `field_registration`, `tracking`, `post_processing`, `goal_detection`.
 
-**BroadTrack** (`field_registration/pnlcalib/broadtrack_calibrator.py`):
-- 9-parameter camera model: angleAxis(3), position(3), f, k1, k2
-- Cauchy robust loss with arc-length parameterized line constraints
-- Multi-distortion-prior PnP initialization
+```python
+from goalinsight import Pipeline
+pipeline = Pipeline(config)
+pipeline.run(video_path, output_dir)
+```
 
-### Key Module Layout
+Key classes in `goalinsight/pipeline/`:
+- `Stage` (ABC): base class with `run(ctx)` method
+- `PipelineContext`: carries video path, config, stage output dirs, stats
+- `Pipeline`: reads config, builds stage list, executes stages in order
+- `STAGE_REGISTRY`: maps stage names to Stage subclasses
+- Adapters in `_adapters.py`: bridge Stage interface to business modules
 
-- `goalinsight/field_registration/pnlcalib/` — Core calibration: `frame_calibrator.py`, `broadtrack_calibrator.py`, `camera.py`, `keypoint_mapping.py` (57↔115 keypoint conversion), `curve_utils.py`
-- `goalinsight/tracking/` — Detection (`detector.py`), tracking (`strongsort_tracker.py`), ball detection/tracking, ReID (`reid/`), team classification (`team/`)
-- `goalinsight/jersey/` — Jersey number recognition backends
-- `goalinsight/utils/config.py` — Config loading and factory functions (`get_calibrator`, `get_reid_extractor`, etc.)
-- `configs/default.yaml` — All configuration options with defaults
+### Data Flow
+
+```
+shot_detection (preprocessing/runner.py)
+  Output: shot_boundaries.json, segments/
+
+field_registration (field_registration/*_runner.py)
+  Output: homographies.pkl, camera_poses.pkl/.json, calibration_metadata.json
+    ↓
+tracking (tracking/orchestrator.py)
+  Input: Video + field_registration output (homographies.pkl, camera_poses)
+  Output: tracks.json, ball_tracks.json, track_features.json, team_assignments.json, tracking.mp4
+    ↓
+post_processing (refinement.py)
+  Input: tracking/tracks.json + track_features.json
+  Output: tracks_refined.json, final_track_summaries.json, statistics.json
+    ↓
+goal_detection (goal_detection.py)
+  Input: tracking/ball_tracks.json + field_registration/camera_poses.json
+  Output: goals.json
+```
+
+### Field Registration: Calibration Backends
+
+Selected via `field_registration.backend` config. Runner files in `field_registration/`:
+
+- **PnLCalib** (default, `pnlcalib_runner.py`): Iterative PnP with multi-candidate sweep, LM optimization, full 5-param distortion. Uses HRNet for keypoint/line detection.
+- **BroadTrack** (`broadtrack_runner.py`): 9-parameter camera model with Cauchy robust loss and arc-length line constraints.
+- **NBJW** (`pnlcalib_runner.py`): Alternative calibration backend (`field_registration/nbjw/`).
+- **Physical** (`physical_runner.py`): Fixed camera intrinsics from `camera_profiles.yaml`.
+- **Homography** (`homography_runner.py`): Direct ground-plane homography via DLT.
+
+### Tracking: Multi-threaded Pipeline
+
+`tracking/orchestrator.py` runs a threaded I/O pipeline: frame prefetch → YOLOv8 inference → tracking/ReID/team classification → output writing. Ball processing runs via `tracking/ball_pipeline.py`: collects detections, fits 3D parabolic trajectories (physics-based optimizer using `scipy.optimize.least_squares`), outputs pitch-projected positions.
+
+### Factory Pattern and Interfaces
+
+`goalinsight/utils/factories.py` provides factory functions that instantiate backends based on config (also re-exported from `utils/config.py` for backwards compatibility):
+- `get_calibrator(config)` → `BaseCalibrator`
+- `get_reid_extractor(config)` → `BaseReIDExtractor`
+- `get_jersey_recognizer(config)` → `BaseJerseyRecognizer`
+- `get_team_classifier(config)` → `BaseTeamClassifier`
+- `get_visualizer(config)` → `BaseVisualizer`
+- `get_side_labeler(config)` → `BaseTeamSideLabeler`
+
+Abstract base classes live in `goalinsight/interfaces/`.
 
 ### Keypoint Format
 
-Input uses 115 SoccerNet-GSR keypoints; internal processing uses 57 PnLCalib keypoints. `KeypointMapper` in `keypoint_mapping.py` converts between formats.
+Input uses 115 SoccerNet-GSR keypoints; internal processing uses 57 PnLCalib keypoints. `KeypointMapper` in `keypoint_mapping.py` converts between formats. 4 non-ground crossbar points (IDs {12,14,16,18}) are at z=-2.44m.
+
+### Ball Tracking and Goal Detection
+
+- **Ball detector** (`tracking/ball_detector.py`): YOLO class 32 (sports ball), supports SAHI sliced inference, size/pitch filtering.
+- **Ball tracker** (`tracking/ball_tracker.py`): ByteTrack/BOTSORT with center-distance matching (better than IoU for tiny bboxes).
+- **3D trajectory** (`tracking/ball_trajectory.py`): Parabolic physics model `P(t) = [x0+vx*dt, y0+vy*dt, z0+vz*dt-0.5*g*dt^2]`, sliding window fitting. Depth via ball pixel diameter (FIFA 0.22m) or ray-z search fallback.
+- **Goal detection** (`goal_detection.py`): Detects goal-line crossings at x=+-52.5m, validates within goal width (|y|<=3.66m) and height (z<=2.44m), deduplicates within 2s.
 
 ## Configuration
 
-YAML configs in `configs/` override `configs/default.yaml`. Key settings:
-- `field_registration.backend`: `pnlcalib` or `broadtrack`
+YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merge_configs`). Key settings:
+- `pipeline.stages`: list of stages to run
+- `field_registration.backend`: `pnlcalib` | `broadtrack` | `physical` | `nbjw` | `homography`
 - `field_registration.keypoint_threshold`, `ransac_threshold` (default 30px)
 - `video.process_fps`: frame sampling rate
-- `detection.model_size`: YOLOv8 variant (n/s/m/l/x)
+- `detection.model`: YOLOv8 variant (yolov8n/s/m/l/x, yolo11*)
+- `ball_detection.*`: ball detector config
+- `reid.backend`: `osnet` | `prtreid`
+- `team_classification.backend`: `kmeans` | `tracklet`
+- `jersey_recognition.backend`: `qwen` | `mmocr`
 
 ## Testing
 

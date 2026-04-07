@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from ._pitch_projection import _PITCH_HALF_LENGTH, _PITCH_HALF_WIDTH
+from .pitch_projection import _PITCH_HALF_LENGTH, _PITCH_HALF_WIDTH
 
 
 # ---------------------------------------------------------------------------
