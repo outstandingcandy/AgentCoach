@@ -27,7 +27,7 @@ def _run_stage1_pnlcalib(
 ):
     """Run Stage 1 using PnLCalib backend."""
     from . import KeypointDetector, LineDetector
-    from ..pnlcalib import (
+    from .pnlcalib import (
         FramebyFrameCalib,
         KeypointMapper,
         LineMapper,
@@ -201,7 +201,7 @@ def _run_stage1_nbjw(
     process_fps: float | None,
 ):
     """Run Stage 1 using NBJW backend."""
-    from ..nbjw import NbjwCalibrator
+    from .nbjw import NbjwCalibrator
 
     fr_config = config.get("field_registration", {})
     nbjw_config = fr_config.get("nbjw", {})
