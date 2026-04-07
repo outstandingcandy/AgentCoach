@@ -63,6 +63,7 @@ field_registration:
     k3_bounds: [-0.05, 0.05]         # Radial distortion k3 absolute bounds
     world_residual_weight: 0.0       # Weight for world-space back-projection residuals (0=disabled)
     world_error_threshold: 5.0       # World-error outlier rejection threshold (meters). Use .inf to disable.
+    calibration_skip: 1              # Calibrate every Nth frame (1=all, 2=half, etc). Skipped frames are interpolated.
 
   # Legacy settings for backwards compatibility
   keypoint_detector:
@@ -88,6 +89,17 @@ field_registration:
     reprojection_threshold: 8.0
     pnl_refine: false
     line_weight: 1.0
+
+# Unified detection: single YOLO pass for both players and ball
+unified_detection:
+  enabled: true                         # Set false to use legacy separate detectors
+  model: "yolov8x"
+  # model_path: null
+  confidence_threshold: 0.3            # Use ball's lower threshold; player filtering is post-hoc
+  iou_threshold: 0.45
+  imgsz: 1920                          # Full resolution for ball detection
+  batch_size: 8                        # Conservative for 1920px (adjust based on GPU VRAM)
+  player_confidence_threshold: 0.5     # Post-hoc filter applied to player detections
 
 # Stage 2: Tracking and Identification
 detection:
@@ -287,3 +299,11 @@ output:
 device: "cuda"            # "cuda" or "cpu"
 num_workers: 4
 batch_size: 16
+
+# Pipeline orchestration
+# Available stages: shot_detection, field_registration, tracking, post_processing, goal_detection
+pipeline:
+  stages:
+    - field_registration
+    - tracking
+    - post_processing

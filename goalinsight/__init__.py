@@ -1,26 +1,26 @@
-"""GoalInsight: 3-Stage Soccer Analysis Pipeline.
+"""GoalInsight: Soccer Video Analysis Pipeline.
 
-Stage 1: Field Registration - Camera calibration via keypoint/line detection
-Stage 2: Tracking & Identification - Player detection, tracking, and ReID
-Stage 3: Post-processing - Temporal consistency and tracklet merging
+Modules:
+- Field Registration: Camera calibration via keypoint/line detection
+- Tracking & Identification: Player detection, tracking, and ReID
+- Post-processing: Temporal consistency and tracklet merging
+- Goal Detection: Ball tracking and goal-line crossing detection
 
 Supports multiple backends for each component:
-- Calibration: PnLCalib (default), NBJW
+- Calibration: PnLCalib (default), BroadTrack, Physical, NBJW
 - ReID: OSNet (default), PRTReID
 - Jersey recognition: Qwen VL (default), MMOCR
 - Team classification: KMeans (default), Tracklet clustering
 - Visualization: Minimal (default), Step-by-step
 """
 
-from .stage0 import run_stage0, get_segments_for_pipeline
-from .stage1 import run_stage1
-from .stage2 import run_stage2
-from .stage3 import run_stage3
+from .pipeline import Pipeline, Stage, PipelineContext, STAGE_REGISTRY
 from .video_processor import VideoProcessor, VideoSampler
 from .highlights import run_highlights
+from .preprocessing.runner import get_segments_for_pipeline
 
 # Factory functions for creating components
-from .utils.config import (
+from .utils.factories import (
     get_calibrator,
     get_reid_extractor,
     get_jersey_recognizer,
@@ -30,14 +30,15 @@ from .utils.config import (
 )
 
 __all__ = [
-    # Stage runners
-    "run_stage0",
-    "get_segments_for_pipeline",
-    "run_stage1",
-    "run_stage2",
-    "run_stage3",
+    # Pipeline
+    "Pipeline",
+    "Stage",
+    "PipelineContext",
+    "STAGE_REGISTRY",
+    # Video processing
     "VideoProcessor",
     "VideoSampler",
+    "get_segments_for_pipeline",
     # Factory functions
     "get_calibrator",
     "get_reid_extractor",

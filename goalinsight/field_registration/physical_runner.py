@@ -22,7 +22,7 @@ import yaml
 from tqdm import tqdm
 
 from ..utils.pitch import get_pitch_template_points, project_pitch_to_image, _draw_topdown_pitch
-from ._shared_vis import draw_vis_keypoints, draw_vis_lines
+from .shared_vis import draw_vis_keypoints, draw_vis_lines
 from ..utils.config import get_default_config, get_process_fps_from_config, FrameSampler
 from ..utils.serialization import json_default as _json_default
 logger = logging.getLogger(__name__)
@@ -158,9 +158,9 @@ def run_stage1_physical(
     Returns:
         Dict with calibration statistics.
     """
-    from ..field_registration import KeypointDetector
-    from ..field_registration.pnlcalib import KeypointMapper, LineMapper
-    from ..field_registration.physical_calibrator import PhysicalCalibrator
+    from . import KeypointDetector
+    from .pnlcalib import KeypointMapper, LineMapper
+    from .physical_calibrator import PhysicalCalibrator
 
     fr_config = config.get("field_registration", {})
     pnl_config = fr_config.get("pnlcalib", {})
@@ -186,7 +186,7 @@ def run_stage1_physical(
     line_mapper = LineMapper()
 
     if use_line_model:
-        from ..field_registration import LineDetector
+        from . import LineDetector
         print("Stage 1 (Physical): Initializing line detector...")
         line_config = {
             "backend": "pnlcalib",
@@ -284,11 +284,23 @@ def run_stage1_physical(
     # Phase B: Calibrate from cached detections (CPU-only, no GPU contention)
 
     batch_size = phys_config.get("detection_batch_size", 32)
+    calibration_skip = max(1, int(phys_config.get("calibration_skip", 1)))
     print(f"  Batch detection: batch_size={batch_size}")
 
     frame_indices = list(sampler)
+
+    # Frame skipping: only detect/calibrate every Nth frame, interpolate the rest
+    if calibration_skip > 1:
+        calib_frame_indices = frame_indices[::calibration_skip]
+        # Always include the last frame for better interpolation at boundaries
+        if calib_frame_indices[-1] != frame_indices[-1]:
+            calib_frame_indices.append(frame_indices[-1])
+        print(f"  Calibration skip={calibration_skip}: calibrating {len(calib_frame_indices)}/{len(frame_indices)} frames, interpolating rest")
+    else:
+        calib_frame_indices = frame_indices
+
     detections = _batch_detect_all_frames(
-        video_path, frame_indices, kp_detector, line_detector,
+        video_path, calib_frame_indices, kp_detector, line_detector,
         batch_size=batch_size,
     )
 
@@ -297,7 +309,7 @@ def run_stage1_physical(
     vis_interval = max(1, len(sampler) // 100)
     joint_frame_data = []
 
-    for idx, frame_idx in enumerate(tqdm(frame_indices, desc="Stage 1 (Physical): Pass 1 - Per-frame")):
+    for idx, frame_idx in enumerate(tqdm(calib_frame_indices, desc="Stage 1 (Physical): Pass 1 - Per-frame")):
         det = detections.get(frame_idx)
         if det is None:
             continue
@@ -427,7 +439,7 @@ def run_stage1_physical(
             camera_poses = {}
 
             # Reuse cached detections from Phase A (same frames, same models)
-            for idx, frame_idx in enumerate(tqdm(frame_indices, desc="Stage 1 (Physical): Pass 2 - Joint intrinsics")):
+            for idx, frame_idx in enumerate(tqdm(calib_frame_indices, desc="Stage 1 (Physical): Pass 2 - Joint intrinsics")):
                 det = detections.get(frame_idx)
                 if det is None:
                     continue
@@ -517,6 +529,26 @@ def run_stage1_physical(
             "n_frames": joint_result["n_frames"],
         }
 
+    # Interpolate poses for skipped frames
+    if calibration_skip > 1 and camera_poses:
+        from ..stage2._pitch_projection import _interpolate_camera_poses
+        skipped_indices = [f for f in frame_indices if f not in camera_poses]
+        if skipped_indices:
+            camera_poses = _interpolate_camera_poses(camera_poses, skipped_indices)
+            # Derive homographies for interpolated frames
+            for fidx in skipped_indices:
+                if fidx in camera_poses:
+                    pose = camera_poses[fidx]
+                    K_i = np.array(pose["K"], dtype=np.float64)
+                    R_i, _ = cv2.Rodrigues(np.array(pose["rvec"], dtype=np.float64))
+                    tvec_i = np.array(pose["tvec"], dtype=np.float64).ravel()
+                    H_i = K_i @ np.column_stack([R_i[:, 0], R_i[:, 1], tvec_i])
+                    if abs(H_i[2, 2]) > 1e-10:
+                        H_i = H_i / H_i[2, 2]
+                    homographies[fidx] = H_i
+                    calibration_results["frames"][fidx] = {"calibrated": True, "interpolated": True}
+            print(f"  Interpolated {len(skipped_indices)} skipped frames from {calibrated_count} calibrated anchors")
+
     # Save results
     with open(output_dir / "calibration_metadata.json", "w") as f:
         json.dump(calibration_results, f, default=_json_default)
@@ -547,10 +579,15 @@ def run_stage1_physical(
         json.dump(camera_poses_json, f, indent=2)
 
     # Statistics
+    interpolated_count = sum(
+        1 for f in calibration_results["frames"].values()
+        if f.get("interpolated")
+    )
     stats = {
         "total_frames": total_frames,
         "processed_frames": len(sampler),
         "calibrated_frames": calibrated_count,
+        "interpolated_frames": interpolated_count,
         "calibration_rate": calibrated_count / len(sampler) if sampler else 0,
         "warm_start_frames": tracker.warm_start_count,
         "reinit_frames": tracker.reinit_count,
@@ -560,17 +597,20 @@ def run_stage1_physical(
         calibration_results["frames"][idx]["reprojection_error"]
         for idx in calibration_results["frames"]
         if calibration_results["frames"][idx].get("calibrated")
+        and not calibration_results["frames"][idx].get("interpolated")
     ]
     world_errors = [
         calibration_results["frames"][idx]["world_error"]
         for idx in calibration_results["frames"]
         if calibration_results["frames"][idx].get("calibrated")
+        and not calibration_results["frames"][idx].get("interpolated")
         and calibration_results["frames"][idx].get("world_error") is not None
     ]
     world_errors_all = [
         calibration_results["frames"][idx]["world_error_all"]
         for idx in calibration_results["frames"]
         if calibration_results["frames"][idx].get("calibrated")
+        and not calibration_results["frames"][idx].get("interpolated")
         and calibration_results["frames"][idx].get("world_error_all") is not None
     ]
     if errors:
@@ -585,6 +625,8 @@ def run_stage1_physical(
 
     print(f"\nStage 1 (Physical) Complete:")
     print(f"  Calibrated: {calibrated_count}/{len(sampler)} ({stats['calibration_rate']*100:.1f}%)")
+    if interpolated_count > 0:
+        print(f"  Interpolated: {interpolated_count} frames (skip={calibration_skip})")
     print(f"  Warm-starts: {tracker.warm_start_count}, Re-inits: {tracker.reinit_count}")
     if errors:
         print(f"  Median error: {stats['median_error']:.2f} px")
@@ -707,7 +749,7 @@ def _batch_detect_all_frames(
 
 def _postprocess_kp_batch(kp_detector, heatmaps, frames):
     """Post-process keypoint heatmaps for a batch of frames."""
-    from ..field_registration.pnlcalib import get_keypoints_from_heatmap_maxpool
+    from .pnlcalib import get_keypoints_from_heatmap_maxpool
 
     results = []
     for i, frame in enumerate(frames):
@@ -737,8 +779,8 @@ def _postprocess_kp_batch(kp_detector, heatmaps, frames):
 
 def _postprocess_line_batch(line_detector, heatmaps, frames):
     """Post-process line heatmaps for a batch of frames."""
-    from ..field_registration.pnlcalib import get_lines_from_heatmap_maxpool
-    from ..field_registration.pnlcalib.hrnet_line import HRNetLineModel
+    from .pnlcalib import get_lines_from_heatmap_maxpool
+    from .pnlcalib.hrnet_line import HRNetLineModel
 
     results = []
     for i, frame in enumerate(frames):
@@ -1013,7 +1055,7 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
         # with detected keypoints to find phantom/missing projections
         if cam and "rvec" in cam and "tvec" in cam:
             import cv2 as _cv2
-            from ..field_registration.pnlcalib import KeypointMapper
+            from .pnlcalib import KeypointMapper
 
             all_world = KeypointMapper.PNLCALIB_WORLD_COORDS_2D
             non_ground = KeypointMapper.NON_GROUND_KEYPOINTS
@@ -1140,7 +1182,7 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
                         cv2.line(vis, c1, c2, (0, 165, 255), 1)
 
         # Draw projected template keypoints (yellow, matching pitch lines)
-        from ..field_registration.pnlcalib import KeypointMapper
+        from .pnlcalib import KeypointMapper
         all_world = calibrator._field_world_coords
         non_ground = KeypointMapper.NON_GROUND_KEYPOINTS
         for kid, (wx, wy) in enumerate(all_world):

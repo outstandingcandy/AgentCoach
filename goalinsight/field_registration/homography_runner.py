@@ -21,7 +21,7 @@ import numpy as np
 from tqdm import tqdm
 
 from ..utils.pitch import get_pitch_template_points, project_pitch_to_image, _draw_topdown_pitch
-from ._shared_vis import draw_vis_keypoints
+from .shared_vis import draw_vis_keypoints
 from ..utils.config import get_default_config, get_process_fps_from_config, FrameSampler
 from ..utils.serialization import json_default as _json_default
 
@@ -47,9 +47,9 @@ def run_stage1_homography(
     Returns:
         Dict with calibration statistics.
     """
-    from ..field_registration import KeypointDetector
-    from ..field_registration.pnlcalib import KeypointMapper
-    from ..field_registration.homography_calibrator import HomographyCalibrator
+    from . import KeypointDetector
+    from .pnlcalib import KeypointMapper
+    from .homography_calibrator import HomographyCalibrator
 
     fr_config = config.get("field_registration", {})
     pnl_config = fr_config.get("pnlcalib", {})

@@ -385,24 +385,30 @@ def detect_goals_from_output(
     """
     output_dir = Path(output_dir)
 
-    # Load ball tracks
-    ball_path = output_dir / "stage2" / "ball_tracks.json"
+    # Load ball tracks (try new name first, fallback to legacy)
+    ball_path = output_dir / "tracking" / "ball_tracks.json"
     if not ball_path.exists():
-        logger.error(f"Ball tracks not found: {ball_path}")
+        ball_path = output_dir / "stage2" / "ball_tracks.json"
+    if not ball_path.exists():
+        logger.error(f"Ball tracks not found in {output_dir}/tracking/ or {output_dir}/stage2/")
         return []
     with open(ball_path) as f:
         ball_tracks = json.load(f)
 
     # Load camera poses (optional, for crossbar validation)
     camera_poses = None
-    poses_path = output_dir / "stage1" / "camera_poses.json"
+    poses_path = output_dir / "field_registration" / "camera_poses.json"
+    if not poses_path.exists():
+        poses_path = output_dir / "stage1" / "camera_poses.json"
     if poses_path.exists():
         with open(poses_path) as f:
             camera_poses = json.load(f)
 
     # Read fps from metadata if not provided
     if fps is None:
-        meta_path = output_dir / "stage1" / "calibration_metadata.json"
+        meta_path = output_dir / "field_registration" / "calibration_metadata.json"
+        if not meta_path.exists():
+            meta_path = output_dir / "stage1" / "calibration_metadata.json"
         if meta_path.exists():
             with open(meta_path) as f:
                 meta = json.load(f)

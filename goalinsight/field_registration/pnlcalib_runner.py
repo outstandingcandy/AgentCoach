@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from ..utils.config import get_default_config, get_process_fps_from_config, FrameSampler
 from ..utils.pitch import get_pitch_template_points, project_pitch_to_image
-from ._shared_vis import (
+from .shared_vis import (
     draw_vis_keypoints,
     draw_vis_lines,
     draw_vis_intersections,
@@ -26,8 +26,8 @@ def _run_stage1_pnlcalib(
     process_fps: float | None,
 ):
     """Run Stage 1 using PnLCalib backend."""
-    from ..field_registration import KeypointDetector, LineDetector
-    from ..field_registration.pnlcalib import (
+    from . import KeypointDetector, LineDetector
+    from ..pnlcalib import (
         FramebyFrameCalib,
         KeypointMapper,
         LineMapper,
@@ -201,7 +201,7 @@ def _run_stage1_nbjw(
     process_fps: float | None,
 ):
     """Run Stage 1 using NBJW backend."""
-    from ..field_registration.nbjw import NbjwCalibrator
+    from ..nbjw import NbjwCalibrator
 
     fr_config = config.get("field_registration", {})
     nbjw_config = fr_config.get("nbjw", {})

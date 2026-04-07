@@ -19,7 +19,7 @@ from tqdm import tqdm
 from ..utils.config import get_default_config, get_process_fps_from_config, FrameSampler
 from ..utils.serialization import json_default as _json_default
 from ..utils.pitch import get_pitch_template_points, project_pitch_to_image, _draw_topdown_pitch
-from ._shared_vis import draw_vis_keypoints, draw_vis_lines, draw_vis_calibration
+from .shared_vis import draw_vis_keypoints, draw_vis_lines, draw_vis_calibration
 
 
 def run_stage1_broadtrack(
@@ -41,9 +41,9 @@ def run_stage1_broadtrack(
     Returns:
         Dict with calibration statistics.
     """
-    from ..field_registration import KeypointDetector
-    from ..field_registration.pnlcalib import KeypointMapper, LineMapper
-    from ..field_registration.pnlcalib.broadtrack_calibrator import BroadTrackCalibrator
+    from . import KeypointDetector
+    from .pnlcalib import KeypointMapper, LineMapper
+    from .pnlcalib.broadtrack_calibrator import BroadTrackCalibrator
 
     fr_config = config.get("field_registration", {})
     pnl_config = fr_config.get("pnlcalib", {})
@@ -69,7 +69,7 @@ def run_stage1_broadtrack(
     line_mapper = LineMapper()
 
     if use_line_model:
-        from ..field_registration import LineDetector
+        from . import LineDetector
         print("Stage 1 (BroadTrack): Initializing line detector...")
         line_config = {
             "backend": "pnlcalib",

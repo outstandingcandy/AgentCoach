@@ -8,18 +8,11 @@ from .role_classifier import RoleClassifier
 # Ball detection and tracking
 from .ball_detector import BallDetector
 from .ball_tracker import BallTracker
+from .unified_detector import UnifiedDetector
 
-# Import from new locations (with backwards compatibility aliases)
+# ReID and team classification
 from .reid.osnet_extractor import OSNetExtractor, ReIDGallery
 from .team.kmeans_classifier import KMeansTeamClassifier, GoalkeeperDetector
-
-# Backwards compatibility aliases
-ReIDExtractor = OSNetExtractor
-TeamClassifier = KMeansTeamClassifier
-
-# Jersey recognition moved to ../jersey/ module
-from ..jersey.qwen_recognizer import QwenJerseyRecognizer, JerseyNumberAggregator
-JerseyRecognizer = QwenJerseyRecognizer
 
 __all__ = [
     "PlayerDetector",
@@ -29,19 +22,14 @@ __all__ = [
     "StrongSORTTracker",
     "Track",
     "TrackStatus",
+    "RoleClassifier",
     # Ball tracking
     "BallDetector",
     "BallTracker",
-    # New names
+    "UnifiedDetector",
+    # ReID and team classification
     "OSNetExtractor",
-    "KMeansTeamClassifier",
-    "QwenJerseyRecognizer",
     "ReIDGallery",
-    "JerseyNumberAggregator",
-    # Backwards compatibility aliases
-    "ReIDExtractor",
-    "JerseyRecognizer",
-    "RoleClassifier",
-    "TeamClassifier",
+    "KMeansTeamClassifier",
     "GoalkeeperDetector",
 ]

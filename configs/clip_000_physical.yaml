@@ -23,6 +23,7 @@ field_registration:
     position_weight: 200.0
     pitch_length: 89.7
     pitch_width: 56.5
+    calibration_skip: 2              # Calibrate every 2nd frame, interpolate the rest
 
   pnlcalib:
     # keypoint_weights: "SV_kp"

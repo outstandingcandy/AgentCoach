@@ -6,7 +6,8 @@ from .config import (
     merge_configs,
     get_process_fps_from_config,
     FrameSampler,
-    # Factory functions
+)
+from .factories import (
     get_calibrator,
     get_reid_extractor,
     get_jersey_recognizer,

@@ -2,14 +2,11 @@
 """Generate a top-down pitch reference diagram with keypoint and line IDs."""
 
 import math
-import sys
 from pathlib import Path
 
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from goalinsight.field_registration.pnlcalib.keypoint_mapping import KeypointMapper
 from goalinsight.field_registration.pnlcalib.line_mapping import LineMapper
