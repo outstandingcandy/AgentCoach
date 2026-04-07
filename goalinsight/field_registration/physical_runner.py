@@ -531,7 +531,7 @@ def run_stage1_physical(
 
     # Interpolate poses for skipped frames
     if calibration_skip > 1 and camera_poses:
-        from ..stage2._pitch_projection import _interpolate_camera_poses
+        from ..tracking.pitch_projection import _interpolate_camera_poses
         skipped_indices = [f for f in frame_indices if f not in camera_poses]
         if skipped_indices:
             camera_poses = _interpolate_camera_poses(camera_poses, skipped_indices)
