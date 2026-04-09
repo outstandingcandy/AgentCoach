@@ -37,6 +37,7 @@ class MatchContext:
     _refined_tracks: dict[str, list[dict]] | None = field(
         default=None, repr=False
     )
+    _events: list[dict] | None = field(default=None, repr=False)
 
     # ------------------------------------------------------------------
     # Factory
@@ -62,7 +63,9 @@ class MatchContext:
         width, height = 1920, 1080
         meta_video_path: str | None = None
 
-        meta_path = pipeline_output_dir / "stage1" / "calibration_metadata.json"
+        meta_path = pipeline_output_dir / "field_registration" / "calibration_metadata.json"
+        if not meta_path.exists():
+            meta_path = pipeline_output_dir / "stage1" / "calibration_metadata.json"
         if meta_path.exists():
             with open(meta_path) as f:
                 meta = json.load(f)
@@ -72,6 +75,12 @@ class MatchContext:
             width = vi.get("width", width)
             height = vi.get("height", height)
             meta_video_path = vi.get("path")
+            # Auto-detect pitch dimensions from calibration metadata
+            # (overridden if caller passes explicit values)
+            if pitch_length == 105.0 and "pitch_length" in vi:
+                pitch_length = vi["pitch_length"]
+            if pitch_width == 68.0 and "pitch_width" in vi:
+                pitch_width = vi["pitch_width"]
 
         # Auto-resolve video path from metadata when not provided
         if video_path is None:
@@ -108,26 +117,40 @@ class MatchContext:
     @property
     def player_tracks(self) -> dict[str, list[dict]]:
         if self._player_tracks is None:
-            self._player_tracks = self._load_json("stage2", "tracks.json") or {}
+            self._player_tracks = (
+                self._load_json("tracking", "tracks.json")
+                or self._load_json("stage2", "tracks.json")
+                or {}
+            )
         return self._player_tracks
 
     @property
     def ball_tracks(self) -> dict[str, dict]:
         if self._ball_tracks is None:
-            self._ball_tracks = self._load_json("stage2", "ball_tracks.json") or {}
+            self._ball_tracks = (
+                self._load_json("tracking", "ball_tracks.json")
+                or self._load_json("stage2", "ball_tracks.json")
+                or {}
+            )
         return self._ball_tracks
 
     @property
     def camera_poses(self) -> dict[str, dict]:
         if self._camera_poses is None:
-            self._camera_poses = self._load_json("stage1", "camera_poses.json") or {}
+            self._camera_poses = (
+                self._load_json("field_registration", "camera_poses.json")
+                or self._load_json("stage1", "camera_poses.json")
+                or {}
+            )
         return self._camera_poses
 
     @property
     def team_assignments(self) -> dict[str, str]:
         if self._team_assignments is None:
             self._team_assignments = (
-                self._load_json("stage2", "team_assignments.json") or {}
+                self._load_json("tracking", "team_assignments.json")
+                or self._load_json("stage2", "team_assignments.json")
+                or {}
             )
             # Apply goalkeeper team correction: goalkeepers are often
             # misclassified by color-based KMeans because their jersey
@@ -138,8 +161,27 @@ class MatchContext:
     @property
     def refined_tracks(self) -> dict[str, list[dict]] | None:
         if self._refined_tracks is None:
-            self._refined_tracks = self._load_json("stage3", "tracks_refined.json")
+            self._refined_tracks = (
+                self._load_json("post_processing", "tracks_refined.json")
+                or self._load_json("stage3", "tracks_refined.json")
+            )
         return self._refined_tracks
+
+    @property
+    def events(self) -> list[dict]:
+        """Load detected events from the event_detection stage output."""
+        if self._events is None:
+            for stage in ("event_detection", "goal_detection"):
+                path = self.pipeline_output_dir / stage / "events.json"
+                if path.exists():
+                    with open(path) as f:
+                        data = json.load(f)
+                    if isinstance(data, list):
+                        self._events = data
+                        break
+            if self._events is None:
+                self._events = []
+        return self._events
 
     # ------------------------------------------------------------------
     # Convenience accessors
@@ -221,7 +263,6 @@ class MatchContext:
     def _load_json(self, stage: str, filename: str) -> dict | None:
         path = self.pipeline_output_dir / stage / filename
         if not path.exists():
-            logger.warning("File not found: %s", path)
             return None
         with open(path) as f:
             return json.load(f)
