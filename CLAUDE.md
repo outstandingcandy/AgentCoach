@@ -45,7 +45,7 @@ pipeline:
     - post_processing
 ```
 
-Available stages: `shot_detection`, `field_registration`, `tracking`, `post_processing`, `goal_detection`.
+Available stages: `shot_detection`, `field_registration`, `tracking`, `post_processing`, `event_detection`, `goal_detection`.
 
 ```python
 from goalinsight import Pipeline
@@ -77,9 +77,10 @@ post_processing (refinement.py)
   Input: tracking/tracks.json + track_features.json
   Output: tracks_refined.json, final_track_summaries.json, statistics.json
     ↓
-goal_detection (goal_detection.py)
-  Input: tracking/ball_tracks.json + field_registration/camera_poses.json
-  Output: goals.json
+event_detection (events/)
+  Input: tracking/ (ball_tracks.json, tracks.json, team_assignments.json) + field_registration/camera_poses.json
+  Output: events.json (all events), goals.json (backward compat)
+  Detectors: possession → pass, shot, carry, defensive (dependency-ordered)
 ```
 
 ### Field Registration: Calibration Backends
@@ -117,7 +118,25 @@ Input uses 115 SoccerNet-GSR keypoints; internal processing uses 57 PnLCalib key
 - **Ball detector** (`tracking/ball_detector.py`): YOLO class 32 (sports ball), supports SAHI sliced inference, size/pitch filtering.
 - **Ball tracker** (`tracking/ball_tracker.py`): ByteTrack/BOTSORT with center-distance matching (better than IoU for tiny bboxes).
 - **3D trajectory** (`tracking/ball_trajectory.py`): Parabolic physics model `P(t) = [x0+vx*dt, y0+vy*dt, z0+vz*dt-0.5*g*dt^2]`, sliding window fitting. Depth via ball pixel diameter (FIFA 0.22m) or ray-z search fallback.
-- **Goal detection** (`goal_detection.py`): Detects goal-line crossings at x=+-52.5m, validates within goal width (|y|<=3.66m) and height (z<=2.44m), deduplicates within 2s.
+- **Goal detection** (`goal_detection.py`): DEPRECATED — delegates to `events` module. Kept for backward compatibility.
+
+### Event Detection (`events/`)
+
+Config-driven event detection framework. Detectors run in dependency order (possession first).
+
+- **Possession** (`detectors/possession.py`): Foundation state machine. Tracks ball-player proximity over consecutive frames.
+- **Pass** (`detectors/pass_detector.py`): Detects passes from possession transitions with ball speed jumps. Classifies successful/failed.
+- **Shot** (`detectors/shot.py`): Detects shots on goal via ball speed + trajectory toward goal. Subsumes goal detection. Outcome: Goal, Saved, Off_Target, Blocked.
+- **Carry** (`detectors/carry.py`): Detects dribbles with forward progress during sustained possession.
+- **Defensive** (`detectors/defensive.py`): Detects tackles (possession change + deflection) and interceptions (failed pass + possession gain).
+
+Key classes:
+- `EventOrchestrator`: topo-sorts detectors by `depends_on`, runs them in order
+- `EventDetectionContext`: shared state passed to all detectors (ball states, possession spans)
+- `MatchEvent`: universal event dataclass with `event_type`, `frame`, `player_id`, `team_id`, `metadata`
+- `DETECTOR_REGISTRY`: maps detector names to classes (like pipeline's STAGE_REGISTRY)
+
+Config: `events.detectors` lists enabled detectors; per-detector thresholds under `events.<name>`.
 
 ## Configuration
 
@@ -131,6 +150,8 @@ YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merg
 - `reid.backend`: `osnet` | `prtreid`
 - `team_classification.backend`: `kmeans` | `tracklet`
 - `jersey_recognition.backend`: `qwen` | `mmocr`
+- `events.detectors`: list of enabled detectors (`possession`, `pass`, `shot`, `carry`, `defensive`)
+- `events.<detector>.*`: per-detector thresholds (distance, speed, angle, etc.)
 
 ## Testing
 

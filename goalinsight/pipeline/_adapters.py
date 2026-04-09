@@ -72,8 +72,8 @@ class TrackingStage(Stage):
         from ..tracking.orchestrator import run_tracking
 
         out = ctx.stage_dir(self.name)
-        cal_dir = ctx.stage_dirs.get("field_registration")
-        if cal_dir is not None and not cal_dir.exists():
+        cal_dir = ctx.stage_dir("field_registration")
+        if not cal_dir.exists():
             cal_dir = None
         if cal_dir is None:
             print("  Warning: No field registration output found, running without calibration")
@@ -91,8 +91,8 @@ class PostProcessingStage(Stage):
     def run(self, ctx: PipelineContext) -> dict[str, Any]:
         from ..refinement import run_refinement
 
-        tracking_dir = ctx.stage_dirs.get("tracking")
-        if tracking_dir is None or not tracking_dir.exists():
+        tracking_dir = ctx.stage_dir("tracking")
+        if not tracking_dir.exists():
             raise RuntimeError("Post-processing requires tracking output")
         out = ctx.stage_dir(self.name)
         return run_refinement(tracking_dir, out, ctx.config)
@@ -102,35 +102,78 @@ class PostProcessingStage(Stage):
 
 
 @register_stage
+class EventDetectionStage(Stage):
+    name = "event_detection"
+    description = "Event Detection (Possession, Passes, Shots, Goals, Carries, Tackles)"
+
+    def run(self, ctx: PipelineContext) -> dict[str, Any]:
+        from ..events import EventType, detect_events_from_dirs
+
+        tracking_dir = ctx.stage_dir("tracking")
+        cal_dir = ctx.stage_dir("field_registration")
+        out = ctx.stage_dir(self.name)
+        out.mkdir(parents=True, exist_ok=True)
+
+        if not (tracking_dir / "ball_tracks.json").exists():
+            print("  Warning: ball_tracks.json not found, skipping event detection")
+            return {"total_events": 0}
+
+        events = detect_events_from_dirs(
+            tracking_dir=tracking_dir,
+            calibration_dir=cal_dir if cal_dir.exists() else None,
+            config=ctx.config,
+        )
+
+        # Write events.json
+        with open(out / "events.json", "w") as f:
+            json.dump([e.to_dict() for e in events], f, indent=2, default=str)
+
+        # Also write goals.json for backward compatibility
+        goals = [e.to_dict() for e in events if e.event_type == EventType.GOAL]
+        with open(out / "goals.json", "w") as f:
+            json.dump(goals, f, indent=2, default=str)
+
+        by_type = {}
+        for e in events:
+            by_type[e.event_type.value] = by_type.get(e.event_type.value, 0) + 1
+
+        return {"total_events": len(events), "by_type": by_type}
+
+    def should_skip(self, ctx: PipelineContext) -> bool:
+        return ctx.skip_existing and (ctx.stage_dir(self.name) / "events.json").exists()
+
+
+@register_stage
 class GoalDetectionStage(Stage):
+    """Backward-compatible goal detection stage — delegates to event detection."""
+
     name = "goal_detection"
     description = "Goal Detection"
 
     def run(self, ctx: PipelineContext) -> dict[str, Any]:
-        from ..goal_detection import detect_goals
+        from ..events import EventType, detect_events_from_dirs
 
-        tracking_dir = ctx.stage_dirs.get("tracking")
-        if tracking_dir is None:
-            tracking_dir = ctx.output_dir / "tracking"
+        tracking_dir = ctx.stage_dir("tracking")
+        cal_dir = ctx.stage_dir("field_registration")
+        out = ctx.stage_dir(self.name)
+        out.mkdir(parents=True, exist_ok=True)
 
-        ball_path = tracking_dir / "ball_tracks.json"
-        if not ball_path.exists():
+        if not (tracking_dir / "ball_tracks.json").exists():
             print("  Warning: ball_tracks.json not found, skipping goal detection")
             return {"goals_detected": 0, "goals": []}
 
-        with open(ball_path) as f:
-            ball_tracks = json.load(f)
+        # Run only possession + shot detectors for goal detection
+        goal_config = dict(ctx.config) if ctx.config else {}
+        goal_config.setdefault("events", {})["detectors"] = ["possession", "shot"]
 
-        cal_dir = ctx.stage_dirs.get("field_registration")
-        camera_poses = None
-        if cal_dir and (cal_dir / "camera_poses.json").exists():
-            with open(cal_dir / "camera_poses.json") as f:
-                camera_poses = json.load(f)
+        events = detect_events_from_dirs(
+            tracking_dir=tracking_dir,
+            calibration_dir=cal_dir if cal_dir.exists() else None,
+            config=goal_config,
+        )
 
-        goals = detect_goals(ball_tracks=ball_tracks, camera_poses=camera_poses)
+        goals = [e.to_dict() for e in events if e.event_type == EventType.GOAL]
 
-        out = ctx.stage_dir(self.name)
-        out.mkdir(parents=True, exist_ok=True)
         with open(out / "goals.json", "w") as f:
             json.dump(goals, f, indent=2, default=str)
 
