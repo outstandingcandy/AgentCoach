@@ -135,7 +135,7 @@ ball_detection:
   pass1_confidence_threshold: 0.5         # High threshold for anchor detections in pass 1
   crop_size: 300                          # Crop region size around interpolated position (pixels)
   crop_enlarge_to: 640                    # Resize crop to this before detection
-  max_interpolation_gap: 30               # Max frames to interpolate across (skip if gap is larger)
+  max_interpolation_gap: 300              # Max frames to interpolate across (skip if gap is larger)
   pass1_batch_size: 8                     # Batch size for pass 1 GPU inference (full-res, needs more VRAM)
   pass2_batch_size: 32                    # Batch size for pass 2 GPU inference (640x640 crops, lighter)
   # Field-space trajectory filtering (applied after tracking)
@@ -310,29 +310,31 @@ events:
     - carry
     - defensive
   possession:
-    distance_threshold: 1.5         # meters — max player-ball distance for possession
-    min_consecutive_seconds: 1.0    # seconds — minimum duration to confirm possession
-    speed_break_threshold: 15.0     # m/s — ball speed above which possession breaks
+    distance_threshold: 3.0         # meters — max player-ball distance for possession (wider for tracking noise)
+    min_consecutive_seconds: 0.5    # seconds — minimum duration to confirm possession (catch short touches)
+    speed_break_threshold: 20.0     # m/s — ball speed above which possession breaks (allow fast dribbles)
   pass:
-    pass_speed_threshold: 5.0       # m/s — minimum ball speed to qualify as a pass
-    max_transit_seconds: 1.0        # seconds — max gap between possession spans
+    pass_speed_threshold: 3.0       # m/s — minimum ball speed to qualify as a pass (catch short passes)
+    max_transit_seconds: 3.0        # seconds — max gap between possession spans (allow longer aerial passes)
   shot:
-    shot_speed_threshold: 10.0      # m/s — minimum ball speed for a shot
+    shot_speed_threshold: 8.0       # m/s — minimum ball speed for a shot (filter slow crosses)
     max_angle_to_goal: 30.0         # degrees — max angle deviation from goal
     min_confidence: 0.15            # minimum ball detection confidence
-    shooter_lookback_seconds: 3.0   # seconds — how far back to look for shooter
+    shooter_lookback_seconds: 5.0   # seconds — how far back to look for shooter (wider window)
     dedup_gap_seconds: 2.0          # seconds — deduplication window
-    approach_window_seconds: 1.0    # seconds — approach direction check window
+    approach_window_seconds: 1.5    # seconds — approach direction check window
     max_frame_gap_seconds: 1.0      # seconds — max gap between consecutive ball obs
+    approach_margin: 3.0            # meters — detect shots when ball is within this distance of goal line
+    tracking_lost_seconds: 1.0      # seconds — gap in tracking that indicates ball left the field
   carry:
-    min_duration_seconds: 2.0       # seconds — minimum possession duration
-    min_total_distance: 5.0         # meters — total displacement threshold
-    min_forward_distance: 3.0       # meters — forward progress threshold
+    min_duration_seconds: 1.0       # seconds — minimum possession duration (catch shorter carries)
+    min_total_distance: 3.0         # meters — total displacement threshold
+    min_forward_distance: 2.0       # meters — forward progress threshold
   defensive:
-    tackle_proximity: 2.0           # meters — defender must be this close to ball
-    tackle_deflection_angle: 45.0   # degrees — ball direction change threshold
-    tackle_max_gap_seconds: 0.5     # seconds — max gap between possession spans for tackle
-    deflection_window_seconds: 0.3  # seconds — window for computing ball deflection angle
+    tackle_proximity: 3.0           # meters — defender must be this close to ball
+    tackle_deflection_angle: 30.0   # degrees — ball direction change threshold (more sensitive)
+    tackle_max_gap_seconds: 1.0     # seconds — max gap between possession spans for tackle
+    deflection_window_seconds: 0.5  # seconds — window for computing ball deflection angle
 
 # Pipeline orchestration
 # Available stages: shot_detection, field_registration, tracking, post_processing, event_detection, goal_detection
