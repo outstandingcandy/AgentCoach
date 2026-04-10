@@ -44,11 +44,24 @@ class ShotDetector(BaseEventDetector):
         max_gap_sec = cfg.get("max_frame_gap_seconds", 1.0)
 
         half_length = ctx.pitch_length / 2.0
+        approach_margin = cfg.get("approach_margin", 3.0)
+        tracking_lost_sec = cfg.get("tracking_lost_seconds", 1.0)
 
-        # Step 1: Detect goal-line crossings (from existing goal_detection logic)
+        # Step 1a: Detect goal-line crossings
         crossings = _detect_crossings(
-            ctx.ball_states, half_length, ctx.fps, max_gap_sec
+            ctx.ball_states, half_length, ctx.fps, max_gap_sec,
+            min_speed=shot_speed_min,
         )
+
+        # Step 1b: Detect approach shots (ball near goal + tracking lost or reversal)
+        approach_shots = _detect_approach_shots(
+            ctx.ball_states, half_length, ctx.fps,
+            min_speed=shot_speed_min,
+            approach_margin=approach_margin,
+            tracking_lost_sec=tracking_lost_sec,
+        )
+        crossings.extend(approach_shots)
+        crossings.sort(key=lambda c: c["frame"])
 
         # Step 2: Validate crossings and classify outcomes
         events: list[MatchEvent] = []
@@ -159,6 +172,7 @@ def _detect_crossings(
     half_length: float,
     fps: float,
     max_gap_seconds: float = 1.0,
+    min_speed: float = 5.0,
 ) -> list[dict]:
     """Find frames where ball crosses a goal line."""
     crossings: list[dict] = []
@@ -174,7 +188,7 @@ def _detect_crossings(
         dx = curr.position[0] - prev.position[0]
         dy = curr.position[1] - prev.position[1]
         speed = math.hypot(dx, dy) / max(dt, 1e-6)
-        if speed > 50.0:
+        if speed > 50.0 or speed < min_speed:
             continue
 
         prev_x = prev.position[0]
@@ -199,6 +213,229 @@ def _detect_crossings(
                     crossings.append(c)
 
     return crossings
+
+
+def _detect_approach_shots(
+    ball_states: list[BallState],
+    half_length: float,
+    fps: float,
+    min_speed: float = 5.0,
+    approach_margin: float = 3.0,
+    tracking_lost_sec: float = 1.0,
+) -> list[dict]:
+    """Detect shots where ball approaches goal but tracking is lost before crossing.
+
+    Two modes:
+    1. **Fast approach**: ball near goal at >= min_speed, then tracking lost or reversal.
+    2. **Sustained approach**: ball consistently moving toward goal over multiple frames
+       at >= 2.0 m/s, reaches within approach_margin of goal line, and tracking is lost
+       for an extended period (>= 5× tracking_lost_sec). This catches slower placed shots
+       where tracking loss confirms the ball entered/hit the goal area.
+    """
+    if len(ball_states) < 2:
+        return []
+
+    crossings: list[dict] = []
+    threshold_x = half_length - approach_margin
+    tracking_lost_frames = int(tracking_lost_sec * fps)
+    # Sustained approach requires much longer tracking loss to avoid false positives
+    sustained_lost_frames = int(5.0 * tracking_lost_sec * fps)
+    sustained_min_speed = 2.0  # m/s — minimum for sustained approach
+    sustained_min_obs = 4  # Minimum consecutive observations approaching goal
+
+    for i in range(1, len(ball_states)):
+        prev = ball_states[i - 1]
+        curr = ball_states[i]
+
+        frame_gap = curr.frame - prev.frame
+        dt = frame_gap / fps
+        if dt <= 0 or dt > 2.0:
+            continue
+
+        dx = curr.position[0] - prev.position[0]
+        dy = curr.position[1] - prev.position[1]
+        speed = math.hypot(dx, dy) / max(dt, 1e-6)
+        # Reject impossible speeds
+        if speed > 50.0:
+            continue
+
+        curr_x = curr.position[0]
+        curr_y = curr.position[1]
+
+        # Require reasonable confidence
+        if curr.confidence < 0.15:
+            continue
+
+        # Determine which goal and whether we're in the approach zone
+        for goal_sign, goal_side in [(+1, "right"), (-1, "left")]:
+            # Ball must be in the approach zone and moving toward this goal
+            in_zone = (goal_sign * curr_x > threshold_x
+                       and goal_sign * curr_x <= half_length)
+            moving_toward = goal_sign * dx > 0
+            if not (in_zone and moving_toward):
+                continue
+
+            if speed >= min_speed:
+                # Fast approach: normal trigger check
+                is_shot = _check_approach_trigger(
+                    ball_states, i, tracking_lost_frames, fps, min_speed, goal_sign
+                )
+            elif speed >= sustained_min_speed:
+                # Sustained approach: check consecutive approach + long tracking loss
+                is_shot = _check_sustained_approach(
+                    ball_states, i, sustained_lost_frames, fps,
+                    sustained_min_speed, sustained_min_obs, goal_sign
+                )
+            else:
+                is_shot = False
+
+            if is_shot:
+                crossings.append({
+                    "frame": curr.frame,
+                    "goal_side": goal_side,
+                    "cross_y": curr_y,
+                    "cross_height": curr.height,
+                    "prev": prev,
+                    "curr": curr,
+                    "speed": speed,
+                    "approach_shot": True,
+                })
+
+    return crossings
+
+
+def _check_approach_trigger(
+    ball_states: list[BallState],
+    idx: int,
+    tracking_lost_frames: int,
+    fps: float,
+    min_speed: float,
+    sign: int,
+) -> bool:
+    """Check if an approach shot triggers at index `idx`.
+
+    Looks ahead a few frames: if tracking is lost soon after (even if
+    a smoothed frame sits in between), or ball reverses sharply, it's a shot.
+    `sign` is +1 for right goal, -1 for left goal.
+
+    Args:
+        ball_states: Full list of ball states.
+        idx: Current index in ball_states.
+        sign: +1 for right goal approach, -1 for left goal approach.
+    """
+    curr = ball_states[idx]
+
+    # Last observation in the entire sequence
+    if idx >= len(ball_states) - 1:
+        return True
+
+    # Look ahead up to 3 entries to find where tracking truly ends.
+    # Important: check temporal gaps between consecutive ball_states — a large
+    # frame gap between adjacent entries IS the tracking loss we're looking for.
+    lookahead = min(3, len(ball_states) - 1 - idx)
+    last_near_goal = idx
+    for j in range(1, lookahead + 1):
+        nxt = ball_states[idx + j]
+        prev_state = ball_states[idx + j - 1]
+        # If there's a large temporal gap, tracking was lost at prev_state
+        if nxt.frame - prev_state.frame > tracking_lost_frames:
+            break
+        # Still near the goal zone (within approach_margin tolerance)
+        if sign * nxt.position[0] > sign * curr.position[0] - 3.0:
+            last_near_goal = idx + j
+        else:
+            break
+
+    # Check if tracking is lost after the last near-goal frame
+    last_state = ball_states[last_near_goal]
+    if last_near_goal >= len(ball_states) - 1:
+        return True
+    gap_after = ball_states[last_near_goal + 1].frame - last_state.frame
+    if gap_after > tracking_lost_frames:
+        return True
+
+    # Check sharp reversal: ball reverses direction fast
+    nxt = ball_states[idx + 1]
+    nxt_dt = (nxt.frame - curr.frame) / fps
+    if nxt_dt > 0:
+        nxt_dx = nxt.position[0] - curr.position[0]
+        nxt_speed_x = nxt_dx / nxt_dt
+        # sign=+1: was going +x, reversal means nxt_speed_x < -min_speed
+        # sign=-1: was going -x, reversal means nxt_speed_x > +min_speed
+        if sign * nxt_speed_x < -min_speed:
+            return True
+
+    return False
+
+
+def _check_sustained_approach(
+    ball_states: list[BallState],
+    idx: int,
+    tracking_lost_frames: int,
+    fps: float,
+    min_speed: float,
+    min_consecutive: int,
+    sign: int,
+) -> bool:
+    """Check if the ball has been consistently approaching the goal and tracking is then lost.
+
+    This catches slower shots (placed shots, deflections rolling in) where the
+    instantaneous speed is below the normal shot threshold but the ball is
+    clearly heading toward goal over multiple frames.
+
+    Requires:
+    - At least `min_consecutive` observations where ball moves toward the goal
+    - Average approach speed >= min_speed
+    - Tracking lost for >= tracking_lost_frames after the last observation
+    """
+    # Count consecutive approach observations looking backwards
+    approach_count = 0
+    total_dx = 0.0
+    total_dt = 0.0
+
+    for j in range(idx, max(idx - 10, 0), -1):
+        if j == 0:
+            break
+        curr_bs = ball_states[j]
+        prev_bs = ball_states[j - 1]
+        dt = (curr_bs.frame - prev_bs.frame) / fps
+        if dt <= 0 or dt > 2.0:
+            break
+        dx = curr_bs.position[0] - prev_bs.position[0]
+        # Must be moving toward the goal (sign=+1 → dx>0, sign=-1 → dx<0)
+        if sign * dx <= 0:
+            break
+        approach_count += 1
+        total_dx += abs(dx)
+        total_dt += dt
+
+    if approach_count < min_consecutive:
+        return False
+
+    avg_speed = total_dx / max(total_dt, 1e-6)
+    if avg_speed < min_speed:
+        return False
+
+    # Require tracking to be lost for an extended period after
+    curr = ball_states[idx]
+    lookahead = min(3, len(ball_states) - 1 - idx)
+    last_near_goal = idx
+    for j in range(1, lookahead + 1):
+        nxt = ball_states[idx + j]
+        prev_state = ball_states[idx + j - 1]
+        # Large temporal gap = tracking already lost
+        if nxt.frame - prev_state.frame > tracking_lost_frames:
+            break
+        if sign * nxt.position[0] > sign * curr.position[0] - 3.0:
+            last_near_goal = idx + j
+        else:
+            break
+
+    if last_near_goal >= len(ball_states) - 1:
+        return True
+
+    gap_after = ball_states[last_near_goal + 1].frame - ball_states[last_near_goal].frame
+    return gap_after >= tracking_lost_frames
 
 
 def _interpolate_crossing(
@@ -246,20 +483,21 @@ def _classify_crossing(
     goal_x = half_length if goal_side == "right" else -half_length
     sign = 1 if goal_side == "right" else -1
 
-    # Check approach direction
-    approach_window_frames = approach_window_seconds * fps
-    approach_count = 0
-    for bs in ball_states:
-        if bs.frame > frame:
-            break
-        if bs.frame < frame - approach_window_frames:
-            continue
-        dist_to_goal = sign * (goal_x - bs.position[0])
-        if 0 < dist_to_goal < 10:
-            approach_count += 1
+    # Check approach direction (skip for approach shots — already validated)
+    if not crossing.get("approach_shot"):
+        approach_window_frames = approach_window_seconds * fps
+        approach_count = 0
+        for bs in ball_states:
+            if bs.frame > frame:
+                break
+            if bs.frame < frame - approach_window_frames:
+                continue
+            dist_to_goal = sign * (goal_x - bs.position[0])
+            if 0 < dist_to_goal < 10:
+                approach_count += 1
 
-    if approach_count < 2:
-        return None
+        if approach_count < 2:
+            return None
 
     # Determine outcome
     within_width = abs(cross_y) <= GOAL_HALF_WIDTH

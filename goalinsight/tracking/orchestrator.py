@@ -29,7 +29,7 @@ from ..utils.config import (
     get_process_fps_from_config,
     FrameSampler,
 )
-from ..utils.factories import get_reid_extractor, get_team_classifier
+from ..utils.factories import get_reid_extractor, get_team_classifier, get_jersey_recognizer
 from ..utils.serialization import json_default as _json_default_impl, sanitize_for_json
 from ..utils.prefetcher import FramePrefetcher
 from .detector import PlayerDetector
@@ -241,8 +241,22 @@ def run_tracking(
     pitch_width = phys_config.get("pitch_width", 68.0)
     gk_detector = GoalkeeperDetector(pitch_length=pitch_length, pitch_width=pitch_width)
 
+    # Initialize jersey recognizer (if enabled)
+    jr_config = config.get("jersey_recognition", {})
+    jersey_recognition_enabled = jr_config.get("enabled", False)
+    jersey_recognizer = None
+    jersey_aggregator = None
+    if jersey_recognition_enabled:
+        jr_backend = jr_config.get("backend", "qwen_vl")
+        print(f"Stage 2: Initializing jersey recognizer ({jr_backend})...")
+        jersey_recognizer = get_jersey_recognizer(config)
+        from ..jersey.qwen_recognizer import JerseyNumberAggregator
+        jersey_aggregator = JerseyNumberAggregator(
+            window_size=jr_config.get("aggregation_window", 10)
+        )
+
     # Update module-level pitch dimensions for filtering
-    import goalinsight.stage2._pitch_projection as _pp_mod
+    import goalinsight.tracking.pitch_projection as _pp_mod
     _pp_mod._PITCH_HALF_LENGTH = pitch_length / 2
     _pp_mod._PITCH_HALF_WIDTH = pitch_width / 2
 
@@ -304,6 +318,7 @@ def run_tracking(
     track_positions = {}  # track_id -> list of positions
     track_history = {}  # For visualization
     team_assignments = {}  # track_id -> team
+    jersey_detections = {}  # track_id -> list of (jersey_number, confidence)
     tentative_buffer = {}  # track_id -> list of (frame_idx, track_dict) for backfill
 
     # Ball tracking storage
@@ -361,7 +376,6 @@ def run_tracking(
         _cap.release()
 
     _frame_indices_list = list(sampler)
-    _precomputed_frames: dict[int, np.ndarray] = {}
     _precomputed_dets: dict[int, list] = {}
 
     if unified_det is not None:
@@ -398,7 +412,6 @@ def run_tracking(
 
                 # Player pipeline: apply conf threshold post-hoc
                 players = [d for d in players if d["confidence"] >= player_conf_thresh]
-                _precomputed_frames[fidx] = batch_frames[i]
                 _precomputed_dets[fidx] = players
 
                 # Ball pipeline: apply size filter
@@ -479,7 +492,6 @@ def run_tracking(
             _batch_fidxs, _batch_frames = _det_item
             _batch_dets_list = detector.detect_batch(_batch_frames)
             for _i, _fidx in enumerate(_batch_fidxs):
-                _precomputed_frames[_fidx] = _batch_frames[_i]
                 _precomputed_dets[_fidx] = _batch_dets_list[_i]
             _det_pbar.update(len(_batch_fidxs))
         _det_pbar.close()
@@ -573,13 +585,19 @@ def run_tracking(
     # Team classification will be done AFTER all tracking is complete
     # This ensures we use trajectory-averaged features for robust clustering
 
-    # Pre-batch YOLO detection + filtering + crop/color extraction.
+    # Crop extraction + feature computation.
+    # When fused detection was used, reuse _precomputed_dets (skip redundant YOLO).
     # Frames are NOT cached (saves ~40GB for long videos); rendering re-reads via FramePrefetcher.
     import queue as _queue2
+    _has_precomputed = len(_precomputed_dets) > 0
     yolo_batch_size = config.get("detection", {}).get("batch_size", 32)
     _frame_indices_list = list(sampler)
 
-    print(f"  Pre-detecting players: {len(_frame_indices_list)} frames, batch_size={yolo_batch_size}")
+    if _has_precomputed:
+        print(f"  Extracting crops from {len(_frame_indices_list)} frames "
+              f"(reusing {len(_precomputed_dets)} precomputed detections)")
+    else:
+        print(f"  Pre-detecting players: {len(_frame_indices_list)} frames, batch_size={yolo_batch_size}")
     _det_read_q: _queue2.Queue = _queue2.Queue(maxsize=3)
     _det_reader = threading.Thread(
         target=_batch_reader_full,
@@ -593,21 +611,34 @@ def run_tracking(
     _crops_per_frame: dict[int, int] = {}
     _det_color_hists: dict[int, list] = {}   # frame_idx -> per-detection color hists
     _det_saturations: dict[int, list] = {}   # frame_idx -> per-detection saturations
+    _det_jersey_numbers: dict[int, list] = {}  # frame_idx -> per-detection (number, conf)
     _precomputed_ball_dets: dict[int, list] = {}  # non-two-pass ball detections
 
-    _det_pbar = tqdm(total=len(_frame_indices_list), desc="  YOLO batch detect")
+    _det_pbar = tqdm(total=len(_frame_indices_list),
+                     desc="  Crop extract" if _has_precomputed else "  YOLO batch detect")
     while True:
         _det_item = _det_read_q.get()
         if _det_item is None:
             break
         _batch_fidxs, _batch_frames = _det_item
-        _batch_dets_list = detector.detect_batch(_batch_frames)
+
+        # Run YOLO only when we don't have precomputed detections
+        _batch_dets_list = None
+        if not _has_precomputed:
+            _batch_dets_list = detector.detect_batch(_batch_frames)
+
         for _i, _fidx in enumerate(_batch_fidxs):
             _frame = _batch_frames[_i]
 
+            # Get raw detections: from precomputed (fused pass) or fresh YOLO
+            if _has_precomputed:
+                raw_dets = _precomputed_dets.get(_fidx, [])
+            else:
+                raw_dets = _batch_dets_list[_i]
+
             # Filter detections by size and pitch
             detections = detector.filter_by_size(
-                _batch_dets_list[_i], min_height=25, max_height=350,
+                raw_dets, min_height=25, max_height=350,
                 min_aspect_ratio=0.25, max_aspect_ratio=1.0,
             )
             _H_world2img = homographies.get(_fidx)
@@ -645,6 +676,14 @@ def run_tracking(
             _det_color_hists[_fidx] = frame_hists
             _det_saturations[_fidx] = frame_sats
 
+            # Jersey number recognition (batched per frame)
+            if jersey_recognizer and n_crops > 0:
+                frame_crops = _all_crops[-n_crops:]
+                jr_results = jersey_recognizer.recognize_batch(frame_crops)
+                _det_jersey_numbers[_fidx] = jr_results
+            elif jersey_recognizer:
+                _det_jersey_numbers[_fidx] = []
+
             # Ball detection (non-two-pass mode)
             if ball_detector and not two_pass_enabled:
                 _ball_dets = ball_detector.detect(_frame)
@@ -654,7 +693,8 @@ def run_tracking(
         _det_pbar.update(len(_batch_fidxs))
     _det_pbar.close()
     _det_reader.join()
-    cap.release()
+    # Free precomputed detections (already filtered and stored in _filtered_dets)
+    del _precomputed_dets
 
     print(f"  Pre-detected {len(_filtered_dets)} frames")
 
@@ -801,6 +841,15 @@ def run_tracking(
                     track_color_hists[track_id].append(_hists[_det_idx])
                 if _det_idx < len(_sats) and _sats[_det_idx] is not None:
                     track_saturations.setdefault(track_id, []).append(_sats[_det_idx])
+                # Accumulate jersey number predictions per track
+                if jersey_aggregator:
+                    _jrs = _det_jersey_numbers.get(frame_idx, [])
+                    if _det_idx < len(_jrs):
+                        jnum, jconf = _jrs[_det_idx]
+                        jersey_aggregator.add_prediction(track_id, jnum, jconf)
+                        jersey_detections.setdefault(track_id, []).append(
+                            {"number": jnum, "confidence": jconf}
+                        )
 
             if pitch_pos:
                 track_positions[track_id].append(pitch_pos)
@@ -813,6 +862,12 @@ def run_tracking(
             elif pitch_pos:
                 role = gk_detector.classify_role(pitch_pos, team)
 
+            # Get current jersey number consensus for this track
+            jersey_number = None
+            jersey_conf = 0.0
+            if jersey_aggregator:
+                jersey_number, jersey_conf = jersey_aggregator.get_consensus(track_id)
+
             track_info = {
                 "track_id": track_id,
                 "bbox": track["bbox"],
@@ -820,6 +875,8 @@ def run_tracking(
                 "pitch_position": pitch_pos,
                 "team": team,
                 "role": role,
+                "jersey_number": jersey_number,
+                "jersey_confidence": round(jersey_conf, 3),
             }
             frame_tracks.append(track_info)
 
@@ -858,7 +915,7 @@ def run_tracking(
         # This allows using trajectory-averaged features for better clustering
 
     # Free pre-computed detection/feature caches
-    del _det_color_hists, _det_saturations, _precomputed_ball_dets
+    del _det_color_hists, _det_saturations, _det_jersey_numbers, _precomputed_ball_dets
 
     # Save ball tracking debug log
     if ball_debug_log:
@@ -936,7 +993,7 @@ def run_tracking(
             scored_tids.sort(reverse=True)
 
             merge_max_dist = ball_config.get("field_filter", {}).get(
-                "merge_max_distance", 15.0
+                "merge_max_distance", 40.0
             )  # meters — max gap between new frame and nearest existing frame
 
             for _, tid in scored_tids:
@@ -979,9 +1036,13 @@ def run_tracking(
                 print(f"  Removed {n_outliers} merge outlier(s)")
 
             # Run BallTrajectory3D on all valid trajectories for 3D height estimation
+            # Uses batch fit_track() API: collects all observations per track,
+            # segments at kicks, classifies ground/airborne, fits one parabola
+            # per airborne segment with ground-contact anchors at boundaries.
             if ball_trajectory_3d:
                 for _, tid in scored_tids:
-                    ball_trajectory_3d.clear()
+                    # Collect all valid observations for this track
+                    track_obs = []
                     for fidx, track_dict in ball_track_histories[tid]:
                         if track_dict.get("predicted", False):
                             continue
@@ -989,20 +1050,20 @@ def run_tracking(
                             continue
                         if fidx not in all_ball_tracks:
                             continue  # removed by outlier filter
-                        time_sec = fidx / fps if fps > 0 else 0.0
-                        ball_bbox = tuple(track_dict["bbox"]) if "bbox" in track_dict else None
-                        ball_trajectory_3d.add_observation(
-                            time_sec, tuple(track_dict["center"]),
-                            camera_poses[fidx], bbox=ball_bbox,
-                        )
-                        traj_result = ball_trajectory_3d.estimate()
-                        if traj_result and not traj_result.get("rejected"):
-                            # Only update frames owned by this tid (avoid cross-track overwrites)
-                            if fidx in all_ball_tracks and all_ball_tracks[fidx].get("track_id") == tid:
-                                all_ball_tracks[fidx]["pitch_position"] = traj_result["pitch_position"]
-                                all_ball_tracks[fidx]["height"] = traj_result["height"]
-                                all_ball_tracks[fidx]["position_3d"] = traj_result["position_3d"]
-                                all_ball_tracks[fidx]["on_ground"] = traj_result["on_ground"]
+                        track_obs.append((fidx, tuple(track_dict["center"]), camera_poses[fidx]))
+
+                    if not track_obs:
+                        continue
+
+                    # Batch fit: segments at kicks, classifies ground/airborne
+                    traj_results = ball_trajectory_3d.fit_track(track_obs, fps)
+
+                    for fidx, traj_result in traj_results.items():
+                        if fidx in all_ball_tracks and all_ball_tracks[fidx].get("track_id") == tid:
+                            all_ball_tracks[fidx]["pitch_position"] = traj_result["pitch_position"]
+                            all_ball_tracks[fidx]["height"] = traj_result["height"]
+                            all_ball_tracks[fidx]["position_3d"] = traj_result["position_3d"]
+                            all_ball_tracks[fidx]["on_ground"] = traj_result["on_ground"]
 
             print(f"  Ball tracked in {len(all_ball_tracks)}/{len(_frame_indices_list)} frames "
                   f"(from {len(filtered_trajectories)} valid trajectories)")
@@ -1102,7 +1163,20 @@ def run_tracking(
         for tid in off_field_tracks:
             team_assignments.pop(tid, None)
 
-    # Update all tracks with final team assignments and roles
+    # Compute final jersey number assignments via voting
+    jersey_assignments = {}
+    if jersey_aggregator and jersey_detections:
+        print("  Computing jersey number consensus...")
+        for tid in jersey_detections:
+            jnum, jconf = jersey_aggregator.get_consensus(tid)
+            if jnum is not None:
+                jersey_assignments[tid] = {
+                    "number": jnum,
+                    "confidence": round(jconf, 3),
+                }
+        print(f"  Jersey numbers identified: {len(jersey_assignments)} tracks")
+
+    # Update all tracks with final team assignments, roles, and jersey numbers
     for frame_idx in all_tracks:
         all_tracks[frame_idx] = [
             track for track in all_tracks[frame_idx]
@@ -1117,6 +1191,10 @@ def run_tracking(
                 track["role"] = "referee"
             else:
                 track["role"] = "player"
+            # Final jersey number from voting consensus
+            jr = jersey_assignments.get(tid)
+            track["jersey_number"] = jr["number"] if jr else None
+            track["jersey_confidence"] = jr["confidence"] if jr else 0.0
 
     # Generate visualization with final team assignments
     print("\nGenerating visualization with final team assignments...")
@@ -1232,6 +1310,12 @@ def run_tracking(
 
     with open(output_dir / "team_assignments.json", "w") as f:
         json.dump(team_assignments, f, indent=2)
+
+    # Save jersey assignments
+    if jersey_assignments:
+        with open(output_dir / "jersey_assignments.json", "w") as f:
+            json.dump({str(k): v for k, v in jersey_assignments.items()}, f, indent=2)
+        print(f"  Saved jersey assignments for {len(jersey_assignments)} tracks")
 
     # Save track features for Stage 3
     serializable_features = {

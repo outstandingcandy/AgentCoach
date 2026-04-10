@@ -125,13 +125,26 @@ class EventDetectionStage(Stage):
         )
 
         # Write events.json
+        event_dicts = [e.to_dict() for e in events]
         with open(out / "events.json", "w") as f:
-            json.dump([e.to_dict() for e in events], f, indent=2, default=str)
+            json.dump(event_dicts, f, indent=2, default=str)
 
         # Also write goals.json for backward compatibility
         goals = [e.to_dict() for e in events if e.event_type == EventType.GOAL]
         with open(out / "goals.json", "w") as f:
             json.dump(goals, f, indent=2, default=str)
+
+        # Render annotated video
+        from ..events.visualization import render_event_video
+        render_event_video(
+            video_path=ctx.video_path,
+            events=event_dicts,
+            output_path=out / "events.mp4",
+            tracking_dir=tracking_dir if tracking_dir.exists() else None,
+            banner_duration_sec=ctx.config.get("events", {}).get(
+                "banner_duration_sec", 3.0
+            ) if ctx.config else 3.0,
+        )
 
         by_type = {}
         for e in events:
