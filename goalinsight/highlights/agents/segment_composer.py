@@ -46,6 +46,7 @@ class SegmentComposer(BaseClipComposer):
         padding_factor = closeup_cfg.get("padding_factor", 2.0)
         smooth_alpha = closeup_cfg.get("smooth_alpha", 0.3)
         medium_padding = closeup_cfg.get("medium_padding_factor", 4.0)
+        ball_padding = closeup_cfg.get("ball_padding_factor", 6.0)
 
         overlay_cfg = config.get("overlays", {})
         overlays_enabled = overlay_cfg.get("enabled", True)
@@ -63,6 +64,22 @@ class SegmentComposer(BaseClipComposer):
         prev_segment_last_frames: list[np.ndarray] = []
         # Per-frame metadata: source frame_id → crop info
         frame_metadata: dict[str, dict] = {}
+
+        # Effects config
+        effects_cfg = config.get("effects", {})
+        spotlight_enabled = effects_cfg.get("shooter_spotlight", False)
+        spotlight_color = tuple(effects_cfg.get("spotlight_color", [0, 215, 255]))
+        spotlight_alpha = effects_cfg.get("spotlight_alpha", 0.4)
+        trail_enabled = effects_cfg.get("ball_trail", False)
+        trail_length = effects_cfg.get("trail_length", 15)
+        trail_color = tuple(effects_cfg.get("trail_color", [0, 255, 255]))
+
+        # Pre-load data needed for effects
+        shooter_frame = event.metadata.get("shooter_frame", event.frame)
+        scorer_id = None
+        scorer_trajectory_full: list[dict] | None = None
+        if analyzed.key_players:
+            scorer_id = analyzed.key_players[0].get("track_id")
 
         for seg_idx, segment in enumerate(analyzed.segments):
             logger.info(
@@ -85,6 +102,12 @@ class SegmentComposer(BaseClipComposer):
                         segment.end_frame,
                     )
 
+            # Pre-load scorer trajectory for spotlight effect
+            if spotlight_enabled and segment.name == "celebration" and scorer_id is not None:
+                scorer_trajectory_full = ctx.get_player_trajectory(
+                    scorer_id, segment.start_frame, segment.end_frame,
+                )
+
             prev_state: SmoothState | None = None
             segment_frames: list[np.ndarray] = []
 
@@ -94,10 +117,23 @@ class SegmentComposer(BaseClipComposer):
                 end_frame=segment.end_frame + 1,
                 show_progress=False,
             ):
+                # --- Draw effects on raw frame before cropping ---
+                if trail_enabled and segment.name == "buildup" and frame_id >= shooter_frame:
+                    self._draw_ball_trail(
+                        frame, ctx, frame_id, shooter_frame, trail_length, trail_color,
+                    )
+
+                if spotlight_enabled and segment.name == "celebration" and scorer_trajectory_full:
+                    bbox = interpolate_bbox(scorer_trajectory_full, frame_id)
+                    if bbox is not None:
+                        self._draw_spotlight(frame, bbox, spotlight_color, spotlight_alpha)
+
                 rendered_frame, prev_state, crop_info = self._render_frame(
                     frame, frame_id, segment, trajectory,
                     out_w, out_h, out_size,
-                    padding_factor if segment.view_type == "closeup" else medium_padding,
+                    padding_factor if segment.view_type == "closeup"
+                    else ball_padding if segment.focus_target == "ball"
+                    else medium_padding,
                     smooth_alpha, prev_state,
                     overlays_enabled,
                 )
@@ -216,8 +252,23 @@ class SegmentComposer(BaseClipComposer):
                 if overlays_enabled and segment.overlays:
                     self._draw_overlays(rendered, segment.overlays)
                 return rendered, state, crop_info
-            # Fallback to wide if bbox not available
-            prev_state = None
+            # Track lost — hold last known crop position instead of jumping to wide
+            if prev_state is not None:
+                crop, state, crop_info = extract_closeup(
+                    frame,
+                    [prev_state.cx - prev_state.crop_w / 4,
+                     prev_state.cy - prev_state.crop_h / 4,
+                     prev_state.cx + prev_state.crop_w / 4,
+                     prev_state.cy + prev_state.crop_h / 4],
+                    output_size=closeup_size,
+                    padding_factor=padding_factor,
+                    prev_state=prev_state,
+                    smooth_alpha=0.0,  # no smoothing, just hold position
+                )
+                rendered = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                if overlays_enabled and segment.overlays:
+                    self._draw_overlays(rendered, segment.overlays)
+                return rendered, state, crop_info
 
         # Wide view — full frame, scale = 1.0
         rendered = frame
@@ -233,6 +284,67 @@ class SegmentComposer(BaseClipComposer):
             scale=w / out_w if out_w > 0 else 1.0,
         )
         return rendered, prev_state, wide_info
+
+    # ------------------------------------------------------------------
+    # Visual effects
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _draw_spotlight(
+        frame: np.ndarray,
+        bbox: list[float],
+        color: tuple[int, ...] = (0, 215, 255),
+        alpha: float = 0.4,
+    ) -> None:
+        """Draw a glowing ellipse at the player's feet (in-place)."""
+        x1, y1, x2, y2 = bbox
+        cx = int((x1 + x2) / 2)
+        cy = int(y2)  # bottom of bbox = feet
+        w = int((x2 - x1) * 0.6)
+        h = int(w * 0.3)
+        if w < 5 or h < 3:
+            return
+
+        overlay = frame.copy()
+        cv2.ellipse(overlay, (cx, cy), (w, h), 0, 0, 360, color, -1)
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
+
+    @staticmethod
+    def _draw_ball_trail(
+        frame: np.ndarray,
+        ctx: "MatchContext",
+        frame_id: int,
+        trail_start_frame: int,
+        trail_length: int = 15,
+        color: tuple[int, ...] = (0, 255, 255),
+    ) -> None:
+        """Draw a fading trajectory trail behind the ball (in-place)."""
+        # Collect recent ball pixel positions
+        start = max(trail_start_frame, frame_id - trail_length)
+        points: list[tuple[int, int]] = []
+        for f in range(start, frame_id + 1):
+            ball = ctx.get_ball_at_frame(f)
+            if ball is None:
+                continue
+            center = ball.get("center")
+            if center is None:
+                continue
+            points.append((int(center[0]), int(center[1])))
+
+        if len(points) < 2:
+            return
+
+        # Draw segments with increasing thickness and brightness
+        n = len(points)
+        for i in range(1, n):
+            progress = i / n  # 0→1, newer = brighter/thicker
+            thickness = max(1, int(progress * 4 + 1))
+            a = progress * 0.6
+            pt1 = points[i - 1]
+            pt2 = points[i]
+            overlay = frame.copy()
+            cv2.line(overlay, pt1, pt2, color, thickness, cv2.LINE_AA)
+            cv2.addWeighted(overlay, a, frame, 1 - a, 0, dst=frame)
 
     # ------------------------------------------------------------------
     # Overlays

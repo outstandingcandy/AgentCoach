@@ -19,13 +19,12 @@ class GoalEventDetector(BaseEventDetector):
     event_type = "goal"
 
     def detect(self, ctx: MatchContext, config: dict[str, Any]) -> list[Event]:
-        # Try pre-computed events.json first
         events_json = self._load_events_json(ctx)
         if events_json is not None:
             return self._from_events_json(events_json, ctx.fps)
 
-        # Fall back to running event detection directly
-        return self._run_detection(ctx, config)
+        logger.warning("No events.json found — run event_detection stage first")
+        return []
 
     def _load_events_json(self, ctx: MatchContext) -> list[dict] | None:
         """Try to load events.json from pipeline output."""
@@ -61,6 +60,9 @@ class GoalEventDetector(BaseEventDetector):
                         "crossbar_validation": meta.get(
                             "crossbar_validation"
                         ),
+                        "player_id": e.get("player_id"),
+                        "team_id": e.get("team_id"),
+                        "shooter_frame": meta.get("shooter_frame"),
                     },
                 )
             )
@@ -70,52 +72,3 @@ class GoalEventDetector(BaseEventDetector):
         )
         return events
 
-    def _run_detection(
-        self, ctx: MatchContext, config: dict[str, Any]
-    ) -> list[Event]:
-        """Run event detection directly and filter to goals."""
-        from goalinsight.events import EventType, detect_events_from_output
-
-        goal_cfg = config.get("goal_detection", {})
-        min_confidence = goal_cfg.get("min_confidence", 0.15)
-
-        events_config = {
-            "events": {
-                "detectors": ["possession", "shot"],
-                "shot": {"min_confidence": min_confidence},
-            }
-        }
-
-        raw_events = detect_events_from_output(
-            pipeline_output_dir=ctx.pipeline_output_dir,
-            config=events_config,
-            pitch_length=ctx.pitch_length,
-            pitch_width=ctx.pitch_width,
-            fps=ctx.fps,
-        )
-
-        events: list[Event] = []
-        for e in raw_events:
-            if e.event_type != EventType.GOAL:
-                continue
-            meta = e.metadata or {}
-            events.append(
-                Event(
-                    event_type="goal",
-                    frame=e.frame,
-                    timestamp=e.match_time,
-                    confidence=e.confidence,
-                    metadata={
-                        "goal_side": meta.get("goal_side"),
-                        "ball_position": meta.get("ball_position_3d"),
-                        "ball_pixel": meta.get("ball_pixel"),
-                        "ball_speed_mps": meta.get("ball_speed_mps", 0.0),
-                        "crossbar_validation": meta.get(
-                            "crossbar_validation"
-                        ),
-                    },
-                )
-            )
-
-        logger.info("GoalEventDetector found %d goal(s)", len(events))
-        return events

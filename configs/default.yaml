@@ -275,8 +275,17 @@ highlights:
   temporal:
     buildup_max_seconds: 10.0     # Max lookback for build-up start
     buildup_padding_seconds: 2.0  # Extra padding before build-up start
-    celebration_seconds: 4.0      # Duration of celebration segment
-    goal_moment_seconds: 2.0      # Duration of goal moment close-up
+    buildup_extension_seconds: 3.0 # Extend buildup past goal frame
+    buildup_view: medium          # wide / medium / closeup
+    celebration_seconds: 10.0     # Max celebration duration (or until track lost)
+    celebration_view: medium      # wide / medium / closeup
+  effects:
+    shooter_spotlight: true       # Glow ellipse under scorer's feet
+    spotlight_color: [0, 215, 255] # Gold (BGR)
+    spotlight_alpha: 0.4
+    ball_trail: true              # Trajectory trail after shot
+    trail_length: 15              # Frames of trail history
+    trail_color: [0, 255, 255]    # Yellow (BGR)
   overlays:
     enabled: true
     show_event_label: true

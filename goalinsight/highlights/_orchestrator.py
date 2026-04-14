@@ -91,8 +91,10 @@ class HighlightOrchestrator:
         output_dir: Path,
     ) -> list[Path]:
         detector_name = recipe.get("detector", "goal")
-        analyzer_name = recipe.get("analyzer", "scorer")
         composer_name = recipe.get("composer", "segment")
+
+        # Detect → analyze → compose
+        analyzer_name = recipe.get("analyzer", "scorer")
 
         detector = _get_detector(detector_name, self.config)
         analyzer = _get_analyzer(analyzer_name, self.config)
@@ -116,3 +118,4 @@ class HighlightOrchestrator:
             )
 
         return clips
+

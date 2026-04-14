@@ -77,9 +77,10 @@ class ShotDetector(BaseEventDetector):
 
             outcome, goal_event = result
 
-            # Attribute shooter from possession
+            # Attribute shooter from possession or proximity
             shooter_id, shooter_team, shot_frame = self._find_shooter(
                 ctx, crossing["frame"], shooter_lookback_sec,
+                goal_side=crossing.get("goal_side"),
             )
 
             shot_seq += 1
@@ -102,37 +103,34 @@ class ShotDetector(BaseEventDetector):
                     "crossbar_validation": goal_event.get(
                         "crossbar_validation"
                     ),
+                    "shooter_frame": shot_frame,
                 },
             )
             events.append(shot_event)
 
-            # Emit a convenience GOAL event
+            # Emit a convenience GOAL event — inherits player from shot
             if outcome == ShotOutcome.GOAL:
                 goal_seq = sum(
                     1
                     for e in events
                     if e.event_type == EventType.GOAL
                 ) + 1
+                goal_time = round(shot_event.frame / ctx.fps, 1)
                 events.append(
                     MatchEvent(
                         event_id=f"goal_{goal_seq:04d}",
                         event_type=EventType.GOAL,
-                        frame=crossing["frame"],
-                        match_time=crossing["frame"] / ctx.fps,
-                        player_id=shooter_id,
-                        team_id=shooter_team,
+                        frame=shot_event.frame,
+                        match_time=goal_time,
+                        player_id=shot_event.player_id,
+                        team_id=shot_event.team_id,
                         start_position=shot_event.start_position,
                         end_position=shot_event.end_position,
                         confidence=shot_event.confidence,
                         metadata={
                             "shot_event_id": shot_event.event_id,
-                            "goal_side": goal_event["goal_side"],
-                            "ball_position_3d": goal_event["ball_position"],
-                            "ball_speed_mps": goal_event["ball_speed_mps"],
-                            "ball_pixel": goal_event.get("ball_pixel"),
-                            "crossbar_validation": goal_event.get(
-                                "crossbar_validation"
-                            ),
+                            "goal_time": goal_time,
+                            **shot_event.metadata,
                         },
                     )
                 )
@@ -151,15 +149,118 @@ class ShotDetector(BaseEventDetector):
         self,
         ctx: EventDetectionContext,
         goal_frame: int,
-        lookback_seconds: float = 3.0,
+        lookback_seconds: float = 5.0,
+        goal_side: str | None = None,
     ) -> tuple[int | None, str | None, int]:
-        """Find the player who took the shot from possession data."""
+        """Find the player who took the shot.
+
+        Strategy: find the ball acceleration event (the kick) by looking
+        for a speed spike in the ball trajectory, then find the nearest
+        non-goalkeeper player to the ball just before the spike.
+        """
         lookback_frames = int(lookback_seconds * ctx.fps)
-        for f in range(goal_frame, max(0, goal_frame - lookback_frames) - 1, -1):
-            span = ctx.get_possession_at_frame(f)
-            if span is not None:
-                return span.player_id, span.team_id, f
+        start_frame = max(0, goal_frame - lookback_frames)
+
+        half_length = ctx.pitch_length / 2
+        if goal_side is not None:
+            goal_x = -half_length if goal_side == "left" else half_length
+        else:
+            bs = ctx.get_ball_at_frame(goal_frame)
+            if bs is not None:
+                goal_x = half_length if bs.position[0] > 0 else -half_length
+            else:
+                goal_x = None
+
+        # Step 1: Find the kick frame — where ball speed spikes.
+        # Walk backwards through ball_states to find the last big
+        # acceleration before the goal.
+        kick_frame = self._find_kick_frame(
+            ctx.ball_states, goal_frame, start_frame, ctx.fps,
+        )
+
+        # Step 2: Search for nearest player around the kick frame.
+        search_radius = 3.0
+        search_start = kick_frame if kick_frame is not None else goal_frame
+        search_end = max(0, search_start - lookback_frames)
+
+        for f in range(search_start, search_end - 1, -1):
+            bs = ctx.get_ball_at_frame(f)
+            if bs is None:
+                continue
+            bx, by = bs.position[0], bs.position[1]
+
+            players = ctx.get_players_at_frame(f)
+            best_track = None
+            best_dist = float("inf")
+
+            for t in players:
+                pp = t.get("pitch_position")
+                if pp is None:
+                    continue
+                team = ctx.get_team_for_track(t["track_id"])
+                if team == "referee":
+                    continue
+                if goal_x is not None and abs(pp[0] - goal_x) < 3.0:
+                    continue
+                dist = math.hypot(pp[0] - bx, pp[1] - by)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_track = t
+
+            if best_track is not None and best_dist <= search_radius:
+                track_id = best_track["track_id"]
+                team = ctx.get_team_for_track(track_id)
+                logger.info(
+                    "Shooter identified: track_id=%d, team=%s, "
+                    "distance=%.1fm, frame=%d (kick_frame=%s)",
+                    track_id, team, best_dist, f, kick_frame,
+                )
+                return track_id, team, f
+
         return None, None, goal_frame
+
+    @staticmethod
+    def _find_kick_frame(
+        ball_states: list[BallState],
+        goal_frame: int,
+        start_frame: int,
+        fps: float,
+        speed_jump_threshold: float = 8.0,
+    ) -> int | None:
+        """Find the frame where the ball was kicked (speed spike).
+
+        Walks backwards from goal_frame through the high-speed segment
+        until ball speed drops below threshold or a tracking gap appears.
+        Returns the last low-speed frame before the fast segment began.
+        """
+        states = [
+            bs for bs in ball_states
+            if start_frame <= bs.frame <= goal_frame
+        ]
+        if len(states) < 2:
+            return None
+
+        # Walk backwards: skip through the high-speed segment
+        for i in range(len(states) - 1, 0, -1):
+            curr = states[i]
+            prev = states[i - 1]
+            dt = (curr.frame - prev.frame) / fps
+            if dt <= 0:
+                continue
+
+            speed = math.hypot(
+                curr.position[0] - prev.position[0],
+                curr.position[1] - prev.position[1],
+            ) / dt
+
+            # Found a low-speed segment or a tracking gap — prev is
+            # the last frame before the ball started flying.
+            if speed < speed_jump_threshold:
+                return prev.frame
+            if curr.frame - prev.frame > int(0.5 * fps):
+                return prev.frame
+
+        return states[0].frame if states else None
 
 
 # ------------------------------------------------------------------
