@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import logging
-import math
 from typing import Any
 
 from .._base import BaseEventDetector
 from .._context import EventDetectionContext
 from .._registry import register_detector
 from .._types import EventType, MatchEvent, PossessionSpan
+from ._utils import find_nearest_player
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ class PossessionDetector(BaseEventDetector):
                 candidate_positions = []
                 continue
 
-            nearest_id, nearest_team, nearest_dist = self._find_nearest_player(
+            nearest_id, nearest_team, nearest_dist = find_nearest_player(
                 ctx, bs.frame, bs.position
             )
 
@@ -164,36 +164,3 @@ class PossessionDetector(BaseEventDetector):
             )
         )
 
-    @staticmethod
-    def _find_nearest_player(
-        ctx: EventDetectionContext,
-        frame: int,
-        ball_pos: list[float],
-    ) -> tuple[int | None, str | None, float]:
-        """Find the nearest player to the ball at a given frame.
-
-        Returns (track_id, team_id, distance). If no player has a pitch
-        position, returns (None, None, inf).
-        """
-        players = ctx.get_players_at_frame(frame)
-        best_id: int | None = None
-        best_team: str | None = None
-        best_dist = float("inf")
-
-        bx, by = ball_pos
-
-        for p in players:
-            pp = p.get("pitch_position")
-            if pp is None:
-                continue
-            tid = p["track_id"]
-            team = ctx.get_team_for_track(tid)
-            if team == "referee":
-                continue
-            dist = math.hypot(pp[0] - bx, pp[1] - by)
-            if dist < best_dist:
-                best_dist = dist
-                best_id = tid
-                best_team = team
-
-        return best_id, best_team, best_dist

@@ -8,7 +8,9 @@ Available stages:
 - field_registration: Camera calibration (PnLCalib, BroadTrack, Physical, etc.)
 - tracking: Player/ball detection, tracking, ReID, and team classification
 - post_processing: Temporal consistency and tracklet merging
-- goal_detection: Ball trajectory analysis and goal-line crossing detection
+- event_detection: Possession, passes, shots, goals, carries, tackles
+- highlights: Highlight clip generation
+- video_enhancement: Upscaling & frame interpolation (requires video2x)
 """
 
 import argparse

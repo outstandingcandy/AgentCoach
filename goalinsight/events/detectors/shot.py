@@ -16,6 +16,7 @@ from .._base import BaseEventDetector
 from .._context import EventDetectionContext
 from .._registry import register_detector
 from .._types import BallState, EventType, MatchEvent, ShotOutcome
+from ._utils import find_nearest_player
 
 logger = logging.getLogger(__name__)
 
@@ -199,33 +200,24 @@ class ShotDetector(BaseEventDetector):
         search_start = kick_frame if kick_frame is not None else goal_frame
         search_end = max(0, search_start - lookback_frames)
 
+        # Exclude goalkeeper-area players (within 3m of goal line)
+        if goal_x is not None:
+            _gx = goal_x
+            exclude_fn = lambda _p, pp: abs(pp[0] - _gx) < 3.0
+        else:
+            exclude_fn = None
+
         for f in range(search_start, search_end - 1, -1):
             bs = ctx.get_ball_at_frame(f)
             if bs is None:
                 continue
-            bx, by = bs.position[0], bs.position[1]
 
-            players = ctx.get_players_at_frame(f)
-            best_track = None
-            best_dist = float("inf")
+            track_id, team, best_dist = find_nearest_player(
+                ctx, f, (bs.position[0], bs.position[1]),
+                exclude_fn=exclude_fn,
+            )
 
-            for t in players:
-                pp = t.get("pitch_position")
-                if pp is None:
-                    continue
-                team = ctx.get_team_for_track(t["track_id"])
-                if team == "referee":
-                    continue
-                if goal_x is not None and abs(pp[0] - goal_x) < 3.0:
-                    continue
-                dist = math.hypot(pp[0] - bx, pp[1] - by)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_track = t
-
-            if best_track is not None and best_dist <= search_radius:
-                track_id = best_track["track_id"]
-                team = ctx.get_team_for_track(track_id)
+            if track_id is not None and best_dist <= search_radius:
                 logger.info(
                     "Shooter identified: track_id=%d, team=%s, "
                     "distance=%.1fm, frame=%d (kick_frame=%s)",

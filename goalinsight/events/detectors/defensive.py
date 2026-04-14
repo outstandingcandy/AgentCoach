@@ -10,6 +10,7 @@ from .._base import BaseEventDetector
 from .._context import EventDetectionContext
 from .._registry import register_detector
 from .._types import EventType, MatchEvent, PassOutcome
+from ._utils import find_nearest_player
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +141,9 @@ class DefensiveActionDetector(BaseEventDetector):
             if ball is None:
                 continue
 
-            defender_id, defender_dist = self._find_closest_defender(
-                ctx, transition_frame, ball.position, span_b.team_id
+            defender_id, _, defender_dist = find_nearest_player(
+                ctx, transition_frame, ball.position,
+                team_filter=span_b.team_id,
             )
             if defender_id is None or defender_dist > proximity:
                 continue
@@ -174,32 +176,6 @@ class DefensiveActionDetector(BaseEventDetector):
             )
 
         return events
-
-    @staticmethod
-    def _find_closest_defender(
-        ctx: EventDetectionContext,
-        frame: int,
-        ball_pos: list[float],
-        defending_team: str,
-    ) -> tuple[int | None, float]:
-        """Find the closest player from defending_team to the ball."""
-        players = ctx.get_players_at_frame(frame)
-        best_id = None
-        best_dist = float("inf")
-
-        for p in players:
-            pp = p.get("pitch_position")
-            if pp is None:
-                continue
-            team = ctx.get_team_for_track(p["track_id"])
-            if team != defending_team:
-                continue
-            dist = math.hypot(pp[0] - ball_pos[0], pp[1] - ball_pos[1])
-            if dist < best_dist:
-                best_dist = dist
-                best_id = p["track_id"]
-
-        return best_id, best_dist
 
     @staticmethod
     def _compute_deflection(

@@ -6,11 +6,6 @@ import cv2
 import numpy as np
 
 
-# FIFA pitch half-dimensions (meters)
-_PITCH_HALF_LENGTH = 52.5
-_PITCH_HALF_WIDTH = 34.0
-
-
 def _undistort_and_project_to_pitch(pts_2d: np.ndarray, pose: dict) -> list[float] | None:
     """Project a single distorted image point to pitch coordinates via undistortion.
 
@@ -49,6 +44,8 @@ def _filter_by_pitch_undistorted(
     pose: dict,
     margin: float = 5.0,
     use_center: bool = False,
+    pitch_half_length: float = 52.5,
+    pitch_half_width: float = 34.0,
 ) -> list[dict]:
     """Filter detections by pitch boundary using undistorted projection.
 
@@ -57,6 +54,8 @@ def _filter_by_pitch_undistorted(
         pose: Physical camera pose dict.
         margin: Extra meters beyond pitch boundary to allow.
         use_center: If True, use bbox center instead of foot point (for ball).
+        pitch_half_length: Half of the pitch length in meters.
+        pitch_half_width: Half of the pitch width in meters.
 
     Returns:
         Filtered detection list.
@@ -90,8 +89,8 @@ def _filter_by_pitch_undistorted(
 
     # Project to world and filter by pitch boundary
     filtered = []
-    x_lim = _PITCH_HALF_LENGTH + margin
-    y_lim = _PITCH_HALF_WIDTH + margin
+    x_lim = pitch_half_length + margin
+    y_lim = pitch_half_width + margin
 
     for i, det in enumerate(detections):
         pt = proj_undist[i]

@@ -6,7 +6,6 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from .pitch_projection import _PITCH_HALF_LENGTH, _PITCH_HALF_WIDTH
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +87,8 @@ def _filter_trajectories_field_space(
     trajectory_field_data: dict[int, list[tuple]],
     fps: float,
     config: dict,
+    pitch_half_length: float = 52.5,
+    pitch_half_width: float = 34.0,
 ) -> dict[int, list[tuple]]:
     """Filter trajectories based on physical constraints in field space.
 
@@ -100,6 +101,10 @@ def _filter_trajectories_field_space(
     3. Speed: discard if too many inter-frame speeds exceed max
     4. Smoothness: discard if direction changes are too erratic
 
+    Args:
+        pitch_half_length: Half of the pitch length in meters.
+        pitch_half_width: Half of the pitch width in meters.
+
     Returns:
         Filtered dict with invalid trajectories removed.
     """
@@ -110,8 +115,8 @@ def _filter_trajectories_field_space(
     speed_viol_ratio = config.get("speed_violation_ratio", 0.2)
     min_displacement = config.get("min_displacement", 1.0)
 
-    pitch_half_length = _PITCH_HALF_LENGTH + margin
-    pitch_half_width = _PITCH_HALF_WIDTH + margin
+    pitch_half_length = pitch_half_length + margin
+    pitch_half_width = pitch_half_width + margin
 
     filtered = {}
 

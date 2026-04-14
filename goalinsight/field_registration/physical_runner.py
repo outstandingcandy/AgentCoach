@@ -25,6 +25,14 @@ from ..utils.pitch import get_pitch_template_points, project_pitch_to_image, _dr
 from .shared_vis import draw_vis_keypoints, draw_vis_lines
 from ..utils.config import get_default_config, get_process_fps_from_config, FrameSampler
 from ..utils.serialization import json_default as _json_default
+from ._runner_base import (
+    open_video,
+    make_sampler,
+    init_calibration_results,
+    save_calibration_outputs,
+    compute_calibration_stats,
+    print_calibration_summary,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -132,9 +140,9 @@ def _load_camera_profile(config: dict, video_width: int, video_height: int):
     K[1, 2] = video_height / 2.0
     dist_coeffs = np.zeros(5, dtype=np.float64)
 
-    print(f"  Camera profile: {profile_name}")
-    print(f"  K: f={K[0,0]:.1f}, cx={K[0,2]:.1f} (center), cy={K[1,2]:.1f} (center)")
-    print(f"  Distortion: disabled (images assumed undistorted)")
+    logger.info(f"  Camera profile: {profile_name}")
+    logger.info(f"  K: f={K[0,0]:.1f}, cx={K[0,2]:.1f} (center), cy={K[1,2]:.1f} (center)")
+    logger.info(f"  Distortion: disabled (images assumed undistorted)")
 
     return K, dist_coeffs
 
@@ -167,7 +175,7 @@ def run_stage1_physical(
     phys_config = fr_config.get("physical", {})
 
     # Initialize keypoint detector (reuse PnLCalib HRNet detector)
-    print("Stage 1 (Physical): Initializing keypoint detector...")
+    logger.info("Stage 1 (Physical): Initializing keypoint detector...")
     kp_config = {
         "backend": "pnlcalib",
         "pnlcalib": {
@@ -187,7 +195,7 @@ def run_stage1_physical(
 
     if use_line_model:
         from . import LineDetector
-        print("Stage 1 (Physical): Initializing line detector...")
+        logger.info("Stage 1 (Physical): Initializing line detector...")
         line_config = {
             "backend": "pnlcalib",
             "pnlcalib": {
@@ -198,25 +206,18 @@ def run_stage1_physical(
         line_detector = LineDetector(line_config)
         line_detector.load_model()
     else:
-        print("Stage 1 (Physical): Deriving lines from keypoints (no line model)")
+        logger.info("Stage 1 (Physical): Deriving lines from keypoints (no line model)")
 
     # Open video
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {video_path}")
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    cap.release()  # Metadata extracted; prefetcher will open its own handle
-
-    sampler = FrameSampler(total_frames, fps, process_fps)
-    print(f"Video: {total_frames} frames @ {fps:.1f} fps, {width}x{height}")
-    print(f"Processing {len(sampler)} frames at {process_fps or fps} fps")
+    video = open_video(video_path)
+    video.cap.release()  # Metadata extracted; prefetcher will open its own handle
+    width, height = video.width, video.height
+    total_frames = video.total_frames
+    fps = video.fps
+    sampler = make_sampler(video, process_fps)
 
     # Load camera profile with fixed intrinsics
-    print("Stage 1 (Physical): Loading camera profile...")
+    logger.info("Stage 1 (Physical): Loading camera profile...")
     K, dist_coeffs = _load_camera_profile(config, width, height)
 
     # Initialize calibrator (7-DOF: rvec, tvec, f)
@@ -224,17 +225,17 @@ def run_stage1_physical(
     focal_bounds = tuple(phys_config.get("focal_bounds", [1200.0, 2200.0]))
 
     if not do_joint:
-        print("  Joint optimization disabled — per-frame f optimization only")
+        logger.info("  Joint optimization disabled — per-frame f optimization only")
 
     camera_position = phys_config.get("camera_position", None)
     if camera_position is not None:
         camera_position = tuple(camera_position)
-        print(f"  Camera position constraint: ({camera_position[0]}, {camera_position[1]}, {camera_position[2]})")
+        logger.info(f"  Camera position constraint: ({camera_position[0]}, {camera_position[1]}, {camera_position[2]})")
 
     pitch_length = phys_config.get("pitch_length", 105.0)
     pitch_width = phys_config.get("pitch_width", 68.0)
     if pitch_length != 105.0 or pitch_width != 68.0:
-        print(f"  Custom pitch dimensions: {pitch_length}×{pitch_width}m")
+        logger.info(f"  Custom pitch dimensions: {pitch_length}x{pitch_width}m")
     pitch_template = get_pitch_template_points(pitch_length, pitch_width)
 
     calibrator = PhysicalCalibrator(
@@ -258,19 +259,10 @@ def run_stage1_physical(
     )
 
     # Results storage
-    calibration_results = {
-        "video_info": {
-            "path": str(video_path),
-            "total_frames": total_frames,
-            "fps": fps,
-            "width": width,
-            "height": height,
-            "process_fps": process_fps,
-            "pitch_length": pitch_length,
-            "pitch_width": pitch_width,
-        },
-        "frames": {}
-    }
+    calibration_results = init_calibration_results(
+        video_path, video, process_fps,
+        extra_video_info={"pitch_length": pitch_length, "pitch_width": pitch_width},
+    )
     homographies = {}
     camera_poses = {}
 
@@ -287,7 +279,7 @@ def run_stage1_physical(
 
     batch_size = phys_config.get("detection_batch_size", 32)
     calibration_skip = max(1, int(phys_config.get("calibration_skip", 1)))
-    print(f"  Batch detection: batch_size={batch_size}")
+    logger.info(f"  Batch detection: batch_size={batch_size}")
 
     frame_indices = list(sampler)
 
@@ -297,7 +289,7 @@ def run_stage1_physical(
         # Always include the last frame for better interpolation at boundaries
         if calib_frame_indices[-1] != frame_indices[-1]:
             calib_frame_indices.append(frame_indices[-1])
-        print(f"  Calibration skip={calibration_skip}: calibrating {len(calib_frame_indices)}/{len(frame_indices)} frames, interpolating rest")
+        logger.info(f"  Calibration skip={calibration_skip}: calibrating {len(calib_frame_indices)}/{len(frame_indices)} frames, interpolating rest")
     else:
         calib_frame_indices = frame_indices
 
@@ -402,19 +394,19 @@ def run_stage1_physical(
             n_inliers = finfo.get("inliers", 0)
             if px_err < 80 and n_inliers >= 5:
                 good_frame_data.append(fd)
-        print(f"\n  Joint optimization: {len(good_frame_data)}/{len(joint_frame_data)} frames (filtered by error<80px, inliers>=5)...")
-        print(f"  Profile f={K[0,0]:.1f}, cx={K[0,2]:.1f} (center), cy={K[1,2]:.1f} (center)")
+        logger.info(f"  Joint optimization: {len(good_frame_data)}/{len(joint_frame_data)} frames (filtered by error<80px, inliers>=5)...")
+        logger.info(f"  Profile f={K[0,0]:.1f}, cx={K[0,2]:.1f} (center), cy={K[1,2]:.1f} (center)")
 
         # Seed joint optimization with median focal length from Pass 1
         if good_frame_data:
             med_f = float(np.median([fd["f"] for fd in good_frame_data]))
             calibrator.K[0, 0] = med_f
             calibrator.K[1, 1] = med_f
-            print(f"  Median f={med_f:.1f}")
+            logger.info(f"  Median f={med_f:.1f}")
 
         joint_result = calibrator.joint_optimize_intrinsics(good_frame_data)
         if joint_result is not None:
-            print(f"  Joint f={joint_result['f']:.1f}, cost={joint_result['cost']:.2f}")
+            logger.info(f"  Joint f={joint_result['f']:.1f}, cost={joint_result['cost']:.2f}")
 
             # Update calibrator with jointly optimized focal length and lock it
             calibrator.K = joint_result["K"].copy()
@@ -422,7 +414,7 @@ def run_stage1_physical(
             calibrator.focal_bounds = (joint_result["f"] - eps, joint_result["f"] + eps)
 
             # === Pass 2: Re-run per-frame calibration with fixed joint intrinsics ===
-            print(f"\n  Pass 2: Re-calibrating {len(sampler)} frames with joint intrinsics...")
+            logger.info(f"  Pass 2: Re-calibrating {len(sampler)} frames with joint intrinsics...")
             tracker2 = CameraStateTracker(
                 max_reproj_error=phys_config.get("max_reproj_error", 15.0),
             )
@@ -514,12 +506,12 @@ def run_stage1_physical(
 
             tracker = tracker2
         else:
-            print("  Joint optimization failed.")
+            logger.info("  Joint optimization failed.")
     else:
         if not do_joint:
-            print(f"\n  Joint optimization disabled (joint_optimize=false). Using profile intrinsics directly.")
+            logger.info(f"  Joint optimization disabled (joint_optimize=false). Using profile intrinsics directly.")
         else:
-            print(f"\n  Skipping joint optimization (only {len(joint_frame_data)} calibrated frames)")
+            logger.info(f"  Skipping joint optimization (only {len(joint_frame_data)} calibrated frames)")
 
     # Store joint intrinsics in results
     if joint_result is not None:
@@ -549,35 +541,30 @@ def run_stage1_physical(
                         H_i = H_i / H_i[2, 2]
                     homographies[fidx] = H_i
                     calibration_results["frames"][fidx] = {"calibrated": True, "interpolated": True}
-            print(f"  Interpolated {len(skipped_indices)} skipped frames from {calibrated_count} calibrated anchors")
+            logger.info(f"  Interpolated {len(skipped_indices)} skipped frames from {calibrated_count} calibrated anchors")
 
-    # Save results
-    with open(output_dir / "calibration_metadata.json", "w") as f:
-        json.dump(calibration_results, f, default=_json_default)
-    with open(output_dir / "homographies.pkl", "wb") as f:
-        pickle.dump(homographies, f)
-    with open(output_dir / "camera_poses.pkl", "wb") as f:
-        pickle.dump(camera_poses, f)
-
-    # Save camera poses as JSON (human-readable counterpart of pkl)
-    camera_poses_json = {}
-    for fidx, pose in camera_poses.items():
-        camera_poses_json[str(fidx)] = {
-            "K": np.array(pose["K"]).tolist(),
-            "dist_coeffs": np.array(pose["dist_coeffs"]).tolist(),
-            "rvec": np.array(pose["rvec"]).flatten().tolist(),
-            "tvec": np.array(pose["tvec"]).flatten().tolist(),
-        }
-        # Add derived fields
+    # Save results (base: metadata JSON, homographies pkl, camera_poses pkl + json)
+    save_calibration_outputs(
+        output_dir, calibration_results, homographies,
+        camera_poses=camera_poses, json_default=_json_default,
+    )
+    # Append derived fields to camera_poses.json
+    camera_poses_json_path = output_dir / "camera_poses.json"
+    with open(camera_poses_json_path) as f:
+        camera_poses_json = json.load(f)
+    for fidx_str, entry in camera_poses_json.items():
+        pose = camera_poses.get(int(fidx_str))
+        if pose is None:
+            continue
         R_mat, _ = cv2.Rodrigues(np.array(pose["rvec"], dtype=np.float64))
         cam_pos = -R_mat.T @ np.array(pose["tvec"], dtype=np.float64).ravel()
-        camera_poses_json[str(fidx)]["camera_position"] = {
+        entry["camera_position"] = {
             "x": round(float(cam_pos[0]), 3),
             "y": round(float(cam_pos[1]), 3),
             "z": round(float(cam_pos[2]), 3),
         }
-        camera_poses_json[str(fidx)]["focal_length"] = float(np.array(pose["K"])[0, 0])
-    with open(output_dir / "camera_poses.json", "w") as f:
+        entry["focal_length"] = float(np.array(pose["K"])[0, 0])
+    with open(camera_poses_json_path, "w") as f:
         json.dump(camera_poses_json, f, indent=2)
 
     # Statistics
@@ -585,60 +572,37 @@ def run_stage1_physical(
         1 for f in calibration_results["frames"].values()
         if f.get("interpolated")
     )
-    stats = {
-        "total_frames": total_frames,
-        "processed_frames": len(sampler),
-        "calibrated_frames": calibrated_count,
+    # Extra world_error_all stat (physical-specific)
+    frames = calibration_results["frames"]
+    world_errors_all = [
+        frames[idx]["world_error_all"]
+        for idx in frames
+        if frames[idx].get("calibrated")
+        and not frames[idx].get("interpolated")
+        and frames[idx].get("world_error_all") is not None
+    ]
+    extra = {
         "interpolated_frames": interpolated_count,
-        "calibration_rate": calibrated_count / len(sampler) if sampler else 0,
         "warm_start_frames": tracker.warm_start_count,
         "reinit_frames": tracker.reinit_count,
     }
-
-    errors = [
-        calibration_results["frames"][idx]["reprojection_error"]
-        for idx in calibration_results["frames"]
-        if calibration_results["frames"][idx].get("calibrated")
-        and not calibration_results["frames"][idx].get("interpolated")
-    ]
-    world_errors = [
-        calibration_results["frames"][idx]["world_error"]
-        for idx in calibration_results["frames"]
-        if calibration_results["frames"][idx].get("calibrated")
-        and not calibration_results["frames"][idx].get("interpolated")
-        and calibration_results["frames"][idx].get("world_error") is not None
-    ]
-    world_errors_all = [
-        calibration_results["frames"][idx]["world_error_all"]
-        for idx in calibration_results["frames"]
-        if calibration_results["frames"][idx].get("calibrated")
-        and not calibration_results["frames"][idx].get("interpolated")
-        and calibration_results["frames"][idx].get("world_error_all") is not None
-    ]
-    if errors:
-        stats["mean_error"] = float(np.mean(errors))
-        stats["median_error"] = float(np.median(errors))
-    if world_errors:
-        stats["mean_world_error"] = float(np.mean(world_errors))
-        stats["median_world_error"] = float(np.median(world_errors))
     if world_errors_all:
-        stats["mean_world_error_all"] = float(np.mean(world_errors_all))
-        stats["median_world_error_all"] = float(np.median(world_errors_all))
+        extra["mean_world_error_all"] = float(np.mean(world_errors_all))
+        extra["median_world_error_all"] = float(np.median(world_errors_all))
 
-    print(f"\nStage 1 (Physical) Complete:")
-    print(f"  Calibrated: {calibrated_count}/{len(sampler)} ({stats['calibration_rate']*100:.1f}%)")
+    stats = compute_calibration_stats(
+        calibration_results, video, sampler, calibrated_count,
+        exclude_interpolated=True, extra_stats=extra,
+    )
+
+    print_calibration_summary(stats, label="Stage 1 (Physical)")
     if interpolated_count > 0:
-        print(f"  Interpolated: {interpolated_count} frames (skip={calibration_skip})")
-    print(f"  Warm-starts: {tracker.warm_start_count}, Re-inits: {tracker.reinit_count}")
-    if errors:
-        print(f"  Median error: {stats['median_error']:.2f} px")
-        print(f"  Mean error: {stats['mean_error']:.2f} px")
-    if world_errors:
-        print(f"  Median world error (detected): {stats['median_world_error']:.2f} m")
-    if world_errors_all:
-        print(f"  Median world error (all 57):   {stats['median_world_error_all']:.2f} m")
+        logger.info(f"  Interpolated: {interpolated_count} frames (skip={calibration_skip})")
+    logger.info(f"  Warm-starts: {tracker.warm_start_count}, Re-inits: {tracker.reinit_count}")
+    if "median_world_error_all" in stats:
+        logger.info(f"  Median world error (all 57):   {stats['median_world_error_all']:.2f} m")
     if joint_result is not None:
-        print(f"  Joint f={joint_result['f']:.1f}")
+        logger.info(f"  Joint f={joint_result['f']:.1f}")
 
     return stats
 

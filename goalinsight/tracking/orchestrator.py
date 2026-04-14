@@ -14,6 +14,7 @@ Supports configurable backends via factory functions:
 
 import bisect
 import json
+import logging
 import pickle
 import threading
 from collections import deque
@@ -23,6 +24,8 @@ from typing import Any
 import cv2
 import numpy as np
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 from ..utils.config import (
     get_default_config,
@@ -41,8 +44,6 @@ from .unified_detector import UnifiedDetector
 from .ball_trajectory import BallTrajectory3D
 
 from .pitch_projection import (
-    _PITCH_HALF_LENGTH,
-    _PITCH_HALF_WIDTH,
     _undistort_and_project_to_pitch,
     _filter_by_pitch_undistorted,
     _interpolate_camera_poses,
@@ -135,10 +136,10 @@ def run_tracking(
     camera_poses = {}
     if calibration_dir:
         if (calibration_dir / "camera_poses.pkl").exists():
-            print("Loading Stage 1 physical camera poses...")
+            logger.info("Loading Stage 1 physical camera poses...")
             with open(calibration_dir / "camera_poses.pkl", "rb") as f:
                 camera_poses = pickle.load(f)
-            print(f"  Loaded {len(camera_poses)} camera poses")
+            logger.info(f"  Loaded {len(camera_poses)} camera poses")
             # Pre-compute homographies from physical params for legacy code paths
             for fidx, pose in camera_poses.items():
                 R, _ = cv2.Rodrigues(np.array(pose["rvec"], dtype=np.float64))
@@ -149,10 +150,10 @@ def run_tracking(
                     H = H / H[2, 2]
                 homographies[fidx] = H
         elif (calibration_dir / "homographies.pkl").exists():
-            print("Loading Stage 1 calibration results...")
+            logger.info("Loading Stage 1 calibration results...")
             with open(calibration_dir / "homographies.pkl", "rb") as f:
                 homographies = pickle.load(f)
-            print(f"  Loaded {len(homographies)} homographies")
+            logger.info(f"  Loaded {len(homographies)} homographies")
 
     # Initialize detectors — unified mode fuses player + ball into one YOLO pass
     det_config = config.get("detection", {})
@@ -173,7 +174,7 @@ def run_tracking(
 
     unified_det = None
     if unified_enabled:
-        print("Stage 2: Initializing unified detector (player + ball)...")
+        logger.info("Stage 2: Initializing unified detector (player + ball)...")
         unified_det = UnifiedDetector({
             "model": unified_config.get("model", det_config.get("model", "yolov8x")),
             "model_path": unified_config.get("model_path", det_config.get("model_path")),
@@ -191,7 +192,7 @@ def run_tracking(
             "imgsz": 1280,
         })
     else:
-        print("Stage 2: Initializing YOLOv8 detector...")
+        logger.info("Stage 2: Initializing YOLOv8 detector...")
         detector = PlayerDetector({
             "model": "yolov8x",
             "confidence_threshold": det_config.get("confidence_threshold", 0.5),
@@ -209,7 +210,7 @@ def run_tracking(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     # Initialize StrongSORT tracker
-    print("Stage 2: Initializing StrongSORT tracker...")
+    logger.info("Stage 2: Initializing StrongSORT tracker...")
     # Frame interval: native_fps / process_fps (e.g., 30/10 = 3.0)
     # Scales Kalman noise so gating works correctly at lower fps
     effective_fps = process_fps if process_fps and process_fps < fps else fps
@@ -227,13 +228,13 @@ def run_tracking(
 
     # Initialize ReID extractor via factory function
     reid_backend = config.get("reid", {}).get("backend", "osnet")
-    print(f"Stage 2: Initializing ReID extractor ({reid_backend})...")
+    logger.info(f"Stage 2: Initializing ReID extractor ({reid_backend})...")
     reid_extractor = get_reid_extractor(config)
     reid_extractor.load_model()
 
     # Initialize team classifier via factory function and goalkeeper detector
     tc_backend = config.get("team_classification", {}).get("backend", "kmeans")
-    print(f"Stage 2: Initializing team classifier ({tc_backend})...")
+    logger.info(f"Stage 2: Initializing team classifier ({tc_backend})...")
     team_classifier = get_team_classifier(config)
     fr_config = config.get("field_registration", {})
     phys_config = fr_config.get("physical", {})
@@ -248,24 +249,22 @@ def run_tracking(
     jersey_aggregator = None
     if jersey_recognition_enabled:
         jr_backend = jr_config.get("backend", "qwen_vl")
-        print(f"Stage 2: Initializing jersey recognizer ({jr_backend})...")
+        logger.info(f"Stage 2: Initializing jersey recognizer ({jr_backend})...")
         jersey_recognizer = get_jersey_recognizer(config)
         from ..jersey.qwen_recognizer import JerseyNumberAggregator
         jersey_aggregator = JerseyNumberAggregator(
             window_size=jr_config.get("aggregation_window", 10)
         )
 
-    # Update module-level pitch dimensions for filtering
-    import goalinsight.tracking.pitch_projection as _pp_mod
-    _pp_mod._PITCH_HALF_LENGTH = pitch_length / 2
-    _pp_mod._PITCH_HALF_WIDTH = pitch_width / 2
+    pitch_half_length = pitch_length / 2
+    pitch_half_width = pitch_width / 2
 
     # Initialize ball detection and tracking
     ball_detector = None
     ball_tracker = None
     ball_trajectory_3d = None
     if ball_enabled:
-        print("Stage 2: Initializing ball detector and tracker...")
+        logger.info("Stage 2: Initializing ball detector and tracker...")
         ball_detector = BallDetector(ball_config)
         if unified_det is not None:
             # Share model weights — no second GPU load
@@ -285,8 +284,8 @@ def run_tracking(
             ball_trajectory_3d = BallTrajectory3D(traj3d_config)
 
     sampler = FrameSampler(total_frames, fps, process_fps)
-    print(f"Video: {total_frames} frames @ {fps:.1f} fps, {width}x{height}")
-    print(f"Processing {len(sampler)} frames at {process_fps or fps} fps")
+    logger.info(f"Video: {total_frames} frames @ {fps:.1f} fps, {width}x{height}")
+    logger.info(f"Processing {len(sampler)} frames at {process_fps or fps} fps")
 
     # Interpolate camera poses for frames not in stage1 (when tracking_fps > calibration_fps)
     if camera_poses and any(f not in camera_poses for f in sampler):
@@ -301,7 +300,7 @@ def run_tracking(
             if abs(H[2, 2]) > 1e-10:
                 H = H / H[2, 2]
             homographies[fidx] = H
-        print(f"  Interpolated camera poses: {len(camera_poses)} (from stage1 calibration)")
+        logger.info(f"  Interpolated camera poses: {len(camera_poses)} (from stage1 calibration)")
 
     # Output video (camera view + top-down pitch side-by-side)
     output_fps = process_fps if process_fps and process_fps < fps else fps
@@ -387,8 +386,8 @@ def run_tracking(
         )
         num_batches = (len(_frame_indices_list) + fused_batch_size - 1) // fused_batch_size
 
-        print(f"\nFused detection pass: {len(_frame_indices_list)} frames, "
-              f"batch_size={fused_batch_size}, imgsz={unified_det.imgsz}")
+        logger.info(f"Fused detection pass: {len(_frame_indices_list)} frames, "
+                    f"batch_size={fused_batch_size}, imgsz={unified_det.imgsz}")
 
         read_q: _queue.Queue = _queue.Queue(maxsize=2)
         reader = threading.Thread(
@@ -425,10 +424,10 @@ def run_tracking(
         pbar.close()
         reader.join()
 
-        print(f"  Pre-detected {len(_precomputed_dets)} frames (player + ball)")
+        logger.info(f"  Pre-detected {len(_precomputed_dets)} frames (player + ball)")
         if ball_detector is not None:
             pass1_det_frames = sum(1 for d in all_ball_detections.values() if d)
-            print(f"  Ball pass 1: {pass1_det_frames} frames with detections")
+            logger.info(f"  Ball pass 1: {pass1_det_frames} frames with detections")
             # Unified pass pre-computes ball detections, so treat as two-pass
             two_pass_enabled = True
 
@@ -436,7 +435,7 @@ def run_tracking(
         # ---- Legacy: separate ball pass 1 + player pre-detection ----
         if two_pass_enabled:
             frame_indices = list(sampler)
-            print("\nBall detection pass 1: scanning all frames...")
+            logger.info("Ball detection pass 1: scanning all frames...")
             pass1_batch_size = ball_config.get("pass1_batch_size", 8)
             num_batches = (len(frame_indices) + pass1_batch_size - 1) // pass1_batch_size
 
@@ -470,12 +469,12 @@ def run_tracking(
             reader_ball.join()
 
             pass1_det_frames = sum(1 for d in all_ball_detections.values() if d)
-            print(f"  Pass 1: {pass1_det_frames} frames with detections out of {len(frame_indices)}")
+            logger.info(f"  Pass 1: {pass1_det_frames} frames with detections out of {len(frame_indices)}")
 
         # Legacy player pre-detection
-        print("\nStage 2: Processing frames...")
+        logger.info("Stage 2: Processing frames...")
         yolo_batch_size = det_config.get("batch_size", 32)
-        print(f"  Pre-detecting players: {len(_frame_indices_list)} frames, batch_size={yolo_batch_size}")
+        logger.info(f"  Pre-detecting players: {len(_frame_indices_list)} frames, batch_size={yolo_batch_size}")
         _det_read_q: _queue.Queue = _queue.Queue(maxsize=3)
         _det_reader = threading.Thread(
             target=_batch_reader_full,
@@ -496,7 +495,7 @@ def run_tracking(
             _det_pbar.update(len(_batch_fidxs))
         _det_pbar.close()
         _det_reader.join()
-        print(f"  Pre-detected {len(_precomputed_dets)} frames")
+        logger.info(f"  Pre-detected {len(_precomputed_dets)} frames")
 
     cap.release()
 
@@ -526,7 +525,7 @@ def run_tracking(
                 pass2_tasks.append((fidx, center))
 
         if pass2_tasks:
-            print(f"Ball detection pass 2: crop+enlarge on {len(pass2_tasks)} frames...")
+            logger.info(f"Ball detection pass 2: crop+enlarge on {len(pass2_tasks)} frames...")
             pass2_count = 0
             pass2_batch_size = ball_config.get("pass2_batch_size", 32)
 
@@ -562,7 +561,7 @@ def run_tracking(
             pbar2.close()
             reader2.join()
 
-            print(f"  Pass 2: found ball in {pass2_count} additional frames")
+            logger.info(f"  Pass 2: found ball in {pass2_count} additional frames")
 
     # Save ball diagnostic data (all detections from both passes)
     if all_ball_detections:
@@ -578,10 +577,10 @@ def run_tracking(
             ]
 
         total_det_frames = sum(1 for d in all_ball_detections.values() if d)
-        print(f"  Total frames with ball detections: {total_det_frames}/{len(_frame_indices_list)}")
+        logger.info(f"  Total frames with ball detections: {total_det_frames}/{len(_frame_indices_list)}")
 
     # Process frames
-    print("\nStage 2: Processing frames...")
+    logger.info("Stage 2: Processing frames...")
     # Team classification will be done AFTER all tracking is complete
     # This ensures we use trajectory-averaged features for robust clustering
 
@@ -594,10 +593,10 @@ def run_tracking(
     _frame_indices_list = list(sampler)
 
     if _has_precomputed:
-        print(f"  Extracting crops from {len(_frame_indices_list)} frames "
-              f"(reusing {len(_precomputed_dets)} precomputed detections)")
+        logger.info(f"  Extracting crops from {len(_frame_indices_list)} frames "
+                    f"(reusing {len(_precomputed_dets)} precomputed detections)")
     else:
-        print(f"  Pre-detecting players: {len(_frame_indices_list)} frames, batch_size={yolo_batch_size}")
+        logger.info(f"  Pre-detecting players: {len(_frame_indices_list)} frames, batch_size={yolo_batch_size}")
     _det_read_q: _queue2.Queue = _queue2.Queue(maxsize=3)
     _det_reader = threading.Thread(
         target=_batch_reader_full,
@@ -649,7 +648,11 @@ def run_tracking(
                 except np.linalg.LinAlgError:
                     pass
             if _fidx in camera_poses:
-                detections = _filter_by_pitch_undistorted(detections, camera_poses[_fidx], margin=5.0)
+                detections = _filter_by_pitch_undistorted(
+                    detections, camera_poses[_fidx], margin=5.0,
+                    pitch_half_length=pitch_half_length,
+                    pitch_half_width=pitch_half_width,
+                )
             elif _H_inv is not None:
                 detections = detector.filter_by_pitch(detections, _H_inv, margin=5.0)
             _filtered_dets[_fidx] = detections
@@ -696,14 +699,14 @@ def run_tracking(
     # Free precomputed detections (already filtered and stored in _filtered_dets)
     del _precomputed_dets
 
-    print(f"  Pre-detected {len(_filtered_dets)} frames")
+    logger.info(f"  Pre-detected {len(_filtered_dets)} frames")
 
     # Batch ReID extraction (GPU-saturated)
     _precomputed_embeds: dict[int, Any] = {}
     if _all_crops:
         reid_chunk_size = 2048
         n_total_crops = len(_all_crops)
-        print(f"  ReID streaming extract: {n_total_crops} crops (chunks of {reid_chunk_size})")
+        logger.info(f"  ReID streaming extract: {n_total_crops} crops (chunks of {reid_chunk_size})")
         embed_chunks = []
         for chunk_start in range(0, n_total_crops, reid_chunk_size):
             chunk = _all_crops[chunk_start : chunk_start + reid_chunk_size]
@@ -719,7 +722,7 @@ def run_tracking(
                 offset += n
 
     del _all_crops, _crops_per_frame
-    print(f"  ReID done: {len(_precomputed_embeds)} frames with embeddings")
+    logger.info(f"  ReID done: {len(_precomputed_embeds)} frames with embeddings")
 
     # Helper: match a track bbox to its source detection by IoU
     def _match_track_to_det(track_bbox, dets):
@@ -922,11 +925,11 @@ def run_tracking(
         debug_path = output_dir / "ball_debug_log.json"
         with open(debug_path, "w") as f:
             json.dump({str(k): v for k, v in sorted(ball_debug_log.items())}, f, indent=1)
-        print(f"  Ball debug log saved to {debug_path}")
+        logger.info(f"  Ball debug log saved to {debug_path}")
 
     # === Field-space trajectory projection and filtering ===
     if ball_detector and ball_tracker and ball_track_histories:
-        print("\nProjecting ball trajectories to field space...")
+        logger.info("Projecting ball trajectories to field space...")
         trajectory_field_data: dict[int, list[tuple]] = {}
 
         for tid, history in ball_track_histories.items():
@@ -955,20 +958,22 @@ def run_tracking(
             if field_points:
                 trajectory_field_data[tid] = field_points
 
-        print(f"  Total trajectories: {len(trajectory_field_data)}")
+        logger.info(f"  Total trajectories: {len(trajectory_field_data)}")
         for tid, pts in trajectory_field_data.items():
-            print(f"    Track {tid}: {len(pts)} projected points "
-                  f"(frames {pts[0][0]}-{pts[-1][0]})")
+            logger.info(f"    Track {tid}: {len(pts)} projected points "
+                        f"(frames {pts[0][0]}-{pts[-1][0]})")
 
         # Apply field-space filtering
         field_filter_config = ball_config.get("field_filter", {})
         if field_filter_config.get("enabled", True):
             filtered_trajectories = _filter_trajectories_field_space(
                 trajectory_field_data, fps, field_filter_config,
+                pitch_half_length=pitch_half_length,
+                pitch_half_width=pitch_half_width,
             )
             n_rejected = len(trajectory_field_data) - len(filtered_trajectories)
-            print(f"  Field filter: {len(filtered_trajectories)} trajectories pass, "
-                  f"{n_rejected} rejected")
+            logger.info(f"  Field filter: {len(filtered_trajectories)} trajectories pass, "
+                        f"{n_rejected} rejected")
         else:
             filtered_trajectories = trajectory_field_data
 
@@ -1033,7 +1038,7 @@ def run_tracking(
             # Remove spatial outliers BEFORE 3D estimation (uses raw projection coords)
             n_outliers = _remove_merge_outliers(all_ball_tracks, fps)
             if n_outliers > 0:
-                print(f"  Removed {n_outliers} merge outlier(s)")
+                logger.info(f"  Removed {n_outliers} merge outlier(s)")
 
             # Run BallTrajectory3D on all valid trajectories for 3D height estimation
             # Uses batch fit_track() API: collects all observations per track,
@@ -1065,8 +1070,8 @@ def run_tracking(
                             all_ball_tracks[fidx]["position_3d"] = traj_result["position_3d"]
                             all_ball_tracks[fidx]["on_ground"] = traj_result["on_ground"]
 
-            print(f"  Ball tracked in {len(all_ball_tracks)}/{len(_frame_indices_list)} frames "
-                  f"(from {len(filtered_trajectories)} valid trajectories)")
+            logger.info(f"  Ball tracked in {len(all_ball_tracks)}/{len(_frame_indices_list)} frames "
+                        f"(from {len(filtered_trajectories)} valid trajectories)")
 
             # Tag rejected trajectory detections in diagnostic data
             rejected_tids = set(trajectory_field_data.keys()) - set(filtered_trajectories.keys())
@@ -1079,7 +1084,7 @@ def run_tracking(
                             if abs(dc[0] - tc[0]) < 2 and abs(dc[1] - tc[1]) < 2:
                                 d["source"] = "rejected"
         else:
-            print("  No valid ball trajectory found after filtering")
+            logger.info("  No valid ball trajectory found after filtering")
 
         # Render diagnostic visualization
         if all_ball_dets_diag:
@@ -1087,8 +1092,75 @@ def run_tracking(
                 video_path, sampler, all_ball_dets_diag, output_dir,
             )
 
-    # Final team classification using jersey color histograms
-    print("\nFinalizing team assignments using jersey color histograms...")
+    team_assignments, jersey_assignments = _classify_teams(
+        all_tracks=all_tracks,
+        track_color_hists=track_color_hists,
+        track_positions=track_positions,
+        track_saturations=track_saturations,
+        team_classifier=team_classifier,
+        gk_detector=gk_detector,
+        jersey_aggregator=jersey_aggregator,
+        jersey_detections=jersey_detections,
+        pitch_length=pitch_length,
+        pitch_width=pitch_width,
+    )
+
+    _render_tracking_video(
+        video_path=video_path,
+        output_dir=output_dir,
+        sampler=sampler,
+        all_tracks=all_tracks,
+        team_assignments=team_assignments,
+        all_ball_tracks=all_ball_tracks,
+        ball_debug_log=ball_debug_log,
+        ball_enabled=ball_enabled,
+        out=out,
+        fps=fps,
+        height=height,
+        pitch_length=pitch_length,
+        pitch_width=pitch_width,
+    )
+
+    return _save_tracking_outputs(
+        output_dir=output_dir,
+        all_tracks=all_tracks,
+        team_assignments=team_assignments,
+        jersey_assignments=jersey_assignments,
+        track_features=track_features,
+        all_ball_tracks=all_ball_tracks,
+        ball_enabled=ball_enabled,
+        total_frames=total_frames,
+        sampler=sampler,
+    )
+
+
+_json_default = _json_default_impl
+
+
+# ---------------------------------------------------------------------------
+# Extracted sub-functions for run_tracking
+# ---------------------------------------------------------------------------
+
+
+def _classify_teams(
+    *,
+    all_tracks: dict,
+    track_color_hists: dict,
+    track_positions: dict,
+    track_saturations: dict,
+    team_classifier,
+    gk_detector,
+    jersey_aggregator,
+    jersey_detections: dict,
+    pitch_length: float,
+    pitch_width: float,
+) -> tuple[dict, dict]:
+    """Team classification, role refinement, off-field filtering, jersey voting.
+
+    Returns:
+        (team_assignments, jersey_assignments)
+    """
+    logger.info("Finalizing team assignments using jersey color histograms...")
 
     # Compute trajectory-averaged color histograms
     mean_color_features = {}
@@ -1102,8 +1174,8 @@ def run_tracking(
         if poss:
             mean_positions[tid] = np.median(poss, axis=0).tolist()
 
-    print(f"  Tracks with color features: {len(mean_color_features)}")
-    print(f"  Tracks with positions: {len(mean_positions)}")
+    logger.info(f"  Tracks with color features: {len(mean_color_features)}")
+    logger.info(f"  Tracks with positions: {len(mean_positions)}")
 
     # Compute median bbox heights per track (for filtering noisy small tracks)
     track_bbox_heights_all = {}
@@ -1130,6 +1202,7 @@ def run_tracking(
         if sats:
             mean_saturations[tid] = float(np.mean(sats))
 
+    team_assignments = {}
     if len(mean_color_features) >= 6:
         team_assignments = team_classifier.fit(
             mean_color_features, mean_positions,
@@ -1137,36 +1210,35 @@ def run_tracking(
             track_frame_counts=track_frame_counts,
             track_mean_saturations=mean_saturations,
         )
-        print(f"  Team assignments: {len(team_assignments)} tracks classified")
+        logger.info(f"  Team assignments: {len(team_assignments)} tracks classified")
     else:
-        print("  Warning: Not enough tracks for team classification")
+        logger.warning("Not enough tracks for team classification")
 
     # Role refinement: linesman + goalkeeper detection by position
     goalkeeper_tracks = set()
     if mean_positions:
-        print("  Refining roles by position...")
+        logger.info("  Refining roles by position...")
         team_assignments, goalkeeper_tracks = gk_detector.refine_roles(
             team_assignments, mean_positions, all_positions=track_positions
         )
 
     # Filter out off-field tracks (substitutes, coaches, spectators)
-    # A track is off-field if its median position is outside the pitch boundary
     half_l = pitch_length / 2
     half_w = pitch_width / 2
-    off_field_margin = 0.5  # meters beyond pitch boundary to still include
+    off_field_margin = 0.5
     off_field_tracks = set()
     for tid, pos in mean_positions.items():
         if abs(pos[0]) > half_l + off_field_margin or abs(pos[1]) > half_w + off_field_margin:
             off_field_tracks.add(tid)
     if off_field_tracks:
-        print(f"  Off-field tracks removed: {sorted(off_field_tracks)}")
+        logger.info(f"  Off-field tracks removed: {sorted(off_field_tracks)}")
         for tid in off_field_tracks:
             team_assignments.pop(tid, None)
 
     # Compute final jersey number assignments via voting
     jersey_assignments = {}
     if jersey_aggregator and jersey_detections:
-        print("  Computing jersey number consensus...")
+        logger.info("  Computing jersey number consensus...")
         for tid in jersey_detections:
             jnum, jconf = jersey_aggregator.get_consensus(tid)
             if jnum is not None:
@@ -1174,7 +1246,7 @@ def run_tracking(
                     "number": jnum,
                     "confidence": round(jconf, 3),
                 }
-        print(f"  Jersey numbers identified: {len(jersey_assignments)} tracks")
+        logger.info(f"  Jersey numbers identified: {len(jersey_assignments)} tracks")
 
     # Update all tracks with final team assignments, roles, and jersey numbers
     for frame_idx in all_tracks:
@@ -1191,27 +1263,40 @@ def run_tracking(
                 track["role"] = "referee"
             else:
                 track["role"] = "player"
-            # Final jersey number from voting consensus
             jr = jersey_assignments.get(tid)
             track["jersey_number"] = jr["number"] if jr else None
             track["jersey_confidence"] = jr["confidence"] if jr else 0.0
 
-    # Generate visualization with final team assignments
-    print("\nGenerating visualization with final team assignments...")
+    return team_assignments, jersey_assignments
 
-    # Re-read frames for rendering (frames are not cached to save memory)
+
+def _render_tracking_video(
+    *,
+    video_path: Path,
+    output_dir: Path,
+    sampler,
+    all_tracks: dict,
+    team_assignments: dict,
+    all_ball_tracks: dict,
+    ball_debug_log: dict,
+    ball_enabled: bool,
+    out: cv2.VideoWriter,
+    fps: float,
+    height: int,
+    pitch_length: float,
+    pitch_width: float,
+) -> None:
+    """Render the tracking visualization video with team + ball overlays."""
+    logger.info("Generating visualization with final team assignments...")
+
     render_prefetcher = _FramePrefetcher(video_path, list(sampler), prefetch_size=4)
+    track_history = {}
 
-    track_history = {}  # Reset for visualization
-
-    # Create per-frame output directories
     vis_frames_dir = output_dir / "frames"
     vis_frames_dir.mkdir(exist_ok=True)
 
-    # Pre-sort ball track keys for fast slicing
     _ball_sorted_keys = sorted(all_ball_tracks.keys()) if ball_enabled else []
 
-    # Background writer thread for file I/O
     import queue as _wq
     _write_queue: _wq.Queue = _wq.Queue(maxsize=32)
 
@@ -1237,13 +1322,10 @@ def run_tracking(
         if frame is None:
             break
 
-        # Get tracks for this frame with updated team assignments
         frame_tracks = all_tracks.get(frame_idx, [])
-
-        # Draw visualization
         vis = draw_tracks(frame, frame_tracks, track_history, team_assignments)
 
-        # Draw ball: raw detections + tracked ball
+        # Draw ball
         ball_track_this = None
         ball_traj_world = None
         ball_dets_this = None
@@ -1257,14 +1339,11 @@ def run_tracking(
             keys_up_to = _ball_sorted_keys[:end]
             traj = [all_ball_tracks[fi]["center"] for fi in keys_up_to]
             traj = traj[-30:]
-            # Build per-track_id trajectories
             for fi in keys_up_to:
                 tid = all_ball_tracks[fi].get("track_id")
                 if tid is not None:
                     traj_by_tid.setdefault(tid, []).append(all_ball_tracks[fi]["center"])
-            # Keep only last 30 points per track
             traj_by_tid = {tid: pts[-30:] for tid, pts in traj_by_tid.items()}
-            # Get world trajectory (for top-down view)
             ball_traj_world = [
                 all_ball_tracks[fi]["pitch_position"]
                 for fi in keys_up_to
@@ -1275,7 +1354,6 @@ def run_tracking(
                               ball_detections=ball_dets_this,
                               ball_trajectories_by_tid=traj_by_tid)
 
-        # Draw top-down pitch diagram
         topdown = draw_topdown_pitch(
             height, frame_tracks, team_assignments,
             ball_track=ball_track_this,
@@ -1285,7 +1363,6 @@ def run_tracking(
         )
         combined = np.hstack([vis, topdown])
 
-        # Offload all I/O to background writer
         fname = f"frame_{frame_idx:05d}"
         _write_queue.put(("video", combined))
         _write_queue.put(("image", str(vis_frames_dir / f"{fname}.jpg"), combined))
@@ -1297,27 +1374,37 @@ def run_tracking(
             "ball": ball_track_this,
         }))
 
-    # Wait for writer to finish
     _write_queue.put(None)
     _writer.join()
 
     render_prefetcher.shutdown()
     out.release()
 
-    # Save results
+
+def _save_tracking_outputs(
+    *,
+    output_dir: Path,
+    all_tracks: dict,
+    team_assignments: dict,
+    jersey_assignments: dict,
+    track_features: dict,
+    all_ball_tracks: dict,
+    ball_enabled: bool,
+    total_frames: int,
+    sampler,
+) -> dict:
+    """Write tracking output files and compute statistics."""
     with open(output_dir / "tracks.json", "w") as f:
         json.dump({str(k): v for k, v in all_tracks.items()}, f)
 
     with open(output_dir / "team_assignments.json", "w") as f:
         json.dump(team_assignments, f, indent=2)
 
-    # Save jersey assignments
     if jersey_assignments:
         with open(output_dir / "jersey_assignments.json", "w") as f:
             json.dump({str(k): v for k, v in jersey_assignments.items()}, f, indent=2)
-        print(f"  Saved jersey assignments for {len(jersey_assignments)} tracks")
+        logger.info(f"  Saved jersey assignments for {len(jersey_assignments)} tracks")
 
-    # Save track features for Stage 3
     serializable_features = {
         str(tid): [f.tolist() if isinstance(f, np.ndarray) else f for f in feats]
         for tid, feats in track_features.items()
@@ -1325,12 +1412,11 @@ def run_tracking(
     with open(output_dir / "track_features.json", "w") as f:
         json.dump(serializable_features, f)
 
-    # Save ball tracks
     if ball_enabled and all_ball_tracks:
         serializable_ball_tracks = {str(k): sanitize_for_json(v) for k, v in all_ball_tracks.items()}
         with open(output_dir / "ball_tracks.json", "w") as f:
             json.dump(serializable_ball_tracks, f, indent=2)
-        print(f"  Saved {len(all_ball_tracks)} ball detections")
+        logger.info(f"  Saved {len(all_ball_tracks)} ball detections")
 
     # Statistics
     unique_tracks = set()
@@ -1353,16 +1439,13 @@ def run_tracking(
     with open(output_dir / "statistics.json", "w") as f:
         json.dump(stats, f, indent=2)
 
-    print(f"\nStage 2 Complete:")
-    print(f"  Processed frames: {len(sampler)}")
-    print(f"  Unique tracks: {len(unique_tracks)}")
-    print(f"  Team distribution: {team_counts}")
-    print(f"  Output: {output_dir}")
+    logger.info(f"Stage 2 Complete:")
+    logger.info(f"  Processed frames: {len(sampler)}")
+    logger.info(f"  Unique tracks: {len(unique_tracks)}")
+    logger.info(f"  Team distribution: {team_counts}")
+    logger.info(f"  Output: {output_dir}")
 
     return stats
-
-
-_json_default = _json_default_impl
 
 
 def main():

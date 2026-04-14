@@ -9,6 +9,7 @@ Selected via config: field_registration.backend = "broadtrack"
 """
 
 import json
+import logging
 import pickle
 from pathlib import Path
 
@@ -16,10 +17,20 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
+logger = logging.getLogger(__name__)
+
 from ..utils.config import get_default_config, get_process_fps_from_config, FrameSampler
 from ..utils.serialization import json_default as _json_default
 from ..utils.pitch import get_pitch_template_points, project_pitch_to_image, _draw_topdown_pitch
 from .shared_vis import draw_vis_keypoints, draw_vis_lines, draw_vis_calibration
+from ._runner_base import (
+    open_video,
+    make_sampler,
+    init_calibration_results,
+    save_calibration_outputs,
+    compute_calibration_stats,
+    print_calibration_summary,
+)
 
 
 def run_stage1_broadtrack(
@@ -50,7 +61,7 @@ def run_stage1_broadtrack(
     bt_config = fr_config.get("broadtrack", {})
 
     # Initialize keypoint detector (reuse existing PnLCalib detector)
-    print("Stage 1 (BroadTrack): Initializing keypoint detector...")
+    logger.info("Stage 1 (BroadTrack): Initializing keypoint detector...")
     kp_config = {
         "backend": "pnlcalib",
         "pnlcalib": {
@@ -70,7 +81,7 @@ def run_stage1_broadtrack(
 
     if use_line_model:
         from . import LineDetector
-        print("Stage 1 (BroadTrack): Initializing line detector...")
+        logger.info("Stage 1 (BroadTrack): Initializing line detector...")
         line_config = {
             "backend": "pnlcalib",
             "pnlcalib": {
@@ -81,23 +92,16 @@ def run_stage1_broadtrack(
         line_detector = LineDetector(line_config)
         line_detector.load_model()
     else:
-        print("Stage 1 (BroadTrack): Deriving lines from keypoints (no line model)")
+        logger.info("Stage 1 (BroadTrack): Deriving lines from keypoints (no line model)")
 
     ransac_thresh = pnl_config.get("ransac_threshold", 30.0)
     pitch_template = get_pitch_template_points()
 
     # Open video
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {video_path}")
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    sampler = FrameSampler(total_frames, fps, process_fps)
-    print(f"Video: {total_frames} frames @ {fps:.1f} fps, {width}x{height}")
-    print(f"Processing {len(sampler)} frames at {process_fps or fps} fps")
+    video = open_video(video_path)
+    cap = video.cap
+    width, height = video.width, video.height
+    sampler = make_sampler(video, process_fps)
 
     # Initialize BroadTrack calibrator
     calibrator = BroadTrackCalibrator(
@@ -111,17 +115,7 @@ def run_stage1_broadtrack(
     )
 
     # Results storage
-    calibration_results = {
-        "video_info": {
-            "path": str(video_path),
-            "total_frames": total_frames,
-            "fps": fps,
-            "width": width,
-            "height": height,
-            "process_fps": process_fps,
-        },
-        "frames": {}
-    }
+    calibration_results = init_calibration_results(video_path, video, process_fps)
     homographies = {}
 
     # Create visualization subdirectories
@@ -190,34 +184,11 @@ def run_stage1_broadtrack(
 
     cap.release()
 
-    # Save results
-    with open(output_dir / "calibration_metadata.json", "w") as f:
-        json.dump(calibration_results, f)
-    with open(output_dir / "homographies.pkl", "wb") as f:
-        pickle.dump(homographies, f)
-
-    # Statistics
-    stats = {
-        "total_frames": total_frames,
-        "processed_frames": len(sampler),
-        "calibrated_frames": calibrated_count,
-        "calibration_rate": calibrated_count / len(sampler) if sampler else 0,
-    }
-
-    errors = [
-        calibration_results["frames"][idx]["reprojection_error"]
-        for idx in calibration_results["frames"]
-        if calibration_results["frames"][idx].get("calibrated")
-    ]
-    if errors:
-        stats["mean_error"] = float(np.mean(errors))
-        stats["median_error"] = float(np.median(errors))
-
-    print(f"\nStage 1 (BroadTrack) Complete:")
-    print(f"  Calibrated: {calibrated_count}/{len(sampler)} ({stats['calibration_rate']*100:.1f}%)")
-    if errors:
-        print(f"  Median error: {stats['median_error']:.2f} px")
-
+    save_calibration_outputs(output_dir, calibration_results, homographies)
+    stats = compute_calibration_stats(
+        calibration_results, video, sampler, calibrated_count,
+    )
+    print_calibration_summary(stats, label="Stage 1 (BroadTrack)")
     return stats
 
 
