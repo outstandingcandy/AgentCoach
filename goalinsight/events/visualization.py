@@ -84,10 +84,15 @@ def render_event_video(
     player_tracks = {}
     ball_tracks = {}
     team_assignments = {}
+    player_frame_keys = []
+    ball_frame_keys = []
     if tracking_dir:
         player_tracks = _load_json(tracking_dir / "tracks.json") or {}
         ball_tracks = _load_json(tracking_dir / "ball_tracks.json") or {}
         team_assignments = _load_json(tracking_dir / "team_assignments.json") or {}
+        # Pre-sort frame keys for nearest-frame lookup (tracking may be subsampled)
+        player_frame_keys = sorted(int(k) for k in player_tracks.keys())
+        ball_frame_keys = sorted(int(k) for k in ball_tracks.keys())
 
     # Build a sorted list of frames that have events (for the event timeline bar)
     event_frames = sorted(set(e["frame"] for e in events))
@@ -100,9 +105,14 @@ def render_event_video(
             break
 
         # Draw tracking overlays (players + ball)
+        # Tracking data may be subsampled (e.g., every 3rd frame at process_fps=10).
+        # Use nearest available frame to avoid flickering.
         if player_tracks or ball_tracks:
+            player_key = _find_nearest_key(frame_idx, player_frame_keys)
+            ball_key = _find_nearest_key(frame_idx, ball_frame_keys)
             frame = _draw_tracking_overlay(
-                frame, frame_idx, player_tracks, ball_tracks, team_assignments
+                frame, player_key, ball_key,
+                player_tracks, ball_tracks, team_assignments,
             )
 
         # Draw active event banners
@@ -270,9 +280,34 @@ def _format_event_detail(event: dict) -> str:
     return ""
 
 
+def _find_nearest_key(
+    frame_idx: int,
+    sorted_keys: list[int],
+    max_distance: int = 5,
+) -> int | None:
+    """Find the nearest frame key to frame_idx via binary search.
+
+    Returns None if no key is within max_distance frames.
+    """
+    if not sorted_keys:
+        return None
+    import bisect
+    pos = bisect.bisect_left(sorted_keys, frame_idx)
+    best = None
+    best_dist = max_distance + 1
+    for i in (pos - 1, pos):
+        if 0 <= i < len(sorted_keys):
+            d = abs(sorted_keys[i] - frame_idx)
+            if d < best_dist:
+                best_dist = d
+                best = sorted_keys[i]
+    return best
+
+
 def _draw_tracking_overlay(
     frame: np.ndarray,
-    frame_idx: int,
+    player_key: int | None,
+    ball_key: int | None,
     player_tracks: dict,
     ball_tracks: dict,
     team_assignments: dict,
@@ -281,33 +316,35 @@ def _draw_tracking_overlay(
     h, w = frame.shape[:2]
 
     # Player tracks
-    tracks = player_tracks.get(str(frame_idx), [])
-    for t in tracks:
-        bbox = t.get("bbox")
-        if bbox is None:
-            continue
-        x1, y1, x2, y2 = map(int, bbox)
-        tid = t.get("track_id", 0)
-        team = team_assignments.get(str(tid), t.get("team", "unknown"))
-        color = TEAM_COLORS.get(team, (128, 128, 128))
+    if player_key is not None:
+        tracks = player_tracks.get(str(player_key), [])
+        for t in tracks:
+            bbox = t.get("bbox")
+            if bbox is None:
+                continue
+            x1, y1, x2, y2 = map(int, bbox)
+            tid = t.get("track_id", 0)
+            team = team_assignments.get(str(tid), t.get("team", "unknown"))
+            color = TEAM_COLORS.get(team, (128, 128, 128))
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        # Label
-        role = t.get("role", "player")
-        label = f"{tid}"
-        if role == "goalkeeper":
-            label = f"GK-{tid}"
-        cv2.putText(frame, label, (x1, y1 - 4), FONT, 0.4, color, 1)
+            # Label
+            role = t.get("role", "player")
+            label = f"{tid}"
+            if role == "goalkeeper":
+                label = f"GK-{tid}"
+            cv2.putText(frame, label, (x1, y1 - 4), FONT, 0.4, color, 1)
 
     # Ball track
-    ball = ball_tracks.get(str(frame_idx))
-    if ball:
-        center = ball.get("center")
-        if center:
-            cx, cy = int(center[0]), int(center[1])
-            cv2.circle(frame, (cx, cy), 8, (0, 165, 255), -1)
-            cv2.circle(frame, (cx, cy), 8, (255, 255, 255), 2)
+    if ball_key is not None:
+        ball = ball_tracks.get(str(ball_key))
+        if ball:
+            center = ball.get("center")
+            if center:
+                cx, cy = int(center[0]), int(center[1])
+                cv2.circle(frame, (cx, cy), 8, (0, 165, 255), -1)
+                cv2.circle(frame, (cx, cy), 8, (255, 255, 255), 2)
 
     return frame
 

@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import logging
-import math
 from typing import Any
 
-from .._closeup import interpolate_bbox
 from .._context import MatchContext
 from .._temporal import find_buildup_start, find_celebration_end
 from .._types import AnalyzedEvent, ClipSegment, Event
@@ -34,90 +32,94 @@ class ScorerAnalyzer(BaseSceneAnalyzer):
         buildup_max = temporal_cfg.get("buildup_max_seconds", 10.0)
         buildup_pad = temporal_cfg.get("buildup_padding_seconds", 2.0)
         celebration_dur = temporal_cfg.get("celebration_seconds", 4.0)
-        goal_moment_dur = temporal_cfg.get("goal_moment_seconds", 2.0)
 
-        # --- Player attribution ---
-        scorer = self._find_scorer(ctx, goal_frame, goal_side)
-        key_players: list[dict[str, Any]] = []
-        if scorer is not None:
-            key_players.append(scorer)
-            logger.info(
-                "Scorer identified: track_id=%d, team=%s, distance=%.1fm",
-                scorer["track_id"],
-                scorer["team"],
-                scorer["distance"],
+        # --- Player attribution (from event detector) ---
+        event_player = event.metadata.get("player_id")
+        event_team = event.metadata.get("team_id")
+        if event_player is None:
+            raise ValueError(
+                f"Goal event at frame {goal_frame} has no player_id — "
+                "run event_detection stage first to get shooter attribution"
             )
-        else:
-            logger.warning("Could not identify scorer for goal at frame %d", goal_frame)
+
+        shooter_frame = event.metadata.get("shooter_frame", goal_frame)
+        scorer = {
+            "track_id": event_player,
+            "role": "scorer",
+            "team": event_team or "unknown",
+            "distance": 0.0,
+            "frame": shooter_frame,
+        }
+        logger.info(
+            "Scorer from event detector: track_id=%s, team=%s",
+            event_player, event_team,
+        )
+        key_players: list[dict[str, Any]] = [scorer]
 
         # --- Temporal windows ---
         buildup_start = find_buildup_start(
             ctx, goal_frame, goal_side,
             max_seconds=buildup_max, padding_seconds=buildup_pad,
         )
-        celebration_end = find_celebration_end(
-            goal_frame, fps,
+
+        scorer_id = scorer["track_id"]
+        celebration_start = goal_frame
+        celebration_max_end = find_celebration_end(
+            celebration_start, fps,
             duration_seconds=celebration_dur,
             total_frames=ctx.frame_count or None,
         )
 
-        half_moment = int(goal_moment_dur * fps / 2)
-        shot_dur = temporal_cfg.get("shot_closeup_seconds", 3.0)
-        half_shot = int(shot_dur * fps / 2)
-
-        # Scorer's last-touch frame (the moment of the shot)
-        shot_frame = scorer["frame"] if scorer else goal_frame
+        # Truncate celebration when scorer track is lost
+        scorer_trajectory = ctx.get_player_trajectory(
+            scorer_id, celebration_start, celebration_max_end,
+        )
+        if scorer_trajectory:
+            last_seen = max(t["frame"] for t in scorer_trajectory)
+            celebration_end = min(celebration_max_end, last_seen)
+            if celebration_end < celebration_max_end:
+                logger.info(
+                    "Celebration truncated: scorer track %s lost at frame %d "
+                    "(max was %d)",
+                    scorer_id, last_seen, celebration_max_end,
+                )
+        else:
+            celebration_end = celebration_max_end
 
         # --- Segment plan ---
+        # Buildup extends past goal frame; celebration starts at goal frame.
+        # The two segments overlap — buildup shows the ball entering the net,
+        # celebration tracks the scorer from the goal moment.
+        buildup_ext = int(temporal_cfg.get("buildup_extension_seconds", 3.0) * fps)
+        buildup_end = min(goal_frame + buildup_ext, celebration_end)
+
         segments: list[ClipSegment] = []
 
-        # 1. Build-up: medium shot following the ball
+        # 1. Build-up → goal moment + extension: follow the ball
+        buildup_view = temporal_cfg.get("buildup_view", "medium")
         segments.append(
             ClipSegment(
                 name="buildup",
                 start_frame=buildup_start,
-                end_frame=max(buildup_start, shot_frame - half_shot - 1),
-                view_type="medium",
+                end_frame=buildup_end,
+                view_type=buildup_view,
                 focus_target="ball",
             )
         )
 
-        # 2. Shot close-up: follow the scorer around the shooting moment
-        scorer_id = scorer["track_id"] if scorer else None
-        segments.append(
-            ClipSegment(
-                name="shot",
-                start_frame=max(0, shot_frame - half_shot),
-                end_frame=shot_frame + half_shot,
-                view_type="closeup",
-                focus_target="player" if scorer_id else "ball",
-                focus_track_id=scorer_id,
+        # 2. Celebration: follow the scorer from goal frame
+        celebration_view = temporal_cfg.get("celebration_view", "medium")
+        if celebration_start <= celebration_end:
+            segments.append(
+                ClipSegment(
+                    name="celebration",
+                    start_frame=celebration_start,
+                    end_frame=celebration_end,
+                    view_type=celebration_view,
+                    focus_target="player",
+                    focus_track_id=scorer_id,
+                )
             )
-        )
-
-        # 3. Goal moment: close-up following the ball into the net
-        segments.append(
-            ClipSegment(
-                name="goal_moment",
-                start_frame=max(0, goal_frame - half_moment),
-                end_frame=goal_frame + half_moment,
-                view_type="closeup",
-                focus_target="ball",
-                overlays=[{"type": "text", "text": "GOAL!", "position": "top_center"}],
-            )
-        )
-
-        # 4. Celebration: medium shot following the scorer
-        segments.append(
-            ClipSegment(
-                name="celebration",
-                start_frame=goal_frame + half_moment + 1,
-                end_frame=celebration_end,
-                view_type="medium",
-                focus_target="player",
-                focus_track_id=scorer_id,
-            )
-        )
 
         return AnalyzedEvent(
             event=event,
@@ -125,132 +127,3 @@ class ScorerAnalyzer(BaseSceneAnalyzer):
             segments=segments,
         )
 
-    # ------------------------------------------------------------------
-    # Player attribution internals
-    # ------------------------------------------------------------------
-
-    def _find_scorer(
-        self,
-        ctx: MatchContext,
-        goal_frame: int,
-        goal_side: str,
-        search_radius: float = 3.0,
-        lookback_frames: int = 90,
-    ) -> dict[str, Any] | None:
-        """Find the player who scored.
-
-        Strategy:
-        1. Determine which team is attacking the goal (by spatial distribution).
-        2. At the goal frame, find the nearest attacking player to the ball.
-        3. If none within radius, search the preceding lookback_frames.
-        """
-        # Try nearby frames if goal_frame has no tracks
-        attacking_team = None
-        for offset in range(0, 30):
-            for f in (goal_frame - offset, goal_frame + offset):
-                if f < 0:
-                    continue
-                attacking_team = self._infer_attacking_team(ctx, f, goal_side)
-                if attacking_team is not None:
-                    break
-            if attacking_team is not None:
-                break
-
-        logger.info("Attacking team: %s (goal_side=%s)", attacking_team, goal_side)
-
-        # Search from goal_frame backwards
-        for f in range(goal_frame, max(0, goal_frame - lookback_frames) - 1, -1):
-            ball = ctx.get_ball_at_frame(f)
-            if ball is None or ball.get("pitch_position") is None:
-                continue
-            bx, by = ball["pitch_position"]
-
-            tracks = ctx.get_tracks_at_frame(f)
-            best_track = None
-            best_dist = float("inf")
-
-            half_length = ctx.pitch_length / 2
-            goal_x = -half_length if goal_side == "left" else half_length
-
-            for t in tracks:
-                pp = t.get("pitch_position")
-                if pp is None:
-                    continue
-                team = ctx.get_team_for_track(t["track_id"])
-                if team == "referee":
-                    continue
-                # Skip players hugging the goal line — likely the goalkeeper
-                # trying to save, not the scorer. Threshold: within 3m of
-                # the goal line.
-                dist_to_goal_line = abs(pp[0] - goal_x)
-                if dist_to_goal_line < 3.0:
-                    continue
-                # Only consider the attacking team (or unknown if team not determined)
-                if attacking_team and team not in (attacking_team, "unknown"):
-                    continue
-                dist = math.hypot(pp[0] - bx, pp[1] - by)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_track = t
-
-            if best_track is not None and best_dist <= search_radius:
-                return {
-                    "track_id": best_track["track_id"],
-                    "role": "scorer",
-                    "team": ctx.get_team_for_track(best_track["track_id"]),
-                    "distance": best_dist,
-                    "frame": f,
-                }
-
-        return None
-
-    def _infer_attacking_team(
-        self,
-        ctx: MatchContext,
-        goal_frame: int,
-        goal_side: str,
-    ) -> str | None:
-        """Infer which team is attacking the given goal side.
-
-        Heuristic: the defending team has its goalkeeper + defenders near
-        the goal, so the team with FEWER players in the goal-side half is
-        the attacking team (their home half is the opposite side).
-
-        Example: goal on left → defending team clusters in the left half
-        → the team with fewer players in the left half is the attacker.
-        """
-        tracks = ctx.get_tracks_at_frame(goal_frame)
-        if not tracks:
-            return None
-
-        # Count players in the goal-side half per team
-        team_in_goal_half: dict[str, int] = {}
-        team_total: dict[str, int] = {}
-        for t in tracks:
-            pp = t.get("pitch_position")
-            if pp is None:
-                continue
-            team = ctx.get_team_for_track(t["track_id"])
-            if team in ("referee", "unknown"):
-                continue
-
-            team_total[team] = team_total.get(team, 0) + 1
-
-            in_goal_half = (
-                (goal_side == "left" and pp[0] < 0)
-                or (goal_side == "right" and pp[0] > 0)
-            )
-            if in_goal_half:
-                team_in_goal_half[team] = team_in_goal_half.get(team, 0) + 1
-
-        if not team_total:
-            return None
-
-        # The defending team has a higher fraction of players in the goal-side half.
-        # The attacking team has a lower fraction → they came from the other side.
-        team_fractions = {
-            team: team_in_goal_half.get(team, 0) / team_total[team]
-            for team in team_total
-        }
-        # Attacking team = lowest fraction in goal-side half
-        return min(team_fractions, key=team_fractions.get)

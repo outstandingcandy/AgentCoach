@@ -26,14 +26,25 @@ _DEFAULT_HIGHLIGHT_CONFIG: dict[str, Any] = {
         "output_size": [640, 360],
         "padding_factor": 4.0,
         "smooth_alpha": 0.15,
-        "medium_padding_factor": 8.0,
+        "medium_padding_factor": 2.5,
+        "ball_padding_factor": 6.0,
     },
     "temporal": {
         "buildup_max_seconds": 10.0,
         "buildup_padding_seconds": 2.0,
-        "celebration_seconds": 4.0,
-        "goal_moment_seconds": 4.0,
+        "buildup_extension_seconds": 3.0,
+        "buildup_view": "wide",
+        "celebration_seconds": 10.0,
+        "celebration_view": "medium",
         "shot_closeup_seconds": 3.0,
+    },
+    "effects": {
+        "shooter_spotlight": True,
+        "spotlight_color": [0, 215, 255],  # gold BGR
+        "spotlight_alpha": 0.4,
+        "ball_trail": True,
+        "trail_length": 15,
+        "trail_color": [0, 255, 255],  # yellow BGR
     },
     "overlays": {
         "enabled": True,

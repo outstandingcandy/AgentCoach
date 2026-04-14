@@ -1,6 +1,8 @@
-# Run highlight clip generator on pipeline output
-python scripts/run_highlights.py \
-  --pipeline-output output/pipeline_007_2 \
-  --celebration-seconds 10 \
-  --pitch-length 91 \
-  --pitch-width 55
+# Run full pipeline with fine-tuned model
+  # --stages field_registration,tracking \
+python scripts/run_full_pipeline.py \
+  --video data/raw_videos/football_sunday_full.mp4 \
+  --output output/full_pipeline/full \
+  --stages highlights \
+  --no-timestamp \
+  --config configs/clip_000_physical.yaml

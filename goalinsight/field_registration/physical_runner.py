@@ -266,6 +266,8 @@ def run_stage1_physical(
             "width": width,
             "height": height,
             "process_fps": process_fps,
+            "pitch_length": pitch_length,
+            "pitch_width": pitch_width,
         },
         "frames": {}
     }

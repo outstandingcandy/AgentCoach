@@ -191,3 +191,27 @@ class GoalDetectionStage(Stage):
             json.dump(goals, f, indent=2, default=str)
 
         return {"goals_detected": len(goals), "goals": goals}
+
+
+@register_stage
+class HighlightsStage(Stage):
+    name = "highlights"
+    description = "Highlight Clipping"
+
+    def run(self, ctx: PipelineContext) -> dict[str, Any]:
+        from ..highlights import run_highlights
+
+        out = ctx.stage_dir(self.name)
+        config = ctx.config.get("highlights", {}) if ctx.config else {}
+
+        clips = run_highlights(
+            output_dir=out,
+            pipeline_output_dir=ctx.output_dir,
+            video_path=ctx.video_path,
+            config=config,
+        )
+
+        return {"clips": [str(c) for c in clips], "count": len(clips)}
+
+    def should_skip(self, ctx: PipelineContext) -> bool:
+        return False  # Always regenerate highlights

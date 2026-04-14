@@ -118,11 +118,13 @@ def extract_closeup(
 def interpolate_bbox(
     trajectory: list[dict],
     frame: int,
+    max_extrapolate: int = 15,
 ) -> list[float] | None:
     """Linearly interpolate a bbox for *frame* from surrounding observations.
 
     Each entry in *trajectory* must have 'frame' and 'bbox' keys.
-    Returns None if interpolation is not possible.
+    Returns None if the frame is beyond *max_extrapolate* frames from
+    any observation (track lost — caller should fall back to wide view).
     """
     if not trajectory:
         return None
@@ -147,7 +149,8 @@ def interpolate_bbox(
                 for i in range(4)
             ]
 
-    # Fallback: use nearest observation (no distance limit — better to
-    # hold the last known position than to jump to full-frame wide view)
+    # Extrapolate from nearest observation, but only within limit
     nearest = min(trajectory, key=lambda t: abs(t["frame"] - frame))
-    return nearest["bbox"]
+    if abs(nearest["frame"] - frame) <= max_extrapolate:
+        return nearest["bbox"]
+    return None
