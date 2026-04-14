@@ -75,9 +75,7 @@ class SegmentComposer(BaseClipComposer):
         trail_color = tuple(effects_cfg.get("trail_color", [0, 255, 255]))
 
         # Pre-load data needed for effects
-        shooter_frame = event.metadata.get("shooter_frame", event.frame)
         scorer_id = None
-        scorer_trajectory_full: list[dict] | None = None
         if analyzed.key_players:
             scorer_id = analyzed.key_players[0].get("track_id")
 
@@ -102,9 +100,10 @@ class SegmentComposer(BaseClipComposer):
                         segment.end_frame,
                     )
 
-            # Pre-load scorer trajectory for spotlight effect
-            if spotlight_enabled and segment.name == "celebration" and scorer_id is not None:
-                scorer_trajectory_full = ctx.get_player_trajectory(
+            # Pre-load scorer trajectory for spotlight effect (all segments)
+            scorer_trajectory_seg: list[dict] | None = None
+            if spotlight_enabled and scorer_id is not None:
+                scorer_trajectory_seg = ctx.get_player_trajectory(
                     scorer_id, segment.start_frame, segment.end_frame,
                 )
 
@@ -118,13 +117,13 @@ class SegmentComposer(BaseClipComposer):
                 show_progress=False,
             ):
                 # --- Draw effects on raw frame before cropping ---
-                if trail_enabled and segment.name == "buildup" and frame_id >= shooter_frame:
+                if trail_enabled:
                     self._draw_ball_trail(
-                        frame, ctx, frame_id, shooter_frame, trail_length, trail_color,
+                        frame, ctx, frame_id, trail_length, trail_color,
                     )
 
-                if spotlight_enabled and segment.name == "celebration" and scorer_trajectory_full:
-                    bbox = interpolate_bbox(scorer_trajectory_full, frame_id)
+                if spotlight_enabled and scorer_trajectory_seg:
+                    bbox = interpolate_bbox(scorer_trajectory_seg, frame_id)
                     if bbox is not None:
                         self._draw_spotlight(frame, bbox, spotlight_color, spotlight_alpha)
 
@@ -150,14 +149,29 @@ class SegmentComposer(BaseClipComposer):
                         "scale": round(crop_info.scale, 4),
                     }
 
-            # Cross-fade between segments
-            if seg_idx > 0 and prev_segment_last_frames and crossfade_frames > 0:
-                self._write_crossfade(
-                    writer, prev_segment_last_frames, segment_frames,
-                    crossfade_frames,
+            # Apply slow-motion if needed (e.g. replay segment)
+            if segment.speed < 1.0 and len(segment_frames) >= 2:
+                segment_frames = self._interpolate_slowmo(
+                    segment_frames, segment.speed,
                 )
-                # Skip the cross-faded frames from the current segment
-                segment_frames = segment_frames[crossfade_frames:]
+
+            # Semantic transitions between segments
+            if seg_idx > 0 and prev_segment_last_frames:
+                transition = segment.transition
+                if transition == "crossfade" and crossfade_frames > 0:
+                    self._write_crossfade(
+                        writer, prev_segment_last_frames, segment_frames,
+                        crossfade_frames,
+                    )
+                    # Skip the cross-faded frames from the current segment
+                    segment_frames = segment_frames[crossfade_frames:]
+                elif transition == "flash":
+                    self._write_flash_transition(
+                        writer,
+                        prev_segment_last_frames[-1],
+                        segment_frames[0] if segment_frames else None,
+                    )
+                # "cut" — no transition, just concatenate
 
             for sf in segment_frames:
                 writer.write(sf)
@@ -296,31 +310,52 @@ class SegmentComposer(BaseClipComposer):
         color: tuple[int, ...] = (0, 215, 255),
         alpha: float = 0.4,
     ) -> None:
-        """Draw a glowing ellipse at the player's feet (in-place)."""
+        """Draw a soft, multi-layer glowing ellipse at the player's feet.
+
+        Three concentric layers (large→small) with increasing opacity
+        create a Gaussian-like falloff for a natural spotlight effect.
+        """
         x1, y1, x2, y2 = bbox
         cx = int((x1 + x2) / 2)
         cy = int(y2)  # bottom of bbox = feet
-        w = int((x2 - x1) * 0.6)
-        h = int(w * 0.3)
-        if w < 5 or h < 3:
+        base_w = int((x2 - x1) * 0.6)
+        base_h = int(base_w * 0.3)
+        if base_w < 5 or base_h < 3:
             return
 
         overlay = frame.copy()
-        cv2.ellipse(overlay, (cx, cy), (w, h), 0, 0, 360, color, -1)
-        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
+        # Outer glow (large, faint)
+        cv2.ellipse(overlay, (cx, cy), (int(base_w * 1.5), int(base_h * 1.5)),
+                     0, 0, 360, color, -1)
+        cv2.addWeighted(overlay, alpha * 0.3, frame, 1 - alpha * 0.3, 0, dst=frame)
+        # Mid glow
+        overlay[:] = frame
+        cv2.ellipse(overlay, (cx, cy), (base_w, base_h),
+                     0, 0, 360, color, -1)
+        cv2.addWeighted(overlay, alpha * 0.5, frame, 1 - alpha * 0.5, 0, dst=frame)
+        # Inner core (bright, small)
+        overlay[:] = frame
+        cv2.ellipse(overlay, (cx, cy), (int(base_w * 0.5), int(base_h * 0.5)),
+                     0, 0, 360, color, -1)
+        cv2.addWeighted(overlay, alpha * 0.8, frame, 1 - alpha * 0.8, 0, dst=frame)
 
     @staticmethod
     def _draw_ball_trail(
         frame: np.ndarray,
         ctx: "MatchContext",
         frame_id: int,
-        trail_start_frame: int,
         trail_length: int = 15,
         color: tuple[int, ...] = (0, 255, 255),
     ) -> None:
-        """Draw a fading trajectory trail behind the ball (in-place)."""
-        # Collect recent ball pixel positions
-        start = max(trail_start_frame, frame_id - trail_length)
+        """Draw a comet-style trajectory trail behind the ball (in-place).
+
+        Uses a single overlay + blend instead of per-segment copies
+        (15× fewer frame copies at 1080p).  Newer segments are drawn
+        brighter and thicker to create a comet/fade effect.  The trail
+        always looks back *trail_length* frames from the current position,
+        so it runs throughout the entire highlight.
+        """
+        start = max(0, frame_id - trail_length)
         points: list[tuple[int, int]] = []
         for f in range(start, frame_id + 1):
             ball = ctx.get_ball_at_frame(f)
@@ -334,17 +369,72 @@ class SegmentComposer(BaseClipComposer):
         if len(points) < 2:
             return
 
-        # Draw segments with increasing thickness and brightness
+        # Single overlay — brightness encodes the per-segment fade
+        overlay = frame.copy()
         n = len(points)
         for i in range(1, n):
             progress = i / n  # 0→1, newer = brighter/thicker
             thickness = max(1, int(progress * 4 + 1))
-            a = progress * 0.6
-            pt1 = points[i - 1]
-            pt2 = points[i]
-            overlay = frame.copy()
-            cv2.line(overlay, pt1, pt2, color, thickness, cv2.LINE_AA)
-            cv2.addWeighted(overlay, a, frame, 1 - a, 0, dst=frame)
+            c = tuple(int(v * progress) for v in color)
+            cv2.line(overlay, points[i - 1], points[i], c, thickness, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, dst=frame)
+
+    # ------------------------------------------------------------------
+    # Transitions
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _write_flash_transition(
+        writer: cv2.VideoWriter,
+        last_frame: np.ndarray,
+        first_frame: np.ndarray | None,
+    ) -> None:
+        """Write a brief white-flash transition (3 frames).
+
+        Broadcast-style "goal confirmed" effect: previous frame fades to
+        white, then white fades into the next segment.
+        """
+        white = np.full_like(last_frame, 255)
+        # Fade out: 50/50 blend with white
+        writer.write(cv2.addWeighted(last_frame, 0.5, white, 0.5, 0))
+        # Peak: pure white
+        writer.write(white)
+        # Fade in: 50/50 blend from white
+        if first_frame is not None:
+            writer.write(cv2.addWeighted(first_frame, 0.5, white, 0.5, 0))
+
+    # ------------------------------------------------------------------
+    # Slow-motion
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _interpolate_slowmo(
+        frames: list[np.ndarray],
+        speed: float,
+    ) -> list[np.ndarray]:
+        """Generate slow-motion frames via linear blending.
+
+        For speed=0.4, each source frame produces ~2.5 output frames.
+        Consecutive source frames are cross-blended for smooth motion
+        rather than frame duplication.
+        """
+        n_src = len(frames)
+        n_out = int(n_src / speed)
+        result: list[np.ndarray] = []
+        for i in range(n_out):
+            src_pos = i * speed
+            src_idx = min(int(src_pos), n_src - 1)
+            frac = src_pos - int(src_pos)
+            if frac < 0.01 or src_idx + 1 >= n_src:
+                result.append(frames[src_idx])
+            else:
+                blended = cv2.addWeighted(
+                    frames[src_idx], 1.0 - frac,
+                    frames[src_idx + 1], frac,
+                    0,
+                )
+                result.append(blended)
+        return result
 
     # ------------------------------------------------------------------
     # Overlays

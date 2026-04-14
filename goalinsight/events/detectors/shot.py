@@ -154,10 +154,16 @@ class ShotDetector(BaseEventDetector):
     ) -> tuple[int | None, str | None, int]:
         """Find the player who took the shot.
 
-        Strategy: find the ball acceleration event (the kick) by looking
-        for a speed spike in the ball trajectory, then find the nearest
-        non-goalkeeper player to the ball just before the spike.
+        Uses pixel-space kick detection (shared with ball_trajectory's
+        ``_segment_at_kicks``) to locate the kick frame, then searches
+        for the nearest non-goalkeeper player to the ball at that moment.
+
+        Pixel acceleration is more reliable than pitch-coordinate speed
+        because pixel centers are direct observations — pitch positions
+        depend on 3D fitting quality which degrades for airborne balls.
         """
+        from goalinsight.tracking.ball_trajectory import detect_kick_frames
+
         lookback_frames = int(lookback_seconds * ctx.fps)
         start_frame = max(0, goal_frame - lookback_frames)
 
@@ -171,12 +177,22 @@ class ShotDetector(BaseEventDetector):
             else:
                 goal_x = None
 
-        # Step 1: Find the kick frame — where ball speed spikes.
-        # Walk backwards through ball_states to find the last big
-        # acceleration before the goal.
-        kick_frame = self._find_kick_frame(
-            ctx.ball_states, goal_frame, start_frame, ctx.fps,
-        )
+        # Step 1: Find kick frames using pixel-space acceleration
+        # (same algorithm as ball_trajectory._segment_at_kicks).
+        pixel_obs = [
+            (bs.frame, tuple(bs.pixel_center))
+            for bs in ctx.ball_states
+            if bs.pixel_center is not None
+            and start_frame <= bs.frame <= goal_frame
+        ]
+        kick_frames = detect_kick_frames(pixel_obs)
+
+        # Take the last kick before the goal — that's the shot.
+        kick_frame = None
+        for kf in reversed(kick_frames):
+            if kf <= goal_frame:
+                kick_frame = kf
+                break
 
         # Step 2: Search for nearest player around the kick frame.
         search_radius = 3.0
@@ -218,49 +234,6 @@ class ShotDetector(BaseEventDetector):
                 return track_id, team, f
 
         return None, None, goal_frame
-
-    @staticmethod
-    def _find_kick_frame(
-        ball_states: list[BallState],
-        goal_frame: int,
-        start_frame: int,
-        fps: float,
-        speed_jump_threshold: float = 8.0,
-    ) -> int | None:
-        """Find the frame where the ball was kicked (speed spike).
-
-        Walks backwards from goal_frame through the high-speed segment
-        until ball speed drops below threshold or a tracking gap appears.
-        Returns the last low-speed frame before the fast segment began.
-        """
-        states = [
-            bs for bs in ball_states
-            if start_frame <= bs.frame <= goal_frame
-        ]
-        if len(states) < 2:
-            return None
-
-        # Walk backwards: skip through the high-speed segment
-        for i in range(len(states) - 1, 0, -1):
-            curr = states[i]
-            prev = states[i - 1]
-            dt = (curr.frame - prev.frame) / fps
-            if dt <= 0:
-                continue
-
-            speed = math.hypot(
-                curr.position[0] - prev.position[0],
-                curr.position[1] - prev.position[1],
-            ) / dt
-
-            # Found a low-speed segment or a tracking gap — prev is
-            # the last frame before the ball started flying.
-            if speed < speed_jump_threshold:
-                return prev.frame
-            if curr.frame - prev.frame > int(0.5 * fps):
-                return prev.frame
-
-        return states[0].frame if states else None
 
 
 # ------------------------------------------------------------------

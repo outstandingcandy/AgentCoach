@@ -1,4 +1,15 @@
-"""ScorerAnalyzer — player attribution and segment planning for goal events."""
+"""ScorerAnalyzer — player attribution and segment planning for goal events.
+
+Produces a broadcast-style 4-segment highlight:
+
+    buildup → strike → celebration → replay
+
+- **Buildup**: wide/medium view following the ball through the attacking play.
+- **Strike**: closeup on the ball from the moment of the kick through the
+  ball entering the net — the narrative climax.
+- **Celebration**: medium view tracking the scorer's reaction.
+- **Replay**: slow-motion replay of the strike with ball trail overlay.
+"""
 
 from __future__ import annotations
 
@@ -27,11 +38,7 @@ class ScorerAnalyzer(BaseSceneAnalyzer):
         goal_frame = event.frame
         goal_side = event.metadata.get("goal_side", "right")
         fps = ctx.fps
-
         temporal_cfg = config.get("temporal", {})
-        buildup_max = temporal_cfg.get("buildup_max_seconds", 10.0)
-        buildup_pad = temporal_cfg.get("buildup_padding_seconds", 2.0)
-        celebration_dur = temporal_cfg.get("celebration_seconds", 4.0)
 
         # --- Player attribution (from event detector) ---
         event_player = event.metadata.get("player_id")
@@ -55,14 +62,31 @@ class ScorerAnalyzer(BaseSceneAnalyzer):
             event_player, event_team,
         )
         key_players: list[dict[str, Any]] = [scorer]
+        scorer_id = scorer["track_id"]
 
-        # --- Temporal windows ---
+        # --- Temporal boundaries ---
+        buildup_max = temporal_cfg.get("buildup_max_seconds", 10.0)
+        buildup_pad = temporal_cfg.get("buildup_padding_seconds", 2.0)
         buildup_start = find_buildup_start(
             ctx, goal_frame, goal_side,
             max_seconds=buildup_max, padding_seconds=buildup_pad,
         )
 
-        scorer_id = scorer["track_id"]
+        # Strike window: the shot and ball flight into the net.
+        # Starts 0.5s before the kick (minimal pre-read so the closeup is
+        # already locked on when the ball leaves the foot), runs until the
+        # ball is in the net + post buffer.
+        strike_pre = int(temporal_cfg.get("strike_pre_seconds", 0.5) * fps)
+        strike_post = int(temporal_cfg.get("strike_post_seconds", 1.5) * fps)
+        strike_start = max(0, shooter_frame - strike_pre)
+        strike_end = goal_frame + strike_post
+
+        # Buildup runs until the kick — hard cut so the zoom change
+        # coincides with the ball being struck (maximum dramatic impact).
+        buildup_end = shooter_frame
+
+        # Celebration window
+        celebration_dur = temporal_cfg.get("celebration_seconds", 10.0)
         celebration_start = goal_frame
         celebration_max_end = find_celebration_end(
             celebration_start, fps,
@@ -86,30 +110,42 @@ class ScorerAnalyzer(BaseSceneAnalyzer):
         else:
             celebration_end = celebration_max_end
 
-        # --- Segment plan ---
-        # Buildup extends past goal frame; celebration starts at goal frame.
-        # The two segments overlap — buildup shows the ball entering the net,
-        # celebration tracks the scorer from the goal moment.
-        buildup_ext = int(temporal_cfg.get("buildup_extension_seconds", 3.0) * fps)
-        buildup_end = min(goal_frame + buildup_ext, celebration_end)
-
+        # --- Segment plan: buildup → strike → celebration → replay ---
         segments: list[ClipSegment] = []
+        min_segment_frames = int(1.0 * fps)
 
-        # 1. Build-up → goal moment + extension: follow the ball
-        buildup_view = temporal_cfg.get("buildup_view", "medium")
+        # 1. Build-up: wide/medium view following the ball
+        buildup_view = temporal_cfg.get("buildup_view", "wide")
+        if buildup_end - buildup_start >= min_segment_frames:
+            segments.append(
+                ClipSegment(
+                    name="buildup",
+                    start_frame=buildup_start,
+                    end_frame=buildup_end,
+                    view_type=buildup_view,
+                    focus_target="ball",
+                    transition="cut",
+                )
+            )
+
+        # 2. Strike: closeup following the ball through the shot.
+        #    Hard cut from buildup — the zoom change hits at the same
+        #    instant the ball is kicked (no crossfade blurring the moment).
+        strike_view = temporal_cfg.get("strike_view", "closeup")
         segments.append(
             ClipSegment(
-                name="buildup",
-                start_frame=buildup_start,
-                end_frame=buildup_end,
-                view_type=buildup_view,
+                name="strike",
+                start_frame=strike_start,
+                end_frame=strike_end,
+                view_type=strike_view,
                 focus_target="ball",
+                transition="cut",
             )
         )
 
-        # 2. Celebration: follow the scorer from goal frame
+        # 3. Celebration: medium view following the scorer
         celebration_view = temporal_cfg.get("celebration_view", "medium")
-        if celebration_start <= celebration_end:
+        if celebration_end - celebration_start >= min_segment_frames:
             segments.append(
                 ClipSegment(
                     name="celebration",
@@ -118,6 +154,27 @@ class ScorerAnalyzer(BaseSceneAnalyzer):
                     view_type=celebration_view,
                     focus_target="player",
                     focus_track_id=scorer_id,
+                    transition="flash",
+                )
+            )
+
+        # 4. Replay: slow-motion of the strike
+        replay_enabled = temporal_cfg.get("replay_enabled", True)
+        replay_speed = temporal_cfg.get("replay_speed", 0.4)
+        if replay_enabled:
+            segments.append(
+                ClipSegment(
+                    name="replay",
+                    start_frame=strike_start,
+                    end_frame=strike_end,
+                    view_type=strike_view,
+                    focus_target="ball",
+                    transition="crossfade",
+                    speed=replay_speed,
+                    overlays=[
+                        {"type": "text", "text": "REPLAY",
+                         "position": "top_center"},
+                    ],
                 )
             )
 

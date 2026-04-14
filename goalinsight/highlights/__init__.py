@@ -32,11 +32,14 @@ _DEFAULT_HIGHLIGHT_CONFIG: dict[str, Any] = {
     "temporal": {
         "buildup_max_seconds": 10.0,
         "buildup_padding_seconds": 2.0,
-        "buildup_extension_seconds": 3.0,
         "buildup_view": "wide",
+        "strike_pre_seconds": 0.5,
+        "strike_post_seconds": 1.5,
+        "strike_view": "closeup",
         "celebration_seconds": 10.0,
         "celebration_view": "medium",
-        "shot_closeup_seconds": 3.0,
+        "replay_enabled": True,
+        "replay_speed": 0.4,
     },
     "effects": {
         "shooter_spotlight": True,

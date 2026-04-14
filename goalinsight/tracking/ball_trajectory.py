@@ -96,6 +96,52 @@ def ray_intersect_z(
 
 
 # ---------------------------------------------------------------------------
+# Kick detection (shared between trajectory fitting and event detection)
+# ---------------------------------------------------------------------------
+
+def detect_kick_frames(
+    observations: list[tuple[int, tuple[float, float]]],
+    accel_threshold: float = 50.0,
+) -> list[int]:
+    """Detect kick events from pixel-space acceleration.
+
+    A kick is a sudden change in the ball's pixel velocity — the frame
+    where it was struck.  This is more reliable than pitch-coordinate
+    speed for two reasons:
+
+    1. Pixel centers are direct observations, not derived from 3D fitting
+       (which can drift for airborne balls).
+    2. The same algorithm is used by the trajectory fitter to segment
+       flight phases, so kick detection is consistent across the pipeline.
+
+    Args:
+        observations: list of (frame_idx, (px_x, px_y)) sorted by frame.
+        accel_threshold: Pixel acceleration magnitude to trigger a kick.
+
+    Returns:
+        Sorted list of frame indices where kicks were detected (the last
+        frame before the ball's velocity changed).
+    """
+    if len(observations) < 3:
+        return []
+
+    kick_frames: list[int] = []
+    for i in range(2, len(observations)):
+        _, prev2_px = observations[i - 2]
+        f_prev1, prev1_px = observations[i - 1]
+        _, curr_px = observations[i]
+
+        v_old = (prev1_px[0] - prev2_px[0], prev1_px[1] - prev2_px[1])
+        v_new = (curr_px[0] - prev1_px[0], curr_px[1] - prev1_px[1])
+        accel = ((v_new[0] - v_old[0]) ** 2 + (v_new[1] - v_old[1]) ** 2) ** 0.5
+
+        if accel > accel_threshold:
+            kick_frames.append(f_prev1)
+
+    return kick_frames
+
+
+# ---------------------------------------------------------------------------
 # Observation type used throughout
 # ---------------------------------------------------------------------------
 # (frame_idx, time_sec, pixel_center, camera_pose)
@@ -239,32 +285,28 @@ class BallTrajectory3D:
     # ------------------------------------------------------------------
 
     def _segment_at_kicks(self, obs_list: list[Obs]) -> list[list[Obs]]:
-        """Split observation sequence at sudden pixel accelerations (kicks).
+        """Split observation sequence at kick boundaries.
 
-        A kick changes the ball's motion regime (ground→air, pass→shot, etc).
-        Each segment between kicks is one continuous motion phase where a
-        single parabola model is valid.
+        Delegates kick detection to the module-level `detect_kick_frames`
+        (pixel-space acceleration), then splits the observation list so
+        each segment contains one continuous motion phase where a single
+        parabola model is valid.
         """
         if len(obs_list) < 3:
             return [obs_list]
+
+        pixel_obs = [(fidx, px) for fidx, _, px, _ in obs_list]
+        kick_set = set(detect_kick_frames(pixel_obs, self.kick_accel_threshold))
 
         segments: list[list[Obs]] = []
         current: list[Obs] = [obs_list[0], obs_list[1]]
 
         for i in range(2, len(obs_list)):
-            _, _, prev2_px, _ = obs_list[i - 2]
-            _, _, prev1_px, _ = obs_list[i - 1]
-            _, _, curr_px, _ = obs_list[i]
-
-            v_old = (prev1_px[0] - prev2_px[0], prev1_px[1] - prev2_px[1])
-            v_new = (curr_px[0] - prev1_px[0], curr_px[1] - prev1_px[1])
-            accel = ((v_new[0] - v_old[0]) ** 2 + (v_new[1] - v_old[1]) ** 2) ** 0.5
-
-            if accel > self.kick_accel_threshold:
-                # Kick detected — end current segment, start new one
+            prev1_frame = obs_list[i - 1][0]
+            if prev1_frame in kick_set:
                 if len(current) >= 2:
                     segments.append(current)
-                current = [obs_list[i - 1]]  # overlap: last pre-kick frame starts new segment
+                current = [obs_list[i - 1]]  # overlap: kick frame starts new segment
 
             current.append(obs_list[i])
 

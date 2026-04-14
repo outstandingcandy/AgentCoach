@@ -275,10 +275,14 @@ highlights:
   temporal:
     buildup_max_seconds: 10.0     # Max lookback for build-up start
     buildup_padding_seconds: 2.0  # Extra padding before build-up start
-    buildup_extension_seconds: 3.0 # Extend buildup past goal frame
-    buildup_view: medium          # wide / medium / closeup
+    buildup_view: wide            # wide / medium / closeup
+    strike_pre_seconds: 0.5       # Seconds before shooter_frame (short — cut lands on the kick)
+    strike_post_seconds: 1.5      # Seconds after goal_frame (ball enters net)
+    strike_view: closeup          # Closeup on ball during shot
     celebration_seconds: 10.0     # Max celebration duration (or until track lost)
     celebration_view: medium      # wide / medium / closeup
+    replay_enabled: true          # Slow-motion replay of the strike
+    replay_speed: 0.4             # Playback speed for replay (0.4 = 2.5x slower)
   effects:
     shooter_spotlight: true       # Glow ellipse under scorer's feet
     spotlight_color: [0, 215, 255] # Gold (BGR)
