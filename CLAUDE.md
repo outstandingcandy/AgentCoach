@@ -47,7 +47,7 @@ pipeline:
     - post_processing
 ```
 
-Available stages: `shot_detection`, `field_registration`, `tracking`, `post_processing`, `event_detection`, `goal_detection`, `highlights`, `video_enhancement`.
+Available stages: `shot_detection`, `field_registration`, `tracking`, `post_processing`, `event_detection`, `highlights`, `video_enhancement`.
 
 ```python
 from goalinsight import Pipeline

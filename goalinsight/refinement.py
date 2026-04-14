@@ -8,6 +8,7 @@ This module:
 """
 
 import json
+import logging
 import pickle
 from pathlib import Path
 from collections import Counter
@@ -17,6 +18,8 @@ import numpy as np
 from tqdm import tqdm
 
 from .utils.config import get_default_config, get_process_fps_from_config
+
+logger = logging.getLogger(__name__)
 
 
 def majority_vote(values: list, min_count: int = 2) -> any:
@@ -227,7 +230,7 @@ def run_refinement(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load Stage 2 results
-    print("Stage 3: Loading tracking results...")
+    logger.info("Stage 3: Loading tracking results...")
 
     tracks_path = tracking_dir / "tracks.json"
     if not tracks_path.exists():
@@ -248,20 +251,20 @@ def run_refinement(
         with open(reid_path, "rb") as f:
             reid_features = pickle.load(f)
 
-    print(f"  Loaded {len(tracks_data)} frames, {len(set(t['track_id'] for tracks in tracks_data.values() for t in tracks))} unique tracks")
+    logger.info(f"  Loaded {len(tracks_data)} frames, {len(set(t['track_id'] for tracks in tracks_data.values() for t in tracks))} unique tracks")
 
     original_track_count = len(set(
         t["track_id"] for tracks in tracks_data.values() for t in tracks
     ))
 
     # Step 1: Temporal consistency (majority voting)
-    print("Stage 3: Applying temporal consistency...")
+    logger.info("Stage 3: Applying temporal consistency...")
     tracks_data = apply_temporal_consistency(tracks_data, track_summaries)
 
     # Step 2: Tracklet merging
     merge_count = 0
     if enable_tracklet_merge and reid_features:
-        print("Stage 3: Finding mergeable tracklets...")
+        logger.info("Stage 3: Finding mergeable tracklets...")
         merge_pairs = find_mergeable_tracklets(
             track_summaries,
             reid_features,
@@ -271,7 +274,7 @@ def run_refinement(
         )
 
         if merge_pairs:
-            print(f"  Found {len(merge_pairs)} potential merge pairs")
+            logger.info(f"  Found {len(merge_pairs)} potential merge pairs")
 
             # Build merge mapping (use first track ID for merged tracks)
             merge_map = {}
@@ -300,11 +303,11 @@ def run_refinement(
                         tid = merge_map[tid]
                     track["track_id"] = tid
 
-            print(f"  Merged {merge_count} tracklet pairs")
+            logger.info(f"  Merged {merge_count} tracklet pairs")
 
     # Step 3: SAM2 segmentation refinement (optional)
     if enable_sam2:
-        print("Stage 3: SAM2 refinement not yet implemented")
+        logger.info("Stage 3: SAM2 refinement not yet implemented")
         # TODO: Implement SAM2-based refinement
 
     # Save refined results
@@ -345,10 +348,10 @@ def run_refinement(
     with open(output_dir / "statistics.json", "w") as f:
         json.dump(stats, f, indent=2)
 
-    print(f"\nStage 3 Complete:")
-    print(f"  Original tracks: {original_track_count}")
-    print(f"  Final tracks: {final_track_count}")
-    print(f"  Merged: {merge_count} pairs")
+    logger.info(f"Stage 3 Complete:")
+    logger.info(f"  Original tracks: {original_track_count}")
+    logger.info(f"  Final tracks: {final_track_count}")
+    logger.info(f"  Merged: {merge_count} pairs")
 
     return stats
 

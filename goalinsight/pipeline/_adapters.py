@@ -157,43 +157,6 @@ class EventDetectionStage(Stage):
 
 
 @register_stage
-class GoalDetectionStage(Stage):
-    """Backward-compatible goal detection stage — delegates to event detection."""
-
-    name = "goal_detection"
-    description = "Goal Detection"
-
-    def run(self, ctx: PipelineContext) -> dict[str, Any]:
-        from ..events import EventType, detect_events_from_dirs
-
-        tracking_dir = ctx.stage_dir("tracking")
-        cal_dir = ctx.stage_dir("field_registration")
-        out = ctx.stage_dir(self.name)
-        out.mkdir(parents=True, exist_ok=True)
-
-        if not (tracking_dir / "ball_tracks.json").exists():
-            print("  Warning: ball_tracks.json not found, skipping goal detection")
-            return {"goals_detected": 0, "goals": []}
-
-        # Run only possession + shot detectors for goal detection
-        goal_config = dict(ctx.config) if ctx.config else {}
-        goal_config.setdefault("events", {})["detectors"] = ["possession", "shot"]
-
-        events = detect_events_from_dirs(
-            tracking_dir=tracking_dir,
-            calibration_dir=cal_dir if cal_dir.exists() else None,
-            config=goal_config,
-        )
-
-        goals = [e.to_dict() for e in events if e.event_type == EventType.GOAL]
-
-        with open(out / "goals.json", "w") as f:
-            json.dump(goals, f, indent=2, default=str)
-
-        return {"goals_detected": len(goals), "goals": goals}
-
-
-@register_stage
 class HighlightsStage(Stage):
     name = "highlights"
     description = "Highlight Clipping"

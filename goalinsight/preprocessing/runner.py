@@ -5,10 +5,13 @@ continuous shots, and exports frame ranges for downstream processing.
 """
 
 import json
+import logging
 from pathlib import Path
 
 from . import ShotBoundary, ShotDetector, SegmentInfo, VideoSegmenter
 from ..utils.config import get_default_config
+
+logger = logging.getLogger(__name__)
 
 
 def run_shot_detection(
@@ -36,10 +39,10 @@ def run_shot_detection(
     sd_config = config.get("shot_detection", {})
     vs_config = config.get("video_segmentation", {})
 
-    print(f"Shot Detection: Processing {video_path.name}")
+    logger.info(f"Shot Detection: Processing {video_path.name}")
 
     if not sd_config.get("enabled", True):
-        print("Shot Detection: Disabled, treating video as single segment")
+        logger.info("Shot Detection: Disabled, treating video as single segment")
         import cv2
         cap = cv2.VideoCapture(str(video_path))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -57,15 +60,15 @@ def run_shot_detection(
         ]
         boundaries = []
     else:
-        print("Shot Detection: Detecting shot boundaries...")
+        logger.info("Shot Detection: Detecting shot boundaries...")
         detector = ShotDetector(config)
         boundaries = detector.detect(video_path)
-        print(f"Shot Detection: Found {len(boundaries)} shot boundaries")
+        logger.info(f"Shot Detection: Found {len(boundaries)} shot boundaries")
 
-        print("Shot Detection: Segmenting video...")
+        logger.info("Shot Detection: Segmenting video...")
         segmenter = VideoSegmenter(config)
         segments = segmenter.segment(video_path, boundaries, output_dir)
-        print(f"Shot Detection: Created {len(segments)} segments")
+        logger.info(f"Shot Detection: Created {len(segments)} segments")
 
     _save_boundaries(boundaries, output_dir)
 
@@ -91,11 +94,11 @@ def run_shot_detection(
     with open(output_dir / "shot_detection_summary.json", "w") as f:
         json.dump(stats, f, indent=2)
 
-    print(f"\nShot Detection Complete:")
-    print(f"  Shot boundaries: {len(boundaries)}")
-    print(f"  Segments: {len(segments)}")
+    logger.info(f"Shot Detection Complete:")
+    logger.info(f"  Shot boundaries: {len(boundaries)}")
+    logger.info(f"  Segments: {len(segments)}")
     for seg in segments:
-        print(f"    [{seg.segment_id}] frames {seg.start_frame}-{seg.end_frame} ({seg.duration_seconds:.1f}s)")
+        logger.info(f"    [{seg.segment_id}] frames {seg.start_frame}-{seg.end_frame} ({seg.duration_seconds:.1f}s)")
 
     return stats
 

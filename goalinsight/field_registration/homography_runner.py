@@ -24,6 +24,14 @@ from ..utils.pitch import get_pitch_template_points, project_pitch_to_image, _dr
 from .shared_vis import draw_vis_keypoints
 from ..utils.config import get_default_config, get_process_fps_from_config, FrameSampler
 from ..utils.serialization import json_default as _json_default
+from ._runner_base import (
+    open_video,
+    make_sampler,
+    init_calibration_results,
+    save_calibration_outputs,
+    compute_calibration_stats,
+    print_calibration_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +64,7 @@ def run_stage1_homography(
     homog_config = fr_config.get("homography", {})
 
     # Initialize keypoint detector
-    print("Stage 1 (Homography): Initializing keypoint detector...")
+    logger.info("Stage 1 (Homography): Initializing keypoint detector...")
     kp_config = {
         "backend": "pnlcalib",
         "pnlcalib": {
@@ -70,23 +78,16 @@ def run_stage1_homography(
     keypoint_mapper = KeypointMapper()
 
     # Open video
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {video_path}")
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    sampler = FrameSampler(total_frames, fps, process_fps)
-    print(f"Video: {total_frames} frames @ {fps:.1f} fps, {width}x{height}")
-    print(f"Processing {len(sampler)} frames at {process_fps or fps} fps")
+    video = open_video(video_path)
+    cap = video.cap
+    width, height = video.width, video.height
+    sampler = make_sampler(video, process_fps)
 
     pitch_length = homog_config.get("pitch_length", 105.0)
     pitch_width = homog_config.get("pitch_width", 68.0)
     pitch_template = get_pitch_template_points(pitch_length, pitch_width)
     if pitch_length != 105.0 or pitch_width != 68.0:
-        print(f"  Custom pitch dimensions: {pitch_length}×{pitch_width}m")
+        logger.info(f"  Custom pitch dimensions: {pitch_length}x{pitch_width}m")
 
     calibrator = HomographyCalibrator(
         image_size=(width, height),
@@ -98,18 +99,10 @@ def run_stage1_homography(
     )
 
     # Results storage
-    calibration_results = {
-        "video_info": {
-            "path": str(video_path),
-            "total_frames": total_frames,
-            "fps": fps,
-            "width": width,
-            "height": height,
-            "process_fps": process_fps,
-        },
-        "backend": "homography",
-        "frames": {},
-    }
+    calibration_results = init_calibration_results(
+        video_path, video, process_fps,
+        extra_top_level={"backend": "homography"},
+    )
     homographies = {}
 
     # Create visualization subdirectories
@@ -170,46 +163,14 @@ def run_stage1_homography(
 
     cap.release()
 
-    # Save results
-    with open(output_dir / "calibration_metadata.json", "w") as f:
-        json.dump(calibration_results, f, default=_json_default)
-    with open(output_dir / "homographies.pkl", "wb") as f:
-        pickle.dump(homographies, f)
-
-    # Statistics
-    stats = {
-        "total_frames": total_frames,
-        "processed_frames": len(sampler),
-        "calibrated_frames": calibrated_count,
-        "calibration_rate": calibrated_count / len(sampler) if sampler else 0,
-    }
-
-    errors = [
-        calibration_results["frames"][idx]["reprojection_error"]
-        for idx in calibration_results["frames"]
-        if calibration_results["frames"][idx].get("calibrated")
-    ]
-    world_errors = [
-        calibration_results["frames"][idx]["world_error"]
-        for idx in calibration_results["frames"]
-        if calibration_results["frames"][idx].get("calibrated")
-        and calibration_results["frames"][idx].get("world_error") is not None
-    ]
-    if errors:
-        stats["mean_error"] = float(np.mean(errors))
-        stats["median_error"] = float(np.median(errors))
-    if world_errors:
-        stats["mean_world_error"] = float(np.mean(world_errors))
-        stats["median_world_error"] = float(np.median(world_errors))
-
-    print(f"\nStage 1 (Homography) Complete:")
-    print(f"  Calibrated: {calibrated_count}/{len(sampler)} ({stats['calibration_rate']*100:.1f}%)")
-    if errors:
-        print(f"  Median error: {stats['median_error']:.2f} px")
-        print(f"  Mean error: {stats['mean_error']:.2f} px")
-    if world_errors:
-        print(f"  Median world error: {stats['median_world_error']:.2f} m")
-
+    save_calibration_outputs(
+        output_dir, calibration_results, homographies,
+        json_default=_json_default,
+    )
+    stats = compute_calibration_stats(
+        calibration_results, video, sampler, calibrated_count,
+    )
+    print_calibration_summary(stats, label="Stage 1 (Homography)")
     return stats
 
 

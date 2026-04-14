@@ -3,7 +3,6 @@
 import cv2
 import numpy as np
 
-from .pitch_projection import _PITCH_HALF_LENGTH, _PITCH_HALF_WIDTH
 
 
 # Team colors for visualization
