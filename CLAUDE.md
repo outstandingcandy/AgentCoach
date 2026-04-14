@@ -47,7 +47,7 @@ pipeline:
     - post_processing
 ```
 
-Available stages: `shot_detection`, `field_registration`, `tracking`, `post_processing`, `event_detection`, `goal_detection`, `highlights`.
+Available stages: `shot_detection`, `field_registration`, `tracking`, `post_processing`, `event_detection`, `goal_detection`, `highlights`, `video_enhancement`.
 
 ```python
 from goalinsight import Pipeline
@@ -87,6 +87,10 @@ event_detection (events/)
 highlights (highlights/)
   Input: events.json + tracking/ + video
   Output: highlight clip MP4s per recipe (e.g. goal_highlight_0001.mp4)
+    ↓
+video_enhancement (video_enhancement/)
+  Input: highlight clip MP4s
+  Output: upscaled / frame-interpolated MP4s (via video2x CLI)
 ```
 
 ### Field Registration: Calibration Backends
@@ -143,6 +147,16 @@ Recipe-based agent pipeline: **Detector → Analyzer → Composer**. Recipes are
 - `_closeup.py`: `extract_closeup()` crops and scales frames; `interpolate_bbox()` interpolates/extrapolates with a max-distance limit.
 - `_temporal.py`: `find_buildup_start()`, `find_celebration_end()` compute temporal windows.
 
+### Video Enhancement (`video_enhancement/`)
+
+Post-processing stage that upscales and/or frame-interpolates highlight clips using [video2x](https://github.com/k4yt3x/video2x) (CLI tool, Vulkan GPU).
+
+- **Modes**: `binary` (local video2x) or `docker` (container with GPU passthrough, needed on older glibc systems).
+- **Upscaling**: Real-ESRGAN, Real-CUGAN, or libplacebo (Anime4K shaders). 2x or 4x scale.
+- **Frame interpolation**: RIFE. 2x+ frame rate multiplier.
+- **Two-pass**: If both upscale and interpolation are enabled, upscale runs first, then interpolation on the upscaled output.
+- Processes all `.mp4` clips from the highlights stage, preserving subdirectory structure.
+
 ### Factory Pattern and Interfaces
 
 `goalinsight/utils/factories.py` provides factory functions that instantiate backends based on config (also re-exported from `utils/config.py` for backwards compatibility):
@@ -176,6 +190,10 @@ YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merg
 - `highlights.recipes`: list of highlight recipes (each with detector, analyzer, composer)
 - `highlights.temporal.*`: buildup/celebration durations, view types
 - `highlights.effects.*`: shooter spotlight, ball trail settings
+- `video_enhancement.enabled`: toggle video2x processing (requires Vulkan GPU)
+- `video_enhancement.upscale.*`: upscaling processor, scale factor, model
+- `video_enhancement.interpolate.*`: frame interpolation processor, multiplier
+- `video_enhancement.encoder.*`: output codec and quality settings
 
 ## Testing
 

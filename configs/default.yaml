@@ -302,6 +302,30 @@ highlights:
       analyzer: "scorer"
       composer: "segment"
 
+# Stage 5: Video Enhancement (video2x — upscaling & frame interpolation)
+video_enhancement:
+  enabled: false                      # Disabled by default (requires video2x + Vulkan GPU)
+  mode: "docker"                      # "binary" (local video2x) or "docker" (container with GPU)
+  binary_path: null                   # binary mode: path to video2x (null = auto-detect via PATH)
+  docker_image: "ghcr.io/k4yt3x/video2x:latest"  # docker mode: container image
+
+  upscale:
+    enabled: true                     # Enable upscaling pass
+    processor: "realesrgan"           # realesrgan | realcugan | libplacebo
+    scale: 2                          # Scaling factor: 2 or 4
+    model: null                       # Model name (null = processor default)
+
+  interpolate:
+    enabled: false                    # Enable frame interpolation pass
+    processor: "rife"                 # Frame interpolation processor
+    multiplier: 2                     # Frame rate multiplier (2 = 25fps→50fps)
+
+  encoder:
+    codec: "libx264"                  # Output video codec
+    extra:                            # Extra encoder options (passed as -e key=value)
+      crf: "17"                       # Quality (lower = better, 17 ≈ visually lossless)
+      preset: "slow"                  # Encoding speed/quality tradeoff
+
 # Output
 output:
   format: "json"          # Output format
@@ -350,7 +374,7 @@ events:
     deflection_window_seconds: 0.5  # seconds — window for computing ball deflection angle
 
 # Pipeline orchestration
-# Available stages: shot_detection, field_registration, tracking, post_processing, event_detection, goal_detection
+# Available stages: shot_detection, field_registration, tracking, post_processing, event_detection, goal_detection, highlights, video_enhancement
 pipeline:
   stages:
     - field_registration

@@ -215,3 +215,40 @@ class HighlightsStage(Stage):
 
     def should_skip(self, ctx: PipelineContext) -> bool:
         return False  # Always regenerate highlights
+
+
+@register_stage
+class VideoEnhancementStage(Stage):
+    name = "video_enhancement"
+    description = "Video Enhancement (Upscaling & Frame Interpolation)"
+
+    def run(self, ctx: PipelineContext) -> dict[str, Any]:
+        config = ctx.config.get("video_enhancement", {}) if ctx.config else {}
+
+        if not config.get("enabled", False):
+            print("  Video enhancement disabled in config")
+            return {"enhanced_clips": [], "count": 0}
+
+        highlights_dir = ctx.stage_dir("highlights")
+        if not highlights_dir.exists():
+            print("  Warning: No highlights output found, skipping video enhancement")
+            return {"enhanced_clips": [], "count": 0}
+
+        from ..video_enhancement import run_video_enhancement
+
+        out = ctx.stage_dir(self.name)
+        clips = run_video_enhancement(
+            input_dir=highlights_dir,
+            output_dir=out,
+            config=config,
+        )
+
+        return {"enhanced_clips": [str(c) for c in clips], "count": len(clips)}
+
+    def should_skip(self, ctx: PipelineContext) -> bool:
+        if not ctx.skip_existing:
+            return False
+        out = ctx.stage_dir(self.name)
+        if not out.exists():
+            return False
+        return any(out.rglob("*.mp4"))
