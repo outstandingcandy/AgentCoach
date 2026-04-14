@@ -23,7 +23,7 @@ class Event:
 class ClipSegment:
     """A segment of the highlight clip to render."""
 
-    name: str               # "buildup", "goal_moment", "celebration"
+    name: str               # "buildup", "strike", "celebration", "replay"
     start_frame: int
     end_frame: int
     view_type: str          # "wide", "closeup", "medium"
@@ -31,6 +31,8 @@ class ClipSegment:
     focus_track_id: int | None = None   # Player to focus on (when focus_target="player")
     overlays: list[dict[str, Any]] = field(default_factory=list)
     # overlay example: {"type": "text", "text": "GOAL!", "position": "center"}
+    transition: str = "crossfade"       # "cut", "crossfade", "flash"
+    speed: float = 1.0                  # < 1.0 for slow-motion replay
 
 
 @dataclass
