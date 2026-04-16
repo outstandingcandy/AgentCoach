@@ -1102,7 +1102,7 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
                         p2 = (int(float(pts[i + 1][0])), int(float(pts[i + 1][1])))
                         p1_in = -margin < p1[0] < w + margin and -margin < p1[1] < h + margin
                         p2_in = -margin < p2[0] < w + margin and -margin < p2[1] < h + margin
-                        if p1_in or p2_in:
+                        if p1_in and p2_in:
                             # Clamp for OpenCV safety
                             clamp = w + h
                             p1c = (max(-clamp, min(clamp, p1[0])), max(-clamp, min(clamp, p1[1])))

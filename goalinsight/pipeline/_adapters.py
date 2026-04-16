@@ -167,6 +167,11 @@ class HighlightsStage(Stage):
         out = ctx.stage_dir(self.name)
         config = ctx.config.get("highlights", {}) if ctx.config else {}
 
+        # Pass video_enhancement config so the composer can upscale
+        # source frames before composition (better quality than post-hoc).
+        if ctx.config and "video_enhancement" in ctx.config:
+            config = {**config, "video_enhancement": ctx.config["video_enhancement"]}
+
         clips = run_highlights(
             output_dir=out,
             pipeline_output_dir=ctx.output_dir,
