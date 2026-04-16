@@ -142,20 +142,22 @@ Recipe-based agent pipeline: **Detector → Analyzer → Composer**. Recipes are
 - `HighlightOrchestrator` (`_orchestrator.py`): Reads recipes, chains the three agents per recipe.
 - Agents in `highlights/agents/`:
   - `GoalEventDetector`: Reads events.json, filters to GOAL events. Requires `event_detection` stage to have run first.
-  - `ScorerAnalyzer`: Uses `player_id`/`team_id` from event metadata (no duplicate attribution logic). Produces segment plan: buildup (follows ball) → celebration (follows scorer). Celebration truncates when scorer track is lost.
-  - `SegmentComposer`: Renders video with per-segment crop/zoom (closeup, medium, wide, ball-follow). Visual effects: scorer spotlight ellipse, ball trajectory trail. Holds last known crop when track is lost (no jarring wide-view jump).
+  - `ScorerAnalyzer`: Uses `player_id`/`team_id` from event metadata (no duplicate attribution logic). Produces 4-segment plan: buildup (wide, follows ball) → strike (closeup, ball through shot) → celebration (medium, follows scorer, truncates when track lost) → replay (slow-motion of strike with RIFE interpolation).
+  - `SegmentComposer`: Renders video with per-segment crop/zoom (closeup, medium, wide, ball-follow). Visual effects: scorer spotlight ellipse, ball trajectory trail. Holds last known crop when track is lost (no jarring wide-view jump). When `video_enhancement` is enabled in config, upscales source frames via video2x *before* composition so cropping/effects/slow-motion all operate on high-res frames. Replay slow-motion uses RIFE optical-flow interpolation (falls back to linear blending if video2x unavailable).
 - `_closeup.py`: `extract_closeup()` crops and scales frames; `interpolate_bbox()` interpolates/extrapolates with a max-distance limit.
 - `_temporal.py`: `find_buildup_start()`, `find_celebration_end()` compute temporal windows.
 
 ### Video Enhancement (`video_enhancement/`)
 
-Post-processing stage that upscales and/or frame-interpolates highlight clips using [video2x](https://github.com/k4yt3x/video2x) (CLI tool, Vulkan GPU).
+Upscaling and frame interpolation using [video2x](https://github.com/k4yt3x/video2x) (Vulkan GPU). Two integration points:
+
+1. **Inline (preferred)**: When `video_enhancement.enabled` is set, the highlights `SegmentComposer` upscales source frames *before* composition. The pipeline adapter injects the top-level `video_enhancement` config into highlights config. This produces higher quality because cropping/effects/slow-motion operate on upscaled frames.
+2. **Post-hoc stage**: The `video_enhancement` pipeline stage processes finished highlight clips. Useful for standalone upscaling or frame interpolation of any MP4.
 
 - **Modes**: `binary` (local video2x) or `docker` (container with GPU passthrough, needed on older glibc systems).
 - **Upscaling**: Real-ESRGAN, Real-CUGAN, or libplacebo (Anime4K shaders). 2x or 4x scale.
-- **Frame interpolation**: RIFE. 2x+ frame rate multiplier.
+- **Frame interpolation**: RIFE. 2x+ frame rate multiplier. Also used for replay slow-motion inside `SegmentComposer`.
 - **Two-pass**: If both upscale and interpolation are enabled, upscale runs first, then interpolation on the upscaled output.
-- Processes all `.mp4` clips from the highlights stage, preserving subdirectory structure.
 
 ### Factory Pattern and Interfaces
 
@@ -194,6 +196,10 @@ YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merg
 - `video_enhancement.upscale.*`: upscaling processor, scale factor, model
 - `video_enhancement.interpolate.*`: frame interpolation processor, multiplier
 - `video_enhancement.encoder.*`: output codec and quality settings
+
+## Tools
+
+- `tools/make_comparison.py`: Creates picture-in-picture comparison video (enhanced full-screen + raw source as PiP in bottom-right). Reads highlight metadata JSON to reconstruct segment timing. Usage: `python tools/make_comparison.py --enhanced <highlight.mp4> --raw <source.mp4> --output <out.mp4> --label`
 
 ## Testing
 
