@@ -139,7 +139,10 @@ def draw_vis_calibration(frame, keypoints, lines, calibrator, result, pitch_temp
             valid_points = [p for p in points if p is not None]
             for i in range(len(valid_points) - 1):
                 pt1, pt2 = valid_points[i], valid_points[i + 1]
-                if all(-1000 < c < 3000 for c in pt1 + pt2):
+                margin = 200
+                pt1_in = -margin < pt1[0] < w + margin and -margin < pt1[1] < h + margin
+                pt2_in = -margin < pt2[0] < w + margin and -margin < pt2[1] < h + margin
+                if pt1_in and pt2_in:
                     cv2.line(vis, pt1, pt2, (0, 165, 255), 2)
 
     # Build inlier set for keypoint coloring

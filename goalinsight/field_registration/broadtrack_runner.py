@@ -269,7 +269,10 @@ def _draw_broadtrack_calibration(
                 if pts[i] is not None and pts[i + 1] is not None:
                     p1 = tuple(int(c) for c in pts[i])
                     p2 = tuple(int(c) for c in pts[i + 1])
-                    if all(-5000 < c < 10000 for c in p1 + p2):
+                    margin = 200
+                    p1_in = -margin < p1[0] < w + margin and -margin < p1[1] < h + margin
+                    p2_in = -margin < p2[0] < w + margin and -margin < p2[1] < h + margin
+                    if p1_in and p2_in:
                         cv2.line(vis, p1, p2, color, 2)
 
         # Draw detected keypoints (green=inlier, red=outlier)

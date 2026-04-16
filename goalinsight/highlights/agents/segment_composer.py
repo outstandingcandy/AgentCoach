@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -59,11 +60,6 @@ class SegmentComposer(BaseClipComposer):
         out_w, out_h = ctx.width, ctx.height
 
         vp = VideoProcessor()
-        writer = vp.create_video_writer(output_path, out_w, out_h, output_fps)
-
-        prev_segment_last_frames: list[np.ndarray] = []
-        # Per-frame metadata: source frame_id → crop info
-        frame_metadata: dict[str, dict] = {}
 
         # Effects config
         effects_cfg = config.get("effects", {})
@@ -78,6 +74,29 @@ class SegmentComposer(BaseClipComposer):
         scorer_id = None
         if analyzed.key_players:
             scorer_id = analyzed.key_players[0].get("track_id")
+
+        # --- Upscale source frames before composition ---
+        ve_cfg = config.get("video_enhancement", {})
+        upscale_enabled = ve_cfg.get("enabled", False) and ve_cfg.get("upscale", {}).get("enabled", False)
+
+        upscaled_frames: dict[int, np.ndarray] | None = None
+        upscale_scale = 1
+        if upscale_enabled:
+            upscaled_frames, upscale_scale = self._upscale_source_frames(
+                analyzed, ctx, vp, ve_cfg,
+            )
+
+        # Adjust output dimensions if upscaled
+        if upscale_scale > 1:
+            out_w *= upscale_scale
+            out_h *= upscale_scale
+            out_size = (out_size[0] * upscale_scale, out_size[1] * upscale_scale)
+
+        writer = vp.create_video_writer(output_path, out_w, out_h, output_fps)
+
+        prev_segment_last_frames: list[np.ndarray] = []
+        # Per-frame metadata: source frame_id → crop info
+        frame_metadata: dict[str, dict] = {}
 
         for seg_idx, segment in enumerate(analyzed.segments):
             logger.info(
@@ -100,59 +119,109 @@ class SegmentComposer(BaseClipComposer):
                         segment.end_frame,
                     )
 
+            # Scale trajectory bboxes to match upscaled resolution
+            if trajectory and upscale_scale > 1:
+                trajectory = [
+                    {**t, "bbox": [c * upscale_scale for c in t["bbox"]]}
+                    for t in trajectory
+                ]
+
             # Pre-load scorer trajectory for spotlight effect (all segments)
             scorer_trajectory_seg: list[dict] | None = None
             if spotlight_enabled and scorer_id is not None:
                 scorer_trajectory_seg = ctx.get_player_trajectory(
                     scorer_id, segment.start_frame, segment.end_frame,
                 )
+                if scorer_trajectory_seg and upscale_scale > 1:
+                    scorer_trajectory_seg = [
+                        {**t, "bbox": [c * upscale_scale for c in t["bbox"]]}
+                        for t in scorer_trajectory_seg
+                    ]
 
             prev_state: SmoothState | None = None
             segment_frames: list[np.ndarray] = []
 
-            for frame_id, _ts, frame in vp.extract_frames(
-                ctx.video_path,
-                start_frame=segment.start_frame,
-                end_frame=segment.end_frame + 1,
-                show_progress=False,
-            ):
-                # --- Draw effects on raw frame before cropping ---
-                if trail_enabled:
-                    self._draw_ball_trail(
-                        frame, ctx, frame_id, trail_length, trail_color,
+            if upscaled_frames is not None:
+                # Use pre-upscaled frames
+                for frame_id in range(segment.start_frame, segment.end_frame + 1):
+                    frame = upscaled_frames.get(frame_id)
+                    if frame is None:
+                        continue
+                    frame = frame.copy()
+
+                    if trail_enabled:
+                        self._draw_ball_trail(
+                            frame, ctx, frame_id, trail_length, trail_color,
+                            scale=upscale_scale,
+                        )
+                    if spotlight_enabled and scorer_trajectory_seg:
+                        bbox = interpolate_bbox(scorer_trajectory_seg, frame_id)
+                        if bbox is not None:
+                            self._draw_spotlight(frame, bbox, spotlight_color, spotlight_alpha)
+
+                    rendered_frame, prev_state, crop_info = self._render_frame(
+                        frame, frame_id, segment, trajectory,
+                        out_w, out_h, out_size,
+                        padding_factor if segment.view_type == "closeup"
+                        else ball_padding if segment.focus_target == "ball"
+                        else medium_padding,
+                        smooth_alpha, prev_state,
+                        overlays_enabled,
                     )
+                    segment_frames.append(rendered_frame)
 
-                if spotlight_enabled and scorer_trajectory_seg:
-                    bbox = interpolate_bbox(scorer_trajectory_seg, frame_id)
-                    if bbox is not None:
-                        self._draw_spotlight(frame, bbox, spotlight_color, spotlight_alpha)
+                    if crop_info is not None:
+                        frame_metadata[str(frame_id)] = {
+                            "segment": segment.name,
+                            "view_type": segment.view_type,
+                            "center": [round(crop_info.center[0], 1),
+                                       round(crop_info.center[1], 1)],
+                            "crop_box": crop_info.crop_box,
+                            "scale": round(crop_info.scale, 4),
+                        }
+            else:
+                # Original path: read from source video
+                for frame_id, _ts, frame in vp.extract_frames(
+                    ctx.video_path,
+                    start_frame=segment.start_frame,
+                    end_frame=segment.end_frame + 1,
+                    show_progress=False,
+                ):
+                    if trail_enabled:
+                        self._draw_ball_trail(
+                            frame, ctx, frame_id, trail_length, trail_color,
+                        )
+                    if spotlight_enabled and scorer_trajectory_seg:
+                        bbox = interpolate_bbox(scorer_trajectory_seg, frame_id)
+                        if bbox is not None:
+                            self._draw_spotlight(frame, bbox, spotlight_color, spotlight_alpha)
 
-                rendered_frame, prev_state, crop_info = self._render_frame(
-                    frame, frame_id, segment, trajectory,
-                    out_w, out_h, out_size,
-                    padding_factor if segment.view_type == "closeup"
-                    else ball_padding if segment.focus_target == "ball"
-                    else medium_padding,
-                    smooth_alpha, prev_state,
-                    overlays_enabled,
-                )
-                segment_frames.append(rendered_frame)
+                    rendered_frame, prev_state, crop_info = self._render_frame(
+                        frame, frame_id, segment, trajectory,
+                        out_w, out_h, out_size,
+                        padding_factor if segment.view_type == "closeup"
+                        else ball_padding if segment.focus_target == "ball"
+                        else medium_padding,
+                        smooth_alpha, prev_state,
+                        overlays_enabled,
+                    )
+                    segment_frames.append(rendered_frame)
 
-                # Record frame metadata
-                if crop_info is not None:
-                    frame_metadata[str(frame_id)] = {
-                        "segment": segment.name,
-                        "view_type": segment.view_type,
-                        "center": [round(crop_info.center[0], 1),
-                                   round(crop_info.center[1], 1)],
-                        "crop_box": crop_info.crop_box,
-                        "scale": round(crop_info.scale, 4),
-                    }
+                    if crop_info is not None:
+                        frame_metadata[str(frame_id)] = {
+                            "segment": segment.name,
+                            "view_type": segment.view_type,
+                            "center": [round(crop_info.center[0], 1),
+                                       round(crop_info.center[1], 1)],
+                            "crop_box": crop_info.crop_box,
+                            "scale": round(crop_info.scale, 4),
+                        }
 
             # Apply slow-motion if needed (e.g. replay segment)
             if segment.speed < 1.0 and len(segment_frames) >= 2:
                 segment_frames = self._interpolate_slowmo(
-                    segment_frames, segment.speed,
+                    segment_frames, segment.speed, ve_cfg,
+                    output_fps, output_dir,
                 )
 
             # Semantic transitions between segments
@@ -193,6 +262,93 @@ class SegmentComposer(BaseClipComposer):
 
         logger.info("Highlight clip saved: %s", output_path)
         return output_path
+
+    # ------------------------------------------------------------------
+    # Source frame upscaling
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _upscale_source_frames(
+        analyzed: AnalyzedEvent,
+        ctx: MatchContext,
+        vp: VideoProcessor,
+        ve_cfg: dict[str, Any],
+    ) -> tuple[dict[int, np.ndarray], int]:
+        """Extract source frames, upscale via video2x, return as dict.
+
+        Returns:
+            (upscaled_frames, scale_factor) where upscaled_frames maps
+            frame_id → upscaled numpy array, and scale_factor is the
+            integer upscale multiplier (e.g. 2).
+        """
+        from goalinsight.video_enhancement import _make_cmd, _run_video2x, _video2x_args, _upscale_args
+
+        upscale_cfg = ve_cfg.get("upscale", {})
+        scale = upscale_cfg.get("scale", 2)
+        encoder_cfg = ve_cfg.get("encoder", {"codec": "libx264", "extra": {"crf": "17", "preset": "fast"}})
+
+        # Compute the full frame range across all segments (with trail lookback)
+        trail_length = 15
+        min_frame = min(s.start_frame for s in analyzed.segments)
+        max_frame = max(s.end_frame for s in analyzed.segments)
+        min_frame = max(0, min_frame - trail_length)
+
+        # Collect unique frame IDs needed (segments may overlap, e.g. strike + replay)
+        needed: set[int] = set()
+        for seg in analyzed.segments:
+            for f in range(max(0, seg.start_frame - trail_length), seg.end_frame + 1):
+                needed.add(f)
+
+        # Build ordered frame list
+        frame_ids_sorted = sorted(needed)
+        frame_id_to_idx: dict[int, int] = {fid: i for i, fid in enumerate(frame_ids_sorted)}
+
+        logger.info(
+            "Upscaling %d source frames [%d → %d] at %dx ...",
+            len(frame_ids_sorted), frame_ids_sorted[0], frame_ids_sorted[-1], scale,
+        )
+
+        h, w = ctx.height, ctx.width
+
+        with tempfile.TemporaryDirectory(prefix="_upscale_src_") as tmpdir:
+            tmp = Path(tmpdir)
+            src_path = tmp / "src.mp4"
+            dst_path = tmp / "upscaled.mp4"
+
+            # Write source frames in order
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(src_path), fourcc, ctx.fps, (w, h))
+            for frame_id, _ts, frame in vp.extract_frames(
+                ctx.video_path,
+                start_frame=frame_ids_sorted[0],
+                end_frame=frame_ids_sorted[-1] + 1,
+                show_progress=False,
+            ):
+                if frame_id in needed:
+                    writer.write(frame)
+            writer.release()
+
+            # Run video2x upscale
+            processor = upscale_cfg.get("processor", "realesrgan")
+            args = _video2x_args(processor, _upscale_args(upscale_cfg), encoder_cfg)
+            cmd = _make_cmd(None, src_path, dst_path, args, ve_cfg)
+            _run_video2x(cmd, "highlight_source", "upscale")
+
+            # Read back upscaled frames and map to original frame_ids
+            cap = cv2.VideoCapture(str(dst_path))
+            upscaled: dict[int, np.ndarray] = {}
+            idx = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if idx < len(frame_ids_sorted):
+                    upscaled[frame_ids_sorted[idx]] = frame
+                idx += 1
+            cap.release()
+
+        logger.info("Upscaled %d frames (output res: %dx%d)", len(upscaled), w * scale, h * scale)
+        return upscaled, scale
 
     # ------------------------------------------------------------------
     # Ball trajectory
@@ -318,26 +474,29 @@ class SegmentComposer(BaseClipComposer):
         x1, y1, x2, y2 = bbox
         cx = int((x1 + x2) / 2)
         cy = int(y2)  # bottom of bbox = feet
-        base_w = int((x2 - x1) * 0.6)
-        base_h = int(base_w * 0.3)
+        base_w = int((x2 - x1) * 0.8)
+        base_h = int(base_w * 0.35)
         if base_w < 5 or base_h < 3:
             return
 
         overlay = frame.copy()
         # Outer glow (large, faint)
-        cv2.ellipse(overlay, (cx, cy), (int(base_w * 1.5), int(base_h * 1.5)),
+        cv2.ellipse(overlay, (cx, cy), (int(base_w * 1.8), int(base_h * 1.8)),
                      0, 0, 360, color, -1)
-        cv2.addWeighted(overlay, alpha * 0.3, frame, 1 - alpha * 0.3, 0, dst=frame)
+        cv2.addWeighted(overlay, alpha * 0.4, frame, 1 - alpha * 0.4, 0, dst=frame)
         # Mid glow
         overlay[:] = frame
         cv2.ellipse(overlay, (cx, cy), (base_w, base_h),
                      0, 0, 360, color, -1)
-        cv2.addWeighted(overlay, alpha * 0.5, frame, 1 - alpha * 0.5, 0, dst=frame)
+        cv2.addWeighted(overlay, alpha * 0.7, frame, 1 - alpha * 0.7, 0, dst=frame)
         # Inner core (bright, small)
         overlay[:] = frame
         cv2.ellipse(overlay, (cx, cy), (int(base_w * 0.5), int(base_h * 0.5)),
                      0, 0, 360, color, -1)
-        cv2.addWeighted(overlay, alpha * 0.8, frame, 1 - alpha * 0.8, 0, dst=frame)
+        cv2.addWeighted(overlay, alpha * 1.0, frame, 1 - alpha * 1.0, 0, dst=frame)
+        # Bright rim outline
+        cv2.ellipse(frame, (cx, cy), (base_w, base_h),
+                     0, 0, 360, color, 2, cv2.LINE_AA)
 
     @staticmethod
     def _draw_ball_trail(
@@ -346,6 +505,7 @@ class SegmentComposer(BaseClipComposer):
         frame_id: int,
         trail_length: int = 15,
         color: tuple[int, ...] = (0, 255, 255),
+        scale: int = 1,
     ) -> None:
         """Draw a comet-style trajectory trail behind the ball (in-place).
 
@@ -364,7 +524,7 @@ class SegmentComposer(BaseClipComposer):
             center = ball.get("center")
             if center is None:
                 continue
-            points.append((int(center[0]), int(center[1])))
+            points.append((int(center[0] * scale), int(center[1] * scale)))
 
         if len(points) < 2:
             return
@@ -374,10 +534,12 @@ class SegmentComposer(BaseClipComposer):
         n = len(points)
         for i in range(1, n):
             progress = i / n  # 0→1, newer = brighter/thicker
-            thickness = max(1, int(progress * 4 + 1))
-            c = tuple(int(v * progress) for v in color)
+            thickness = max(2, int(progress * 6 + 2))
+            c = tuple(int(v * (0.3 + 0.7 * progress)) for v in color)
             cv2.line(overlay, points[i - 1], points[i], c, thickness, cv2.LINE_AA)
-        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, dst=frame)
+        cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, dst=frame)
+        # Bright dot at current ball position
+        cv2.circle(frame, points[-1], max(3, thickness // 2), color, -1, cv2.LINE_AA)
 
     # ------------------------------------------------------------------
     # Transitions
@@ -411,13 +573,25 @@ class SegmentComposer(BaseClipComposer):
     def _interpolate_slowmo(
         frames: list[np.ndarray],
         speed: float,
+        ve_cfg: dict[str, Any] | None = None,
+        output_fps: float = 25.0,
+        work_dir: Path | None = None,
     ) -> list[np.ndarray]:
-        """Generate slow-motion frames via linear blending.
+        """Generate slow-motion frames.
 
-        For speed=0.4, each source frame produces ~2.5 output frames.
-        Consecutive source frames are cross-blended for smooth motion
-        rather than frame duplication.
+        When video_enhancement config is available, uses RIFE via video2x
+        for high-quality optical-flow interpolation.  Falls back to linear
+        blending when video2x is not configured.
         """
+        if ve_cfg and ve_cfg.get("enabled", False) and work_dir is not None:
+            try:
+                return SegmentComposer._interpolate_slowmo_rife(
+                    frames, speed, ve_cfg, output_fps, work_dir,
+                )
+            except Exception as exc:
+                logger.warning("RIFE slowmo failed, falling back to linear blend: %s", exc)
+
+        # Fallback: linear blending
         n_src = len(frames)
         n_out = int(n_src / speed)
         result: list[np.ndarray] = []
@@ -434,6 +608,69 @@ class SegmentComposer(BaseClipComposer):
                     0,
                 )
                 result.append(blended)
+        return result
+
+    @staticmethod
+    def _interpolate_slowmo_rife(
+        frames: list[np.ndarray],
+        speed: float,
+        ve_cfg: dict[str, Any],
+        output_fps: float,
+        work_dir: Path,
+    ) -> list[np.ndarray]:
+        """Slow-motion via RIFE frame interpolation (video2x).
+
+        Writes source frames to a temp video at *output_fps*, runs RIFE to
+        multiply the frame count by ``1/speed`` (rounded to power of 2),
+        then reads back the interpolated frames.
+        """
+        from goalinsight.video_enhancement import _make_cmd, _run_video2x, _video2x_args
+
+        # Compute RIFE multiplier: round 1/speed to nearest power of 2
+        raw_mult = 1.0 / speed
+        rife_mult = 2
+        while rife_mult * 2 <= raw_mult + 0.5:
+            rife_mult *= 2
+
+        h, w = frames[0].shape[:2]
+
+        with tempfile.TemporaryDirectory(dir=work_dir, prefix="_slowmo_") as tmpdir:
+            tmp = Path(tmpdir)
+            src_path = tmp / "src.mp4"
+            dst_path = tmp / "dst.mp4"
+
+            # Write source frames
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(src_path), fourcc, output_fps, (w, h))
+            for f in frames:
+                writer.write(f)
+            writer.release()
+
+            # Run RIFE interpolation via video2x
+            encoder_cfg = ve_cfg.get("encoder", {"codec": "libx264", "extra": {"crf": "17", "preset": "fast"}})
+            args = _video2x_args("rife", ["-m", str(rife_mult)], encoder_cfg)
+            cmd = _make_cmd(None, src_path, dst_path, args, ve_cfg)
+            _run_video2x(cmd, "slowmo_replay", "interpolate")
+
+            # Read back interpolated frames
+            cap = cv2.VideoCapture(str(dst_path))
+            result: list[np.ndarray] = []
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if frame.shape[:2] != (h, w):
+                    frame = cv2.resize(frame, (w, h))
+                result.append(frame)
+            cap.release()
+
+        if not result:
+            raise RuntimeError("RIFE produced no output frames")
+
+        logger.info(
+            "RIFE slowmo: %d source → %d interpolated (×%d)",
+            len(frames), len(result), rife_mult,
+        )
         return result
 
     # ------------------------------------------------------------------

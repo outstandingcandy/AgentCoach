@@ -34,3 +34,18 @@ field_registration:
 
 ball_detection:
   confidence_threshold: 0.15  # Lower threshold; tracker Kalman filter handles false positives
+
+video_enhancement:
+  enabled: true
+  mode: "docker"
+  upscale:
+    enabled: true
+    processor: "realesrgan"
+    scale: 2
+  interpolate:
+    enabled: false
+  encoder:
+    codec: "libx264"
+    extra:
+      crf: "17"
+      preset: "slow"
