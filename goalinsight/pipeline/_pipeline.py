@@ -8,7 +8,7 @@ from typing import Any
 from ._base import PipelineContext, Stage
 from ._registry import STAGE_REGISTRY
 
-DEFAULT_STAGES = ["field_registration", "tracking", "post_processing"]
+DEFAULT_STAGES = ["field_registration", "tracking"]
 
 
 class Pipeline:

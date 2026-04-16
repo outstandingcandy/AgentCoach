@@ -9,21 +9,6 @@ from ._registry import register_stage
 
 
 @register_stage
-class ShotDetectionStage(Stage):
-    name = "shot_detection"
-    description = "Shot Detection & Segmentation"
-
-    def run(self, ctx: PipelineContext) -> dict[str, Any]:
-        from ..preprocessing.runner import run_shot_detection
-
-        out = ctx.stage_dir(self.name)
-        return run_shot_detection(ctx.video_path, out, ctx.config)
-
-    def should_skip(self, ctx: PipelineContext) -> bool:
-        return ctx.skip_existing and (ctx.stage_dir(self.name) / "shot_boundaries.json").exists()
-
-
-@register_stage
 class FieldRegistrationStage(Stage):
     name = "field_registration"
     description = "Field Registration"
@@ -81,24 +66,6 @@ class TrackingStage(Stage):
 
     def should_skip(self, ctx: PipelineContext) -> bool:
         return ctx.skip_existing and (ctx.stage_dir(self.name) / "tracks.json").exists()
-
-
-@register_stage
-class PostProcessingStage(Stage):
-    name = "post_processing"
-    description = "Post-processing Refinement"
-
-    def run(self, ctx: PipelineContext) -> dict[str, Any]:
-        from ..refinement import run_refinement
-
-        tracking_dir = ctx.stage_dir("tracking")
-        if not tracking_dir.exists():
-            raise RuntimeError("Post-processing requires tracking output")
-        out = ctx.stage_dir(self.name)
-        return run_refinement(tracking_dir, out, ctx.config)
-
-    def should_skip(self, ctx: PipelineContext) -> bool:
-        return ctx.skip_existing and (ctx.stage_dir(self.name) / "tracks_refined.json").exists()
 
 
 @register_stage
@@ -185,38 +152,3 @@ class HighlightsStage(Stage):
         return False  # Always regenerate highlights
 
 
-@register_stage
-class VideoEnhancementStage(Stage):
-    name = "video_enhancement"
-    description = "Video Enhancement (Upscaling & Frame Interpolation)"
-
-    def run(self, ctx: PipelineContext) -> dict[str, Any]:
-        config = ctx.config.get("video_enhancement", {}) if ctx.config else {}
-
-        if not config.get("enabled", False):
-            print("  Video enhancement disabled in config")
-            return {"enhanced_clips": [], "count": 0}
-
-        highlights_dir = ctx.stage_dir("highlights")
-        if not highlights_dir.exists():
-            print("  Warning: No highlights output found, skipping video enhancement")
-            return {"enhanced_clips": [], "count": 0}
-
-        from ..video_enhancement import run_video_enhancement
-
-        out = ctx.stage_dir(self.name)
-        clips = run_video_enhancement(
-            input_dir=highlights_dir,
-            output_dir=out,
-            config=config,
-        )
-
-        return {"enhanced_clips": [str(c) for c in clips], "count": len(clips)}
-
-    def should_skip(self, ctx: PipelineContext) -> bool:
-        if not ctx.skip_existing:
-            return False
-        out = ctx.stage_dir(self.name)
-        if not out.exists():
-            return False
-        return any(out.rglob("*.mp4"))

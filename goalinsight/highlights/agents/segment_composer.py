@@ -22,6 +22,53 @@ from .base import BaseClipComposer
 logger = logging.getLogger(__name__)
 
 
+class _UpscaledFrameReader:
+    """Disk-backed reader for upscaled video frames.
+
+    Keeps the upscaled video on disk and reads frames on demand via
+    cv2.VideoCapture, so only one frame is in memory at a time.
+    Sequential reads are fast (no seek needed); random access seeks
+    to the requested position.
+    """
+
+    def __init__(
+        self,
+        video_path: Path,
+        tmpdir: str,
+        frame_id_to_idx: dict[int, int],
+    ) -> None:
+        self._video_path = video_path
+        self._tmpdir = tmpdir
+        self._frame_id_to_idx = frame_id_to_idx
+        self._cap = cv2.VideoCapture(str(video_path))
+        self._next_idx = 0  # next sequential index the capture will return
+
+    def read(self, frame_id: int) -> np.ndarray | None:
+        """Read a single upscaled frame by its original frame_id."""
+        idx = self._frame_id_to_idx.get(frame_id)
+        if idx is None:
+            return None
+
+        # Seek if not at the expected position
+        if idx != self._next_idx:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            self._next_idx = idx
+
+        ret, frame = self._cap.read()
+        if not ret:
+            return None
+        self._next_idx = idx + 1
+        return frame
+
+    def close(self) -> None:
+        """Release the capture and clean up the temp directory."""
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+
 class SegmentComposer(BaseClipComposer):
     """Compose a highlight clip by stitching segments with optional close-ups."""
 
@@ -79,10 +126,10 @@ class SegmentComposer(BaseClipComposer):
         ve_cfg = config.get("video_enhancement", {})
         upscale_enabled = ve_cfg.get("enabled", False) and ve_cfg.get("upscale", {}).get("enabled", False)
 
-        upscaled_frames: dict[int, np.ndarray] | None = None
+        upscale_reader: _UpscaledFrameReader | None = None
         upscale_scale = 1
         if upscale_enabled:
-            upscaled_frames, upscale_scale = self._upscale_source_frames(
+            upscale_reader, upscale_scale = self._upscale_source_frames(
                 analyzed, ctx, vp, ve_cfg,
             )
 
@@ -141,10 +188,10 @@ class SegmentComposer(BaseClipComposer):
             prev_state: SmoothState | None = None
             segment_frames: list[np.ndarray] = []
 
-            if upscaled_frames is not None:
-                # Use pre-upscaled frames
+            if upscale_reader is not None:
+                # Use pre-upscaled frames (read from disk, not memory)
                 for frame_id in range(segment.start_frame, segment.end_frame + 1):
-                    frame = upscaled_frames.get(frame_id)
+                    frame = upscale_reader.read(frame_id)
                     if frame is None:
                         continue
                     frame = frame.copy()
@@ -254,6 +301,10 @@ class SegmentComposer(BaseClipComposer):
 
         writer.release()
 
+        # Clean up upscaled temp directory
+        if upscale_reader is not None:
+            upscale_reader.close()
+
         # Save per-frame crop metadata JSON alongside the video
         meta_path = output_path.with_suffix(".json")
         with open(meta_path, "w") as f:
@@ -273,13 +324,13 @@ class SegmentComposer(BaseClipComposer):
         ctx: MatchContext,
         vp: VideoProcessor,
         ve_cfg: dict[str, Any],
-    ) -> tuple[dict[int, np.ndarray], int]:
-        """Extract source frames, upscale via video2x, return as dict.
+    ) -> tuple["_UpscaledFrameReader", int]:
+        """Extract source frames, upscale via video2x, return a disk-backed reader.
 
         Returns:
-            (upscaled_frames, scale_factor) where upscaled_frames maps
-            frame_id → upscaled numpy array, and scale_factor is the
-            integer upscale multiplier (e.g. 2).
+            (reader, scale_factor) where reader provides frame-by-frame access
+            to the upscaled video on disk (no bulk memory allocation), and
+            scale_factor is the integer upscale multiplier (e.g. 2).
         """
         from goalinsight.video_enhancement import _make_cmd, _run_video2x, _video2x_args, _upscale_args
 
@@ -289,9 +340,6 @@ class SegmentComposer(BaseClipComposer):
 
         # Compute the full frame range across all segments (with trail lookback)
         trail_length = 15
-        min_frame = min(s.start_frame for s in analyzed.segments)
-        max_frame = max(s.end_frame for s in analyzed.segments)
-        min_frame = max(0, min_frame - trail_length)
 
         # Collect unique frame IDs needed (segments may overlap, e.g. strike + replay)
         needed: set[int] = set()
@@ -301,7 +349,6 @@ class SegmentComposer(BaseClipComposer):
 
         # Build ordered frame list
         frame_ids_sorted = sorted(needed)
-        frame_id_to_idx: dict[int, int] = {fid: i for i, fid in enumerate(frame_ids_sorted)}
 
         logger.info(
             "Upscaling %d source frames [%d → %d] at %dx ...",
@@ -310,45 +357,40 @@ class SegmentComposer(BaseClipComposer):
 
         h, w = ctx.height, ctx.width
 
-        with tempfile.TemporaryDirectory(prefix="_upscale_src_") as tmpdir:
-            tmp = Path(tmpdir)
-            src_path = tmp / "src.mp4"
-            dst_path = tmp / "upscaled.mp4"
+        # Use a temp directory that persists until the reader is closed
+        tmpdir = tempfile.mkdtemp(prefix="_upscale_src_")
+        tmp = Path(tmpdir)
+        src_path = tmp / "src.mp4"
+        dst_path = tmp / "upscaled.mp4"
 
-            # Write source frames in order
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(str(src_path), fourcc, ctx.fps, (w, h))
-            for frame_id, _ts, frame in vp.extract_frames(
-                ctx.video_path,
-                start_frame=frame_ids_sorted[0],
-                end_frame=frame_ids_sorted[-1] + 1,
-                show_progress=False,
-            ):
-                if frame_id in needed:
-                    writer.write(frame)
-            writer.release()
+        # Write source frames in order
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        vid_writer = cv2.VideoWriter(str(src_path), fourcc, ctx.fps, (w, h))
+        for frame_id, _ts, frame in vp.extract_frames(
+            ctx.video_path,
+            start_frame=frame_ids_sorted[0],
+            end_frame=frame_ids_sorted[-1] + 1,
+            show_progress=False,
+        ):
+            if frame_id in needed:
+                vid_writer.write(frame)
+        vid_writer.release()
 
-            # Run video2x upscale
-            processor = upscale_cfg.get("processor", "realesrgan")
-            args = _video2x_args(processor, _upscale_args(upscale_cfg), encoder_cfg)
-            cmd = _make_cmd(None, src_path, dst_path, args, ve_cfg)
-            _run_video2x(cmd, "highlight_source", "upscale")
+        # Run video2x upscale
+        processor = upscale_cfg.get("processor", "realesrgan")
+        args = _video2x_args(processor, _upscale_args(upscale_cfg), encoder_cfg)
+        cmd = _make_cmd(None, src_path, dst_path, args, ve_cfg)
+        _run_video2x(cmd, "highlight_source", "upscale")
 
-            # Read back upscaled frames and map to original frame_ids
-            cap = cv2.VideoCapture(str(dst_path))
-            upscaled: dict[int, np.ndarray] = {}
-            idx = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if idx < len(frame_ids_sorted):
-                    upscaled[frame_ids_sorted[idx]] = frame
-                idx += 1
-            cap.release()
+        # Remove source video to free disk space
+        src_path.unlink(missing_ok=True)
 
-        logger.info("Upscaled %d frames (output res: %dx%d)", len(upscaled), w * scale, h * scale)
-        return upscaled, scale
+        # Build frame_id → sequential index mapping
+        frame_id_to_idx = {fid: i for i, fid in enumerate(frame_ids_sorted)}
+
+        reader = _UpscaledFrameReader(dst_path, tmpdir, frame_id_to_idx)
+        logger.info("Upscaled %d frames (output res: %dx%d)", len(frame_ids_sorted), w * scale, h * scale)
+        return reader, scale
 
     # ------------------------------------------------------------------
     # Ball trajectory

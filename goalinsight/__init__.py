@@ -3,8 +3,8 @@
 Modules:
 - Field Registration: Camera calibration via keypoint/line detection
 - Tracking & Identification: Player detection, tracking, and ReID
-- Post-processing: Temporal consistency and tracklet merging
-- Goal Detection: Ball tracking and goal-line crossing detection
+- Event Detection: Possession, passes, shots, goals, carries, tackles
+- Highlights: Agent-based highlight clip generation
 
 Supports multiple backends for each component:
 - Calibration: PnLCalib (default), BroadTrack, Physical, NBJW
@@ -17,7 +17,6 @@ Supports multiple backends for each component:
 from .pipeline import Pipeline, Stage, PipelineContext, STAGE_REGISTRY
 from .video_processor import VideoProcessor, VideoSampler
 from .highlights import run_highlights
-from .preprocessing.runner import get_segments_for_pipeline
 
 # Factory functions for creating components
 from .utils.factories import (
@@ -38,7 +37,6 @@ __all__ = [
     # Video processing
     "VideoProcessor",
     "VideoSampler",
-    "get_segments_for_pipeline",
     # Factory functions
     "get_calibrator",
     "get_reid_extractor",
