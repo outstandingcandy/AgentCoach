@@ -166,7 +166,6 @@ def _load_json(
     legacy_map = {
         "tracking": "stage2",
         "field_registration": "stage1",
-        "post_processing": "stage3",
     }
     legacy = legacy_map.get(stage)
     if legacy:

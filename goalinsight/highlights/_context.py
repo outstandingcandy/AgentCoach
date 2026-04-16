@@ -34,9 +34,6 @@ class MatchContext:
     _ball_tracks: dict[str, dict] | None = field(default=None, repr=False)
     _camera_poses: dict[str, dict] | None = field(default=None, repr=False)
     _team_assignments: dict[str, str] | None = field(default=None, repr=False)
-    _refined_tracks: dict[str, list[dict]] | None = field(
-        default=None, repr=False
-    )
     _events: list[dict] | None = field(default=None, repr=False)
 
     # ------------------------------------------------------------------
@@ -159,15 +156,6 @@ class MatchContext:
         return self._team_assignments
 
     @property
-    def refined_tracks(self) -> dict[str, list[dict]] | None:
-        if self._refined_tracks is None:
-            self._refined_tracks = (
-                self._load_json("post_processing", "tracks_refined.json")
-                or self._load_json("stage3", "tracks_refined.json")
-            )
-        return self._refined_tracks
-
-    @property
     def events(self) -> list[dict]:
         """Load detected events from the event_detection stage output."""
         if self._events is None:
@@ -189,8 +177,7 @@ class MatchContext:
 
     def get_tracks_at_frame(self, frame: int) -> list[dict]:
         """Return player tracks at *frame* (preferring refined if available)."""
-        source = self.refined_tracks if self.refined_tracks else self.player_tracks
-        return source.get(str(frame), [])
+        return self.player_tracks.get(str(frame), [])
 
     def get_ball_at_frame(self, frame: int) -> dict | None:
         return self.ball_tracks.get(str(frame))
@@ -202,10 +189,9 @@ class MatchContext:
 
         Each returned dict has at least: frame, bbox, pitch_position.
         """
-        source = self.refined_tracks if self.refined_tracks else self.player_tracks
         result: list[dict[str, Any]] = []
         for f in range(start_frame, end_frame + 1):
-            for t in source.get(str(f), []):
+            for t in self.player_tracks.get(str(f), []):
                 if t.get("track_id") == track_id:
                     result.append({"frame": f, **t})
                     break

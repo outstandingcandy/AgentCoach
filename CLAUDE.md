@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GoalInsight is a soccer video analysis pipeline: field registration (camera calibration), player tracking/identification, ball tracking with 3D trajectory estimation, event detection, highlight generation, and post-processing refinement.
+GoalInsight is a soccer video analysis pipeline: field registration (camera calibration), player tracking/identification, ball tracking with 3D trajectory estimation, event detection, and highlight generation.
 
 ## Environment & Running
 
@@ -17,7 +17,7 @@ goalinsight \
   --video data/raw_videos/football_sunday_output_000.mp4 \
   --output output/ \
   --config configs/clip_000_finetuned.yaml \
-  --stages field_registration,tracking,post_processing
+  --stages field_registration,tracking
 
 # Or via script
 python scripts/run_full_pipeline.py [same args]
@@ -44,10 +44,9 @@ pipeline:
   stages:
     - field_registration
     - tracking
-    - post_processing
 ```
 
-Available stages: `shot_detection`, `field_registration`, `tracking`, `post_processing`, `event_detection`, `highlights`, `video_enhancement`.
+Available stages: `field_registration`, `tracking`, `event_detection`, `highlights`.
 
 ```python
 from goalinsight import Pipeline
@@ -65,19 +64,12 @@ Key classes in `goalinsight/pipeline/`:
 ### Data Flow
 
 ```
-shot_detection (preprocessing/runner.py)
-  Output: shot_boundaries.json, segments/
-
 field_registration (field_registration/*_runner.py)
   Output: homographies.pkl, camera_poses.pkl/.json, calibration_metadata.json
     ↓
 tracking (tracking/orchestrator.py)
   Input: Video + field_registration output (homographies.pkl, camera_poses)
   Output: tracks.json, ball_tracks.json, track_features.json, team_assignments.json, tracking.mp4
-    ↓
-post_processing (refinement.py)
-  Input: tracking/tracks.json + track_features.json
-  Output: tracks_refined.json, final_track_summaries.json, statistics.json
     ↓
 event_detection (events/)
   Input: tracking/ (ball_tracks.json, tracks.json, team_assignments.json) + field_registration/camera_poses.json
@@ -87,10 +79,6 @@ event_detection (events/)
 highlights (highlights/)
   Input: events.json + tracking/ + video
   Output: highlight clip MP4s per recipe (e.g. goal_highlight_0001.mp4)
-    ↓
-video_enhancement (video_enhancement/)
-  Input: highlight clip MP4s
-  Output: upscaled / frame-interpolated MP4s (via video2x CLI)
 ```
 
 ### Field Registration: Calibration Backends
@@ -149,15 +137,11 @@ Recipe-based agent pipeline: **Detector → Analyzer → Composer**. Recipes are
 
 ### Video Enhancement (`video_enhancement/`)
 
-Upscaling and frame interpolation using [video2x](https://github.com/k4yt3x/video2x) (Vulkan GPU). Two integration points:
-
-1. **Inline (preferred)**: When `video_enhancement.enabled` is set, the highlights `SegmentComposer` upscales source frames *before* composition. The pipeline adapter injects the top-level `video_enhancement` config into highlights config. This produces higher quality because cropping/effects/slow-motion operate on upscaled frames.
-2. **Post-hoc stage**: The `video_enhancement` pipeline stage processes finished highlight clips. Useful for standalone upscaling or frame interpolation of any MP4.
+Upscaling and frame interpolation using [video2x](https://github.com/k4yt3x/video2x) (Vulkan GPU). Used inline by the highlights `SegmentComposer` — when `video_enhancement.enabled` is set, upscales source frames *before* composition so cropping/effects/slow-motion operate on high-res frames. Replay slow-motion uses RIFE optical-flow interpolation.
 
 - **Modes**: `binary` (local video2x) or `docker` (container with GPU passthrough, needed on older glibc systems).
 - **Upscaling**: Real-ESRGAN, Real-CUGAN, or libplacebo (Anime4K shaders). 2x or 4x scale.
-- **Frame interpolation**: RIFE. 2x+ frame rate multiplier. Also used for replay slow-motion inside `SegmentComposer`.
-- **Two-pass**: If both upscale and interpolation are enabled, upscale runs first, then interpolation on the upscaled output.
+- **Frame interpolation**: RIFE. 2x+ frame rate multiplier.
 
 ### Factory Pattern and Interfaces
 
@@ -192,10 +176,6 @@ YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merg
 - `highlights.recipes`: list of highlight recipes (each with detector, analyzer, composer)
 - `highlights.temporal.*`: buildup/celebration durations, view types
 - `highlights.effects.*`: shooter spotlight, ball trail settings
-- `video_enhancement.enabled`: toggle video2x processing (requires Vulkan GPU)
-- `video_enhancement.upscale.*`: upscaling processor, scale factor, model
-- `video_enhancement.interpolate.*`: frame interpolation processor, multiplier
-- `video_enhancement.encoder.*`: output codec and quality settings
 
 ## Tools
 

@@ -919,13 +919,15 @@ def run_tracking(
 
     # Free pre-computed detection/feature caches
     del _det_color_hists, _det_saturations, _det_jersey_numbers, _precomputed_ball_dets
+    del _filtered_dets, _precomputed_embeds, all_ball_detections
 
-    # Save ball tracking debug log
+    # Save ball tracking debug log and free memory
     if ball_debug_log:
         debug_path = output_dir / "ball_debug_log.json"
         with open(debug_path, "w") as f:
             json.dump({str(k): v for k, v in sorted(ball_debug_log.items())}, f, indent=1)
         logger.info(f"  Ball debug log saved to {debug_path}")
+    ball_debug_log.clear()
 
     # === Field-space trajectory projection and filtering ===
     if ball_detector and ball_tracker and ball_track_histories:
@@ -1092,6 +1094,9 @@ def run_tracking(
                 video_path, sampler, all_ball_dets_diag, output_dir,
             )
 
+    # Free ball processing intermediates before rendering
+    del ball_track_histories, all_ball_track_candidates, all_ball_dets_diag
+
     team_assignments, jersey_assignments = _classify_teams(
         all_tracks=all_tracks,
         track_color_hists=track_color_hists,
@@ -1105,21 +1110,25 @@ def run_tracking(
         pitch_width=pitch_width,
     )
 
-    _render_tracking_video(
-        video_path=video_path,
-        output_dir=output_dir,
-        sampler=sampler,
-        all_tracks=all_tracks,
-        team_assignments=team_assignments,
-        all_ball_tracks=all_ball_tracks,
-        ball_debug_log=ball_debug_log,
-        ball_enabled=ball_enabled,
-        out=out,
-        fps=fps,
-        height=height,
-        pitch_length=pitch_length,
-        pitch_width=pitch_width,
-    )
+    if config.get("output", {}).get("save_visualizations", True):
+        _render_tracking_video(
+            video_path=video_path,
+            output_dir=output_dir,
+            sampler=sampler,
+            all_tracks=all_tracks,
+            team_assignments=team_assignments,
+            all_ball_tracks=all_ball_tracks,
+            ball_debug_log=ball_debug_log,
+            ball_enabled=ball_enabled,
+            out=out,
+            fps=fps,
+            height=height,
+            pitch_length=pitch_length,
+            pitch_width=pitch_width,
+        )
+    else:
+        out.release()
+        logger.info("Skipping tracking visualization (save_visualizations=false)")
 
     return _save_tracking_outputs(
         output_dir=output_dir,

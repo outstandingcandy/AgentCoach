@@ -4,13 +4,10 @@
 Run the analysis pipeline with configurable stages.
 
 Available stages:
-- shot_detection: Shot boundary detection & video segmentation
 - field_registration: Camera calibration (PnLCalib, BroadTrack, Physical, etc.)
 - tracking: Player/ball detection, tracking, ReID, and team classification
-- post_processing: Temporal consistency and tracklet merging
 - event_detection: Possession, passes, shots, goals, carries, tackles
 - highlights: Highlight clip generation
-- video_enhancement: Upscaling & frame interpolation (requires video2x)
 """
 
 import argparse
@@ -54,7 +51,7 @@ def main():
         "--stages",
         type=str,
         default=None,
-        help="Comma-separated stages to run (default: from config or field_registration,tracking,post_processing)"
+        help="Comma-separated stages to run (default: from config or field_registration,tracking)"
     )
     parser.add_argument(
         "--skip-existing",
@@ -71,6 +68,11 @@ def main():
         type=str,
         default=None,
         help="Custom run name (used instead of timestamp)"
+    )
+    parser.add_argument(
+        "--no-viz",
+        action="store_true",
+        help="Skip tracking visualization video (saves time and memory)"
     )
     args = parser.parse_args()
 
@@ -101,6 +103,12 @@ def main():
         if "pnlcalib" not in config["field_registration"]:
             config["field_registration"]["pnlcalib"] = {}
         config["field_registration"]["pnlcalib"]["keypoint_model_path"] = args.keypoint_model
+
+    # Override visualization setting
+    if args.no_viz:
+        if "output" not in config:
+            config["output"] = {}
+        config["output"]["save_visualizations"] = False
 
     # Build and run pipeline
     if args.stages:

@@ -1,23 +1,5 @@
 # SoccerMaster Data Curation Pipeline - Default Configuration
 
-# Stage 0: Shot Detection & Segmentation (Preprocessing)
-shot_detection:
-  enabled: true
-  method: "adaptive"           # "adaptive", "histogram", or "fixed"
-  frame_diff:
-    adaptive_ratio: 3.0        # Adaptive threshold = mean + ratio * std
-    window_size: 50            # Sliding window size for local statistics
-  histogram:
-    color_space: "hsv"         # Color space for histogram comparison
-    bins: [8, 12, 3]           # Histogram bins for H, S, V channels
-  min_shot_duration: 1.0       # Minimum shot duration in seconds
-
-video_segmentation:
-  enabled: true                # Whether to export segment video files
-  output_format: "mkv"         # Output video format
-  export_frame_ranges: true    # Export frame_ranges.json for lazy processing
-  accurate_cut: true           # Re-encode for frame-accurate cuts (slower but precise)
-
 # Video Processing
 video:
   process_fps: 10         # Frames per second to process (e.g., 10 = process 10 frames per second)
@@ -249,20 +231,7 @@ role_classification:
 visualization:
   backend: "minimal"      # "minimal" (default) or "step"
 
-# Stage 3: Post-processing
-postprocess:
-  sam2:
-    enabled: true
-    model: "sam2_hiera_large"
-    device: "cuda"
-  majority_voting:
-    window_size: 5        # Temporal window for voting
-  trajectory_merger:
-    reid_threshold: 0.8   # Cosine similarity threshold
-    max_gap_frames: 30    # Max frames gap for merging
-    require_same_jersey: true
-
-# Stage 4: Highlight Clipping (agent-based)
+# Highlight Clipping (agent-based)
 highlights:
   enabled: false
   output_fps: 25.0
@@ -301,30 +270,6 @@ highlights:
       detector: "goal"
       analyzer: "scorer"
       composer: "segment"
-
-# Stage 5: Video Enhancement (video2x — upscaling & frame interpolation)
-video_enhancement:
-  enabled: false                      # Disabled by default (requires video2x + Vulkan GPU)
-  mode: "docker"                      # "binary" (local video2x) or "docker" (container with GPU)
-  binary_path: null                   # binary mode: path to video2x (null = auto-detect via PATH)
-  docker_image: "ghcr.io/k4yt3x/video2x:latest"  # docker mode: container image
-
-  upscale:
-    enabled: true                     # Enable upscaling pass
-    processor: "realesrgan"           # realesrgan | realcugan | libplacebo
-    scale: 2                          # Scaling factor: 2 or 4
-    model: null                       # Model name (null = processor default)
-
-  interpolate:
-    enabled: false                    # Enable frame interpolation pass
-    processor: "rife"                 # Frame interpolation processor
-    multiplier: 2                     # Frame rate multiplier (2 = 25fps→50fps)
-
-  encoder:
-    codec: "libx264"                  # Output video codec
-    extra:                            # Extra encoder options (passed as -e key=value)
-      crf: "17"                       # Quality (lower = better, 17 ≈ visually lossless)
-      preset: "slow"                  # Encoding speed/quality tradeoff
 
 # Output
 output:
@@ -374,9 +319,8 @@ events:
     deflection_window_seconds: 0.5  # seconds — window for computing ball deflection angle
 
 # Pipeline orchestration
-# Available stages: shot_detection, field_registration, tracking, post_processing, event_detection, goal_detection, highlights, video_enhancement
+# Available stages: field_registration, tracking, event_detection, highlights
 pipeline:
   stages:
     - field_registration
     - tracking
-    - post_processing
