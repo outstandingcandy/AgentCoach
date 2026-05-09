@@ -44,5 +44,8 @@ einops>=0.6.0             # Tensor operations (optional, for clean code)
 openai>=1.0.0             # For VLM API mode
 httpx>=0.24.0
 
+# Annotation UI (manual pitch keypoint labeling for finetune GT)
+gradio>=4.0.0
+
 # Testing
 pytest>=7.0.0
