@@ -45,11 +45,7 @@ PNLCALIB_WORLD_COORDS = [
 ]
 PNLCALIB_KEYPOINTS = {i: (coords[0], coords[1]) for i, coords in enumerate(PNLCALIB_WORLD_COORDS)}
 
-# Add PnLCalib to path
-PNLCALIB_PATH = Path(__file__).parents[5] / "PnLCalib"
-sys.path.insert(0, str(PNLCALIB_PATH))
-
-from model.cls_hrnet import get_cls_net
+from ..hrnet import HRNetKeypointModel
 
 from .point_dataloader import AugmentedPointDataset, CachedAugmentedDataset, PointAnnotationDataset
 
@@ -541,13 +537,10 @@ def main():
     writer = SummaryWriter(log_dir=str(log_dir))
     print(f"TensorBoard: tensorboard --logdir {log_dir}")
 
-    # Load model config
-    config = load_model_config(args.config)
-
     # Create model
     print("Loading pretrained model...")
-    model = get_cls_net(config)
-    model.load_state_dict(torch.load(args.pretrained, map_location=device))
+    model = HRNetKeypointModel(num_keypoints=58)
+    model.load_pretrained(args.pretrained)
     model = model.to(device)
 
     # Optionally freeze backbone
