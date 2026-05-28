@@ -29,3 +29,7 @@ debug_*.py
 
 # Claude
 .claude/
+
+# Per-run logs and large generated artifacts
+logs/
+webapp_videos/
