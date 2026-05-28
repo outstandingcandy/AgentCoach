@@ -13,7 +13,6 @@ Storage structure:
 """
 
 import json
-import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -66,50 +65,34 @@ class AnnotationIndex:
     def get_video_dir(self, video_name: str) -> Path:
         return self.base_dir / video_name
 
+    def get_all_video_names(self) -> list[str]:
+        return sorted(self.index.get("annotations", {}).keys())
 
-def migrate_legacy_annotations(
-    legacy_dir: str,
-    annotations_dir: str = "output/annotations",
-) -> bool:
-    """Migrate legacy annotations.json + H0.npy into unified storage."""
-    legacy_path = Path(legacy_dir)
-    json_path = legacy_path / "annotations.json"
-
-    if not json_path.exists():
-        print(f"No annotations.json found in {legacy_dir}")
-        return False
-
-    try:
-        with open(json_path) as f:
-            data = json.load(f)
-
-        video_path = data.get("video_path", "")
-        video_name = Path(video_path).stem if video_path else legacy_path.name
-        frame_idx = data.get("anchor_frame_idx", 0)
-
-        index = AnnotationIndex(annotations_dir)
-        target_dir = index.get_video_dir(video_name)
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        data["frame_idx"] = frame_idx
-        data["video_name"] = video_name
-        data["migrated_from"] = str(legacy_path)
-        data["migrated_at"] = datetime.now().isoformat()
-
-        with open(target_dir / f"frame_{frame_idx}.json", "w") as f:
-            json.dump(data, f, indent=2)
-
-        h0_path = legacy_path / "H0.npy"
-        if h0_path.exists():
-            shutil.copy(h0_path, target_dir / f"frame_{frame_idx}.npy")
-
-        vis_path = legacy_path / "anchor_frame.jpg"
-        if vis_path.exists():
-            shutil.copy(vis_path, target_dir / f"frame_{frame_idx}.jpg")
-
-        index.add_frame(video_name, frame_idx)
-        print(f"Migrated {video_name} frame {frame_idx} to {target_dir}")
-        return True
-    except Exception as e:
-        print(f"Migration failed: {e}")
-        return False
+    def get_annotated_frame_stats(self) -> list[dict]:
+        """Walk every video in the index, read each frame_<idx>.json for
+        per-frame stats. Returns rows ready to render in the UI."""
+        rows: list[dict] = []
+        for video_name, entry in self.index.get("annotations", {}).items():
+            video_dir = self.get_video_dir(video_name)
+            for frame_idx in sorted(entry.get("frames", [])):
+                row = {
+                    "video_name": video_name,
+                    "frame_idx": int(frame_idx),
+                    "num_points": None,
+                    "rmse": None,
+                    "video_path": None,
+                }
+                json_path = video_dir / f"frame_{frame_idx}.json"
+                if json_path.exists():
+                    try:
+                        with open(json_path) as f:
+                            data = json.load(f)
+                        manual = int(data.get("num_manual_points", 0))
+                        derived = int(data.get("num_derived_points", 0))
+                        row["num_points"] = manual + derived
+                        row["rmse"] = float(data.get("reprojection_error", 0.0))
+                        row["video_path"] = data.get("video_path")
+                    except (json.JSONDecodeError, IOError, ValueError):
+                        pass
+                rows.append(row)
+        return rows

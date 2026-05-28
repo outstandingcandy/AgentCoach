@@ -1,0 +1,184 @@
+"""Homography solve and projection for the annotator.
+
+Module-level functions taking the annotator state as their first argument.
+Reads/writes ``state.H0``, ``state.reprojection_error``, ``state.derived_*``,
+``state.auto_*`` directly.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+from .homography import (
+    MIN_POINTS_FOR_PNLCALIB,
+    camera_to_image_to_world,
+    line_intersection,
+    project_camera_point,
+    solve_camera,
+)
+from .keypoint_utils import find_nearest_keypoint
+from .pitch import keypoints as _pk
+from .pitch.keypoints import (
+    INTERSECTON_TO_PITCH_POINTS,
+    NOT_ON_PLANE,
+)
+
+if TYPE_CHECKING:
+    from .annotator_state import AnchorAnnotator
+
+
+def collect_pnp_points(
+    state: "AnchorAnnotator",
+) -> tuple[list[tuple[float, float]], list[tuple[float, float, float]]]:
+    """Gather (pixel, world_xyz) pairs from manual + accepted-derived points.
+
+    Manual keypoints contribute their full 3D pitch coord (crossbars at z<0).
+    Accepted derived points are line intersections, always on the ground plane.
+    """
+    pixel_pts: list[tuple[float, float]] = []
+    world_3d_pts: list[tuple[float, float, float]] = []
+
+    for i, name in enumerate(state.keypoint_names):
+        pixel_pts.append(state.clicked_points[i])
+        pt_3d = _pk.PITCH_POINTS[name]
+        world_3d_pts.append(
+            (float(pt_3d[0]), float(pt_3d[1]), float(pt_3d[2])),
+        )
+    for i, (pixel, world, _) in enumerate(state.derived_points):
+        accepted = state.derived_accepted[i] if i < len(state.derived_accepted) else False
+        if not accepted:
+            continue
+        pixel_pts.append(pixel)
+        world_3d_pts.append((float(world[0]), float(world[1]), 0.0))
+
+    return pixel_pts, world_3d_pts
+
+
+def compute_line_intersections(state: "AnchorAnnotator") -> None:
+    """Recompute derived points from pairwise line intersections."""
+    state.derived_points = []
+    state.derived_accepted = []
+    if len(state.annotated_lines) < 2:
+        return
+
+    for i, line1 in enumerate(state.annotated_lines):
+        for line2 in state.annotated_lines[i + 1:]:
+            pixel_int = line_intersection(
+                (line1["pixels"][0], line1["pixels"][1]),
+                (line2["pixels"][0], line2["pixels"][1]),
+            )
+            world_int = line_intersection(line1["world"], line2["world"])
+            if not (pixel_int and world_int and state.current_frame is not None):
+                continue
+            px, py = pixel_int
+            h, w = state.current_frame.shape[:2]
+            if not (0 <= px < w and 0 <= py < h):
+                continue
+            wx, wy = world_int
+            name, _ = find_nearest_keypoint(wx, wy)
+            if name is None:
+                continue
+            state.derived_points.append((pixel_int, world_int, name))
+            state.derived_accepted.append(False)
+
+
+def compute_auto_projections(state: "AnchorAnnotator") -> None:
+    """Auto-project all un-annotated HRNet keypoints using the solved camera."""
+    state.auto_projected_points = []
+    state.auto_accepted = []
+    if state.H0 is None or state.current_frame is None:
+        return
+
+    h, w = state.current_frame.shape[:2]
+    annotated_names = set(state.keypoint_names)
+
+    pixel_pts, world_3d_pts = collect_pnp_points(state)
+    cam, _, _ = solve_camera(pixel_pts, world_3d_pts, (w, h))
+    if cam is None:
+        return
+
+    for idx, name in INTERSECTON_TO_PITCH_POINTS.items():
+        if name in annotated_names or name not in _pk.PITCH_POINTS:
+            continue
+        pt_3d = _pk.PITCH_POINTS[name]
+        if not np.all(np.isfinite(pt_3d)):
+            continue
+
+        pixel = project_camera_point(
+            cam, (float(pt_3d[0]), float(pt_3d[1]), float(pt_3d[2])),
+        )
+        if pixel is None:
+            continue
+        px, py = pixel
+        margin = 50
+        if not (-margin <= px < w + margin and -margin <= py < h + margin):
+            continue
+        is_ground = idx not in NOT_ON_PLANE
+        state.auto_projected_points.append((
+            (px, py),
+            (float(pt_3d[0]), float(pt_3d[1])),
+            name,
+            idx,
+            is_ground,
+        ))
+        state.auto_accepted.append(False)
+
+
+def compute_homography(state: "AnchorAnnotator") -> str:
+    """Solve a Camera (and image->world H) from manual + accepted-derived points.
+
+    Returns a status string for the UI. Mutates ``state.H0``,
+    ``state.reprojection_error``, and triggers ``compute_auto_projections``.
+    """
+    if state.current_frame is None:
+        return "No frame loaded."
+
+    pixel_pts, world_3d_pts = collect_pnp_points(state)
+
+    total_points = len(pixel_pts)
+    if total_points < MIN_POINTS_FOR_PNLCALIB:
+        return (
+            f"Need at least {MIN_POINTS_FOR_PNLCALIB} points "
+            f"(pnlcalib RANSAC requirement). Current: {total_points} — "
+            f"add more keypoints or annotate intersecting lines to "
+            f"derive corner points."
+        )
+    unique_world = {
+        (round(x, 3), round(y, 3), round(z, 3)) for x, y, z in world_3d_pts
+    }
+    if len(unique_world) < MIN_POINTS_FOR_PNLCALIB:
+        return (
+            f"Need {MIN_POINTS_FOR_PNLCALIB} DIFFERENT world points. "
+            f"Current unique: {len(unique_world)}"
+        )
+
+    h, w = state.current_frame.shape[:2]
+    cam, mean_error, diag = solve_camera(pixel_pts, world_3d_pts, (w, h))
+    if cam is None:
+        return (
+            f"PnP RANSAC failed across all focal/distortion candidates "
+            f"({total_points} pts). Add more diverse points/lines to "
+            f"break the bearing-degenerate basin."
+        )
+    H = camera_to_image_to_world(cam)
+    if H is None:
+        return "Homography computation failed."
+
+    state.reprojection_error = mean_error
+    state.H0 = H
+    compute_auto_projections(state)
+
+    warn = ""
+    if diag.get("back_facing"):
+        warn += " ⚠ back-facing pose (tvec_z≤0)"
+    if diag.get("max_err", 0) > 200:
+        warn += f" ⚠ max_err={diag['max_err']:.0f}px (median={diag['median_err']:.1f})"
+    return (
+        f"H0 from {total_points} pts. "
+        f"mean={state.reprojection_error:.2f}px "
+        f"median={diag.get('median_err', 0):.2f}px "
+        f"fx={diag.get('fx', 0):.0f}, "
+        f"projected: {len(state.auto_projected_points)}{warn}"
+    )

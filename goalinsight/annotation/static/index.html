@@ -1,0 +1,627 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Soccer Pitch Annotator</title>
+<style>
+  :root {
+    --bg: #181a1b;
+    --panel: #23262a;
+    --border: #303336;
+    --text: #e6e7e9;
+    --muted: #9aa1a8;
+    --accent: #4f8cff;
+    --accent-hi: #6fa3ff;
+    --danger: #e25b5b;
+    --warn: #d49a1a;
+    --ok: #4caf50;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 8px 12px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  header .title { font-weight: 600; }
+  header .video-name { color: var(--muted); }
+  main {
+    display: grid; grid-template-columns: 1fr 380px; gap: 12px;
+    padding: 12px; height: calc(100vh - 47px);
+  }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px; }
+  .left { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  .frame-wrap {
+    flex: 1; min-height: 0;
+    position: relative; background: #000; border-radius: 4px;
+    overflow: hidden; display: flex; align-items: center; justify-content: center;
+  }
+  .frame-wrap img { max-width: 100%; max-height: 100%; cursor: crosshair; user-select: none; }
+  .frame-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .frame-controls input[type=range] { flex: 1; }
+  .right { display: flex; flex-direction: column; gap: 10px; overflow: hidden; }
+  .right .scrollarea { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 4px; }
+  .right h3 { margin: 0 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; display: flex; justify-content: space-between; align-items: center; }
+  .right h3 .h3-actions { display: flex; gap: 4px; }
+  .right .panel { padding: 8px; }
+  .pitch-images img { width: 100%; display: block; border-radius: 3px; }
+  .pitch-images { display: flex; flex-direction: column; gap: 8px; }
+  button, select, input[type=number] {
+    background: #2d3034; color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 5px 9px; font-size: 13px;
+  }
+  button { cursor: pointer; }
+  button:hover { background: #3a3e44; border-color: #54585e; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: var(--accent-hi); }
+  button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+  button.tiny { padding: 1px 6px; font-size: 11px; line-height: 1.2; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .row.tight { gap: 4px; }
+  .row.spread { justify-content: space-between; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 11px; background: #303336; color: var(--muted); }
+  .badge.green { background: #2a4d2a; color: #b9e7b9; }
+  .badge.red { background: #4d2a2a; color: #e7b9b9; }
+  .badge.warn { background: #4d3e1a; color: #e7d49a; }
+  .status { background: #15171a; padding: 6px 8px; border-radius: 4px; min-height: 28px; color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; word-break: break-word; }
+  .points-list, .lines-list { max-height: 200px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 11px; padding: 0; margin: 0; }
+  .points-list li, .lines-list li {
+    list-style: none; padding: 2px 4px; border-radius: 3px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .points-list li:nth-child(odd), .lines-list li:nth-child(odd) { background: #1d1f22; }
+  .points-list li.pending, .lines-list li.pending { opacity: 0.55; }
+  .points-list li .body, .lines-list li .body { flex: 1; cursor: pointer; }
+  .points-list li button, .lines-list li button { flex: 0 0 auto; }
+  .points-list li.active, .lines-list li.active { background: #2a3d5a !important; color: #cfe0ff; outline: 1px solid var(--accent); }
+  button.tiny.danger { background: #4d2a2a; border-color: #6d3a3a; color: #e7b9b9; }
+  button.tiny.danger:hover { background: var(--danger); border-color: var(--danger); color: #fff; }
+  .accept-btn.accepted { background: var(--ok); border-color: var(--ok); color: #fff; }
+  .pending { color: var(--warn); }
+  .derived { color: #d27dde; }
+  .auto-ground { color: #69b8ff; }
+  .auto-crossbar { color: #cf90ff; }
+  .label-with-input { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 100px; }
+  .label-with-input label { color: var(--muted); font-size: 11px; }
+  select { width: 100%; }
+  .toggle-group { display: flex; }
+  .toggle-group button { border-radius: 0; border-right-width: 0; flex: 1; }
+  .toggle-group button:first-child { border-radius: 4px 0 0 4px; }
+  .toggle-group button:last-child { border-radius: 0 4px 4px 0; border-right-width: 1px; }
+  .toggle-group button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .stats { display: flex; gap: 12px; font-size: 12px; flex-wrap: wrap; }
+  .stats div span { color: var(--muted); margin-right: 4px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; padding: 2px 0; user-select: none; }
+  hr.thin { border: none; border-top: 1px solid var(--border); margin: 6px 0; }
+
+  .video-list, .frames-list { padding: 0; margin: 0; max-height: 200px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 12px; }
+  .video-list li, .frames-list li {
+    list-style: none; padding: 4px 6px; border-radius: 3px; cursor: pointer;
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  }
+  .video-list li:hover, .frames-list li:hover { background: #2d3034; }
+  .video-list li.active, .frames-list li.active { background: #2a3d5a; color: #cfe0ff; }
+  .video-list li.unavailable { opacity: 0.4; pointer-events: none; cursor: not-allowed; }
+  .frames-list li .meta { color: var(--muted); font-size: 11px; }
+  .frames-group { margin-bottom: 4px; }
+  .frames-group > summary { padding: 4px 6px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">Soccer Pitch Annotator</span>
+  <span class="video-name" id="hdr-video">…</span>
+  <span class="badge" id="hdr-frame">frame —</span>
+  <span class="badge" id="hdr-h0">no homography</span>
+  <span class="badge" id="hdr-counts">0 pts</span>
+  <label style="margin-left: auto; display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted);">
+    <input type="checkbox" id="toggle-projection" checked /> Projection
+  </label>
+</header>
+<main>
+  <section class="left">
+    <div class="frame-wrap panel" style="padding: 4px;">
+      <img id="frame-img" alt="frame" draggable="false" />
+    </div>
+
+    <div class="panel frame-controls">
+      <button id="btn-prev">◀ prev</button>
+      <button id="btn-next">next ▶</button>
+      <input type="range" id="frame-slider" min="0" max="0" value="0" />
+      <input type="number" id="frame-input" min="0" value="0" style="width: 90px;" />
+    </div>
+
+    <div class="panel">
+      <div class="row spread">
+        <div class="row">
+          <div class="toggle-group">
+            <button id="mode-point" class="active">Point mode</button>
+            <button id="mode-line">Line mode</button>
+          </div>
+        </div>
+        <div class="row tight">
+          <button id="btn-undo">Undo</button>
+          <button id="btn-reset">Reset all</button>
+          <button id="btn-compute" class="primary">Compute homography</button>
+          <button id="btn-save" class="danger">Save frame</button>
+        </div>
+      </div>
+      <hr class="thin" />
+      <div class="row">
+        <div class="label-with-input">
+          <label for="kp-select">Keypoint</label>
+          <select id="kp-select"></select>
+        </div>
+        <button id="btn-add-kp">Add keypoint</button>
+        <div class="label-with-input">
+          <label for="line-select">Line</label>
+          <select id="line-select"></select>
+        </div>
+        <button id="btn-add-line">Add line</button>
+      </div>
+      <hr class="thin" />
+      <div id="status" class="status">Click on the image to mark points.</div>
+    </div>
+  </section>
+
+  <aside class="right">
+    <div class="scrollarea">
+      <div class="panel">
+        <h3>Videos</h3>
+        <ul class="video-list" id="video-list"></ul>
+      </div>
+
+      <div class="panel">
+        <h3>Annotated frames</h3>
+        <div id="frames-groups"></div>
+      </div>
+
+      <div class="panel pitch-images">
+        <h3>Reference: keypoints</h3>
+        <img id="pitch-img" />
+        <h3 style="margin-top: 8px;">Reference: lines</h3>
+        <img id="lines-img" />
+        <h3 style="margin-top: 8px;">Tactical view</h3>
+        <img id="tactical-img" />
+      </div>
+
+      <div class="panel">
+        <h3>Stats</h3>
+        <div class="stats" id="stats"></div>
+      </div>
+
+      <div class="panel">
+        <h3>Manual points</h3>
+        <ul class="points-list" id="manual-points"></ul>
+      </div>
+      <div class="panel">
+        <h3>Lines</h3>
+        <ul class="lines-list" id="lines-list"></ul>
+      </div>
+      <div class="panel">
+        <h3>
+          <span>Derived points</span>
+          <span class="h3-actions">
+            <button class="tiny" id="btn-derived-accept-all">Accept all</button>
+            <button class="tiny" id="btn-derived-reject-all">Reject all</button>
+          </span>
+        </h3>
+        <ul class="points-list" id="derived-points"></ul>
+      </div>
+      <div class="panel">
+        <h3>
+          <span>Auto-projected</span>
+          <span class="h3-actions">
+            <button class="tiny" id="btn-auto-accept-all">Accept all</button>
+            <button class="tiny" id="btn-auto-reject-all">Reject all</button>
+          </span>
+        </h3>
+        <ul class="points-list" id="auto-points"></ul>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+
+let keypoints = [];
+let lines = [];
+let lastState = null;
+let info = null;
+
+async function api(method, path, body) {
+  const opts = { method };
+  if (body !== undefined) {
+    opts.headers = { "Content-Type": "application/json" };
+    opts.body = JSON.stringify(body);
+  }
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`${path}: ${r.status} ${text}`);
+  }
+  return r.json();
+}
+
+async function apiOrStatus(method, path, body) {
+  // Like api() but on 4xx, surface message in #status without throwing.
+  const opts = { method };
+  if (body !== undefined) {
+    opts.headers = { "Content-Type": "application/json" };
+    opts.body = JSON.stringify(body);
+  }
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    let msg = await r.text();
+    try { msg = JSON.parse(msg).detail || msg; } catch (_) {}
+    $("#status").textContent = `${r.status}: ${msg}`;
+    return null;
+  }
+  return r.json();
+}
+
+function refreshFrame() {
+  const ts = Date.now();
+  $("#frame-img").src = `/api/frame.jpg?ts=${ts}`;
+  refreshTactical();
+}
+
+function refreshPitch(opts = {}) {
+  const ts = Date.now();
+  const params = new URLSearchParams({ ts });
+  if (opts.highlight_keypoint) params.set("highlight_keypoint", opts.highlight_keypoint);
+  if (opts.highlight_line) params.set("highlight_line", opts.highlight_line);
+  $("#pitch-img").src = `/api/pitch.jpg?${params}`;
+
+  const lp = new URLSearchParams({ ts });
+  if (opts.highlight_line) lp.set("highlight_line", opts.highlight_line);
+  $("#lines-img").src = `/api/lines.jpg?${lp}`;
+}
+
+function refreshTactical() {
+  const ts = Date.now();
+  $("#tactical-img").src = `/api/tactical.jpg?ts=${ts}`;
+}
+
+function applyState(state) {
+  lastState = state;
+  $("#hdr-video").textContent = state.video_name || "(no video)";
+  $("#hdr-frame").textContent = `frame ${state.frame_idx} / ${state.total_frames - 1}`;
+  $("#hdr-h0").textContent = state.homography_computed
+    ? `H0 ✓ (${state.reprojection_error.toFixed(2)} m)`
+    : "no homography";
+  $("#hdr-h0").className = "badge " + (state.homography_computed ? "green" : "");
+
+  const manualConfirmed = state.manual_points.filter(p => !p.pending).length;
+  const derivedAccepted = state.derived_points.filter(p => p.accepted).length;
+  const autoAccepted = (state.auto_projected_points || []).filter(p => p.accepted).length;
+  const accepted = manualConfirmed + derivedAccepted + autoAccepted;
+  const pending = state.derived_points.length - derivedAccepted
+                + (state.auto_projected_points || []).length - autoAccepted;
+  $("#hdr-counts").textContent = `${accepted} accepted (${manualConfirmed} manual + ${derivedAccepted} derived + ${autoAccepted} auto), ${pending} pending`;
+
+  if (state.status) $("#status").textContent = state.status;
+
+  // Mode toggle
+  $("#mode-point").classList.toggle("active", state.mode === "point");
+  $("#mode-line").classList.toggle("active", state.mode === "line");
+
+  // Slider
+  $("#frame-slider").max = state.total_frames - 1;
+  $("#frame-slider").value = state.frame_idx;
+  $("#frame-input").max = state.total_frames - 1;
+  $("#frame-input").value = state.frame_idx;
+
+  // Stats
+  $("#stats").innerHTML = `
+    <div><span>manual</span>${manualConfirmed}</div>
+    <div><span>pending pt</span>${state.manual_points.filter(p => p.pending).length}</div>
+    <div><span>derived</span>${derivedAccepted}/${state.derived_points.length}</div>
+    <div><span>auto</span>${autoAccepted}/${(state.auto_projected_points || []).length}</div>
+    <div><span>lines</span>${state.lines.length}</div>
+    <div><span>line clicks</span>${state.line_pending.length}</div>
+  `;
+
+  const selM = state.selected_manual_idx;
+  const fmtPt = (p, idx) => {
+    const sel = idx === selM ? "active" : "";
+    if (p.pending) {
+      return `<li class="pending ${sel}" data-manual-idx="${idx}">
+        <span class="body">P${idx + 1}. (${p.pixel[0].toFixed(0)}, ${p.pixel[1].toFixed(0)}) → pending</span>
+        <button class="tiny danger" data-manual-del="${idx}" title="Delete">✕</button>
+      </li>`;
+    }
+    return `<li class="${sel}" data-manual-idx="${idx}">
+      <span class="body">[${p.hrnet_index}] ${p.name} → (${p.pixel[0].toFixed(0)}, ${p.pixel[1].toFixed(0)}) ⇒ (${p.world[0].toFixed(1)}, ${p.world[1].toFixed(1)})</span>
+      <button class="tiny danger" data-manual-del="${idx}" title="Delete">✕</button>
+    </li>`;
+  };
+  $("#manual-points").innerHTML = state.manual_points.map(fmtPt).join("") || "<li>(none)</li>";
+
+  const selL = state.selected_line_idx;
+  $("#lines-list").innerHTML = state.lines.map((ln, i) => {
+    const sel = i === selL ? "active" : "";
+    return `<li class="${sel}" data-line-idx="${i}">
+      <span class="body">L${i + 1}. ${ln.name}: (${ln.pixels[0][0].toFixed(0)},${ln.pixels[0][1].toFixed(0)}) → (${ln.pixels[1][0].toFixed(0)},${ln.pixels[1][1].toFixed(0)})</span>
+      <button class="tiny danger" data-line-del="${i}" title="Delete">✕</button>
+    </li>`;
+  }).join("") || "<li>(none)</li>";
+
+  $("#toggle-projection").checked = !!state.show_projection;
+
+  $("#derived-points").innerHTML = state.derived_points.map((dp, i) => {
+    const cls = dp.accepted ? "" : "pending";
+    const btn = dp.accepted ? "✓" : "✗";
+    const btnCls = dp.accepted ? "accept-btn accepted tiny" : "accept-btn tiny";
+    return `<li class="${cls}" data-derived-idx="${i}" title="Click to toggle">
+      <span class="body derived">D${i + 1}. ${dp.name} → (${dp.pixel[0].toFixed(0)}, ${dp.pixel[1].toFixed(0)}) ⇒ (${dp.world[0].toFixed(1)}, ${dp.world[1].toFixed(1)})</span>
+      <button class="${btnCls}">${btn}</button>
+    </li>`;
+  }).join("") || "<li>(none)</li>";
+
+  const auto = state.auto_projected_points || [];
+  $("#auto-points").innerHTML = auto.map((ap, i) => {
+    const cls = ap.accepted ? "" : "pending";
+    const btn = ap.accepted ? "✓" : "✗";
+    const btnCls = ap.accepted ? "accept-btn accepted tiny" : "accept-btn tiny";
+    const flavor = ap.is_ground ? "auto-ground" : "auto-crossbar";
+    const tag = ap.is_ground ? "" : "T";
+    return `<li class="${cls}" data-auto-idx="${i}" title="Click to toggle">
+      <span class="body ${flavor}">[${ap.hrnet_index}]${tag} ${ap.name} → (${ap.pixel[0].toFixed(0)}, ${ap.pixel[1].toFixed(0)})</span>
+      <button class="${btnCls}">${btn}</button>
+    </li>`;
+  }).join("") || "<li>(none)</li>";
+
+  refreshPitch();
+  refreshVideosAndFrames();
+}
+
+async function refreshVideosAndFrames() {
+  try {
+    const [videos, framesStats] = await Promise.all([
+      api("GET", "/api/videos"),
+      api("GET", "/api/annotated_frames"),
+    ]);
+
+    const activeName = lastState ? lastState.video_name : null;
+    const activeFrame = lastState ? lastState.frame_idx : null;
+
+    $("#video-list").innerHTML = videos.map(v => {
+      const cls = [];
+      if (v.is_active) cls.push("active");
+      if (!v.available) cls.push("unavailable");
+      const tag = !v.available ? `<span class="badge red">missing</span>`
+                : v.annotated_count > 0 ? `<span class="badge green">${v.annotated_count} ann</span>`
+                : `<span class="badge">0 ann</span>`;
+      return `<li class="${cls.join(' ')}" data-video="${v.name}">
+        <span>${v.name}</span>
+        ${tag}
+      </li>`;
+    }).join("") || "<li>(no videos found)</li>";
+
+    // Group frames by video.
+    const byVideo = new Map();
+    for (const r of framesStats) {
+      if (!byVideo.has(r.video_name)) byVideo.set(r.video_name, []);
+      byVideo.get(r.video_name).push(r);
+    }
+    const groups = [];
+    for (const [video, rows] of byVideo) {
+      const open = video === activeName ? "open" : "";
+      const items = rows.map(r => {
+        const isActive = video === activeName && r.frame_idx === activeFrame;
+        const pts = r.num_points == null ? "?" : r.num_points;
+        const rmse = r.rmse == null ? "" : `rmse=${r.rmse.toFixed(2)}`;
+        return `<li class="${isActive ? 'active' : ''}" data-video="${video}" data-frame="${r.frame_idx}">
+          <span>frame ${r.frame_idx}</span>
+          <span class="meta">${pts} pts &nbsp; ${rmse}</span>
+        </li>`;
+      }).join("");
+      groups.push(`<details class="frames-group" ${open}>
+        <summary>${video} (${rows.length})</summary>
+        <ul class="frames-list">${items}</ul>
+      </details>`);
+    }
+    $("#frames-groups").innerHTML = groups.join("") || "<div style='color: var(--muted); font-size: 12px;'>(no annotated frames)</div>";
+  } catch (err) {
+    console.error("video/frames refresh failed", err);
+  }
+}
+
+function imgToFrameCoords(evt) {
+  const img = $("#frame-img");
+  if (!img.naturalWidth) return null;
+  const rect = img.getBoundingClientRect();
+  const x = (evt.clientX - rect.left) * (img.naturalWidth / rect.width);
+  const y = (evt.clientY - rect.top) * (img.naturalHeight / rect.height);
+  return { x, y };
+}
+
+async function onImageClick(evt) {
+  const pt = imgToFrameCoords(evt);
+  if (!pt) return;
+  const state = await api("POST", "/api/click", pt);
+  applyState(state);
+  refreshFrame();
+}
+
+async function gotoFrame(idx) {
+  const state = await api("POST", "/api/goto", { frame_idx: Number(idx) });
+  applyState(state);
+  refreshFrame();
+}
+
+async function jumpTo(videoName, frameIdx) {
+  const state = await apiOrStatus("POST", "/api/jump", { video_name: videoName, frame_idx: frameIdx });
+  if (state) {
+    applyState(state);
+    refreshFrame();
+  }
+}
+
+async function init() {
+  info = await api("GET", "/api/info");
+
+  keypoints = await api("GET", "/api/keypoints");
+  lines = await api("GET", "/api/lines");
+
+  const kpSel = $("#kp-select");
+  for (const kp of keypoints) {
+    const opt = document.createElement("option");
+    opt.value = kp.name;
+    const ground = kp.is_ground ? "" : " ⌃";
+    opt.textContent = `[${kp.hrnet_index}] ${kp.name}${ground}`;
+    kpSel.appendChild(opt);
+  }
+  kpSel.addEventListener("change", () => refreshPitch({ highlight_keypoint: kpSel.value }));
+
+  const lineSel = $("#line-select");
+  for (const ln of lines) {
+    const opt = document.createElement("option");
+    opt.value = ln.name; opt.textContent = ln.name;
+    if (ln.color) {
+      opt.style.background = ln.color;
+      opt.style.color = "#000";
+    }
+    lineSel.appendChild(opt);
+  }
+  lineSel.addEventListener("change", () => refreshPitch({ highlight_line: lineSel.value }));
+
+  // Buttons
+  $("#mode-point").addEventListener("click", async () => applyState(await api("POST", "/api/mode", { mode: "point" })));
+  $("#mode-line").addEventListener("click", async () => applyState(await api("POST", "/api/mode", { mode: "line" })));
+
+  $("#btn-add-kp").addEventListener("click", async () => {
+    const state = await api("POST", "/api/add_keypoint", { name: kpSel.value });
+    applyState(state); refreshFrame();
+  });
+  $("#btn-add-line").addEventListener("click", async () => {
+    const state = await api("POST", "/api/add_line", { name: lineSel.value });
+    applyState(state); refreshFrame();
+  });
+  $("#btn-undo").addEventListener("click", async () => { applyState(await api("POST", "/api/undo")); refreshFrame(); });
+  $("#btn-reset").addEventListener("click", async () => {
+    if (!confirm("Reset all annotations on this frame?")) return;
+    applyState(await api("POST", "/api/reset")); refreshFrame();
+  });
+  $("#btn-compute").addEventListener("click", async () => { applyState(await api("POST", "/api/compute")); refreshFrame(); });
+  $("#btn-save").addEventListener("click", async () => { applyState(await api("POST", "/api/save")); refreshFrame(); });
+
+  // Confirm/reject bulk
+  $("#btn-derived-accept-all").addEventListener("click", async () => {
+    applyState(await api("POST", "/api/derived/accept_all")); refreshFrame();
+  });
+  $("#btn-derived-reject-all").addEventListener("click", async () => {
+    applyState(await api("POST", "/api/derived/reject_all")); refreshFrame();
+  });
+  $("#btn-auto-accept-all").addEventListener("click", async () => {
+    applyState(await api("POST", "/api/auto/accept_all")); refreshFrame();
+  });
+  $("#btn-auto-reject-all").addEventListener("click", async () => {
+    applyState(await api("POST", "/api/auto/reject_all")); refreshFrame();
+  });
+
+  // Manual points: click body to select/toggle, click ✕ to delete
+  $("#manual-points").addEventListener("click", async (e) => {
+    const delBtn = e.target.closest("button[data-manual-del]");
+    if (delBtn) {
+      e.stopPropagation();
+      applyState(await api("POST", "/api/manual/delete", { idx: Number(delBtn.dataset.manualDel) }));
+      refreshFrame();
+      return;
+    }
+    const li = e.target.closest("li[data-manual-idx]");
+    if (!li) return;
+    const idx = Number(li.dataset.manualIdx);
+    const next = (lastState && lastState.selected_manual_idx === idx) ? null : idx;
+    applyState(await api("POST", "/api/manual/select", { idx: next }));
+    refreshFrame();
+  });
+
+  // Lines: click body to select, click ✕ to delete
+  $("#lines-list").addEventListener("click", async (e) => {
+    const delBtn = e.target.closest("button[data-line-del]");
+    if (delBtn) {
+      e.stopPropagation();
+      applyState(await api("POST", "/api/line/delete", { idx: Number(delBtn.dataset.lineDel) }));
+      refreshFrame();
+      return;
+    }
+    const li = e.target.closest("li[data-line-idx]");
+    if (!li) return;
+    const idx = Number(li.dataset.lineIdx);
+    const next = (lastState && lastState.selected_line_idx === idx) ? null : idx;
+    applyState(await api("POST", "/api/line/select", { idx: next }));
+    refreshFrame();
+  });
+
+  // Projection toggle
+  $("#toggle-projection").addEventListener("change", async (e) => {
+    applyState(await api("POST", "/api/projection", { show: e.target.checked }));
+    refreshFrame();
+  });
+
+  // Per-row toggles (delegated; whole row is clickable)
+  $("#derived-points").addEventListener("click", async (e) => {
+    const li = e.target.closest("li[data-derived-idx]");
+    if (!li) return;
+    applyState(await api("POST", "/api/derived/toggle", { idx: Number(li.dataset.derivedIdx) }));
+    refreshFrame();
+  });
+  $("#auto-points").addEventListener("click", async (e) => {
+    const li = e.target.closest("li[data-auto-idx]");
+    if (!li) return;
+    applyState(await api("POST", "/api/auto/toggle", { idx: Number(li.dataset.autoIdx) }));
+    refreshFrame();
+  });
+
+  // Video & frames panels (delegated)
+  $("#video-list").addEventListener("click", async (e) => {
+    const li = e.target.closest("li[data-video]");
+    if (!li || li.classList.contains("unavailable")) return;
+    await jumpTo(li.dataset.video, 0);
+  });
+  $("#frames-groups").addEventListener("click", async (e) => {
+    const li = e.target.closest("li[data-frame]");
+    if (!li) return;
+    await jumpTo(li.dataset.video, Number(li.dataset.frame));
+  });
+
+  // Frame nav
+  $("#btn-prev").addEventListener("click", () => gotoFrame(Math.max(0, lastState.frame_idx - 1)));
+  $("#btn-next").addEventListener("click", () => gotoFrame(Math.min(lastState.total_frames - 1, lastState.frame_idx + 1)));
+  $("#frame-slider").addEventListener("change", (e) => gotoFrame(e.target.value));
+  $("#frame-input").addEventListener("change", (e) => gotoFrame(e.target.value));
+
+  // Image click
+  $("#frame-img").addEventListener("click", onImageClick);
+
+  // Keyboard shortcuts
+  window.addEventListener("keydown", (e) => {
+    if (["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)) return;
+    if (e.key === "ArrowLeft") $("#btn-prev").click();
+    else if (e.key === "ArrowRight") $("#btn-next").click();
+    else if (e.key === "z" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("#btn-undo").click(); }
+    else if (e.key === "p") $("#mode-point").click();
+    else if (e.key === "l") $("#mode-line").click();
+    else if (e.key === "h") $("#btn-compute").click();
+    else if (e.key === "s" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("#btn-save").click(); }
+  });
+
+  // Initial state
+  const state = await api("GET", "/api/state");
+  applyState(state);
+  refreshFrame();
+}
+
+init().catch(err => {
+  $("#status").textContent = "Init failed: " + err.message;
+  console.error(err);
+});
+</script>
+</body>
+</html>

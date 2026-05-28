@@ -1,38 +1,67 @@
 """SoccerPitch geometry with y-up convention.
 
 Pitch center is the origin. X grows toward the right goal. Y grows toward the
-top of the image / away from the camera (y-up). Goal crossbars have z = -2.44.
+top of the image / away from the camera (y-up). Goal crossbars have z = -GOAL_HEIGHT.
 
 Adapted from soccernet-calibration-sportlight/baseline/soccerpitch.py via
 goal-sight-v2, with the y-axis flipped so top = +W/2 (matches PnLCalib).
+
+Default dimensions are FIFA-spec; pass overrides to ``__init__`` (or
+``SoccerPitch.from_dict``) for non-standard fields (e.g. 7-a-side).
 """
 
 import numpy as np
 
 
-class SoccerPitch:
-    GOAL_LINE_TO_PENALTY_MARK = 11.0
-    PENALTY_AREA_WIDTH = 40.32
-    PENALTY_AREA_LENGTH = 16.5
-    GOAL_AREA_WIDTH = 18.32
-    GOAL_AREA_LENGTH = 5.5
-    CENTER_CIRCLE_RADIUS = 9.15
-    GOAL_HEIGHT = 2.44
-    GOAL_LENGTH = 7.32
+# FIFA defaults — used when a SoccerPitch is constructed with no overrides.
+FIFA_DEFAULTS: dict[str, float] = {
+    "pitch_length": 105.0,
+    "pitch_width": 68.0,
+    "penalty_area_width": 40.32,
+    "penalty_area_length": 16.5,
+    "goal_area_width": 18.32,
+    "goal_area_length": 5.5,
+    "goal_line_to_penalty_mark": 11.0,
+    "center_circle_radius": 9.15,
+    "goal_height": 2.44,
+    "goal_length": 7.32,
+}
 
-    def __init__(self, pitch_length: float = 105.0, pitch_width: float = 68.0):
+
+class SoccerPitch:
+    def __init__(
+        self,
+        pitch_length: float = FIFA_DEFAULTS["pitch_length"],
+        pitch_width: float = FIFA_DEFAULTS["pitch_width"],
+        penalty_area_width: float = FIFA_DEFAULTS["penalty_area_width"],
+        penalty_area_length: float = FIFA_DEFAULTS["penalty_area_length"],
+        goal_area_width: float = FIFA_DEFAULTS["goal_area_width"],
+        goal_area_length: float = FIFA_DEFAULTS["goal_area_length"],
+        goal_line_to_penalty_mark: float = FIFA_DEFAULTS["goal_line_to_penalty_mark"],
+        center_circle_radius: float = FIFA_DEFAULTS["center_circle_radius"],
+        goal_height: float = FIFA_DEFAULTS["goal_height"],
+        goal_length: float = FIFA_DEFAULTS["goal_length"],
+    ):
         self.PITCH_LENGTH = pitch_length
         self.PITCH_WIDTH = pitch_width
+        self.PENALTY_AREA_WIDTH = penalty_area_width
+        self.PENALTY_AREA_LENGTH = penalty_area_length
+        self.GOAL_AREA_WIDTH = goal_area_width
+        self.GOAL_AREA_LENGTH = goal_area_length
+        self.GOAL_LINE_TO_PENALTY_MARK = goal_line_to_penalty_mark
+        self.CENTER_CIRCLE_RADIUS = center_circle_radius
+        self.GOAL_HEIGHT = goal_height
+        self.GOAL_LENGTH = goal_length
 
         hL = pitch_length / 2.0
         hW = pitch_width / 2.0
-        pa_w = SoccerPitch.PENALTY_AREA_WIDTH / 2.0
-        pa_d = SoccerPitch.PENALTY_AREA_LENGTH
-        ga_w = SoccerPitch.GOAL_AREA_WIDTH / 2.0
-        ga_d = SoccerPitch.GOAL_AREA_LENGTH
-        g_w = SoccerPitch.GOAL_LENGTH / 2.0
-        g_h = SoccerPitch.GOAL_HEIGHT
-        ccr = SoccerPitch.CENTER_CIRCLE_RADIUS
+        pa_w = self.PENALTY_AREA_WIDTH / 2.0
+        pa_d = self.PENALTY_AREA_LENGTH
+        ga_w = self.GOAL_AREA_WIDTH / 2.0
+        ga_d = self.GOAL_AREA_LENGTH
+        g_w = self.GOAL_LENGTH / 2.0
+        g_h = self.GOAL_HEIGHT
+        ccr = self.CENTER_CIRCLE_RADIUS
 
         def pt(x: float, y: float, z: float = 0.0) -> np.ndarray:
             return np.array([x, y, z], dtype=float)
@@ -57,8 +86,8 @@ class SoccerPitch:
         r_goal_br_post = pt(hL, -g_w, 0.0)
         r_goal_tr_post = pt(hL, -g_w, -g_h)
 
-        l_pen_mark = pt(-hL + SoccerPitch.GOAL_LINE_TO_PENALTY_MARK, 0)
-        r_pen_mark = pt(hL - SoccerPitch.GOAL_LINE_TO_PENALTY_MARK, 0)
+        l_pen_mark = pt(-hL + self.GOAL_LINE_TO_PENALTY_MARK, 0)
+        r_pen_mark = pt(hL - self.GOAL_LINE_TO_PENALTY_MARK, 0)
 
         # Penalty areas (y-up: top = +pa_w, bottom = -pa_w)
         l_pa_tl = pt(-hL, pa_w)
@@ -82,8 +111,12 @@ class SoccerPitch:
 
         # Penalty-arc intersections with penalty-area front line.
         # dx from pen-mark to front line; y via circle equation.
-        dx = pa_d - SoccerPitch.GOAL_LINE_TO_PENALTY_MARK
-        arc_y = float(np.sqrt(ccr ** 2 - dx ** 2))
+        dx = pa_d - self.GOAL_LINE_TO_PENALTY_MARK
+        # Non-FIFA pitches may have center_circle_radius < dx, which makes the
+        # arc not intersect the front line. In that case the keypoint is
+        # geometrically undefined; emit NaN so consumers can detect & skip.
+        radicand = ccr ** 2 - dx ** 2
+        arc_y = float(np.sqrt(radicand)) if radicand > 0 else float("nan")
         l_front_x = -hL + pa_d
         r_front_x = hL - pa_d
         tl_16m = pt(l_front_x, arc_y)
@@ -132,3 +165,12 @@ class SoccerPitch:
             "TR_16M_LINE_AND_PENALTY_ARC_INTERSECTION": tr_16m,
             "BR_16M_LINE_AND_PENALTY_ARC_INTERSECTION": br_16m,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SoccerPitch":
+        """Construct from a dict (e.g. parsed YAML).
+
+        Unknown keys are ignored. Missing keys default to FIFA values.
+        """
+        kwargs = {k: data[k] for k in FIFA_DEFAULTS if k in data}
+        return cls(**kwargs)

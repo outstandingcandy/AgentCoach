@@ -18,8 +18,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .keypoint_utils import PITCH_KEYPOINTS, convert_keypoint_name
-from .pitch.keypoints import PITCH_POINTS_TO_INTERSECTON
+from .pitch import keypoints as _pk
+from .pitch.keypoints import (
+    PITCH_POINTS_TO_INTERSECTON,
+    pitch_name_to_pnlcalib_id,
+)
 
 
 def load_frame_annotation(frame_dir: Path, frame_idx: int) -> dict | None:
@@ -45,14 +48,15 @@ def load_frame_annotation(frame_dir: Path, frame_idx: int) -> dict | None:
 
     for pt in data.get("points", []):
         pixel = tuple(pt["pixel"])
-        raw_name = pt.get("keypoint_name") or pt.get("name", "")
-        kp_name = convert_keypoint_name(raw_name)
+        kp_name = pt.get("keypoint_name") or pt.get("name", "")
 
         if "world" in pt:
             world = tuple(pt["world"])
-        elif kp_name in PITCH_KEYPOINTS:
-            world = PITCH_KEYPOINTS[kp_name]
+        elif kp_name in _pk.PITCH_POINTS:
+            wp = _pk.PITCH_POINTS[kp_name]
+            world = (float(wp[0]), float(wp[1]))
         else:
+            print(f"Skipping unknown keypoint '{kp_name}' in {json_path}")
             continue
 
         result["clicked_points"].append(pixel)
@@ -182,33 +186,39 @@ def save_frame_annotation(
                     wx, wy = world_points[i]
                     kp_name = keypoint_names[i]
                     hrnet_idx = PITCH_POINTS_TO_INTERSECTON.get(kp_name, -1)
+                    pnl_id = pitch_name_to_pnlcalib_id(kp_name)
                     pt_data = {
                         "pixel": [float(px), float(py)],
                         "world": [float(wx), float(wy)],
                         "keypoint_name": kp_name,
                         "hrnet_index": hrnet_idx,
+                        "pnlcalib_id": pnl_id,
                         "source": "manual",
                     }
                     all_points_data["manual_points"].append(pt_data)
                     all_points_data["all_points"].append(pt_data)
 
             for pixel, world, name in derived_points:
+                pnl_id = pitch_name_to_pnlcalib_id(name)
                 pt_data = {
                     "pixel": [float(x) for x in pixel],
                     "world": [float(x) for x in world],
                     "keypoint_name": name,
                     "hrnet_index": -1,
+                    "pnlcalib_id": pnl_id,
                     "source": "derived",
                 }
                 all_points_data["derived_points"].append(pt_data)
                 all_points_data["all_points"].append(pt_data)
 
             for pixel, world, name, hrnet_idx, is_ground in auto_projected_points:
+                pnl_id = pitch_name_to_pnlcalib_id(name)
                 pt_data = {
                     "pixel": [float(pixel[0]), float(pixel[1])],
                     "world": [float(world[0]), float(world[1])],
                     "keypoint_name": name,
                     "hrnet_index": hrnet_idx,
+                    "pnlcalib_id": pnl_id,
                     "is_ground_plane": is_ground,
                     "source": "auto_projected",
                 }
@@ -224,70 +234,3 @@ def save_frame_annotation(
     except Exception as e:
         print(f"Save error: {e}")
         return False
-
-
-def load_from_json(output_dir: str) -> tuple[int, np.ndarray | None, dict]:
-    """Load a single legacy annotations.json (pre-index format)."""
-    output_dir = Path(output_dir)
-    result = {
-        "clicked_points": [],
-        "world_points": [],
-        "keypoint_names": [],
-        "annotated_lines": [],
-        "derived_points": [],
-        "reprojection_error": 0.0,
-    }
-
-    try:
-        with open(output_dir / "annotations.json") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        print(f"Annotation file not found: {output_dir / 'annotations.json'}")
-        return 0, None, result
-    except json.JSONDecodeError as e:
-        print(f"Invalid JSON in annotations file: {e}")
-        return 0, None, result
-
-    anchor_frame = data.get("anchor_frame_idx", 0)
-    result["reprojection_error"] = float(data.get("reprojection_error", 0.0))
-
-    for pt in data.get("points", []):
-        pixel = tuple(pt["pixel"])
-        raw_name = pt.get("keypoint_name") or pt.get("name", "")
-        kp_name = convert_keypoint_name(raw_name)
-
-        if "world" in pt:
-            world = tuple(pt["world"])
-        elif kp_name in PITCH_KEYPOINTS:
-            world = PITCH_KEYPOINTS[kp_name]
-        else:
-            print(f"Warning: Unknown keypoint '{raw_name}', skipping")
-            continue
-
-        result["clicked_points"].append(pixel)
-        result["world_points"].append(world)
-        result["keypoint_names"].append(kp_name)
-
-    for line in data.get("lines", []):
-        result["annotated_lines"].append({
-            "pixels": [tuple(line["pixels"][0]), tuple(line["pixels"][1])],
-            "world": (tuple(line["world"][0]), tuple(line["world"][1])),
-            "name": line["name"],
-        })
-
-    for dp in data.get("derived_points", []):
-        result["derived_points"].append((
-            tuple(dp["pixel"]),
-            tuple(dp["world"]),
-            dp["name"],
-        ))
-
-    H0 = None
-    h0_path = output_dir / "H0.npy"
-    if h0_path.exists():
-        try:
-            H0 = np.load(h0_path)
-        except Exception as e:
-            print(f"Failed to load H0.npy: {e}")
-
-    return anchor_frame, H0, result
