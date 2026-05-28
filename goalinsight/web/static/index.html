@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>GoalInsight Viewer</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; background: #101418; color: #e6e9ee;
+                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { display: grid; grid-template-columns: 1fr 420px; grid-template-rows: auto 1fr;
+           grid-template-areas: "header header" "video chat"; height: 100vh;
+           overflow: hidden; }
+    header { grid-area: header; padding: 8px 16px; border-bottom: 1px solid #262b33;
+             display: flex; gap: 24px; align-items: center; font-size: 13px; color: #9aa3ad; }
+    header strong { color: #e6e9ee; margin-right: 4px; }
+    #video-pane { grid-area: video; display: flex; align-items: center; justify-content: center;
+                  background: #000; overflow: hidden; min-height: 0; min-width: 0; }
+    #player { max-width: 100%; max-height: 100%; }
+    #chat-pane { grid-area: chat; display: flex; flex-direction: column;
+                 border-left: 1px solid #262b33; background: #161b21;
+                 min-height: 0; overflow: hidden; }
+    #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+    .msg { padding: 10px 12px; border-radius: 10px; line-height: 1.45; white-space: pre-wrap;
+           max-width: 92%; font-size: 14px; }
+    .msg.user { background: #2a4661; align-self: flex-end; }
+    .msg.assistant { background: #1e242b; align-self: flex-start; border: 1px solid #2a323c; }
+    .msg.system-hint { background: transparent; color: #6b7380; font-style: italic; font-size: 12px; align-self: center; }
+    .msg .meta { font-size: 11px; color: #9aa3ad; margin-bottom: 4px; }
+    #composer { padding: 12px; border-top: 1px solid #262b33; display: flex; gap: 8px; }
+    #input { flex: 1; resize: none; background: #0d1116; color: #e6e9ee;
+             border: 1px solid #2a323c; border-radius: 8px; padding: 10px; font: inherit; }
+    #input:focus { outline: none; border-color: #3b82f6; }
+    button { background: #3b82f6; color: white; border: 0; border-radius: 8px;
+             padding: 10px 16px; font-weight: 600; cursor: pointer; }
+    button:disabled { background: #2a323c; color: #6b7380; cursor: not-allowed; }
+    .tag { display: inline-block; padding: 2px 6px; border-radius: 4px;
+           background: #1e242b; border: 1px solid #2a323c; font-size: 12px; margin-right: 4px; }
+    .seek { display: inline-block; padding: 1px 6px; margin: 0 2px;
+            border-radius: 4px; background: #2a4661; color: #cfe3ff;
+            font-size: 12px; font-weight: 600; cursor: pointer;
+            border: 1px solid #3b82f6; user-select: none; }
+    .seek:hover { background: #3b82f6; color: #fff; }
+  </style>
+</head>
+<body>
+  <header>
+    <div><strong>Video:</strong><span id="meta-video">loading...</span></div>
+    <div><strong>Duration:</strong><span id="meta-duration">-</span></div>
+    <div><strong>Teams:</strong><span id="meta-teams">-</span></div>
+    <div><strong>Events:</strong><span id="meta-events">-</span></div>
+    <div style="margin-left:auto"><strong>t=</strong><span id="meta-time">0.00s</span></div>
+  </header>
+
+  <div id="video-pane">
+    <video id="player" src="/video" controls preload="metadata"></video>
+  </div>
+
+  <div id="chat-pane">
+    <div id="messages">
+      <div class="msg system-hint">
+        Ask about the match. Your current video timestamp is sent with each question so you can ask things like "who has the ball right now?" or "was that last pass successful?"
+      </div>
+    </div>
+    <div id="composer">
+      <textarea id="input" rows="2" placeholder="Ask a question about the match..."></textarea>
+      <button id="send">Send</button>
+    </div>
+  </div>
+
+  <script>
+    const player = document.getElementById('player');
+    const messagesEl = document.getElementById('messages');
+    const inputEl = document.getElementById('input');
+    const sendBtn = document.getElementById('send');
+    const timeEl = document.getElementById('meta-time');
+
+    const history = []; // {role, content}
+
+    function fmtTime(s) {
+      if (!isFinite(s)) return '-';
+      const m = Math.floor(s / 60);
+      const r = (s - m * 60).toFixed(2);
+      return `${String(m).padStart(2,'0')}:${String(r).padStart(5,'0')}`;
+    }
+
+    player.addEventListener('timeupdate', () => {
+      timeEl.textContent = fmtTime(player.currentTime);
+    });
+
+    // Match [MM:SS] or [MM:SS.ff] / [M:SS]; up to 999 minutes.
+    const SEEK_RE = /\[(\d{1,3}):([0-5]\d)(?:\.(\d{1,2}))?\]/g;
+
+    // Start a few seconds before the cited moment so the user has time
+    // to follow the buildup before the action.
+    const SEEK_LEAD_S = 4;
+
+    function seekTo(seconds) {
+      const start = Math.max(0, seconds - SEEK_LEAD_S);
+      try { player.currentTime = start; } catch {}
+      player.play().catch(() => {});
+    }
+
+    function renderWithSeeks(target, text) {
+      target.textContent = '';
+      let last = 0;
+      for (const m of text.matchAll(SEEK_RE)) {
+        if (m.index > last) {
+          target.appendChild(document.createTextNode(text.slice(last, m.index)));
+        }
+        const mins = parseInt(m[1], 10);
+        const secs = parseInt(m[2], 10);
+        const frac = m[3] ? parseFloat('0.' + m[3]) : 0;
+        const t = mins * 60 + secs + frac;
+        const btn = document.createElement('span');
+        btn.className = 'seek';
+        btn.textContent = `▶ ${m[1].padStart(2,'0')}:${m[2]}`;
+        btn.title = `Jump to ${fmtTime(t)}`;
+        btn.addEventListener('click', () => seekTo(t));
+        target.appendChild(btn);
+        last = m.index + m[0].length;
+      }
+      if (last < text.length) {
+        target.appendChild(document.createTextNode(text.slice(last)));
+      }
+    }
+
+    function addMessage(role, content) {
+      const div = document.createElement('div');
+      div.className = `msg ${role}`;
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = role === 'user'
+        ? `you @ ${fmtTime(player.currentTime)}`
+        : 'assistant';
+      div.appendChild(meta);
+      const body = document.createElement('div');
+      if (role === 'assistant') {
+        renderWithSeeks(body, content);
+      } else {
+        body.textContent = content;
+      }
+      div.appendChild(body);
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return body;
+    }
+
+    async function send() {
+      const text = inputEl.value.trim();
+      if (!text) return;
+      inputEl.value = '';
+      sendBtn.disabled = true;
+      inputEl.disabled = true;
+
+      addMessage('user', text);
+      history.push({ role: 'user', content: text });
+
+      const placeholder = addMessage('assistant', '');
+      let acc = '';
+      try {
+        const resp = await fetch('/api/chat/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: history,
+            current_time: player.currentTime || 0,
+          }),
+        });
+        if (!resp.ok || !resp.body) {
+          const err = resp.body ? await resp.text() : `HTTP ${resp.status}`;
+          placeholder.textContent = `error: ${err}`;
+          history.pop();
+          return;
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        let streamErr = null;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          // SSE frames are separated by blank lines.
+          let idx;
+          while ((idx = buf.indexOf('\n\n')) !== -1) {
+            const frame = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            for (const line of frame.split('\n')) {
+              if (!line.startsWith('data:')) continue;
+              const payload = line.slice(5).trim();
+              if (!payload) continue;
+              let obj;
+              try { obj = JSON.parse(payload); } catch { continue; }
+              if (obj.delta) {
+                acc += obj.delta;
+                renderWithSeeks(placeholder, acc);
+                messagesEl.scrollTop = messagesEl.scrollHeight;
+              } else if (obj.error) {
+                streamErr = obj.error;
+              }
+            }
+          }
+        }
+        if (streamErr) {
+          placeholder.textContent = `error: ${streamErr}`;
+          history.pop();
+        } else if (!acc) {
+          placeholder.textContent = '(no response)';
+          history.pop();
+        } else {
+          history.push({ role: 'assistant', content: acc });
+        }
+      } catch (e) {
+        placeholder.textContent = acc
+          ? `${acc}\n\n[stream interrupted: ${e}]`
+          : `error: ${e}`;
+        if (!acc) history.pop();
+      } finally {
+        sendBtn.disabled = false;
+        inputEl.disabled = false;
+        inputEl.focus();
+      }
+    }
+
+    sendBtn.addEventListener('click', send);
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    });
+
+    (async () => {
+      try {
+        const r = await fetch('/api/meta');
+        const m = await r.json();
+        document.getElementById('meta-video').textContent = m.video_name;
+        document.getElementById('meta-duration').textContent =
+          `${fmtTime(m.duration_s)} (${m.frame_count} frames @ ${m.fps.toFixed(1)} fps)`;
+        const teamTags = Object.entries(m.teams)
+          .map(([t, n]) => `<span class="tag">${t}: ${n}</span>`).join('');
+        document.getElementById('meta-teams').innerHTML = teamTags || '-';
+        const eventTags = Object.entries(m.event_counts)
+          .map(([t, n]) => `<span class="tag">${t}: ${n}</span>`).join('');
+        document.getElementById('meta-events').innerHTML = eventTags || 'none';
+      } catch (e) {
+        document.getElementById('meta-video').textContent = `(meta load failed: ${e})`;
+      }
+    })();
+  </script>
+</body>
+</html>
