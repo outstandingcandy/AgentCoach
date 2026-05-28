@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 from scipy.optimize import least_squares
 
+from ..utils.projection import project_points_2d
 from .pnlcalib.curve_utils import (
     compute_cumulated_lengths,
     interpolate_on_polyline,
@@ -561,13 +562,11 @@ class PhysicalCalibrator:
         dist_opt = dist_fixed
 
         # Step 5: Sanity check — reject catastrophically bad results
-        projected_check, _ = cv2.projectPoints(
-            world_pts.reshape(-1, 1, 3),
-            rvec_opt.reshape(3, 1), tvec_opt.reshape(3, 1),
-            K_opt, dist_opt,
+        projected_check = project_points_2d(
+            world_pts, rvec_opt, tvec_opt, K_opt, dist_opt,
         )
         median_err_check = float(np.median(np.linalg.norm(
-            projected_check.reshape(-1, 2) - img_pts, axis=1
+            projected_check - img_pts, axis=1
         )))
         if median_err_check > 200:
             logger.warning("Optimization result rejected (median_err=%.0fpx > 200px)", median_err_check)
@@ -871,13 +870,8 @@ class PhysicalCalibrator:
         self.K[1, 1] = best_f
 
         # Compute per-point reprojection errors for RANSAC result
-        projected, _ = cv2.projectPoints(
-            world_pts.reshape(-1, 1, 3),
-            rvec, tvec, K_best, dist,
-        )
-        per_point_errors = np.linalg.norm(
-            projected.reshape(-1, 2) - img_pts, axis=1
-        )
+        projected = project_points_2d(world_pts, rvec, tvec, K_best, dist)
+        per_point_errors = np.linalg.norm(projected - img_pts, axis=1)
         logger.debug("PnP RANSAC best: f=%.0f, %d/%d inliers",
                       best_f, best_inlier_count, len(img_pts))
 
@@ -939,17 +933,15 @@ class PhysicalCalibrator:
         per_sample_weight = self.line_weight / np.sqrt(n_samples) if n_samples > 0 else 0.0
 
         def cost_fn(x):
-            rvec = x[:3].reshape(3, 1)
-            tvec = x[3:6].reshape(3, 1)
+            rvec = x[:3]
+            tvec = x[3:6]
             f = x[6]
             K_cur = np.array([[f, 0, cx_fixed], [0, f, cy_fixed], [0, 0, 1]], dtype=np.float64)
 
             # Point residuals: projected - detected
-            projected, _ = cv2.projectPoints(
-                world_pts.reshape(-1, 1, 3),
-                rvec, tvec, K_cur, dist_zero,
+            projected = project_points_2d(
+                world_pts, rvec, tvec, K_cur, dist_zero,
             )
-            projected = projected.reshape(-1, 2)
             point_residuals = (projected - img_pts).ravel()
 
             all_residuals = [point_residuals]
@@ -958,11 +950,9 @@ class PhysicalCalibrator:
             if valid_lc:
                 img_bound = max(self.width, self.height) * 3
                 for i, lc in enumerate(valid_lc):
-                    proj_line, _ = cv2.projectPoints(
-                        lc["world_samples"].reshape(-1, 1, 3),
-                        rvec, tvec, K_cur, dist_zero,
+                    proj_line = project_points_2d(
+                        lc["world_samples"], rvec, tvec, K_cur, dist_zero,
                     )
-                    proj_line = proj_line.reshape(-1, 2)
                     diffs = proj_line - line_origins[i]
                     distances = diffs @ line_normals[i]
                     valid = (np.abs(proj_line[:, 0]) < img_bound) & (np.abs(proj_line[:, 1]) < img_bound)
@@ -1015,12 +1005,7 @@ class PhysicalCalibrator:
         """Compute reprojection error statistics."""
         K_use = K if K is not None else self.K
         dist_use = dist if dist is not None else self.dist_coeffs
-        projected, _ = cv2.projectPoints(
-            world_pts.reshape(-1, 1, 3),
-            rvec.reshape(3, 1), tvec.reshape(3, 1),
-            K_use, dist_use,
-        )
-        projected = projected.reshape(-1, 2)
+        projected = project_points_2d(world_pts, rvec, tvec, K_use, dist_use)
         errors = np.linalg.norm(projected - img_pts, axis=1)
 
         mean_error = float(np.mean(errors)) if len(errors) > 0 else float("inf")
@@ -1071,12 +1056,7 @@ class PhysicalCalibrator:
         world_3d = np.array(world_3d, dtype=np.float64)
 
         # Project world→image
-        projected, _ = cv2.projectPoints(
-            world_3d.reshape(-1, 1, 3),
-            rvec.reshape(3, 1), tvec.reshape(3, 1),
-            K_use, dist_use,
-        )
-        img_pts = projected.reshape(-1, 2)
+        img_pts = project_points_2d(world_3d, rvec, tvec, K_use, dist_use)
 
         # Back-project image→world and compute error
         errors = self._backproject_errors(rvec, tvec, img_pts, world_3d, K_use, dist_use)
@@ -1184,19 +1164,17 @@ class PhysicalCalibrator:
                 world_pts = fd["world_pts"]
 
                 # Point residuals
-                projected, _ = cv2.projectPoints(
-                    world_pts.reshape(-1, 1, 3), rvec, tvec, K_cur, dist_zero,
+                projected = project_points_2d(
+                    world_pts, rvec, tvec, K_cur, dist_zero,
                 )
-                all_residuals.append((projected.reshape(-1, 2) - img_pts).ravel())
+                all_residuals.append((projected - img_pts).ravel())
 
                 # Line residuals
                 normals, origins, valid_lcs = frame_line_info[i]
                 for j, lc in enumerate(valid_lcs):
-                    proj_line, _ = cv2.projectPoints(
-                        lc["world_samples"].reshape(-1, 1, 3),
-                        rvec, tvec, K_cur, dist_zero,
+                    proj_line = project_points_2d(
+                        lc["world_samples"], rvec, tvec, K_cur, dist_zero,
                     )
-                    proj_line = proj_line.reshape(-1, 2)
                     distances = (proj_line - origins[j]) @ normals[j]
                     valid = (np.abs(proj_line[:, 0]) < img_bound) & (np.abs(proj_line[:, 1]) < img_bound)
                     distances[~valid] = 0.0

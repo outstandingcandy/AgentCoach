@@ -353,13 +353,11 @@ class BroadTrackCalibrator:
                     continue
 
                 # Evaluate reprojection error on original (distorted) points
-                proj, _ = cv2.projectPoints(
-                    world_pts_3d, rvec, tvec, K,
-                    dist_coeffs if dist_coeffs is not None else np.zeros(5),
+                from ...utils.projection import project_points_2d
+                proj = project_points_2d(
+                    world_pts_3d, rvec, tvec, K, dist_coeffs,
                 )
-                errors = np.linalg.norm(
-                    proj.reshape(-1, 2) - img_pts_original, axis=1
-                )
+                errors = np.linalg.norm(proj - img_pts_original, axis=1)
                 median_err = float(np.median(errors))
 
                 if median_err < best_error:
