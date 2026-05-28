@@ -17,7 +17,7 @@ from .heatmap_utils import (
     get_lines_from_heatmap_maxpool,
     soft_argmax_2d,
 )
-from .frame_calibrator import FramebyFrameCalib
+from .frame_calibrator import FramebyFrameCalib, iterative_pnp_calibrate
 from .keypoint_mapping import KeypointMapper
 from .line_mapping import LineMapper
 from .hough_line_matcher import HoughLineMatcher
@@ -34,6 +34,7 @@ __all__ = [
     "get_lines_from_heatmap_maxpool",
     "soft_argmax_2d",
     "FramebyFrameCalib",
+    "iterative_pnp_calibrate",
     "KeypointMapper",
     "LineMapper",
     "HoughLineMatcher",

@@ -129,14 +129,24 @@ class HRNetToPnLCalibMapper:
             world = point['world']
             hrnet_idx = point.get('hrnet_index')
 
-            mapped = self.map_annotation_point(pixel, world, hrnet_idx)
-            if mapped is None:
-                continue
+            # Prefer the explicit pnlcalib_id written by the annotator (added
+            # 2026-05). Older annotation files don't have it; fall back to
+            # the world-coord matcher.
+            saved_pnl_id = point.get('pnlcalib_id')
+            if saved_pnl_id is not None and saved_pnl_id >= 0:
+                # Annotator stores 0-indexed channel; PnLCalib downstream
+                # uses 1-indexed (channel n -> id n+1).
+                pnlcalib_id = int(saved_pnl_id) + 1
+                x, y = float(pixel[0]), float(pixel[1])
+                if hrnet_idx is not None:
+                    self._hrnet_to_pnlcalib_cache[hrnet_idx] = pnlcalib_id
+            else:
+                mapped = self.map_annotation_point(pixel, world, hrnet_idx)
+                if mapped is None:
+                    continue
+                pnlcalib_id = mapped['pnlcalib_id']
+                x, y = mapped['x'], mapped['y']
 
-            pnlcalib_id = mapped['pnlcalib_id']
-            x, y = mapped['x'], mapped['y']
-
-            # Check if point is within image bounds
             in_frame = 0 <= x < image_width and 0 <= y < image_height
 
             keypoints[pnlcalib_id] = {
