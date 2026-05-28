@@ -162,6 +162,14 @@ tracking:
   max_age: 30             # Max frames to keep lost tracks
   min_hits: 3             # Min detections before track is confirmed
   iou_threshold: 0.3
+  # Ghost-track killer: delete a track whose bbox centre has not moved
+  # more than `stationary_max_pixels` over the last `stationary_window`
+  # tracking-frame updates.  Targets the "YOLO false-positive on a
+  # banner / fence / spectator" failure mode where the same static
+  # detection keeps re-binding to an old track via ReID and produces
+  # a 5-15s ghost bbox.  Set stationary_window=0 to disable.
+  stationary_window: 30          # 30 tracking frames ≈ 3s at 10fps
+  stationary_max_pixels: 5.0
 
 reid:
   backend: "osnet"        # "osnet" (default) or "prtreid"
@@ -181,52 +189,12 @@ reid:
     goalkeeper_confidence_threshold: 0.7
     weights_path: null    # Path to weights (null = auto-download)
 
-jersey_recognition:
-  backend: "qwen_vl"      # "qwen_vl" (default) or "mmocr"
-  enabled: false          # Whether jersey recognition is enabled
-  mode: "local"           # "local" or "api" (for qwen_vl backend)
-
-  # Qwen VL backend settings (used when backend="qwen_vl")
-  local:
-    model: "Qwen/Qwen3-VL-8B-Instruct"
-    device: "cuda"
-    max_new_tokens: 10
-  api:
-    base_url: null        # API endpoint URL
-    model: "qwen3-vl-8b"
-    api_key_env: "QWEN_API_KEY"
-
-  # MMOCR backend settings (used when backend="mmocr")
-  mmocr:
-    det_model: "dbnet_resnet18_fpnc_1200e_icdar2015"
-    rec_model: "SAR"
-    min_confidence: 0.3
-    batch_size: 1
-
+# Team classification — consumed by the track_consolidation stage
+# (tracker itself no longer does team/role assignment).
 team_classification:
-  backend: "kmeans"       # "kmeans" (default) or "tracklet"
-  position_weight: 0.1    # Weight for position features in clustering
+  backend: "kmeans"
+  position_weight: 0.1    # Weight for position features in KMeans
   min_samples_per_team: 5 # Minimum samples before classification
-
-  # Tracklet clustering settings (used when backend="tracklet")
-  tracklet:
-    n_clusters: 2
-    random_state: 42
-    n_init: 10
-    min_samples: 2
-
-role_classification:
-  # Classification mode:
-  # - "reid": Use ReID embeddings for team classification (RECOMMENDED - SoccerMaster paper)
-  # - "color": Legacy color histogram clustering (not recommended)
-  mode: "reid"
-  n_clusters: 2           # Two teams
-  use_field_position: true  # Use pitch position to assign left/right labels
-
-  # Legacy color-based settings (only used when mode="color")
-  color_space: "hsv"
-  feature_type: "histogram"
-  use_background_removal: true
 
 visualization:
   backend: "minimal"      # "minimal" (default) or "step"
@@ -270,6 +238,83 @@ highlights:
       detector: "goal"
       analyzer: "scorer"
       composer: "segment"
+
+# Track Consolidation (Claude Opus jersey + OSNet ReID merge)
+track_consolidation:
+  enabled: false
+  min_track_frames: 30          # filter tracks with fewer observations
+  frames_per_track: 15          # crops sent to Claude per track
+  sampler:
+    min_bbox_height: 80         # upscale crops smaller than this
+    upper_body_ratio: 0.65      # focus on torso (jersey number region)
+  jersey:
+    # Backend selector. Only one of {claude, gemini, qwen} is used per run.
+    # Each sub-section is read only when its name matches backend.
+    backend: claude
+
+    # --- Claude Opus (AWS Bedrock) -----------------------------------
+    model_id: "us.anthropic.claude-opus-4-7"
+    region: "us-east-1"
+
+    # --- Gemini (Google AI Studio, uses GOOGLE_API_KEY) --------------
+    # Set backend: gemini and override model_id below.
+    # model_id: "gemini-2.5-pro"           # or "gemini-2.5-flash"
+    # api_key_env: "GOOGLE_API_KEY"
+
+    # --- Qwen VL via local vLLM server -------------------------------
+    # Set backend: qwen, launch ``bash scripts/start_qwen_vllm.sh``, then:
+    # model_id: "Qwen/Qwen3.6-27B-FP8"
+    # base_url: "http://localhost:8000/v1"
+
+    # --- Shared tuning ------------------------------------------------
+    max_concurrency: 16
+    max_retries: 2
+    max_tokens: 128
+    max_crop_dim: 384
+    jpeg_quality: 85
+    min_confidence: 0.6         # below this, number is treated as unknown
+  reid:
+    same_person_threshold: 0.0  # 0 = merge all same-(team,jersey) tracks unconditionally
+    orphan_absorb_threshold: 0.94  # high bar: OSNet can't discriminate same-team players
+  goalkeeper:
+    enabled: true                # post-consolidation GK identification
+    goal_area_depth: 16.5        # metres — cluster mean x must be within this of own goal line
+  output:
+    backup_original: true
+    overwrite_tracks_json: true
+
+# Annotated Full-Video Render (HUD-style)
+annotated_video:
+  enabled: false
+  output_fps: null              # null = source fps
+  glow:
+    enabled: true
+    alpha: 0.35
+  carrier:
+    max_distance_m: 2.0
+    exclude_goalkeeper: true
+    hysteresis_frames: 5
+    outline_color: [0, 255, 255]   # weak yellow (BGR)
+  distance_network:
+    n_opponents: 3
+    max_edge_m: 20.0
+    line_color: [200, 200, 255]
+  speed:
+    window_frames: 5
+    ema_alpha: 0.4
+    min_samples: 2
+  labels:
+    font_scale: 0.5
+    bg_alpha: 0.55
+  ball_trail:
+    enabled: true
+    length: 15
+    color: [0, 255, 255]
+  minimap:
+    enabled: true
+    height_frac: 0.28
+    alpha: 0.85
+    margin_px: 20
 
 # Output
 output:
@@ -319,7 +364,7 @@ events:
     deflection_window_seconds: 0.5  # seconds — window for computing ball deflection angle
 
 # Pipeline orchestration
-# Available stages: field_registration, tracking, event_detection, highlights
+# Available stages: field_registration, tracking, event_detection, track_consolidation, highlights, annotated_video
 pipeline:
   stages:
     - field_registration

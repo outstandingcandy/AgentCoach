@@ -40,12 +40,16 @@ numpy>=1.24.0
 yacs>=0.1.8               # Config management (for PnLCalib)
 einops>=0.6.0             # Tensor operations (optional, for clean code)
 
-# API Support
-openai>=1.0.0             # For VLM API mode
+# VLM backends for track_consolidation
+boto3>=1.28                # Claude Opus via AWS Bedrock
+google-genai>=1.0          # Gemini via Google AI Studio
+openai>=1.0.0              # Qwen via local vLLM server (OpenAI-compatible)
 httpx>=0.24.0
 
-# Annotation UI (manual pitch keypoint labeling for finetune GT)
-gradio>=4.0.0
+# Annotation UI + web viewer (FastAPI + HTML/JS, no Gradio)
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.0
 
 # Testing
 pytest>=7.0.0

@@ -96,6 +96,17 @@ class MatchContext:
                     video_path.name, Path(meta_video_path).name,
                 )
 
+        # track_consolidation is a hard precondition for downstream stages.
+        # It writes players.json and rewrites tracks.json with stable
+        # player_ids; without it tracks.json lacks team/role/jersey.
+        players_path = pipeline_output_dir / "track_consolidation" / "players.json"
+        if not players_path.exists():
+            raise RuntimeError(
+                "track_consolidation must be run before this stage. "
+                f"Expected {players_path} to exist. "
+                "Run `--stages track_consolidation` first."
+            )
+
         return cls(
             video_path=video_path,
             pipeline_output_dir=pipeline_output_dir,
@@ -149,10 +160,6 @@ class MatchContext:
                 or self._load_json("stage2", "team_assignments.json")
                 or {}
             )
-            # Apply goalkeeper team correction: goalkeepers are often
-            # misclassified by color-based KMeans because their jersey
-            # differs from teammates. Fix by position-based detection.
-            self._fix_goalkeeper_teams()
         return self._team_assignments
 
     @property
@@ -203,48 +210,6 @@ class MatchContext:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
-    def _fix_goalkeeper_teams(self) -> None:
-        """Apply position-based goalkeeper detection and team correction.
-
-        Goalkeepers are often misclassified by color-based KMeans because
-        their jersey color differs from teammates. This uses
-        GoalkeeperDetector to find goalkeepers by position and correct
-        their team assignment.
-        """
-        from collections import defaultdict
-
-        import numpy as np
-
-        from goalinsight.tracking.team.kmeans_classifier import GoalkeeperDetector
-
-        # Build mean positions from player tracks
-        positions: dict[str, list[list[float]]] = defaultdict(list)
-        source = self.player_tracks
-        for frame_tracks in source.values():
-            for t in frame_tracks:
-                pp = t.get("pitch_position")
-                if pp:
-                    positions[str(t["track_id"])].append(pp)
-
-        mean_positions = {
-            tid: np.median(poss, axis=0).tolist()
-            for tid, poss in positions.items()
-            if len(poss) >= 5
-        }
-
-        if not mean_positions:
-            return
-
-        gk = GoalkeeperDetector(
-            pitch_length=self.pitch_length,
-            pitch_width=self.pitch_width,
-        )
-        self._team_assignments, gk_tracks = gk.refine_roles(
-            self._team_assignments, mean_positions, dict(positions),
-        )
-        if gk_tracks:
-            logger.info("Goalkeeper tracks after correction: %s", gk_tracks)
 
     def _load_json(self, stage: str, filename: str) -> dict | None:
         path = self.pipeline_output_dir / stage / filename

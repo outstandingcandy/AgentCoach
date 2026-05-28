@@ -152,3 +152,48 @@ class HighlightsStage(Stage):
         return False  # Always regenerate highlights
 
 
+@register_stage
+class TrackConsolidationStage(Stage):
+    name = "track_consolidation"
+    description = "Track Consolidation (Claude jersey + ReID merge)"
+
+    def run(self, ctx: PipelineContext) -> dict[str, Any]:
+        from ..track_consolidation import run_track_consolidation
+
+        out = ctx.stage_dir(self.name)
+        config = ctx.config.get("track_consolidation", {}) if ctx.config else {}
+        return run_track_consolidation(
+            output_dir=out,
+            pipeline_output_dir=ctx.output_dir,
+            video_path=ctx.video_path,
+            config=config,
+        )
+
+    def should_skip(self, ctx: PipelineContext) -> bool:
+        return ctx.skip_existing and (ctx.stage_dir(self.name) / "player_map.json").exists()
+
+
+@register_stage
+class AnnotatedVideoStage(Stage):
+    name = "annotated_video"
+    description = "Annotated Full-Video Render (HUD)"
+
+    def run(self, ctx: PipelineContext) -> dict[str, Any]:
+        from ..annotated_video import run_annotated_video
+
+        out = ctx.stage_dir(self.name)
+        config = ctx.config.get("annotated_video", {}) if ctx.config else {}
+        if ctx.config and "video_enhancement" in ctx.config:
+            config = {**config, "video_enhancement": ctx.config["video_enhancement"]}
+
+        return run_annotated_video(
+            output_dir=out,
+            pipeline_output_dir=ctx.output_dir,
+            video_path=ctx.video_path,
+            config=config,
+        )
+
+    def should_skip(self, ctx: PipelineContext) -> bool:
+        return ctx.skip_existing and (ctx.stage_dir(self.name) / "annotated.mp4").exists()
+
+
