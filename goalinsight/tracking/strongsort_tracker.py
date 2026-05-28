@@ -53,6 +53,12 @@ class Track:
     confidence: float = 0.0
     class_id: int = 0
 
+    # Recent bbox-center history for stationary-detection.  Stores at
+    # most ``stationary_window`` (cx, cy) tuples so we can detect
+    # ghost tracks where YOLO keeps re-detecting the same static
+    # background object.
+    center_history: list = field(default_factory=list)
+
     # Attributes
     team: str | None = None
     jersey_number: int | None = None
@@ -245,6 +251,17 @@ class StrongSORTTracker:
         self.max_iou_distance = config.get("max_iou_distance", 0.7)
         self.max_cosine_distance = config.get("max_cosine_distance", 0.3)
         self.feature_alpha = config.get("feature_alpha", 0.9)
+        # Stationary-track killer: delete a track if its bbox centre has
+        # not moved more than ``stationary_max_pixels`` over the last
+        # ``stationary_window`` updates (regardless of how many "matches"
+        # it received in that window).  Defends against YOLO
+        # re-detecting the same static background object — a banner /
+        # spectator / fence-post / parked car — which would otherwise
+        # keep matching to an old track via ReID and produce a 5-15s
+        # ghost bbox.  Set ``stationary_window`` to 0 to disable.
+        self.stationary_window = int(config.get("stationary_window", 30))
+        self.stationary_max_pixels = float(
+            config.get("stationary_max_pixels", 5.0))
 
         frame_interval = config.get("frame_interval", 1.0)
         self.kalman = KalmanFilter(frame_interval=frame_interval)
@@ -252,6 +269,17 @@ class StrongSORTTracker:
         self.next_id = 1
         self.img_w = 1920  # Default, can be updated
         self.img_h = 1080
+
+        # Kill-zones: locations where the stationary killer recently
+        # deleted a track.  New detections falling inside one of these
+        # zones are suppressed for ``stationary_zone_ttl`` updates so a
+        # persistent YOLO false-positive can't immediately respawn the
+        # ghost as a fresh track.  Each entry: (cx, cy, ttl).
+        self.stationary_zones: list[tuple[float, float, int]] = []
+        self.stationary_zone_radius = float(
+            config.get("stationary_zone_radius", 25.0))
+        self.stationary_zone_ttl = int(
+            config.get("stationary_zone_ttl", 300))
 
     def reset(self):
         """Reset tracker state."""
@@ -401,6 +429,7 @@ class StrongSORTTracker:
             track.confidence = det.get("confidence", 1.0)
             track.hits += 1
             track.time_since_update = 0
+            self._record_center(track)
 
             # Update appearance feature
             if embeddings is not None and det_idx < len(embeddings):
@@ -434,6 +463,7 @@ class StrongSORTTracker:
                         track.confidence = det.get("confidence", 1.0)
                         track.hits += 1
                         track.time_since_update = 0
+                        self._record_center(track)
 
                         if embeddings is not None and det_idx < len(embeddings):
                             track.update_feature(embeddings[det_idx], self.feature_alpha)
@@ -444,24 +474,33 @@ class StrongSORTTracker:
 
                         matched_det_indices.add(det_idx)
 
-        # Create new tracks for unmatched detections
+        # Create new tracks for unmatched detections — but suppress any
+        # detection landing inside a kill-zone left behind by the
+        # stationary-track killer.
         for i in range(len(detections)):
-            if i not in matched_det_indices:
-                det = detections[i]
-                track = Track(
-                    track_id=self.next_id,
-                    status=TrackStatus.TENTATIVE,
-                    bbox=det["bbox"],
-                    confidence=det.get("confidence", 1.0),
-                    class_id=det.get("class", 0),
-                )
-                track.kalman_state = self.kalman.initiate(det["bbox"])
+            if i in matched_det_indices:
+                continue
+            det = detections[i]
+            x1, y1, x2, y2 = det["bbox"]
+            dcx = (x1 + x2) / 2.0
+            dcy = (y1 + y2) / 2.0
+            if self._in_kill_zone(dcx, dcy):
+                continue
+            track = Track(
+                track_id=self.next_id,
+                status=TrackStatus.TENTATIVE,
+                bbox=det["bbox"],
+                confidence=det.get("confidence", 1.0),
+                class_id=det.get("class", 0),
+            )
+            track.kalman_state = self.kalman.initiate(det["bbox"])
+            self._record_center(track)
 
-                if embeddings is not None and i < len(embeddings):
-                    track.update_feature(embeddings[i], self.feature_alpha)
+            if embeddings is not None and i < len(embeddings):
+                track.update_feature(embeddings[i], self.feature_alpha)
 
-                self.tracks.append(track)
-                self.next_id += 1
+            self.tracks.append(track)
+            self.next_id += 1
 
         # Update unmatched tracks
         for track in self.tracks:
@@ -481,6 +520,35 @@ class StrongSORTTracker:
             if track.status == TrackStatus.TENTATIVE and track.age > self.n_init + 2:
                 track.status = TrackStatus.DELETED
 
+        # Stationary-track killer: drop confirmed tracks whose bbox
+        # centre has not moved more than ``stationary_max_pixels``
+        # over the last ``stationary_window`` updates.  These are
+        # ghosts — typically YOLO false positives on a fixed-position
+        # banner, fence post, or distant spectator.
+        if self.stationary_window > 0:
+            for track in self.tracks:
+                if track.status != TrackStatus.CONFIRMED:
+                    continue
+                if len(track.center_history) < self.stationary_window:
+                    continue
+                hist = track.center_history[-self.stationary_window:]
+                xs = [c[0] for c in hist]
+                ys = [c[1] for c in hist]
+                span = max(max(xs) - min(xs), max(ys) - min(ys))
+                if span <= self.stationary_max_pixels:
+                    track.status = TrackStatus.DELETED
+                    cx = sum(xs) / len(xs)
+                    cy = sum(ys) / len(ys)
+                    self.stationary_zones.append((
+                        cx, cy, self.stationary_zone_ttl,
+                    ))
+
+        # Decay kill-zones (drop expired ones).
+        self.stationary_zones = [
+            (x, y, ttl - 1) for (x, y, ttl) in self.stationary_zones
+            if ttl - 1 > 0
+        ]
+
         self.tracks = [t for t in self.tracks if t.status != TrackStatus.DELETED]
 
         # Return confirmed + tentative tracks (tentative flagged for backfill)
@@ -498,6 +566,30 @@ class StrongSORTTracker:
                     "confirmed": t.status == TrackStatus.CONFIRMED,
                 })
         return result
+
+    def _in_kill_zone(self, cx: float, cy: float) -> bool:
+        """Return True if (cx, cy) sits within ``stationary_zone_radius``
+        of any active kill-zone."""
+        if not self.stationary_zones:
+            return False
+        r2 = self.stationary_zone_radius ** 2
+        for zx, zy, _ttl in self.stationary_zones:
+            if (cx - zx) ** 2 + (cy - zy) ** 2 <= r2:
+                return True
+        return False
+
+    def _record_center(self, track: Track) -> None:
+        """Push the current bbox centre onto a per-track history ring,
+        capped at ``stationary_window`` entries.  Used by the
+        stationary-track killer at the end of :meth:`update`."""
+        if not track.bbox or self.stationary_window <= 0:
+            return
+        x1, y1, x2, y2 = track.bbox
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        track.center_history.append((cx, cy))
+        if len(track.center_history) > self.stationary_window:
+            del track.center_history[: -self.stationary_window]
 
     def _compute_iou_matrix(
         self,

@@ -10,6 +10,7 @@ TEAM_COLORS = {
     "team_A": (0, 0, 255),     # Red
     "team_B": (255, 0, 0),     # Blue
     "referee": (0, 255, 255),  # Yellow
+    "linesman": (0, 200, 200), # Dim yellow
     "unknown": (128, 128, 128),  # Gray
     "ball": (0, 165, 255),     # Orange
 }
@@ -33,21 +34,28 @@ def draw_topdown_pitch(
     ball_trajectory_world: list[list[float]] | None = None,
     pitch_length: float = 105.0,
     pitch_width: float = 68.0,
+    width: int | None = None,
 ) -> np.ndarray:
     """Draw top-down pitch diagram with player and ball positions.
 
     Args:
-        height: Output image height (matches camera frame height).
+        height: Output canvas height in px.
         tracks: List of track dicts with pitch_position, track_id, role.
         team_assignments: Dict of track_id -> team label.
         ball_track: Ball track dict with pitch_position (optional).
         pitch_length: Pitch length in meters.
         pitch_width: Pitch width in meters.
+        width: Output canvas width in px. Defaults to a 3:4 portrait
+            ratio (height * 0.75) for the legacy side-by-side tracking
+            visualization. Pass an explicit value when embedding the
+            minimap in a video frame so the canvas can match the
+            video's aspect ratio.
 
     Returns:
         Top-down pitch image (BGR).
     """
-    width = int(height * 0.75)  # 3:4 aspect for pitch
+    if width is None:
+        width = int(height * 0.75)  # 3:4 aspect (legacy default)
     pitch = np.zeros((height, width, 3), dtype=np.uint8)
     pitch[:] = (34, 139, 34)
 
