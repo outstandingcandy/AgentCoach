@@ -117,6 +117,9 @@ def get_jersey_recognizer(config: dict[str, Any] | None = None) -> "BaseJerseyRe
         backend_config = jr_config.get("mmocr", {})
         backend_config["device"] = config.get("device", "cuda")
         return MMOCRJerseyRecognizer(backend_config)
+    elif backend == "claude":
+        from ..jersey.claude_recognizer import ClaudeJerseyRecognizer
+        return ClaudeJerseyRecognizer(jr_config.get("claude", jr_config))
     else:
         # Default: Qwen VL
         from ..jersey import QwenJerseyRecognizer
