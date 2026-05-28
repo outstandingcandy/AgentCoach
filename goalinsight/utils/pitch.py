@@ -1,15 +1,18 @@
 """Pitch template constants, projection helpers, and top-down pitch drawing.
 
 Extracted from stage1.py to be shared across pipeline stages.
+
+Default pitch dimensions come from
+``goalinsight.annotation.pitch_constants.get_active_pitch()`` (set by the
+pipeline at config-load time), so non-FIFA pitches are honored automatically.
 """
 
 import cv2
 import numpy as np
 
+from ..annotation import pitch_constants
+from .projection import project_points_with_visibility
 
-# Standard pitch dimensions (in meters, centered at origin)
-PITCH_LENGTH = 105.0
-PITCH_WIDTH = 68.0
 
 # Keypoint IDs forming pitch line segments (connect consecutive IDs)
 PITCH_LINE_KEYPOINTS = [
@@ -32,11 +35,12 @@ def get_pitch_template_points(pitch_length=None, pitch_width=None):
     """Get key points on the pitch template for visualization.
 
     Args:
-        pitch_length: Pitch length in meters (default: PITCH_LENGTH=105).
-        pitch_width: Pitch width in meters (default: PITCH_WIDTH=68).
+        pitch_length: Pitch length in meters (default: active pitch length).
+        pitch_width: Pitch width in meters (default: active pitch width).
     """
-    pl = pitch_length or PITCH_LENGTH
-    pw = pitch_width or PITCH_WIDTH
+    active = pitch_constants.get_active_pitch()
+    pl = pitch_length or active.PITCH_LENGTH
+    pw = pitch_width or active.PITCH_WIDTH
     half_l = pl / 2
     half_w = pw / 2
 
@@ -111,22 +115,14 @@ def _project_with_camera_model(template_points, camera_params):
     K = camera_params["K"]
     dist = camera_params["dist_coeffs"]
 
-    R, _ = cv2.Rodrigues(rvec)
-
     projected = {}
     for name, points in template_points.items():
-        # Build 3D points (z=0 ground plane)
         obj = np.array([[pt[0], pt[1], 0.0] for pt in points], dtype=np.float64)
-
-        # Per-point camera-space Z check
-        cam_pts = (R @ obj.T).T + tvec.flatten()
-        img, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
-        proj_points = []
-        for j, pt2d in enumerate(img.reshape(-1, 2)):
-            if cam_pts[j, 2] <= 0.1:
-                proj_points.append(None)  # Behind camera
-            else:
-                proj_points.append((int(pt2d[0]), int(pt2d[1])))
+        img_pts, in_front = project_points_with_visibility(obj, rvec, tvec, K, dist)
+        proj_points = [
+            (int(p[0]), int(p[1])) if vis else None
+            for p, vis in zip(img_pts, in_front)
+        ]
         projected[name] = proj_points
     return projected
 
@@ -145,16 +141,17 @@ def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_m
         keypoints: Detected keypoints list.
         calibrator: FramebyFrameCalib instance.
         keypoint_mapper: KeypointMapper instance for world coordinate lookup.
-        pitch_length: Pitch length in meters (default: module-level PITCH_LENGTH).
-        pitch_width: Pitch width in meters (default: module-level PITCH_WIDTH).
+        pitch_length: Pitch length in meters (default: active pitch length).
+        pitch_width: Pitch width in meters (default: active pitch width).
 
     Returns:
         Top-down pitch image (BGR).
     """
     from ..field_registration.pnlcalib import KeypointMapper
 
-    pl = pitch_length if pitch_length is not None else PITCH_LENGTH
-    pw = pitch_width if pitch_width is not None else PITCH_WIDTH
+    active = pitch_constants.get_active_pitch()
+    pl = pitch_length if pitch_length is not None else active.PITCH_LENGTH
+    pw = pitch_width if pitch_width is not None else active.PITCH_WIDTH
 
     pitch = np.zeros((height, width, 3), dtype=np.uint8)
     pitch[:] = (34, 139, 34)  # Forest green background

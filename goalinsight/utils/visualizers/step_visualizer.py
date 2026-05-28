@@ -10,6 +10,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from ...annotation import pitch_constants
+from ...annotation.pitch_diagram import draw_pitch_structure
 from ...interfaces import BaseVisualizer
 
 try:
@@ -33,9 +35,6 @@ COLORS = {
     'line': (255, 165, 0),
 }
 
-PITCH_LENGTH = 105.0
-PITCH_WIDTH = 68.0
-
 
 class StepVisualizer(BaseVisualizer):
     """Visualize each pipeline step with detailed output."""
@@ -49,63 +48,35 @@ class StepVisualizer(BaseVisualizer):
         self.writers: dict[str, cv2.VideoWriter] = {}
         self.pitch_template = None
         self.pitch_scale = 8
+        self.pitch_margin = 10
+
+    def _to_radar_pixel(self, x: float, y: float) -> tuple[int, int]:
+        """World (meters) -> radar pixel. y-down (image y)."""
+        pitch = pitch_constants.get_active_pitch()
+        px = int((x + pitch.PITCH_LENGTH / 2 + self.pitch_margin) * self.pitch_scale)
+        py = int((y + pitch.PITCH_WIDTH / 2 + self.pitch_margin) * self.pitch_scale)
+        return (px, py)
 
     def _init_pitch_template(self) -> np.ndarray:
         """Create a pitch template for radar visualization."""
         if self.pitch_template is not None:
             return self.pitch_template
 
-        margin = 10
-        width = int((PITCH_LENGTH + 2 * margin) * self.pitch_scale)
-        height = int((PITCH_WIDTH + 2 * margin) * self.pitch_scale)
+        pitch_dims = pitch_constants.get_active_pitch()
+        width = int((pitch_dims.PITCH_LENGTH + 2 * self.pitch_margin) * self.pitch_scale)
+        height = int((pitch_dims.PITCH_WIDTH + 2 * self.pitch_margin) * self.pitch_scale)
 
         pitch = np.zeros((height, width, 3), dtype=np.uint8)
         pitch[:] = (34, 139, 34)
 
-        def to_pixel(x: float, y: float) -> tuple[int, int]:
-            px = int((x + PITCH_LENGTH / 2 + margin) * self.pitch_scale)
-            py = int((y + PITCH_WIDTH / 2 + margin) * self.pitch_scale)
-            return (px, py)
-
-        color = (255, 255, 255)
-        thickness = 2
-
-        # Boundary
-        corners = [
-            (-PITCH_LENGTH/2, -PITCH_WIDTH/2),
-            (PITCH_LENGTH/2, -PITCH_WIDTH/2),
-            (PITCH_LENGTH/2, PITCH_WIDTH/2),
-            (-PITCH_LENGTH/2, PITCH_WIDTH/2),
-        ]
-        for i in range(4):
-            p1 = to_pixel(*corners[i])
-            p2 = to_pixel(*corners[(i+1) % 4])
-            cv2.line(pitch, p1, p2, color, thickness)
-
-        # Center line
-        cv2.line(pitch, to_pixel(0, -PITCH_WIDTH/2), to_pixel(0, PITCH_WIDTH/2), color, thickness)
-
-        # Center circle
-        center = to_pixel(0, 0)
-        radius = int(9.15 * self.pitch_scale)
-        cv2.circle(pitch, center, radius, color, thickness)
-        cv2.circle(pitch, center, 4, color, -1)
-
-        # Penalty areas
-        pa_w = 40.32 / 2
-        pa_d = 16.5
-        cv2.rectangle(pitch, to_pixel(-PITCH_LENGTH/2, -pa_w), to_pixel(-PITCH_LENGTH/2 + pa_d, pa_w), color, thickness)
-        cv2.rectangle(pitch, to_pixel(PITCH_LENGTH/2 - pa_d, -pa_w), to_pixel(PITCH_LENGTH/2, pa_w), color, thickness)
-
-        # Goal areas
-        ga_w = 18.32 / 2
-        ga_d = 5.5
-        cv2.rectangle(pitch, to_pixel(-PITCH_LENGTH/2, -ga_w), to_pixel(-PITCH_LENGTH/2 + ga_d, ga_w), color, thickness)
-        cv2.rectangle(pitch, to_pixel(PITCH_LENGTH/2 - ga_d, -ga_w), to_pixel(PITCH_LENGTH/2, ga_w), color, thickness)
-
-        # Penalty spots
-        cv2.circle(pitch, to_pixel(-PITCH_LENGTH/2 + 11, 0), 4, color, -1)
-        cv2.circle(pitch, to_pixel(PITCH_LENGTH/2 - 11, 0), 4, color, -1)
+        # Reuse the annotation module's pitch outline drawer. Pass our y-down
+        # to_px (radar visually flips y vs the annotation tactical view); arcs
+        # are skipped because they're orientation-sensitive and not used here.
+        draw_pitch_structure(
+            pitch, self._to_radar_pixel, scale=self.pitch_scale,
+            color=(255, 255, 255), thickness=2,
+            landmark_radius=4, draw_arcs=False,
+        )
 
         self.pitch_template = pitch
         return pitch
@@ -324,12 +295,9 @@ class StepVisualizer(BaseVisualizer):
         vis = frame.copy()
         pitch = self._init_pitch_template().copy()
         ph, pw = pitch.shape[:2]
-
-        margin = 10
-        def to_pixel(x: float, y: float) -> tuple[int, int]:
-            px = int((x + PITCH_LENGTH / 2 + margin) * self.pitch_scale)
-            py = int((y + PITCH_WIDTH / 2 + margin) * self.pitch_scale)
-            return (px, py)
+        pitch_dims = pitch_constants.get_active_pitch()
+        half_l_pad = pitch_dims.PITCH_LENGTH / 2 + 5
+        half_w_pad = pitch_dims.PITCH_WIDTH / 2 + 5
 
         for track in tracks:
             track_id = track['track_id']
@@ -345,10 +313,10 @@ class StepVisualizer(BaseVisualizer):
             world_x = pt[0] / pt[2]
             world_y = pt[1] / pt[2]
 
-            if abs(world_x) > PITCH_LENGTH / 2 + 5 or abs(world_y) > PITCH_WIDTH / 2 + 5:
+            if abs(world_x) > half_l_pad or abs(world_y) > half_w_pad:
                 continue
 
-            px, py = to_pixel(world_x, world_y)
+            px, py = self._to_radar_pixel(world_x, world_y)
             color = COLORS.get(side, COLORS['unknown'])
 
             cv2.circle(pitch, (px, py), 8, color, -1)
@@ -491,12 +459,11 @@ class StepVisualizer(BaseVisualizer):
         vis = frame.copy()
         pitch = self._init_pitch_template().copy()
         ph, pw = pitch.shape[:2]
-
-        margin = 10
-        def to_pixel(x: float, y: float) -> tuple[int, int]:
-            px = int((x + PITCH_LENGTH / 2 + margin) * self.pitch_scale)
-            py = int((y + PITCH_WIDTH / 2 + margin) * self.pitch_scale)
-            return (px, py)
+        pitch_dims = pitch_constants.get_active_pitch()
+        half_l_pad5 = pitch_dims.PITCH_LENGTH / 2 + 5
+        half_w_pad5 = pitch_dims.PITCH_WIDTH / 2 + 5
+        half_l_pad2 = pitch_dims.PITCH_LENGTH / 2 + 2
+        half_w_pad2 = pitch_dims.PITCH_WIDTH / 2 + 2
 
         # Draw players
         for track in tracks:
@@ -513,10 +480,10 @@ class StepVisualizer(BaseVisualizer):
             world_x = pt[0] / pt[2]
             world_y = pt[1] / pt[2]
 
-            if abs(world_x) > PITCH_LENGTH / 2 + 5 or abs(world_y) > PITCH_WIDTH / 2 + 5:
+            if abs(world_x) > half_l_pad5 or abs(world_y) > half_w_pad5:
                 continue
 
-            px, py = to_pixel(world_x, world_y)
+            px, py = self._to_radar_pixel(world_x, world_y)
             color = COLORS.get(side, COLORS['unknown'])
 
             cv2.circle(pitch, (px, py), 8, color, -1)
@@ -526,7 +493,7 @@ class StepVisualizer(BaseVisualizer):
         if ball_track:
             ball_pitch_pos = ball_track.get("pitch_position")
             if ball_pitch_pos:
-                bx, by = to_pixel(ball_pitch_pos[0], ball_pitch_pos[1])
+                bx, by = self._to_radar_pixel(ball_pitch_pos[0], ball_pitch_pos[1])
                 # Ball with highlight
                 cv2.circle(pitch, (bx, by), 6, COLORS['ball'], -1)
                 cv2.circle(pitch, (bx, by), 6, (255, 255, 255), 2)
@@ -538,8 +505,8 @@ class StepVisualizer(BaseVisualizer):
                     if abs(pt[2]) > 1e-6:
                         world_x = pt[0] / pt[2]
                         world_y = pt[1] / pt[2]
-                        if abs(world_x) <= PITCH_LENGTH / 2 + 2 and abs(world_y) <= PITCH_WIDTH / 2 + 2:
-                            bx, by = to_pixel(world_x, world_y)
+                        if abs(world_x) <= half_l_pad2 and abs(world_y) <= half_w_pad2:
+                            bx, by = self._to_radar_pixel(world_x, world_y)
                             cv2.circle(pitch, (bx, by), 6, COLORS['ball'], -1)
                             cv2.circle(pitch, (bx, by), 6, (255, 255, 255), 2)
 

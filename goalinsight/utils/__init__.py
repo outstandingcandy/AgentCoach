@@ -20,8 +20,6 @@ from .io import AnnotationIO
 from .serialization import json_default, sanitize_for_json
 from .prefetcher import FramePrefetcher, DetectionPrefetcher
 from .pitch import (
-    PITCH_LENGTH,
-    PITCH_WIDTH,
     PITCH_LINE_KEYPOINTS,
     get_pitch_template_points,
     project_pitch_to_image,
@@ -47,8 +45,6 @@ __all__ = [
     "sanitize_for_json",
     "FramePrefetcher",
     "DetectionPrefetcher",
-    "PITCH_LENGTH",
-    "PITCH_WIDTH",
     "PITCH_LINE_KEYPOINTS",
     "get_pitch_template_points",
     "project_pitch_to_image",

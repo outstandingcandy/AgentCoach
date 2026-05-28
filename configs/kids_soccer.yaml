@@ -1,0 +1,68 @@
+video:
+  process_fps: 10
+
+# Camera intrinsics. Recovered jointly with pitch dims via fit_pitch_dims.py
+# --fit-fx (this is a long-focal sideline cam, not the 53° default).
+intrinsics:
+  fx: 2448.68   # hfov ≈ 43° (image width assumed 1920)
+
+# Non-FIFA youth pitch. Dims fit jointly from 3 manual annotation frames via
+# scripts/fit_pitch_dims.py --fit-fx (combined RMSE 5.82 px on 53 residuals,
+# fx=2448 / hfov 43°). f64020 and f246/f338 share above-ground cameras at
+# touchline_bottom side. The two unconstrained dims (no center circle /
+# penalty mark in any annotation) are kept at the rough youth-pitch guess.
+pitch:
+  pitch_length: 66.28
+  pitch_width: 43.15
+  penalty_area_width: 21.84
+  penalty_area_length: 9.96
+  goal_area_width: 11.79
+  goal_area_length: 4.13
+  goal_line_to_penalty_mark: 8.0   # unconstrained by annotations
+  center_circle_radius: 7.0        # unconstrained by annotations
+  goal_height: 2.15
+  goal_length: 4.44
+
+field_registration:
+  backend: "pnlcalib"
+
+  pnlcalib:
+    keypoint_model_path: "data/finetuned_models/run_20260526_160037/models/best_model.pt"
+    keypoint_weights: "SV_kp"
+    keypoint_threshold: 0.15
+    line_weights: "SV_lines"
+    line_threshold: 0.10
+    pnl_refine: true
+    line_weight: 1.0
+
+detection:
+  model: "yolov8x"
+  confidence_threshold: 0.4
+  iou_threshold: 0.45
+  imgsz: 1280
+
+ball_detection:
+  enabled: true
+  confidence_threshold: 0.2
+  field_filter:
+    enabled: false
+
+tracking:
+  algorithm: "strongsort"
+  max_age: 50
+
+reid:
+  backend: "osnet"
+  model: "osnet_x1_0"
+
+team_classification:
+  backend: "kmeans"
+  position_weight: 0.1
+
+device: "cuda"
+
+pipeline:
+  stages:
+    - field_registration
+    - tracking
+    - event_detection
