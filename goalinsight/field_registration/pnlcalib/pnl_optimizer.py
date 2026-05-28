@@ -16,6 +16,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from ...utils.projection import project_points_2d
+
 try:
     from scipy.optimize import least_squares
 except ImportError:
@@ -190,18 +192,9 @@ class PnLOptimizer:
         x0 = np.concatenate([initial_rvec, initial_tvec])
 
         def residuals(x):
-            rvec = x[:3]
-            tvec = x[3:6]
-
-            projected, _ = cv2.projectPoints(
-                world_points,
-                rvec,
-                tvec,
-                camera_matrix,
-                None,
+            projected = project_points_2d(
+                world_points, x[:3], x[3:6], camera_matrix,
             )
-            projected = projected.reshape(-1, 2)
-
             return (image_points - projected).flatten()
 
         result = least_squares(
@@ -217,14 +210,9 @@ class PnLOptimizer:
         tvec = result.x[3:6]
 
         # Compute final reprojection error
-        projected, _ = cv2.projectPoints(
-            world_points,
-            rvec,
-            tvec,
-            camera_matrix,
-            None,
+        projected = project_points_2d(
+            world_points, rvec, tvec, camera_matrix,
         )
-        projected = projected.reshape(-1, 2)
         reproj_error = np.mean(np.linalg.norm(image_points - projected, axis=1))
 
         return {
@@ -312,14 +300,9 @@ class PnLOptimizer:
 
             # Point reprojection errors
             if num_points > 0:
-                projected, _ = cv2.projectPoints(
-                    world_points,
-                    rvec,
-                    tvec,
-                    camera_matrix,
-                    None,
+                projected = project_points_2d(
+                    world_points, rvec, tvec, camera_matrix,
                 )
-                projected = projected.reshape(-1, 2)
                 point_errors = (image_points - projected).flatten()
                 errors.extend(point_errors)
 
@@ -329,15 +312,11 @@ class PnLOptimizer:
 
                 # Project world line endpoints to image
                 line_3d = np.array([p1_3d, p2_3d])
-                proj_endpoints, _ = cv2.projectPoints(
-                    line_3d,
-                    rvec,
-                    tvec,
-                    camera_matrix,
-                    None,
+                proj_endpoints = project_points_2d(
+                    line_3d, rvec, tvec, camera_matrix,
                 )
-                proj_p1 = proj_endpoints[0].flatten()
-                proj_p2 = proj_endpoints[1].flatten()
+                proj_p1 = proj_endpoints[0]
+                proj_p2 = proj_endpoints[1]
 
                 # Detected line endpoints
                 det_p1 = np.array([img_line["x1"], img_line["y1"]])
@@ -371,14 +350,9 @@ class PnLOptimizer:
         tvec = result.x[3:6]
 
         # Compute final point reprojection error
-        projected, _ = cv2.projectPoints(
-            world_points,
-            rvec,
-            tvec,
-            camera_matrix,
-            None,
+        projected = project_points_2d(
+            world_points, rvec, tvec, camera_matrix,
         )
-        projected = projected.reshape(-1, 2)
         point_reproj_error = np.mean(np.linalg.norm(image_points - projected, axis=1))
 
         # Compute final line reprojection error
@@ -386,15 +360,11 @@ class PnLOptimizer:
         for i, (p1_3d, p2_3d) in enumerate(world_line_endpoints):
             img_line = matched_image_lines[i]
             line_3d = np.array([p1_3d, p2_3d])
-            proj_endpoints, _ = cv2.projectPoints(
-                line_3d,
-                rvec,
-                tvec,
-                camera_matrix,
-                None,
+            proj_endpoints = project_points_2d(
+                line_3d, rvec, tvec, camera_matrix,
             )
-            proj_p1 = proj_endpoints[0].flatten()
-            proj_p2 = proj_endpoints[1].flatten()
+            proj_p1 = proj_endpoints[0]
+            proj_p2 = proj_endpoints[1]
 
             det_p1 = np.array([img_line["x1"], img_line["y1"]])
             det_p2 = np.array([img_line["x2"], img_line["y2"]])

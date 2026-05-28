@@ -34,13 +34,12 @@ from scipy.optimize import least_squares
 
 def project_3d_to_pixel(point_3d: np.ndarray, pose: dict) -> np.ndarray | None:
     """Project a 3D world point to 2D pixel coordinates."""
-    rvec = np.array(pose["rvec"], dtype=np.float64).reshape(3, 1)
-    tvec = np.array(pose["tvec"], dtype=np.float64).reshape(3, 1)
-    K = np.array(pose["K"], dtype=np.float64)
-    dist = np.array(pose["dist_coeffs"], dtype=np.float64)
-    pt = np.array(point_3d, dtype=np.float64).reshape(1, 3)
-    pts_2d, _ = cv2.projectPoints(pt, rvec, tvec, K, dist)
-    return pts_2d.reshape(2)
+    from ..utils.projection import project_points_2d
+    return project_points_2d(
+        np.asarray(point_3d, dtype=np.float64).reshape(1, 3),
+        pose["rvec"], pose["tvec"], np.asarray(pose["K"], dtype=np.float64),
+        np.asarray(pose["dist_coeffs"], dtype=np.float64),
+    ).reshape(2)
 
 
 def project_to_ground(pixel_center: tuple[float, float], pose: dict) -> list[float] | None:

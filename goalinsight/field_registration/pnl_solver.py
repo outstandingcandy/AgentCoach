@@ -425,22 +425,8 @@ class PnLSolver:
         Returns:
             2D image points, shape (N, 2).
         """
-        if dist_coeffs is None:
-            dist_coeffs = np.zeros(4)
-
-        world_points = np.array(world_points, dtype=np.float32)
-        if world_points.shape[1] == 2:
-            world_points = np.hstack([world_points, np.zeros((len(world_points), 1))])
-
-        image_points, _ = cv2.projectPoints(
-            world_points,
-            rvec,
-            tvec,
-            camera_matrix,
-            dist_coeffs,
-        )
-
-        return image_points.reshape(-1, 2)
+        from ..utils.projection import project_points_2d
+        return project_points_2d(world_points, rvec, tvec, camera_matrix, dist_coeffs)
 
     def unproject_to_pitch(
         self,

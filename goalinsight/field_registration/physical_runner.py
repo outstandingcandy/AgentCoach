@@ -22,6 +22,7 @@ import yaml
 from tqdm import tqdm
 
 from ..utils.pitch import get_pitch_template_points, project_pitch_to_image, _draw_topdown_pitch
+from ..utils.projection import project_points_2d
 from .shared_vis import draw_vis_keypoints, draw_vis_lines
 from ..utils.config import get_default_config, get_process_fps_from_config, FrameSampler
 from ..utils.serialization import json_default as _json_default
@@ -914,21 +915,16 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
         # Line constraint details
         lc_list = result.get("line_constraints", [])
         if lc_list and cam and "rvec" in cam and "tvec" in cam:
-            import cv2 as _cv2
-
             line_details = []
             for lc in lc_list:
                 ws = np.array(lc["world_samples"])
                 imgs = np.array(lc["img_samples"])
 
                 # Project 3D world samples with optimized pose
-                proj_raw, _ = _cv2.projectPoints(
-                    ws.reshape(-1, 1, 3),
-                    cam["rvec"].reshape(3, 1),
-                    cam["tvec"].reshape(3, 1),
+                proj = project_points_2d(
+                    ws, cam["rvec"], cam["tvec"],
                     cam["K"], cam["dist_coeffs"],
                 )
-                proj = proj_raw.reshape(-1, 2)
 
                 # Filter out degenerate projections (behind camera / singularity)
                 IMG_BOUND = 10000
@@ -986,13 +982,10 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
             projected = None
             if (world_pts is not None and len(world_pts) > 0
                     and "rvec" in cam and "tvec" in cam):
-                proj_raw, _ = _cv2.projectPoints(
-                    np.array(world_pts).reshape(-1, 1, 3),
-                    cam["rvec"].reshape(3, 1),
-                    cam["tvec"].reshape(3, 1),
+                projected = project_points_2d(
+                    np.array(world_pts), cam["rvec"], cam["tvec"],
                     cam["K"], cam["dist_coeffs"],
                 )
-                projected = proj_raw.reshape(-1, 2)
 
             for i in range(len(img_pts)):
                 detail = {
@@ -1020,7 +1013,6 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
         # Projection consistency check: project ALL template keypoints and compare
         # with detected keypoints to find phantom/missing projections
         if cam and "rvec" in cam and "tvec" in cam:
-            import cv2 as _cv2
             from .pnlcalib import KeypointMapper
 
             all_world = KeypointMapper.PNLCALIB_WORLD_COORDS_2D
@@ -1033,15 +1025,17 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
             phantom_count = 0  # projected in image but not detected
             missing_count = 0  # detected but projected outside image
 
-            for kid, (wx, wy) in enumerate(all_world):
-                if kid in non_ground:
-                    continue
-                obj = np.array([[[wx, wy, 0.0]]], dtype=np.float64)
-                proj, _ = _cv2.projectPoints(
-                    obj, cam["rvec"].reshape(3, 1), cam["tvec"].reshape(3, 1),
-                    cam["K"], cam["dist_coeffs"],
-                )
-                ix, iy = float(proj.ravel()[0]), float(proj.ravel()[1])
+            ground_ids = [kid for kid in range(len(all_world)) if kid not in non_ground]
+            ground_world = np.array(
+                [[all_world[k][0], all_world[k][1], 0.0] for k in ground_ids],
+                dtype=np.float64,
+            )
+            ground_proj = project_points_2d(
+                ground_world, cam["rvec"], cam["tvec"],
+                cam["K"], cam["dist_coeffs"],
+            )
+            for proj_idx, kid in enumerate(ground_ids):
+                ix, iy = float(ground_proj[proj_idx, 0]), float(ground_proj[proj_idx, 1])
                 in_image = -margin < ix < img_w + margin and -margin < iy < img_h + margin
                 detected = kid in detected_ids
 
@@ -1130,12 +1124,10 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
 
                 # Projected world line samples (orange) — where the model projects them
                 ws = np.array(lc["world_samples"])
-                proj, _ = cv2.projectPoints(
-                    ws.reshape(-1, 1, 3),
-                    camera_params["rvec"], camera_params["tvec"],
+                proj = project_points_2d(
+                    ws, camera_params["rvec"], camera_params["tvec"],
                     camera_params["K"], camera_params["dist_coeffs"],
                 )
-                proj = proj.reshape(-1, 2)
                 for i in range(len(proj) - 1):
                     px1 = (int(proj[i][0]), int(proj[i][1]))
                     px2 = (int(proj[i + 1][0]), int(proj[i + 1][1]))
@@ -1151,15 +1143,17 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
         from .pnlcalib import KeypointMapper
         all_world = calibrator._field_world_coords
         non_ground = KeypointMapper.NON_GROUND_KEYPOINTS
-        for kid, (wx, wy) in enumerate(all_world):
-            if kid in non_ground:
-                continue
-            obj = np.array([[[wx, wy, 0.0]]], dtype=np.float64)
-            proj, _ = cv2.projectPoints(
-                obj, camera_params["rvec"], camera_params["tvec"],
-                camera_params["K"], camera_params["dist_coeffs"],
-            )
-            ix, iy = proj.ravel()
+        ground_ids = [kid for kid in range(len(all_world)) if kid not in non_ground]
+        ground_world = np.array(
+            [[all_world[k][0], all_world[k][1], 0.0] for k in ground_ids],
+            dtype=np.float64,
+        )
+        ground_proj = project_points_2d(
+            ground_world, camera_params["rvec"], camera_params["tvec"],
+            camera_params["K"], camera_params["dist_coeffs"],
+        )
+        for proj_idx, kid in enumerate(ground_ids):
+            ix, iy = ground_proj[proj_idx]
             if -50 < ix < w + 50 and -50 < iy < h + 50:
                 pt = (int(ix), int(iy))
                 cv2.circle(vis, pt, 3, (0, 255, 255), -1)

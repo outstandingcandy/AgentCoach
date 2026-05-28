@@ -614,10 +614,7 @@ def _validate_with_crossbar(
     camera_poses: dict,
 ) -> dict | None:
     """Validate ball pixel against projected goal frame."""
-    try:
-        import cv2
-    except ImportError:
-        return None
+    from ...utils.projection import project_points_2d
 
     pose_frames = sorted(camera_poses.keys(), key=lambda f: int(f))
     nearest = min(
@@ -629,11 +626,6 @@ def _validate_with_crossbar(
     pose = camera_poses[nearest]
     if not pose.get("rvec"):
         return None
-
-    rvec = np.array(pose["rvec"], dtype=np.float64)
-    tvec = np.array(pose["tvec"], dtype=np.float64)
-    K = np.array(pose["K"], dtype=np.float64)
-    dist = np.array(pose["dist_coeffs"], dtype=np.float64)
 
     goal_x = (
         half_length if crossing["goal_side"] == "right" else -half_length
@@ -648,8 +640,11 @@ def _validate_with_crossbar(
         dtype=np.float64,
     )
 
-    img_pts, _ = cv2.projectPoints(goal_3d, rvec, tvec, K, dist)
-    img_pts = img_pts.reshape(-1, 2)
+    img_pts = project_points_2d(
+        goal_3d, pose["rvec"], pose["tvec"],
+        np.asarray(pose["K"], dtype=np.float64),
+        np.asarray(pose["dist_coeffs"], dtype=np.float64),
+    )
 
     ball_pixel = crossing["curr"].pixel_center
     if ball_pixel is None:

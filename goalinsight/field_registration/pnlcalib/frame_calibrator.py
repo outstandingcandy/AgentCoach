@@ -20,6 +20,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from ...utils.projection import project_points_2d
+
 try:
     from scipy.optimize import least_squares
 except ImportError:
@@ -35,6 +37,182 @@ PITCH_LENGTH = 105.0
 PITCH_WIDTH = 68.0
 HALF_L = PITCH_LENGTH / 2  # 52.5
 HALF_W = PITCH_WIDTH / 2   # 34.0
+
+
+def iterative_pnp_calibrate(
+    img_pts: np.ndarray,
+    world_pts_3d: np.ndarray,
+    image_size: tuple[int, int],
+    ransac_threshold: float = 10.0,
+) -> dict[str, Any] | None:
+    """PnLCalib's iterative PnP RANSAC + LM calibration.
+
+    Pipeline:
+    1. Multi-focal PnP RANSAC sweep with distortion priors (zero / -0.15 /
+       -0.30 barrel) — one best candidate per prior.
+    2. LM optimization of [f, rvec, tvec, k1, k2, p1, p2, k3] over inliers.
+    3. Undistort keypoints, re-run PnP RANSAC, repeat until convergence.
+    4. Pick best result across all candidates by lowest median error.
+
+    Args:
+        img_pts: (N, 2) pixel coordinates.
+        world_pts_3d: (N, 3) world coordinates (matching img_pts).
+        image_size: (width, height) for principal-point initialization.
+        ransac_threshold: Reprojection-error threshold (pixels) for RANSAC
+            and inlier mask.
+
+    Returns:
+        ``{"homography", "error", "num_points", "inliers", "camera_params",
+        "img_pts", "inlier_mask"}`` on success, or ``None`` if PnP fails.
+        ``camera_params`` keys: K, rvec, tvec, R, dist_coeffs, focal_length.
+    """
+    if len(img_pts) < 6:
+        logger.warning(f"Not enough 3D points for PnP: {len(img_pts)}")
+        return None
+
+    obj_pts = np.asarray(world_pts_3d, dtype=np.float64)
+    img_pts_2d = np.asarray(img_pts, dtype=np.float64)
+    w, h = int(image_size[0]), int(image_size[1])
+    cx, cy = w / 2.0, h / 2.0
+    focal_candidates = [600, 800, 1000, 1300, 1600, 2000]
+
+    lm_lower = [100, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf,
+                 -0.5, -0.5, -0.01, -0.01, -0.5]
+    lm_upper = [20000, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf,
+                 0.5, 0.5, 0.01, 0.01, 0.5]
+
+    dist_priors = [
+        None,
+        np.array([-0.15, 0.01, 0.0, 0.0, 0.0], dtype=np.float64),
+        np.array([-0.30, 0.05, 0.0, 0.0, 0.0], dtype=np.float64),
+    ]
+    pnp_candidates = []
+    for dist_prior in dist_priors:
+        best_for_prior = None
+        for f_try in focal_candidates:
+            K_try = np.array(
+                [[f_try, 0, cx], [0, f_try, cy], [0, 0, 1]], dtype=np.float64,
+            )
+            ok, rv, tv, inl = cv2.solvePnPRansac(
+                obj_pts, img_pts_2d, K_try, dist_prior,
+                reprojectionError=ransac_threshold, iterationsCount=2000,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+            if ok and inl is not None and len(inl) >= 6:
+                if best_for_prior is None or len(inl) > best_for_prior[0]:
+                    d = (dist_prior if dist_prior is not None
+                         else np.zeros(5, dtype=np.float64))
+                    best_for_prior = (len(inl), float(f_try), rv, tv, inl, d)
+        if best_for_prior is not None:
+            pnp_candidates.append(best_for_prior)
+
+    if not pnp_candidates:
+        logger.warning("PnP RANSAC failed for all focal/distortion candidates")
+        return None
+
+    max_iters = 5
+    overall_best_error = float("inf")
+    best_result = None
+
+    def _make_residuals(obj_in, img_in):
+        def residuals(x):
+            f = x[0]
+            dist = np.array(x[7:12], dtype=np.float64)
+            K = np.array(
+                [[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64,
+            )
+            projected = project_points_2d(obj_in, x[1:4], x[4:7], K, dist)
+            return (projected - img_in).ravel()
+        return residuals
+
+    for _, focal, rvec, tvec, pnp_inliers, dist_init in pnp_candidates:
+        cand_best_error = float("inf")
+
+        for iteration in range(max_iters):
+            idx = pnp_inliers.ravel()
+            obj_inliers = obj_pts[idx]
+            img_inliers = img_pts_2d[idx]
+
+            f_opt, rvec_opt, tvec_opt = focal, rvec, tvec
+            dist_cur = dist_init.copy()
+
+            if least_squares is not None:
+                x0 = np.array([
+                    focal, rvec[0, 0], rvec[1, 0], rvec[2, 0],
+                    tvec[0, 0], tvec[1, 0], tvec[2, 0], *dist_init,
+                ])
+                try:
+                    opt = least_squares(
+                        _make_residuals(obj_inliers, img_inliers), x0,
+                        method="trf", bounds=(lm_lower, lm_upper), max_nfev=300,
+                    )
+                    f_opt = opt.x[0]
+                    rvec_opt = opt.x[1:4].reshape(3, 1)
+                    tvec_opt = opt.x[4:7].reshape(3, 1)
+                    dist_cur = np.array(opt.x[7:12], dtype=np.float64)
+                except Exception:
+                    pass
+
+            K_opt = np.array(
+                [[f_opt, 0, cx], [0, f_opt, cy], [0, 0, 1]], dtype=np.float64,
+            )
+            all_proj = project_points_2d(
+                obj_pts, rvec_opt, tvec_opt, K_opt, dist_cur,
+            )
+            all_errors = np.linalg.norm(all_proj - img_pts_2d, axis=1)
+            inlier_mask = all_errors < ransac_threshold
+            n_inl = int(np.sum(inlier_mask))
+            error = float(np.median(all_errors))
+
+            R_opt, _ = cv2.Rodrigues(rvec_opt)
+            H = K_opt @ np.column_stack(
+                [R_opt[:, 0], R_opt[:, 1], tvec_opt.flatten()],
+            )
+            if abs(H[2, 2]) > 1e-10:
+                H = H / H[2, 2]
+
+            if error < overall_best_error:
+                overall_best_error = error
+                best_result = {
+                    "f": f_opt, "rvec": rvec_opt.copy(), "tvec": tvec_opt.copy(),
+                    "K": K_opt.copy(), "R": R_opt.copy(), "H": H.copy(),
+                    "dist": dist_cur.copy(), "n_inliers": n_inl,
+                    "error": error, "inlier_mask": inlier_mask.copy(),
+                }
+
+            if error >= cand_best_error:
+                break
+            cand_best_error = error
+
+            if iteration == max_iters - 1:
+                break
+
+            pts_undist = cv2.undistortPoints(
+                img_pts_2d.reshape(-1, 1, 2), K_opt, dist_cur, P=K_opt,
+            ).reshape(-1, 2)
+            ok2, rv2, tv2, inl2 = cv2.solvePnPRansac(
+                obj_pts, pts_undist, K_opt, None,
+                reprojectionError=ransac_threshold, iterationsCount=2000,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+            if not ok2 or inl2 is None or len(inl2) < 6:
+                break
+
+            focal, rvec, tvec = f_opt, rv2, tv2
+            pnp_inliers = inl2
+            dist_init = dist_cur
+
+    r = best_result
+    camera_params = {
+        "K": r["K"], "rvec": r["rvec"], "tvec": r["tvec"],
+        "R": r["R"], "dist_coeffs": r["dist"], "focal_length": r["f"],
+    }
+    return {
+        "homography": r["H"], "error": r["error"],
+        "num_points": len(obj_pts), "inliers": r["n_inliers"],
+        "camera_params": camera_params,
+        "img_pts": img_pts_2d, "inlier_mask": r["inlier_mask"],
+    }
 
 
 class FramebyFrameCalib:
@@ -462,165 +640,17 @@ class FramebyFrameCalib:
     ) -> dict[str, Any] | None:
         """Camera calibration using iterative PnP RANSAC + LM optimization.
 
-        Pipeline:
-        1. Build 3D correspondences (ground + crossbar points)
-        2. Multi-focal PnP RANSAC sweep with distortion priors
-        3. LM optimization of [f, rvec, tvec, k1, k2, p1, p2, k3]
-        4. Undistort keypoints, re-run PnP RANSAC, repeat until convergence
-        5. Best result across all candidates selected by lowest error
-
-        Args:
-            keypoint_mapper: KeypointMapper instance.
-            min_confidence: Minimum keypoint confidence.
-            ransac_threshold: Reprojection error threshold (pixels).
-
-        Returns:
-            Calibration result dict, or None on failure.
+        Builds 3D correspondences from the keypoint mapper and delegates to
+        ``iterative_pnp_calibrate`` (the bare-bones algorithm, reused by the
+        manual annotator).
         """
-        img_pts, world_pts_3d, kp_ids = keypoint_mapper.build_3d_correspondence_matrix(
+        img_pts, world_pts_3d, _ = keypoint_mapper.build_3d_correspondence_matrix(
             self.keypoints, filter_by_confidence=min_confidence, exclude_non_ground=True,
         )
-        if len(img_pts) < 6:
-            logger.warning(f"Not enough 3D points for PnP: {len(img_pts)}")
-            return None
-
-        obj_pts = world_pts_3d.astype(np.float64)
-        img_pts_2d = img_pts.astype(np.float64)
-        cx, cy = self.w / 2.0, self.h / 2.0
-        focal_candidates = [600, 800, 1000, 1300, 1600, 2000]
-
-        lm_lower = [100, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf,
-                     -0.5, -0.5, -0.01, -0.01, -0.5]
-        lm_upper = [20000, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf,
-                     0.5, 0.5, 0.01, 0.01, 0.5]
-
-        # Collect best PnP candidate per distortion prior
-        dist_priors = [
-            None,
-            np.array([-0.15, 0.01, 0.0, 0.0, 0.0], dtype=np.float64),
-            np.array([-0.30, 0.05, 0.0, 0.0, 0.0], dtype=np.float64),
-        ]
-        pnp_candidates = []
-        for dist_prior in dist_priors:
-            best_for_prior = None
-            for f_try in focal_candidates:
-                K_try = np.array([[f_try, 0, cx], [0, f_try, cy], [0, 0, 1]], dtype=np.float64)
-                ok, rv, tv, inl = cv2.solvePnPRansac(
-                    obj_pts, img_pts_2d, K_try, dist_prior,
-                    reprojectionError=ransac_threshold, iterationsCount=2000,
-                    flags=cv2.SOLVEPNP_ITERATIVE,
-                )
-                if ok and inl is not None and len(inl) >= 6:
-                    if best_for_prior is None or len(inl) > best_for_prior[0]:
-                        d = dist_prior if dist_prior is not None else np.zeros(5, dtype=np.float64)
-                        best_for_prior = (len(inl), float(f_try), rv, tv, inl, d)
-            if best_for_prior is not None:
-                pnp_candidates.append(best_for_prior)
-
-        if not pnp_candidates:
-            logger.warning("PnP RANSAC failed for all focal/distortion candidates")
-            return None
-
-        # Iterative refinement for each candidate, keep overall best
-        max_iters = 5
-        overall_best_error = float("inf")
-        best_result = None
-
-        def _make_residuals(obj_in, img_in):
-            def residuals(x):
-                f = x[0]
-                rv = x[1:4].reshape(3, 1)
-                tv = x[4:7].reshape(3, 1)
-                dist = np.array(x[7:12], dtype=np.float64)
-                K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
-                projected, _ = cv2.projectPoints(obj_in, rv, tv, K, dist)
-                return (projected.reshape(-1, 2) - img_in).ravel()
-            return residuals
-
-        for _, focal, rvec, tvec, pnp_inliers, dist_init in pnp_candidates:
-            cand_best_error = float("inf")
-
-            for iteration in range(max_iters):
-                idx = pnp_inliers.ravel()
-                obj_inliers = obj_pts[idx]
-                img_inliers = img_pts_2d[idx]
-
-                f_opt, rvec_opt, tvec_opt = focal, rvec, tvec
-                dist_cur = dist_init.copy()
-
-                if least_squares is not None:
-                    x0 = np.array([
-                        focal, rvec[0, 0], rvec[1, 0], rvec[2, 0],
-                        tvec[0, 0], tvec[1, 0], tvec[2, 0], *dist_init,
-                    ])
-                    try:
-                        opt = least_squares(
-                            _make_residuals(obj_inliers, img_inliers), x0,
-                            method="trf", bounds=(lm_lower, lm_upper), max_nfev=300,
-                        )
-                        f_opt = opt.x[0]
-                        rvec_opt = opt.x[1:4].reshape(3, 1)
-                        tvec_opt = opt.x[4:7].reshape(3, 1)
-                        dist_cur = np.array(opt.x[7:12], dtype=np.float64)
-                    except Exception:
-                        pass
-
-                # Evaluate on ALL points
-                K_opt = np.array([[f_opt, 0, cx], [0, f_opt, cy], [0, 0, 1]], dtype=np.float64)
-                all_proj, _ = cv2.projectPoints(obj_pts, rvec_opt, tvec_opt, K_opt, dist_cur)
-                all_errors = np.linalg.norm(all_proj.reshape(-1, 2) - img_pts_2d, axis=1)
-                inlier_mask = all_errors < ransac_threshold
-                n_inl = int(np.sum(inlier_mask))
-                error = float(np.median(all_errors))
-
-                R_opt, _ = cv2.Rodrigues(rvec_opt)
-                H = K_opt @ np.column_stack([R_opt[:, 0], R_opt[:, 1], tvec_opt.flatten()])
-                if abs(H[2, 2]) > 1e-10:
-                    H = H / H[2, 2]
-
-                if error < overall_best_error:
-                    overall_best_error = error
-                    best_result = {
-                        "f": f_opt, "rvec": rvec_opt.copy(), "tvec": tvec_opt.copy(),
-                        "K": K_opt.copy(), "R": R_opt.copy(), "H": H.copy(),
-                        "dist": dist_cur.copy(), "n_inliers": n_inl,
-                        "error": error, "inlier_mask": inlier_mask.copy(),
-                    }
-
-                if error >= cand_best_error:
-                    break
-                cand_best_error = error
-
-                if iteration == max_iters - 1:
-                    break
-
-                # Undistort and re-run PnP for next iteration
-                pts_undist = cv2.undistortPoints(
-                    img_pts_2d.reshape(-1, 1, 2), K_opt, dist_cur, P=K_opt,
-                ).reshape(-1, 2)
-                ok2, rv2, tv2, inl2 = cv2.solvePnPRansac(
-                    obj_pts, pts_undist, K_opt, None,
-                    reprojectionError=ransac_threshold, iterationsCount=2000,
-                    flags=cv2.SOLVEPNP_ITERATIVE,
-                )
-                if not ok2 or inl2 is None or len(inl2) < 6:
-                    break
-
-                focal, rvec, tvec = f_opt, rv2, tv2
-                pnp_inliers = inl2
-                dist_init = dist_cur
-
-        r = best_result
-        camera_params = {
-            "K": r["K"], "rvec": r["rvec"], "tvec": r["tvec"],
-            "R": r["R"], "dist_coeffs": r["dist"], "focal_length": r["f"],
-        }
-        return {
-            "homography": r["H"], "error": r["error"],
-            "num_points": len(obj_pts), "inliers": r["n_inliers"],
-            "camera_params": camera_params,
-            "img_pts": img_pts_2d, "inlier_mask": r["inlier_mask"],
-        }
+        return iterative_pnp_calibrate(
+            img_pts, world_pts_3d, (self.w, self.h),
+            ransac_threshold=ransac_threshold,
+        )
 
     def _h_decompose_calibrate(
         self,
@@ -724,12 +754,10 @@ class FramebyFrameCalib:
         if least_squares is not None:
             def make_residuals(x):
                 f = x[0]
-                rv = x[1:4].reshape(3, 1)
-                tv = x[4:7].reshape(3, 1)
                 dist = np.array([x[7], x[8], x[11], x[12], 0.0], dtype=np.float64)
                 K = np.array([[f, 0, x[9]], [0, f, x[10]], [0, 0, 1]], dtype=np.float64)
-                projected, _ = cv2.projectPoints(obj_pts, rv, tv, K, dist)
-                return (projected.reshape(-1, 2) - img_pts).ravel()
+                projected = project_points_2d(obj_pts, x[1:4], x[4:7], K, dist)
+                return (projected - img_pts).ravel()
 
             x0 = np.array([
                 f_init, rvec_init[0, 0], rvec_init[1, 0], rvec_init[2, 0],
@@ -756,8 +784,8 @@ class FramebyFrameCalib:
                 dist_init = np.zeros(5, dtype=np.float64)
 
         K_opt = np.array([[f_init, 0, cx], [0, f_init, cy], [0, 0, 1]], dtype=np.float64)
-        all_proj, _ = cv2.projectPoints(obj_pts, rvec_init, tvec_init, K_opt, dist_init)
-        all_errors = np.linalg.norm(all_proj.reshape(-1, 2) - img_pts, axis=1)
+        all_proj = project_points_2d(obj_pts, rvec_init, tvec_init, K_opt, dist_init)
+        all_errors = np.linalg.norm(all_proj - img_pts, axis=1)
         final_inlier_mask = all_errors < ransac_threshold
         if int(np.sum(final_inlier_mask)) < 6:
             return None
