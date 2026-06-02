@@ -1,0 +1,32 @@
+# Keep the docker build context small. These dirs balloon to multi-GB
+# locally and have no role in the Processing Job image (data lives on
+# S3, weights are downloaded at startup, output is written to
+# /opt/ml/processing/output at runtime).
+data/
+output/
+webapp_videos/
+chat_artifacts/
+tools/
+docs/
+.venv/
+venv/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / VCS
+.git/
+.idea/
+.vscode/
+
+# CLAUDE settings, transcripts
+.claude/
+
+# Big standalone weights — entrypoint downloads from S3 instead.
+yolov8x.pt
+*.pt
+*.pth

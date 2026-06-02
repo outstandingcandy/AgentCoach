@@ -1,0 +1,36 @@
+# Slim dependency set for SageMaker Processing Job — covers
+# field_registration and tracking only. Excludes VLM/OCR backends
+# (mmocr, mmcv, sam2, qwen-vl-utils, transformers) that aren't reachable
+# from these two stages and would balloon the image by GB.
+#
+# Keep in sync with goalinsight imports under field_registration/* and
+# tracking/* (excluding jersey backends, which only fire from
+# track_consolidation — a stage we run locally for now).
+
+# Pinned PyTorch family lives in the base image; do NOT re-pin here or
+# pip will re-resolve and break CUDA wheels.
+
+ultralytics>=8.0.0
+sahi>=0.11.0
+deep-sort-realtime
+
+# ReID — torchreid pulls torch via its own setup; harmless re-resolve
+# because we install with --no-deps where it matters.
+torchreid
+
+# CV / numerical
+opencv-python-headless>=4.8.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+timm>=0.9.0
+Pillow>=10.0.0
+
+# Utilities
+pyyaml>=6.0
+tqdm>=4.65.0
+numpy>=1.24.0,<2
+yacs>=0.1.8
+einops>=0.6.0
+
+# AWS — used for downloading weights from S3 inside the container.
+boto3>=1.28
