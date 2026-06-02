@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,11 @@ from .chat import ChatEngine
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
+# Plots / images that run_python emits are stored here and mounted at
+# /chat_artifacts/* so the chat UI can render them inline. Cleared on
+# app start so old artifacts from a previous viewer session don't
+# silently shadow new ones with the same name.
+CHAT_ARTIFACTS_URL = "/chat_artifacts"
 
 
 class ChatMessage(BaseModel):
@@ -52,9 +58,23 @@ def create_app(run_dir: Path, video_path: Path | None = None) -> FastAPI:
             raise FileNotFoundError(f"annotated video not found: {full_path}")
 
     ctx = MatchContext.from_output_dir(run_dir)
-    engine = ChatEngine(ctx=ctx)
+
+    artifact_dir = run_dir / "chat_artifacts"
+    if artifact_dir.exists():
+        shutil.rmtree(artifact_dir)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    engine = ChatEngine(
+        ctx=ctx,
+        artifact_dir=artifact_dir,
+        artifact_url_prefix=CHAT_ARTIFACTS_URL,
+    )
 
     app = FastAPI(title="GoalInsight Viewer")
+
+    @app.on_event("shutdown")
+    def _shutdown() -> None:
+        engine.close()
 
     @app.get("/")
     def index() -> FileResponse:
@@ -119,4 +139,9 @@ def create_app(run_dir: Path, video_path: Path | None = None) -> FastAPI:
         )
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount(
+        CHAT_ARTIFACTS_URL,
+        StaticFiles(directory=artifact_dir),
+        name="chat_artifacts",
+    )
     return app
