@@ -26,14 +26,51 @@ pitch:
 field_registration:
   backend: "pnlcalib"
 
+  # Use the upstream-aligned port: it plumbs the pitch.* override above
+  # (via SoccerPitch.from_dict) into the world keypoint table, and uses
+  # heuristic_voting (18 RANSAC combos) instead of single-shot 4-point PnP.
+  # The in-tree pnlcalib path still hardcodes FIFA dims and 4-point PnP, so
+  # on this non-FIFA youth pitch it produced very loose H matrices.
+  pnlcalib_orig:
+    enabled: true
+
   pnlcalib:
-    keypoint_model_path: "data/finetuned_models/run_20260526_160037/models/best_model.pt"
+    keypoint_model_path: "data/finetuned_models/run_20260531_024941/models/best_model.pt"
     keypoint_weights: "SV_kp"
     keypoint_threshold: 0.15
+    # Line detection: re-enabled with finetuned line model (5 frames, 26 lines).
+    # Zero-shot SV_lines previously pulled rep_err 2.91 → 82px because of
+    # uncertain endpoints; a finetuned head on the actual kids_soccer pitch
+    # should give cleaner endpoints.
+    use_lines: true
+    line_model_path: "data/finetuned_line_models/run_20260601_142205/models/best_model.pt"
     line_weights: "SV_lines"
     line_threshold: 0.10
     pnl_refine: true
     line_weight: 1.0
+
+    # Drop keypoints whose world<->image correspondence is inconsistent
+    # with a single planar homography. Catches mis-IDed detections (e.g.
+    # id 17 firing on a left-half frame) before they pull cv2.calibrateCamera
+    # into a phantom small-fx solution.
+    geometric_outlier_filter:
+      enabled: true
+      ransac_threshold_px: 50.0
+      min_keypoints: 6
+
+  # SIFT-based chain propagation between PnLCalib anchors. Fills in
+  # frames the keypoint detector couldn't see enough markings to solve
+  # — a static-camera 60s clip stays geometrically stable enough across
+  # 5–20 frame gaps that frame-to-frame H accumulation tracks the pitch
+  # well. ``max_gap_frames`` bails out of long propagations where drift
+  # would dominate.
+  gap_filling:
+    enabled: true
+    method: improved
+    smoothing_window: 5
+    use_masking: false
+    frame_step: 1
+    max_gap_frames: 60
 
 detection:
   model: "yolov8x"

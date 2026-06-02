@@ -45,8 +45,16 @@ def draw_vis_keypoints(frame, keypoints):
     return vis
 
 
-def draw_vis_lines(frame, lines):
-    """Draw line detection results on the frame."""
+def draw_vis_lines(frame, lines, conf_threshold=0.15):
+    """Draw line detection results on the frame.
+
+    Args:
+        frame: BGR frame.
+        lines: List of dicts from ``LineDetector.detect``.
+        conf_threshold: Minimum confidence to render. Pass the same value the
+            solver was configured with so the overlay reflects what the
+            calibrator actually consumed.
+    """
     from ..field_registration.pnlcalib import LineMapper
 
     vis = frame.copy()
@@ -61,7 +69,7 @@ def draw_vis_lines(frame, lines):
 
     for line in lines:
         conf = line.get("confidence", 0)
-        if conf < 0.15:
+        if conf < conf_threshold:
             continue
         n_detected += 1
         line_id = line.get("id", -1)
@@ -73,10 +81,9 @@ def draw_vis_lines(frame, lines):
         mx, my = (x1 + x2) // 2, (y1 + y2) // 2
         _draw_label(vis, mx, my, f"L{line_id}({conf:.2f})")
 
-    cv2.putText(vis, f"Lines: {n_detected} (conf>=0.15)", (10, 25),
-                font, 0.6, (255, 255, 255), 2)
-    cv2.putText(vis, f"Lines: {n_detected} (conf>=0.15)", (10, 25),
-                font, 0.6, (0, 255, 255), 1)
+    header = f"Lines: {n_detected} (conf>={conf_threshold:.2f})"
+    cv2.putText(vis, header, (10, 25), font, 0.6, (255, 255, 255), 2)
+    cv2.putText(vis, header, (10, 25), font, 0.6, (0, 255, 255), 1)
     return vis
 
 
