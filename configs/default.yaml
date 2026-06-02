@@ -369,3 +369,27 @@ pipeline:
   stages:
     - field_registration
     - tracking
+
+# Stage execution options. Remote execution is opt-in: pass
+# --remote-stages=field_registration,tracking on the CLI (or set
+# execution.remote_stages here) to run those stages on a SageMaker
+# Processing Job. Default is local — leave this commented out.
+# execution:
+#   remote_stages: []
+
+# SageMaker Processing Job settings — populate with the values printed
+# by sagemaker/setup_aws.sh. Leaving any of region/role_arn/image_uri/
+# s3_bucket unset disables remote execution (the stage adapter falls
+# back to local with an explicit error).
+sagemaker:
+  region: ""
+  role_arn: ""
+  image_uri: ""
+  s3_bucket: ""
+  s3_prefix: pipeline-runs
+  weights_s3_prefix: weights
+  default_instance_type: ml.g5.xlarge
+  instance_count: 1
+  volume_size_gb: 50
+  max_runtime_seconds: 3600
+  fetch_visualizations: false  # set true if you need vis dumps locally

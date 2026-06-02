@@ -177,6 +177,10 @@ YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merg
 - `highlights.temporal.*`: buildup/celebration durations, view types
 - `highlights.effects.*`: shooter spotlight, ball trail settings
 
+## Remote stage execution (SageMaker)
+
+`field_registration` and `tracking` can run on a SageMaker Processing Job instead of locally. Default behaviour is unchanged (local). Opt in per-run via `--remote-stages field_registration[,tracking]`. Requires the `sagemaker:` block in config to be filled (region, role_arn, image_uri, s3_bucket). One-time setup is `bash sagemaker/setup_aws.sh && bash sagemaker/upload_weights.sh && bash sagemaker/build_and_push.sh`. Full docs in `sagemaker/README.md`.
+
 ## Tools
 
 - `tools/make_comparison.py`: Creates picture-in-picture comparison video (enhanced full-screen + raw source as PiP in bottom-right). Reads highlight metadata JSON to reconstruct segment timing. Usage: `python tools/make_comparison.py --enhanced <highlight.mp4> --raw <source.mp4> --output <out.mp4> --label`

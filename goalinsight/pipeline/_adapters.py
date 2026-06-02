@@ -1,11 +1,53 @@
 """Pipeline stage adapters — bridge between Pipeline framework and business modules."""
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from ._base import Stage, PipelineContext
 from ._registry import register_stage
+
+logger = logging.getLogger(__name__)
+
+
+def _should_run_remote(stage_name: str, config: dict[str, Any] | None) -> bool:
+    """Honor the ``execution.remote_stages`` opt-in list in config.
+
+    Returns False (= run locally) unless the stage explicitly appears
+    there. Default behavior is unchanged from the local-only era.
+    """
+    if not config:
+        return False
+    remote = (config.get("execution") or {}).get("remote_stages") or []
+    return stage_name in set(remote)
+
+
+def _run_remote(stage_name: str, ctx: PipelineContext) -> dict[str, Any]:
+    """Submit *stage_name* to SageMaker; download products into ctx.output_dir.
+
+    Returns an empty stats dict — remote runs don't surface the rich
+    in-process counters that local runners build up. The product files
+    landing on disk are what downstream stages care about anyway.
+    """
+    from ._remote import SageMakerConfig, run_stage_remote
+
+    sm_config = SageMakerConfig.from_config(ctx.config)
+    if sm_config is None:
+        raise RuntimeError(
+            f"--remote-stages includes '{stage_name}' but the config "
+            "lacks a complete sagemaker block (region, role_arn, "
+            "image_uri, s3_bucket all required)."
+        )
+    logger.info("[%s] running remotely on SageMaker", stage_name)
+    run_stage_remote(
+        stage=stage_name,
+        video_path=ctx.video_path,
+        output_dir=ctx.output_dir,
+        config=ctx.config,
+        sm_config=sm_config,
+    )
+    return {"executed": "remote"}
 
 
 @register_stage
@@ -14,6 +56,9 @@ class FieldRegistrationStage(Stage):
     description = "Field Registration"
 
     def run(self, ctx: PipelineContext) -> dict[str, Any]:
+        if _should_run_remote(self.name, ctx.config):
+            return _run_remote(self.name, ctx)
+
         from ..utils.config import get_default_config, get_process_fps_from_config
 
         out = ctx.stage_dir(self.name)
@@ -54,6 +99,9 @@ class TrackingStage(Stage):
     description = "Tracking and Identification"
 
     def run(self, ctx: PipelineContext) -> dict[str, Any]:
+        if _should_run_remote(self.name, ctx.config):
+            return _run_remote(self.name, ctx)
+
         from ..tracking.orchestrator import run_tracking
 
         out = ctx.stage_dir(self.name)

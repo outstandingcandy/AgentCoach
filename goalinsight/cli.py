@@ -74,6 +74,17 @@ def main():
         action="store_true",
         help="Skip tracking visualization video (saves time and memory)"
     )
+    parser.add_argument(
+        "--remote-stages",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated stages to execute on SageMaker Processing "
+            "Job instead of locally. Currently supported: "
+            "field_registration, tracking. Requires the sagemaker block "
+            "to be configured in the YAML config."
+        ),
+    )
     args = parser.parse_args()
 
     video_path = Path(args.video)
@@ -109,6 +120,12 @@ def main():
         if "output" not in config:
             config["output"] = {}
         config["output"]["save_visualizations"] = False
+
+    # Wire remote-execution opt-in into the config so stage adapters
+    # can read it without us threading a separate flag through Pipeline.
+    if args.remote_stages:
+        remote = [s.strip() for s in args.remote_stages.split(",") if s.strip()]
+        config.setdefault("execution", {})["remote_stages"] = remote
 
     # Build and run pipeline
     if args.stages:
