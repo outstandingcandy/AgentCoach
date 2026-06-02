@@ -13,7 +13,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from . import pitch_constants
-from .index import AnnotationIndex
 from .pitch import keypoints as _pk
 from .pitch.geometry import SoccerPitch
 from .pitch.keypoints import (
@@ -46,7 +45,10 @@ def create_app(
 ) -> FastAPI:
     videos_root_path = Path(videos_root)
     annotator = AnchorAnnotator(annotations_dir=annotations_dir, pitch=pitch)
-    index = AnnotationIndex(annotations_dir)
+    # Share the annotator's index — a separate instance would never see
+    # frames added by ``_save_frame_annotation`` because each AnnotationIndex
+    # caches its own copy of index.json in memory.
+    index = annotator.index
 
     discovered = _discover_videos(videos_root_path)
     if not discovered:

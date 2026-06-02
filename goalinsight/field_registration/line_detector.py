@@ -108,11 +108,25 @@ class LineDetector:
         Returns:
             Preprocessed tensor.
         """
-        # Resize to expected input size
-        resized = cv2.resize(frame, (self.input_size[1], self.input_size[0]))
-
-        # Convert BGR to RGB
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        # Resize to expected input size. The pnlcalib finetune dataloader
+        # (LineAnnotationDataset) loads via PIL.Image and resizes with
+        # PIL.Image.BILINEAR — which is NOT identical to cv2.INTER_LINEAR
+        # (different kernel center + antialias). max-diff between the two
+        # outputs measured on real frames is ~0.19 in [0,1] space, enough
+        # to push edge-adjacent line endpoints past the NMS threshold and
+        # fabricate spurious peaks at the heatmap border. So when the
+        # backend is pnlcalib we go through PIL to match training exactly.
+        if self.backend == "pnlcalib":
+            from PIL import Image
+            rgb_full = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil = Image.fromarray(rgb_full)
+            pil = pil.resize(
+                (self.input_size[1], self.input_size[0]), Image.BILINEAR,
+            )
+            rgb = np.asarray(pil)
+        else:
+            resized = cv2.resize(frame, (self.input_size[1], self.input_size[0]))
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
         # Convert to tensor and normalize to [0, 1]
         tensor = torch.from_numpy(rgb).float().permute(2, 0, 1) / 255.0

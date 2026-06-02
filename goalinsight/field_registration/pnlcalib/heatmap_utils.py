@@ -453,12 +453,17 @@ def get_lines_from_heatmap_maxpool(
 
     batch_size, n_channels, _, width = heatmap.shape
 
-    # Apply local maxima detection using max pooling
-    # Note: For lines, we use standard padding (NOT padding with 1.0 like keypoints)
+    # Apply local maxima detection using max pooling.
+    # Pad with 1.0 (above any real heatmap value) so that border-adjacent
+    # non-peaks lose to the synthetic 1.0 in max_pool and get suppressed.
+    # Without this, channels with near-zero outputs surface fake peaks at
+    # the heatmap edges via topk — which is exactly the artefact we used
+    # to see (every endpoint ending up at x=0/W or y=0/H).
     kernel = min_keypoint_pixel_distance * 2 + 1
-    pad = int((kernel - 1) / 2)
+    pad = min_keypoint_pixel_distance
 
-    max_pooled_heatmap = F.max_pool2d(heatmap, kernel, stride=1, padding=pad)
+    padded_heatmap = F.pad(heatmap, (pad, pad, pad, pad), mode="constant", value=1.0)
+    max_pooled_heatmap = F.max_pool2d(padded_heatmap, kernel, stride=1, padding=0)
     # Keep only local maxima (where value equals max pooled value)
     local_maxima = (max_pooled_heatmap == heatmap)
     # Zero out non-maxima

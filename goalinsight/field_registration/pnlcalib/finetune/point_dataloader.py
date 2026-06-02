@@ -516,6 +516,7 @@ class AugmentedPointDataset(PointAnnotationDataset):
         zoom_range: tuple[float, float] = (1.0, 1.5),
         zoom_prob: float = 0.5,
         min_keypoints: int = 4,
+        hflip_prob: float = 0.5,
         **kwargs,
     ):
         """Initialize with augmentation.
@@ -526,6 +527,13 @@ class AugmentedPointDataset(PointAnnotationDataset):
             zoom_range: (min_zoom, max_zoom) for zoom crop augmentation.
             zoom_prob: Probability of applying zoom crop.
             min_keypoints: Minimum keypoints required after zoom crop.
+            hflip_prob: Probability of horizontal flip + mirror-id swap. Set
+                to 0 when the dataset comes from a fixed-side camera and
+                hflipped images don't reflect any real inference-time view —
+                otherwise the mirror-id swap synthesises positives for the
+                opposite-half keypoint channels and the model double-fires
+                left/right pairs at inference (e.g. id 15 + id 17 firing on
+                the same goalpost).
             **kwargs: Additional arguments for PointAnnotationDataset.
         """
         super().__init__(annotations_dir, **kwargs)
@@ -534,6 +542,7 @@ class AugmentedPointDataset(PointAnnotationDataset):
 
         # Zoom augmentation
         self.zoom_prob = zoom_prob
+        self.hflip_prob = hflip_prob
         self.zoom_crop = KeypointRandomZoomCrop(
             zoom_range=zoom_range,
             min_keypoints=min_keypoints,
@@ -645,8 +654,9 @@ class AugmentedPointDataset(PointAnnotationDataset):
         if self.rng.random() > 0.5:
             image = gamma_correction(image, self.rng)
 
-        # Horizontal flip with keypoint ID swapping
-        if self.rng.random() > 0.5:
+        # Horizontal flip with keypoint ID swapping. See __init__ for why
+        # this is gated rather than always-on.
+        if self.hflip_prob > 0 and self.rng.random() < self.hflip_prob:
             image = np.fliplr(image).copy()
             new_keypoints = {}
             for kp_id, kp in keypoints.items():
@@ -696,6 +706,7 @@ class CachedAugmentedDataset(Dataset):
         sigma: float = 2.0,
         tolerance: float = 0.5,
         seed: int = 42,
+        hflip_prob: float = 0.5,
     ):
         """Initialize and pre-generate all augmented samples.
 
@@ -711,6 +722,8 @@ class CachedAugmentedDataset(Dataset):
             sigma: Gaussian standard deviation for heatmaps.
             tolerance: World coordinate matching tolerance.
             seed: Random seed for reproducibility.
+            hflip_prob: Probability of horizontal flip (see
+                ``AugmentedPointDataset.__init__`` for why this is gated).
         """
         self.image_size = image_size
         self.num_keypoints = num_keypoints
@@ -725,6 +738,7 @@ class CachedAugmentedDataset(Dataset):
 
         # Zoom augmentation
         self.zoom_prob = zoom_prob
+        self.hflip_prob = hflip_prob
         self.zoom_crop = KeypointRandomZoomCrop(
             zoom_range=zoom_range,
             min_keypoints=min_keypoints,
@@ -862,8 +876,9 @@ class CachedAugmentedDataset(Dataset):
         if self.rng.random() > 0.5:
             image = gamma_correction(image, self.rng)
 
-        # Horizontal flip with keypoint ID swapping
-        if self.rng.random() > 0.5:
+        # Horizontal flip with keypoint ID swapping. See __init__ for why
+        # this is gated rather than always-on.
+        if self.hflip_prob > 0 and self.rng.random() < self.hflip_prob:
             image = np.fliplr(image).copy()
             new_keypoints = {}
             for kp_id, kp in keypoints.items():

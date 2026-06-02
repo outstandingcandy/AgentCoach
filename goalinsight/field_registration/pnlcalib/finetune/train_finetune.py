@@ -466,6 +466,17 @@ def main():
         help="Minimum keypoints required after zoom crop",
     )
     parser.add_argument(
+        "--hflip_prob",
+        type=float,
+        default=0.5,
+        help=(
+            "Probability of horizontal flip + mirror-id swap. Set to 0 for "
+            "fixed-side cameras: a hflipped image is never an inference-time "
+            "view, so mirror-id swap synthesises false positives on the "
+            "opposite-half keypoint channels."
+        ),
+    )
+    parser.add_argument(
         "--cuda",
         type=str,
         default="0",
@@ -558,6 +569,7 @@ def main():
         zoom_range=tuple(args.zoom_range),
         zoom_prob=args.zoom_prob,
         min_keypoints=args.min_keypoints,
+        hflip_prob=args.hflip_prob,
     )
 
     # For validation, use pre-cached augmented data (fixed across epochs)
@@ -570,6 +582,7 @@ def main():
         zoom_prob=args.zoom_prob,
         min_keypoints=args.min_keypoints,
         seed=args.val_seed,
+        hflip_prob=args.hflip_prob,
     )
 
     print(f"Training samples: {len(train_dataset)} (with augmentation)")

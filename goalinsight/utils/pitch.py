@@ -44,13 +44,17 @@ def get_pitch_template_points(pitch_length=None, pitch_width=None):
     half_l = pl / 2
     half_w = pw / 2
 
-    # FIFA standard marking dimensions (fixed regardless of pitch size)
-    PA_DEPTH = 16.5
-    PA_HW = 20.16   # penalty area half-width
-    GA_DEPTH = 5.5
-    GA_HW = 9.16    # goal area half-width
-    PS_DIST = 11.0   # penalty spot distance from goal line
-    CR = 9.15        # center circle radius
+    # Marking dimensions track the active pitch — non-FIFA youth pitches
+    # have their own penalty/goal-area sizes. Reading FIFA constants here
+    # produced an overlay where the outer touchlines match the solver's
+    # H but the inner boxes/circle don't, masquerading as "calibration
+    # is wrong" when the H was actually correct.
+    PA_DEPTH = active.PENALTY_AREA_LENGTH
+    PA_HW = active.PENALTY_AREA_WIDTH / 2.0
+    GA_DEPTH = active.GOAL_AREA_LENGTH
+    GA_HW = active.GOAL_AREA_WIDTH / 2.0
+    PS_DIST = active.GOAL_LINE_TO_PENALTY_MARK
+    CR = active.CENTER_CIRCLE_RADIUS
 
     return {
         'pitch_outline': [
@@ -177,26 +181,36 @@ def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_m
     line_color = (255, 255, 255)
     lw = max(1, int(scale * 0.3))
 
+    # Marking dimensions follow the active pitch (kids pitches have
+    # smaller penalty/goal areas than FIFA), matching the same fix in
+    # get_pitch_template_points above.
+    pa_d = active.PENALTY_AREA_LENGTH
+    pa_hw = active.PENALTY_AREA_WIDTH / 2.0
+    ga_d = active.GOAL_AREA_LENGTH
+    ga_hw = active.GOAL_AREA_WIDTH / 2.0
+    ps_dist = active.GOAL_LINE_TO_PENALTY_MARK
+    cr = active.CENTER_CIRCLE_RADIUS
+
     # Pitch outline
     cv2.rectangle(pitch, w2p(-half_l, half_w), w2p(half_l, -half_w), line_color, lw)
     # Center line
     cv2.line(pitch, w2p(0, half_w), w2p(0, -half_w), line_color, lw)
-    # Center circle (r=9.15m)
+    # Center circle
     center_px = w2p(0, 0)
-    cv2.circle(pitch, center_px, int(9.15 * scale), line_color, lw)
+    cv2.circle(pitch, center_px, int(cr * scale), line_color, lw)
     # Center spot
     cv2.circle(pitch, center_px, max(2, int(0.3 * scale)), line_color, -1)
     # Left penalty area
-    cv2.rectangle(pitch, w2p(-half_l, 20.16), w2p(-half_l + 16.5, -20.16), line_color, lw)
+    cv2.rectangle(pitch, w2p(-half_l, pa_hw), w2p(-half_l + pa_d, -pa_hw), line_color, lw)
     # Right penalty area
-    cv2.rectangle(pitch, w2p(half_l - 16.5, 20.16), w2p(half_l, -20.16), line_color, lw)
+    cv2.rectangle(pitch, w2p(half_l - pa_d, pa_hw), w2p(half_l, -pa_hw), line_color, lw)
     # Left goal area
-    cv2.rectangle(pitch, w2p(-half_l, 9.16), w2p(-half_l + 5.5, -9.16), line_color, lw)
+    cv2.rectangle(pitch, w2p(-half_l, ga_hw), w2p(-half_l + ga_d, -ga_hw), line_color, lw)
     # Right goal area
-    cv2.rectangle(pitch, w2p(half_l - 5.5, 9.16), w2p(half_l, -9.16), line_color, lw)
+    cv2.rectangle(pitch, w2p(half_l - ga_d, ga_hw), w2p(half_l, -ga_hw), line_color, lw)
     # Penalty spots
-    cv2.circle(pitch, w2p(-half_l + 11, 0), max(2, int(0.3 * scale)), line_color, -1)
-    cv2.circle(pitch, w2p(half_l - 11, 0), max(2, int(0.3 * scale)), line_color, -1)
+    cv2.circle(pitch, w2p(-half_l + ps_dist, 0), max(2, int(0.3 * scale)), line_color, -1)
+    cv2.circle(pitch, w2p(half_l - ps_dist, 0), max(2, int(0.3 * scale)), line_color, -1)
 
     if result is None:
         return pitch
