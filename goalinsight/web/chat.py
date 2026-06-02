@@ -29,7 +29,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
+from pathlib import Path
+
 from ..highlights._context import MatchContext
+from .code_sandbox import CodeSandbox
 from .match_tools import TOOL_DISPATCH, TOOL_SCHEMAS
 
 try:
@@ -65,6 +68,16 @@ SYSTEM_PROMPT = (
     "ball at one moment. Use it when the user asks about the moment "
     "they are paused on (the user's `current_time` is provided in "
     "each turn).\n"
+    "- run_python: execute Python in a managed sandbox for ad-hoc "
+    "computation or plots (heatmaps, distributions, custom "
+    "aggregations) the other tools can't answer. Match data is "
+    "pre-loaded as ./data/*.json. Save plots to ./output/<name>.png "
+    "— they come back as artifacts whose URLs are returned to you. "
+    "When you reference one in your answer, embed it as standard "
+    "markdown image syntax: `![caption](URL)` so the chat UI renders "
+    "it inline. Use plots only when the user asks for a visualisation "
+    "or a distribution; for simple numbers, prefer the dedicated "
+    "stats tools.\n"
     "Always call a tool before claiming a fact about the match. "
     "Chain tools when needed (e.g. list_events to find the goal, "
     "then get_frame_snapshot of its time to describe the build-up).\n\n"
@@ -104,8 +117,10 @@ SYSTEM_PROMPT = (
 
 
 # Cap on how many tool-call rounds we'll let Claude run per user turn.
-# Real questions need 1-3 rounds; this is a runaway-loop backstop.
-MAX_TOOL_ROUNDS = 6
+# Real questions need 1-3 rounds; run_python may need a couple of
+# debug iterations on top, so we leave headroom. This is a
+# runaway-loop backstop, not a target.
+MAX_TOOL_ROUNDS = 10
 
 
 def _fmt_time(seconds: float) -> str:
@@ -120,23 +135,46 @@ class ChatEngine:
     ctx: MatchContext
     model_id: str = "us.anthropic.claude-opus-4-7"
     region: str = "us-east-1"
-    max_tokens: int = 1024
+    # Generous cap because run_python tool calls can carry hundreds
+    # of lines of Python in a single ``code`` argument; truncating at
+    # ~1k tokens left input_json incomplete and dispatch failed with
+    # "missing required argument: code".
+    max_tokens: int = 4096
     max_retries: int = 2
+    # Where run_python plot artifacts land on disk; the FastAPI app
+    # mounts this directory at ``artifact_url_prefix`` so the chat UI
+    # can render the images directly via <img src="...">.
+    artifact_dir: Path | None = None
+    artifact_url_prefix: str = "/chat_artifacts"
 
     _client: Any = field(default=None, repr=False)
     _schema_brief: str | None = field(default=None, repr=False)
+    _sandbox: CodeSandbox | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if boto3 is None:
             raise ImportError("boto3 is required; install with `pip install boto3`")
         boto_cfg = BotoConfig(
             retries={"max_attempts": 1, "mode": "standard"},
-            read_timeout=60,
+            read_timeout=120,
             connect_timeout=10,
         )
         self._client = boto3.client(
             "bedrock-runtime", region_name=self.region, config=boto_cfg,
         )
+
+    def _ensure_sandbox(self) -> CodeSandbox:
+        if self._sandbox is None:
+            self._sandbox = CodeSandbox(
+                region=self.region,
+                pipeline_output_dir=self.ctx.pipeline_output_dir,
+            )
+        return self._sandbox
+
+    def close(self) -> None:
+        if self._sandbox is not None:
+            self._sandbox.close()
+            self._sandbox = None
 
     # ------------------------------------------------------------------
     # Schema brief
@@ -229,8 +267,21 @@ class ChatEngine:
         impl = TOOL_DISPATCH.get(name)
         if impl is None:
             return {"error": f"unknown tool: {name}"}
+        # run_python needs sandbox + artifact destination plumbed in;
+        # we don't surface those in the public schema. The artifact
+        # dir / url prefix come from the engine's configuration.
+        injected = dict(args)
+        if name == "run_python":
+            if self.artifact_dir is None:
+                return {"error": (
+                    "artifact_dir not configured on ChatEngine; "
+                    "run_python is unavailable in this run."
+                )}
+            injected["sandbox"] = self._ensure_sandbox()
+            injected["artifact_dir"] = self.artifact_dir
+            injected["artifact_url_prefix"] = self.artifact_url_prefix
         try:
-            return impl(self.ctx, **args)
+            return impl(self.ctx, **injected)
         except Exception as exc:  # noqa: BLE001
             logger.exception("tool %s failed with args=%s", name, args)
             return {"error": f"{type(exc).__name__}: {exc}"}

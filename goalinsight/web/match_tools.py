@@ -16,15 +16,22 @@ Conventions:
   (typically "team_A", "team_B", "referee", "unknown").
 - All numeric outputs are rounded to 2 decimals to keep tool_result
   payloads small.
+
+run_python is special: it talks to the AgentCore Code Interpreter
+sandbox (see code_sandbox.py) and needs a sandbox + artifact dir
+plumbed in by the caller. ChatEngine injects these via the dispatcher
+so the schema visible to the LLM stays a single ``code`` arg.
 """
 
 from __future__ import annotations
 
 import math
 from collections import Counter
+from pathlib import Path
 from typing import Any, Callable
 
 from ..highlights._context import MatchContext
+from .code_sandbox import CodeSandbox, SANDBOX_DATA_DIR, SANDBOX_OUTPUT_DIR
 
 
 # Maximum number of items returned by list-shaped tools. Keeps tool_result
@@ -373,6 +380,57 @@ def get_frame_snapshot(
     }
 
 
+# Stdout cap fed back to Claude. Long stdout would balloon tool_result
+# token count; if a script genuinely needs to surface more, it should
+# write to a file in the output dir and Claude can readFiles via a
+# follow-up code block.
+MAX_STDOUT_CHARS = 4000
+
+
+def run_python(
+    ctx: MatchContext,
+    *,
+    code: str,
+    sandbox: CodeSandbox,
+    artifact_dir: Path,
+    artifact_url_prefix: str,
+) -> dict[str, Any]:
+    """Run *code* in the AgentCore sandbox and surface stdout + image artifacts.
+
+    Match data files are pre-uploaded to ``./data/`` inside the
+    sandbox; new image files written to ``./output/`` are pulled back
+    out and saved under ``artifact_dir``. The returned ``artifacts``
+    list carries URLs the frontend can render directly.
+    """
+    result = sandbox.run(code, artifact_dir)
+
+    stdout = result.get("stdout", "") or ""
+    stderr = result.get("stderr", "") or ""
+    truncated = False
+    if len(stdout) > MAX_STDOUT_CHARS:
+        stdout = stdout[:MAX_STDOUT_CHARS] + "\n... [stdout truncated]"
+        truncated = True
+    if len(stderr) > MAX_STDOUT_CHARS:
+        stderr = stderr[:MAX_STDOUT_CHARS] + "\n... [stderr truncated]"
+
+    artifacts_out = []
+    for a in result.get("artifacts") or []:
+        artifacts_out.append({
+            "name": a["path"],
+            "mime_type": a["mime_type"],
+            "url": f"{artifact_url_prefix.rstrip('/')}/{a['path']}",
+        })
+
+    return {
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": result.get("exit_code"),
+        "execution_time_s": result.get("execution_time_s"),
+        "artifacts": artifacts_out,
+        "stdout_truncated": truncated,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Bedrock / Anthropic tool specs
 # ---------------------------------------------------------------------------
@@ -519,6 +577,35 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["time_s"],
         },
     },
+    {
+        "name": "run_python",
+        "description": (
+            "Execute a Python snippet in a managed sandbox to compute "
+            "ad-hoc statistics or generate plots. Use this when the "
+            "other tools cannot answer (e.g. heatmaps, distributions, "
+            "custom aggregations). Match data is pre-uploaded:\n"
+            f"  {SANDBOX_DATA_DIR}/events.json — list of events\n"
+            f"  {SANDBOX_DATA_DIR}/tracks.json — frame -> [player tracks]\n"
+            f"  {SANDBOX_DATA_DIR}/ball_tracks.json — frame -> ball state\n"
+            f"  {SANDBOX_DATA_DIR}/team_assignments.json — player_id -> team_id\n"
+            f"Save plots as PNG to {SANDBOX_OUTPUT_DIR}/<name>.png — they "
+            "will be returned to the user automatically. matplotlib, "
+            "numpy, pandas are pre-installed; use matplotlib.use('Agg') "
+            "before importing pyplot. Print key numbers via stdout. "
+            "Files in /var/data are not accessible — use relative paths "
+            f"like '{SANDBOX_DATA_DIR}/events.json'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python source to execute.",
+                },
+            },
+            "required": ["code"],
+        },
+    },
 ]
 
 
@@ -527,4 +614,5 @@ TOOL_DISPATCH: dict[str, Callable[..., dict[str, Any]]] = {
     "get_player_stats": get_player_stats,
     "get_team_stats": get_team_stats,
     "get_frame_snapshot": get_frame_snapshot,
+    "run_python": run_python,
 }
