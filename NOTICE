@@ -1,0 +1,17 @@
+GoalInsight
+Copyright 2024-2026 Tang Jie
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy
+of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This product vendors third-party code. Each is retained under its original
+license; consult the headers of those files for details.
+
+  * PnLCalib reference port — goalinsight/field_registration/pnlcalib/
+    Source: https://github.com/mguti97/PnLCalib
+
+  * BroadTrack-derived utilities — goalinsight/field_registration/broadtrack_runner.py
+    Source: https://github.com/cmu-rim/broadtrack
