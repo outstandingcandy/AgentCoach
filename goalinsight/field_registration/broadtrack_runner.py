@@ -167,8 +167,20 @@ def run_stage1_broadtrack(
         if idx % vis_interval == 0:
             fname = f"frame_{frame_idx:05d}.jpg"
             json_fname = f"frame_{frame_idx:05d}.json"
-            cv2.imwrite(str(vis_kp_dir / fname), draw_vis_keypoints(frame, keypoints))
-            cv2.imwrite(str(vis_line_dir / fname), draw_vis_lines(frame, lines))
+            cv2.imwrite(
+                str(vis_kp_dir / fname),
+                draw_vis_keypoints(
+                    frame, keypoints,
+                    conf_threshold=pnl_config.get("keypoint_threshold", 0.3434),
+                ),
+            )
+            cv2.imwrite(
+                str(vis_line_dir / fname),
+                draw_vis_lines(
+                    frame, lines,
+                    conf_threshold=pnl_config.get("line_threshold", 0.15),
+                ),
+            )
             # Draw calibration visualization
             vis = _draw_broadtrack_calibration(
                 frame, keypoints, lines, result, pitch_template,

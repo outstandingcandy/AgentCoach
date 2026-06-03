@@ -18,15 +18,24 @@ def _draw_label(img, x, y, label, font=cv2.FONT_HERSHEY_SIMPLEX, font_scale=0.4,
     cv2.putText(img, label, (lx, ly), font, font_scale, (255, 255, 255), thickness)
 
 
-def draw_vis_keypoints(frame, keypoints):
-    """Draw keypoint detection results on the frame."""
+def draw_vis_keypoints(frame, keypoints, conf_threshold=0.3):
+    """Draw keypoint detection results on the frame.
+
+    Args:
+        frame: BGR frame.
+        keypoints: List of dicts from ``KeypointDetector.detect``.
+        conf_threshold: Minimum confidence to render. Pass the same value the
+            solver was configured with so the overlay reflects what the
+            calibrator actually consumed. Default 0.3 matches the typical
+            keypoint head threshold.
+    """
     vis = frame.copy()
     font = cv2.FONT_HERSHEY_SIMPLEX
     n_detected = 0
 
     for kp in keypoints:
         conf = kp.get("confidence", 0)
-        if conf < 0.3:
+        if conf < conf_threshold:
             continue
         n_detected += 1
         x, y = int(kp["x"]), int(kp["y"])
@@ -38,10 +47,9 @@ def draw_vis_keypoints(frame, keypoints):
         cv2.circle(vis, (x, y), 6, (0, 0, 0), 1)
         _draw_label(vis, x, y, f"{kp['id']}({conf:.2f})")
 
-    cv2.putText(vis, f"Keypoints: {n_detected} (conf>=0.3)", (10, 25),
-                font, 0.6, (255, 255, 255), 2)
-    cv2.putText(vis, f"Keypoints: {n_detected} (conf>=0.3)", (10, 25),
-                font, 0.6, (0, 255, 0), 1)
+    header = f"Keypoints: {n_detected} (conf>={conf_threshold:.2f})"
+    cv2.putText(vis, header, (10, 25), font, 0.6, (255, 255, 255), 2)
+    cv2.putText(vis, header, (10, 25), font, 0.6, (0, 255, 0), 1)
     return vis
 
 

@@ -205,7 +205,7 @@ def run_stage1_physical(
             }
         }
         line_detector = LineDetector(line_config)
-        line_detector.load_model()
+        line_detector.load_model(pnl_config.get("line_model_path"))
     else:
         logger.info("Stage 1 (Physical): Deriving lines from keypoints (no line model)")
 
@@ -229,14 +229,52 @@ def run_stage1_physical(
         logger.info("  Joint optimization disabled — per-frame f optimization only")
 
     camera_position = phys_config.get("camera_position", None)
+    lock_camera_position = phys_config.get("lock_camera_position", False)
     if camera_position is not None:
         camera_position = tuple(camera_position)
-        logger.info(f"  Camera position constraint: ({camera_position[0]}, {camera_position[1]}, {camera_position[2]})")
+        mode = "HARD-LOCKED" if lock_camera_position else "soft"
+        logger.info(
+            f"  Camera position constraint ({mode}): "
+            f"({camera_position[0]}, {camera_position[1]}, {camera_position[2]})"
+        )
+    elif lock_camera_position:
+        logger.warning("  lock_camera_position=True but no camera_position set; ignoring")
+        lock_camera_position = False
 
-    pitch_length = phys_config.get("pitch_length", 105.0)
-    pitch_width = phys_config.get("pitch_width", 68.0)
-    if pitch_length != 105.0 or pitch_width != 68.0:
-        logger.info(f"  Custom pitch dimensions: {pitch_length}x{pitch_width}m")
+    # Pitch geometry — two layered sources:
+    # 1. Top-level config.pitch.* dict (matches pnlcalib_orig convention,
+    #    covers PA / GA / goal / center circle).
+    # 2. Per-stage overrides at field_registration.physical.{pitch_length,
+    #    pitch_width} (legacy keys; only set length / width).
+    # Anything missing falls back to FIFA defaults inside PhysicalCalibrator.
+    top_pitch = config.get("pitch", {}) or {}
+    pitch_dims = dict(top_pitch)
+    if "pitch_length" in phys_config:
+        pitch_dims["pitch_length"] = phys_config["pitch_length"]
+    if "pitch_width" in phys_config:
+        pitch_dims["pitch_width"] = phys_config["pitch_width"]
+    pitch_length = pitch_dims.get("pitch_length", 105.0)
+    pitch_width = pitch_dims.get("pitch_width", 68.0)
+    non_default = {k: v for k, v in pitch_dims.items()
+                   if k not in ("pitch_length", "pitch_width")}
+    if pitch_length != 105.0 or pitch_width != 68.0 or non_default:
+        if non_default:
+            logger.info(f"  Custom pitch geometry: {pitch_length}x{pitch_width}m + "
+                        f"markings overridden ({sorted(non_default.keys())})")
+        else:
+            logger.info(f"  Custom pitch dimensions: {pitch_length}x{pitch_width}m")
+
+    # Push the resolved geometry into the global active pitch state so the
+    # downstream visualizers (get_pitch_template_points, _draw_topdown_pitch)
+    # use the same PA / GA / CR sizes as the calibrator. Without this they
+    # render FIFA boundaries while the calibrator solves against kids dims,
+    # and the overlay looks "wrong" even when the calibration is correct.
+    # Mirrors the same setup in pnlcalib_runner.
+    if non_default or pitch_length != 105.0 or pitch_width != 68.0:
+        from ..annotation.pitch.geometry import SoccerPitch as _SP
+        from ..annotation import pitch_constants as _pc
+        _pc.set_active_pitch(_SP.from_dict(pitch_dims))
+
     pitch_template = get_pitch_template_points(pitch_length, pitch_width)
 
     calibrator = PhysicalCalibrator(
@@ -245,13 +283,14 @@ def run_stage1_physical(
         ransac_reproj_error=phys_config.get("ransac_reproj_error", 15.0),
         line_weight=phys_config.get("line_weight", 1.0),
         line_sample_points=phys_config.get("line_sample_points", 20),
+        min_line_length_px=phys_config.get("min_line_length_px", 30.0),
         focal_bounds=focal_bounds,
         world_residual_weight=phys_config.get("world_residual_weight", 0.0),
         world_error_threshold=phys_config.get("world_error_threshold", 5.0),
         camera_position=camera_position,
         position_weight=phys_config.get("position_weight", 50.0),
-        pitch_length=pitch_length,
-        pitch_width=pitch_width,
+        lock_camera_position=lock_camera_position,
+        pitch_dims=pitch_dims,
     )
 
     # Initialize temporal tracker
@@ -363,8 +402,12 @@ def run_stage1_physical(
         if idx % vis_interval == 0:
             fname = f"frame_{frame_idx:05d}.jpg"
             json_fname = f"frame_{frame_idx:05d}.json"
-            cv2.imwrite(str(vis_kp_dir / fname), draw_vis_keypoints(frame, keypoints))
-            cv2.imwrite(str(vis_line_dir / fname), draw_vis_lines(frame, lines))
+            kp_thr = pnl_config.get("keypoint_threshold", 0.3434)
+            ln_thr = pnl_config.get("line_threshold", 0.15)
+            cv2.imwrite(str(vis_kp_dir / fname),
+                        draw_vis_keypoints(frame, keypoints, conf_threshold=kp_thr))
+            cv2.imwrite(str(vis_line_dir / fname),
+                        draw_vis_lines(frame, lines, conf_threshold=ln_thr))
 
             vis = _draw_physical_calibration(
                 frame, keypoints, lines, result, pitch_template,
@@ -824,7 +867,7 @@ def _build_frame_json(frame_idx, keypoints, lines, result, warm_start=False, deb
         if dbg_img is not None and len(dbg_img) > 0:
             info["ransac_input_points"] = [
                 {
-                    "kp_id": int(dbg_ids[i]) if i < len(dbg_ids) else -1,
+                    "kp_id": dbg_ids[i] if i < len(dbg_ids) else -1,
                     "img_x": float(dbg_img[i][0]),
                     "img_y": float(dbg_img[i][1]),
                     "world_x": float(dbg_world[i][0]) if dbg_world is not None and i < len(dbg_world) else None,
@@ -1086,24 +1129,35 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
             result["homography"], pitch_template, camera_params,
         )
 
-        # Draw projected pitch lines (yellow) — only segments within image bounds
+        # Draw projected pitch lines (yellow). Skip segments whose BOTH raw
+        # endpoints (before clipping) fall outside the image+margin — those
+        # are "phantom" segments where two far-side world points project past
+        # opposite image edges and the connecting line crosses the visible
+        # frame as an artifact (e.g. the opposite-half penalty area drawn
+        # under steep perspective). Without this guard, cv2.clipLine
+        # faithfully renders that crossing as a phantom stroke through the
+        # image even though no such line is visible in the scene.
         margin = 200
         for name, pts in projected.items():
             for i in range(len(pts) - 1):
-                if pts[i] is not None and pts[i + 1] is not None:
-                    try:
-                        p1 = (int(float(pts[i][0])), int(float(pts[i][1])))
-                        p2 = (int(float(pts[i + 1][0])), int(float(pts[i + 1][1])))
-                        p1_in = -margin < p1[0] < w + margin and -margin < p1[1] < h + margin
-                        p2_in = -margin < p2[0] < w + margin and -margin < p2[1] < h + margin
-                        if p1_in and p2_in:
-                            # Clamp for OpenCV safety
-                            clamp = w + h
-                            p1c = (max(-clamp, min(clamp, p1[0])), max(-clamp, min(clamp, p1[1])))
-                            p2c = (max(-clamp, min(clamp, p2[0])), max(-clamp, min(clamp, p2[1])))
-                            cv2.line(vis, p1c, p2c, (0, 255, 255), 2)
-                    except (ValueError, OverflowError, TypeError):
-                        continue
+                if pts[i] is None or pts[i + 1] is None:
+                    continue
+                try:
+                    p1 = (int(float(pts[i][0])), int(float(pts[i][1])))
+                    p2 = (int(float(pts[i + 1][0])), int(float(pts[i + 1][1])))
+                except (ValueError, OverflowError, TypeError):
+                    continue
+                p1_in = -margin < p1[0] < w + margin and -margin < p1[1] < h + margin
+                p2_in = -margin < p2[0] < w + margin and -margin < p2[1] < h + margin
+                if not p1_in and not p2_in:
+                    continue  # phantom — both endpoints off-frame
+                # cv2.clipLine(rect=(x, y, w, h)) clips to [x, x+w) × [y, y+h).
+                ok, c1, c2 = cv2.clipLine(
+                    (-margin, -margin, w + 2 * margin, h + 2 * margin),
+                    p1, p2,
+                )
+                if ok:
+                    cv2.line(vis, c1, c2, (0, 255, 255), 2)
 
         # Draw detected keypoints (green=inlier, red=outlier)
         if "img_pts" in result and "inlier_mask" in result:

@@ -158,7 +158,13 @@ def _run_stage1_pnlcalib(
         # Save visualizations periodically
         if idx % vis_interval == 0:
             fname = f"frame_{frame_idx:05d}.jpg"
-            cv2.imwrite(str(vis_kp_dir / fname), draw_vis_keypoints(frame, keypoints))
+            cv2.imwrite(
+                str(vis_kp_dir / fname),
+                draw_vis_keypoints(
+                    frame, keypoints,
+                    conf_threshold=pnl_config.get("keypoint_threshold", 0.3434),
+                ),
+            )
             if vis_line_dir is not None:
                 cv2.imwrite(
                     str(vis_line_dir / fname),
@@ -477,7 +483,13 @@ def _run_stage1_pnlcalib_orig(
 
         if idx % vis_interval == 0:
             fname = f"frame_{frame_idx:05d}.jpg"
-            cv2.imwrite(str(vis_kp_dir / fname), draw_vis_keypoints(frame, keypoints))
+            cv2.imwrite(
+                str(vis_kp_dir / fname),
+                draw_vis_keypoints(
+                    frame, keypoints,
+                    conf_threshold=pnl_config.get("keypoint_threshold", 0.3434),
+                ),
+            )
             if vis_line_dir is not None:
                 cv2.imwrite(
                     str(vis_line_dir / fname),

@@ -1,0 +1,64 @@
+video:
+  process_fps: 10
+
+# Long-focal sideline cam (fx=2448, hfov ≈ 43°). See kids_soccer.yaml.
+intrinsics:
+  fx: 2448.68
+
+# Non-FIFA youth pitch — same dims as kids_soccer.yaml. The physical
+# backend reads pitch_length / pitch_width directly from the physical
+# block; the rest of the pitch.* table is consumed by pnlcalib_orig and
+# isn't used on this path, but kept for parity / future joint runs.
+pitch:
+  pitch_length: 66.28
+  pitch_width: 43.15
+  penalty_area_width: 21.84
+  penalty_area_length: 9.96
+  goal_area_width: 11.79
+  goal_area_length: 4.13
+  goal_line_to_penalty_mark: 8.0
+  center_circle_radius: 7.0
+  goal_height: 2.15
+  goal_length: 4.44
+
+field_registration:
+  backend: "physical"
+
+  physical:
+    camera_profile: "kids_soccer_1080p"
+    ransac_reproj_error: 30.0
+    line_weight: 1.0
+    line_sample_points: 20
+    max_reproj_error: 15.0
+    use_line_model: true
+    focal_bounds: [2300.0, 4000.0]   # wide upper for late-clip zoom-in
+    world_residual_weight: 0.0
+    joint_optimize: false             # camera zooms during clip — keep per-frame f
+    world_error_threshold: 5.0
+
+    # Camera at (bottom touchline × center line), 2 m above the ground.
+    # World frame: pitch center origin, y-up. bottom touchline y = -W/2.
+    camera_position: [-4.0, -21.575, 2.0]
+    lock_camera_position: true        # treated as cm-level prior
+
+    pitch_length: 66.28
+    pitch_width: 43.15
+
+    calibration_skip: 2
+
+  # Reuse the finetuned kids_soccer keypoint + line heads. The physical
+  # runner pulls model paths from this block.
+  pnlcalib:
+    keypoint_model_path: "data/finetuned_models/run_20260531_024941/models/best_model.pt"
+    keypoint_weights: "SV_kp"
+    keypoint_threshold: 0.15
+    use_lines: true
+    line_model_path: "data/finetuned_line_models/run_20260601_142205/models/best_model.pt"
+    line_weights: "SV_lines"
+    line_threshold: 0.10
+
+device: "cuda"
+
+pipeline:
+  stages:
+    - field_registration
