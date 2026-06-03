@@ -60,7 +60,11 @@ Raw fixed-camera video
 └──────────────────┘
 ```
 
-See [`docs/goalinsight-aws-architecture.drawio`](docs/goalinsight-aws-architecture.drawio) for the full system view (open in [draw.io](https://app.diagrams.net)).
+Full system view, including the SageMaker remote-execution path and the Bedrock + AgentCore chat surface:
+
+![GoalInsight on AWS — full architecture](docs/goalinsight-aws-architecture.png)
+
+The editable source is [`docs/goalinsight-aws-architecture.drawio`](docs/goalinsight-aws-architecture.drawio) (open in [draw.io](https://app.diagrams.net)).
 
 A still from the tracking stage (annotated player + ball detections, with team colors and IDs):
 
