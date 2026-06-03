@@ -18,10 +18,11 @@ output/
 *.pth
 *.onnx
 
-# Temp test files
+# Temp test / diagnostic files
 test_*.py
 test_*.jpg
 debug_*.py
+diag_*.py
 
 # OS
 .DS_Store
@@ -33,3 +34,18 @@ debug_*.py
 # Per-run logs and large generated artifacts
 logs/
 webapp_videos/
+chat_artifacts/
+*.log
+
+# Secrets — defensive (none of these exist today; this prevents accidents)
+.env
+.env.*
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+.aws/
+credentials.json
+secrets.yaml
+secrets.yml
