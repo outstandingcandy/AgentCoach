@@ -31,3 +31,15 @@ profiles:
       - [0.0, 1500.0, 540.0]
       - [0.0, 0.0, 1.0]
     dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+  # Long-focal sideline camera used for kids_soccer_match.mp4 / clips.
+  # fx=2448 (hfov ≈ 43°) recovered jointly with pitch dims via
+  # scripts/fit_pitch_dims.py --fit-fx (combined RMSE 5.82 px on 53 residuals).
+  # See configs/kids_soccer.yaml header for context.
+  kids_soccer_1080p:
+    image_size: [1920, 1080]
+    K:
+      - [2448.68, 0.0, 960.0]
+      - [0.0, 2448.68, 540.0]
+      - [0.0, 0.0, 1.0]
+    dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]

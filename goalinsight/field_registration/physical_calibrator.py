@@ -15,6 +15,7 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from ..utils.projection import project_points_2d
+from .pitch_template import LINE_KEYPOINTS, build_field_template
 from .pnlcalib.curve_utils import (
     compute_cumulated_lengths,
     interpolate_on_polyline,
@@ -27,304 +28,10 @@ logger = logging.getLogger(__name__)
 # Ground-only line IDs (exclude crossbars and goal posts)
 GROUND_LINE_IDS = set(range(23)) - {6, 7, 8, 9, 10, 11}
 
-
-def build_field_template(
-    pitch_length: float = 105.0,
-    pitch_width: float = 68.0,
-) -> tuple[list[list[float]], dict, dict]:
-    """Build field template coordinates for given pitch dimensions.
-
-    Penalty area (16.5m × 40.32m), goal area (5.5m × 18.32m), goal (7.32m × 2.44m),
-    penalty spot (11m), and center circle (9.15m radius) are FIFA standard and do not
-    change with pitch size.
-
-    Args:
-        pitch_length: Pitch length in meters (default 105 = FIFA).
-        pitch_width: Pitch width in meters (default 68 = FIFA).
-
-    Returns:
-        Tuple of (world_coords_2d, line_definitions, line_intersections).
-        - world_coords_2d: list of [x, y] centered at pitch center (57 keypoints)
-        - line_definitions: dict matching LineMapper.LINE_DEFINITIONS format
-        - line_intersections: dict matching LINE_INTERSECTIONS format
-    """
-    HL = pitch_length / 2
-    HW = pitch_width / 2
-
-    # Fixed marking dimensions (FIFA standard)
-    PA_DEPTH = 16.5
-    PA_HW = 20.16   # penalty area half-width
-    GA_DEPTH = 5.5
-    GA_HW = 9.16    # goal area half-width
-    G_HW = 3.66     # goal half-width
-    G_H = 2.44      # goal height
-    PS_DIST = 11.0   # penalty spot from goal line
-    CR = 9.15        # center circle radius
-
-    # --- Raw coordinates in pitch-local system (0,0 at top-left, y-down) ---
-    # Then centered: x - HL, HW - y
-    pa_top_y = HW - PA_HW
-    pa_bot_y = HW + PA_HW
-    ga_top_y = HW - GA_HW
-    ga_bot_y = HW + GA_HW
-    g_top_y = HW - G_HW
-    g_bot_y = HW + G_HW
-
-    # Penalty arc points (radius CR from penalty spot, at penalty area front line x)
-    # Left penalty spot at (PS_DIST, HW), arc top: x=PA_DEPTH
-    arc_dy = (CR**2 - (PA_DEPTH - PS_DIST)**2) ** 0.5
-    # Center circle points (radius CR from center)
-    # Top/bottom: at y = HW ± CR
-    # Left/right: at x = HL ± CR
-    # Diagonal points at 45°: offset = CR * cos(45°) ≈ CR / sqrt(2)
-    cc_diag = CR / (2**0.5)
-
-    raw = [
-        # 0-2: pitch top edge
-        [0., 0.], [HL, 0.], [pitch_length, 0.],
-        # 3-6: penalty area top
-        [0., pa_top_y], [PA_DEPTH, pa_top_y],
-        [pitch_length - PA_DEPTH, pa_top_y], [pitch_length, pa_top_y],
-        # 7-10: goal area top
-        [0., ga_top_y], [GA_DEPTH, ga_top_y],
-        [pitch_length - GA_DEPTH, ga_top_y], [pitch_length, ga_top_y],
-        # 11-14: goal top posts (ground + crossbar top, same x/y)
-        [0., g_top_y], [0., g_top_y],
-        [pitch_length, g_top_y], [pitch_length, g_top_y],
-        # 15-18: goal bottom posts
-        [0., g_bot_y], [0., g_bot_y],
-        [pitch_length, g_bot_y], [pitch_length, g_bot_y],
-        # 19-22: goal area bottom
-        [0., ga_bot_y], [GA_DEPTH, ga_bot_y],
-        [pitch_length - GA_DEPTH, ga_bot_y], [pitch_length, ga_bot_y],
-        # 23-26: penalty area bottom
-        [0., pa_bot_y], [PA_DEPTH, pa_bot_y],
-        [pitch_length - PA_DEPTH, pa_bot_y], [pitch_length, pa_bot_y],
-        # 27-29: pitch bottom edge
-        [0., pitch_width], [HL, pitch_width], [pitch_length, pitch_width],
-        # 30-35: penalty arc + center circle top/bottom (symmetric)
-        [PA_DEPTH, HW - arc_dy],             # 30: left penalty arc top
-        [HL, HW - CR],                       # 31: center circle top
-        [pitch_length - PA_DEPTH, HW - arc_dy],  # 32: right penalty arc top
-        [PA_DEPTH, HW + arc_dy],             # 33: left penalty arc bottom
-        [HL, HW + CR],                       # 34: center circle bottom
-        [pitch_length - PA_DEPTH, HW + arc_dy],  # 35: right penalty arc bottom
-        # 36-43: penalty arc inner + center circle diagonal points
-        [PS_DIST + CR * (PA_DEPTH - PS_DIST) / CR, HW - CR * arc_dy / CR],
-        # ^ simplification: just use actual geometry
-    ]
-    # Actually, the circle/arc diagonal points are complex. Let me compute them properly.
-    # Points 36-43 are at specific angles on their respective circles.
-    # Use the original offsets from circle centers (these don't depend on pitch size).
-
-    # Offsets of arc/circle points from their centers (from original 105×68 coords):
-    # Left penalty arc center = (11, 34) in old coords
-    # Original kp36 = (19.99, 32.29) → offset from (11, 34) = (8.99, -1.71)
-    # Original kp40 = (19.99, 35.7)  → offset from (11, 34) = (8.99, 1.7)
-    # Center circle center = (52.5, 34)
-    # Original kp37 = (43.68, 31.53) → offset from (52.5, 34) = (-8.82, -2.47)
-    # Original kp38 = (61.31, 31.53) → offset = (8.81, -2.47)
-    # Original kp41 = (43.68, 36.46) → offset = (-8.82, 2.46)
-    # Original kp42 = (61.31, 36.46) → offset = (8.81, 2.46)
-    # Right penalty arc center = (94, 34) in old coords
-    # Original kp39 = (85, 32.29)    → offset from (94, 34) = (-9, -1.71)
-    # Original kp43 = (85, 35.7)     → offset from (94, 34) = (-9, 1.7)
-
-    # Circle point offsets (fixed, radius-dependent only)
-    left_ps = [PS_DIST, HW]
-    right_ps = [pitch_length - PS_DIST, HW]
-    center = [HL, HW]
-
-    # Offsets from original data (invariant to pitch size)
-    lpa_offsets = {
-        36: (8.99, -1.71), 40: (8.99, 1.7),
-        45: (5.5, 0.0), 46: (9.15, 0.0), 44: (0.0, 0.0),
-    }
-    cc_offsets = {
-        37: (-8.82, -2.47), 38: (8.81, -2.47),
-        41: (-8.82, 2.46), 42: (8.81, 2.46),
-        47: (-6.47, -6.47), 48: (6.47, -6.47),
-        49: (-9.15, 0.0), 50: (0.0, 0.0), 51: (9.0, 0.0),
-        52: (-6.47, 6.47), 53: (6.47, 6.47),
-        31: (0.0, -9.15), 34: (0.0, 9.15),
-    }
-    rpa_offsets = {
-        39: (-9.0, -1.71), 43: (-9.0, 1.7),
-        54: (-9.15, 0.0), 55: (-5.5, 0.0), 56: (0.0, 0.0),
-    }
-
-    # Build full raw coords list (57 keypoints)
-    raw_coords = [
-        # 0-29: field structure points
-        [0., 0.], [HL, 0.], [pitch_length, 0.],
-        [0., pa_top_y], [PA_DEPTH, pa_top_y],
-        [pitch_length - PA_DEPTH, pa_top_y], [pitch_length, pa_top_y],
-        [0., ga_top_y], [GA_DEPTH, ga_top_y],
-        [pitch_length - GA_DEPTH, ga_top_y], [pitch_length, ga_top_y],
-        [0., g_top_y], [0., g_top_y],
-        [pitch_length, g_top_y], [pitch_length, g_top_y],
-        [0., g_bot_y], [0., g_bot_y],
-        [pitch_length, g_bot_y], [pitch_length, g_bot_y],
-        [0., ga_bot_y], [GA_DEPTH, ga_bot_y],
-        [pitch_length - GA_DEPTH, ga_bot_y], [pitch_length, ga_bot_y],
-        [0., pa_bot_y], [PA_DEPTH, pa_bot_y],
-        [pitch_length - PA_DEPTH, pa_bot_y], [pitch_length, pa_bot_y],
-        [0., pitch_width], [HL, pitch_width], [pitch_length, pitch_width],
-        # 30: left penalty arc top
-        [PA_DEPTH, HW - arc_dy],
-        # 31: center circle top
-        [center[0] + cc_offsets[31][0], center[1] + cc_offsets[31][1]],
-        # 32: right penalty arc top
-        [pitch_length - PA_DEPTH, HW - arc_dy],
-        # 33: left penalty arc bottom
-        [PA_DEPTH, HW + arc_dy],
-        # 34: center circle bottom
-        [center[0] + cc_offsets[34][0], center[1] + cc_offsets[34][1]],
-        # 35: right penalty arc bottom
-        [pitch_length - PA_DEPTH, HW + arc_dy],
-        # 36-43: arc/circle diagonal points
-        [left_ps[0] + lpa_offsets[36][0], left_ps[1] + lpa_offsets[36][1]],
-        [center[0] + cc_offsets[37][0], center[1] + cc_offsets[37][1]],
-        [center[0] + cc_offsets[38][0], center[1] + cc_offsets[38][1]],
-        [right_ps[0] + rpa_offsets[39][0], right_ps[1] + rpa_offsets[39][1]],
-        [left_ps[0] + lpa_offsets[40][0], left_ps[1] + lpa_offsets[40][1]],
-        [center[0] + cc_offsets[41][0], center[1] + cc_offsets[41][1]],
-        [center[0] + cc_offsets[42][0], center[1] + cc_offsets[42][1]],
-        [right_ps[0] + rpa_offsets[43][0], right_ps[1] + rpa_offsets[43][1]],
-        # 44-46: left penalty area points
-        [left_ps[0] + lpa_offsets[44][0], left_ps[1] + lpa_offsets[44][1]],
-        [left_ps[0] + lpa_offsets[45][0], left_ps[1] + lpa_offsets[45][1]],
-        [left_ps[0] + lpa_offsets[46][0], left_ps[1] + lpa_offsets[46][1]],
-        # 47-53: center circle points
-        [center[0] + cc_offsets[47][0], center[1] + cc_offsets[47][1]],
-        [center[0] + cc_offsets[48][0], center[1] + cc_offsets[48][1]],
-        [center[0] + cc_offsets[49][0], center[1] + cc_offsets[49][1]],
-        [center[0] + cc_offsets[50][0], center[1] + cc_offsets[50][1]],
-        [center[0] + cc_offsets[51][0], center[1] + cc_offsets[51][1]],
-        [center[0] + cc_offsets[52][0], center[1] + cc_offsets[52][1]],
-        [center[0] + cc_offsets[53][0], center[1] + cc_offsets[53][1]],
-        # 54-56: right penalty area points
-        [right_ps[0] + rpa_offsets[54][0], right_ps[1] + rpa_offsets[54][1]],
-        [right_ps[0] + rpa_offsets[55][0], right_ps[1] + rpa_offsets[55][1]],
-        [right_ps[0] + rpa_offsets[56][0], right_ps[1] + rpa_offsets[56][1]],
-    ]
-
-    # Center: x - HL, HW - y (y-up convention)
-    world_coords_2d = [[x - HL, HW - y] for x, y in raw_coords]
-
-    # --- Line definitions (same structure as LineMapper.LINE_DEFINITIONS) ---
-    line_defs = {
-        0:  {"p1": (-HL, PA_HW, 0), "p2": (-HL + PA_DEPTH, PA_HW, 0)},
-        1:  {"p1": (-HL + PA_DEPTH, PA_HW, 0), "p2": (-HL + PA_DEPTH, -PA_HW, 0)},
-        2:  {"p1": (-HL + PA_DEPTH, -PA_HW, 0), "p2": (-HL, -PA_HW, 0)},
-        3:  {"p1": (HL, PA_HW, 0), "p2": (HL - PA_DEPTH, PA_HW, 0)},
-        4:  {"p1": (HL - PA_DEPTH, PA_HW, 0), "p2": (HL - PA_DEPTH, -PA_HW, 0)},
-        5:  {"p1": (HL - PA_DEPTH, -PA_HW, 0), "p2": (HL, -PA_HW, 0)},
-        6:  {"p1": (-HL, -G_HW, G_H), "p2": (-HL, G_HW, G_H)},
-        7:  {"p1": (-HL, -G_HW, 0), "p2": (-HL, -G_HW, G_H)},
-        8:  {"p1": (-HL, G_HW, 0), "p2": (-HL, G_HW, G_H)},
-        9:  {"p1": (HL, -G_HW, G_H), "p2": (HL, G_HW, G_H)},
-        10: {"p1": (HL, -G_HW, 0), "p2": (HL, -G_HW, G_H)},
-        11: {"p1": (HL, G_HW, 0), "p2": (HL, G_HW, G_H)},
-        12: {"p1": (0, -HW, 0), "p2": (0, HW, 0)},
-        13: {"p1": (-HL, HW, 0), "p2": (HL, HW, 0)},
-        14: {"p1": (-HL, -HW, 0), "p2": (-HL, HW, 0)},
-        15: {"p1": (HL, -HW, 0), "p2": (HL, HW, 0)},
-        16: {"p1": (-HL, -HW, 0), "p2": (HL, -HW, 0)},
-        17: {"p1": (-HL, GA_HW, 0), "p2": (-HL + GA_DEPTH, GA_HW, 0)},
-        18: {"p1": (-HL + GA_DEPTH, GA_HW, 0), "p2": (-HL + GA_DEPTH, -GA_HW, 0)},
-        19: {"p1": (-HL + GA_DEPTH, -GA_HW, 0), "p2": (-HL, -GA_HW, 0)},
-        20: {"p1": (HL, GA_HW, 0), "p2": (HL - GA_DEPTH, GA_HW, 0)},
-        21: {"p1": (HL - GA_DEPTH, GA_HW, 0), "p2": (HL - GA_DEPTH, -GA_HW, 0)},
-        22: {"p1": (HL - GA_DEPTH, -GA_HW, 0), "p2": (HL, -GA_HW, 0)},
-    }
-
-    # --- Line intersections ---
-    pa_front_x = HL - PA_DEPTH
-    ga_front_x = HL - GA_DEPTH
-    line_intersections = {
-        (0, 1):   (-pa_front_x,  PA_HW, 0.0,  4),
-        (1, 2):   (-pa_front_x, -PA_HW, 0.0, 24),
-        (0, 14):  (-HL,          PA_HW, 0.0,  3),
-        (2, 14):  (-HL,         -PA_HW, 0.0, 23),
-        (3, 4):   ( pa_front_x,  PA_HW, 0.0,  5),
-        (4, 5):   ( pa_front_x, -PA_HW, 0.0, 25),
-        (3, 15):  ( HL,          PA_HW, 0.0,  6),
-        (5, 15):  ( HL,         -PA_HW, 0.0, 26),
-        (17, 18): (-ga_front_x,  GA_HW, 0.0,  8),
-        (18, 19): (-ga_front_x, -GA_HW, 0.0, 20),
-        (17, 14): (-HL,          GA_HW, 0.0,  7),
-        (19, 14): (-HL,         -GA_HW, 0.0, 19),
-        (20, 21): ( ga_front_x,  GA_HW, 0.0,  9),
-        (21, 22): ( ga_front_x, -GA_HW, 0.0, 21),
-        (20, 15): ( HL,          GA_HW, 0.0, 10),
-        (22, 15): ( HL,         -GA_HW, 0.0, 22),
-        (13, 14): (-HL,          HW,    0.0,  0),
-        (13, 15): ( HL,          HW,    0.0,  2),
-        (16, 14): (-HL,         -HW,    0.0, 27),
-        (16, 15): ( HL,         -HW,    0.0, 29),
-        (12, 13): ( 0.0,         HW,    0.0,  1),
-        (12, 16): ( 0.0,        -HW,    0.0, 28),
-    }
-
-    return world_coords_2d, line_defs, line_intersections
-
-# Keypoints that lie on each ground line (ordered by arc-length parameter t).
-# Copied from BroadTrackCalibrator to avoid import dependency.
-LINE_KEYPOINTS: dict[int, list[int]] = {
-    0:  [3, 4],                         # Big rect. left top
-    1:  [4, 30, 45, 33, 24],            # Big rect. left side
-    2:  [24, 23],                        # Big rect. left bottom
-    3:  [6, 5],                          # Big rect. right top
-    4:  [5, 32, 55, 35, 25],            # Big rect. right side
-    5:  [25, 26],                        # Big rect. right bottom
-    12: [28, 34, 50, 31, 1],            # Middle line
-    13: [0, 1, 2],                       # Side line top
-    14: [27, 23, 19, 15, 11, 7, 3, 0],  # Side line left (goal line)
-    15: [29, 26, 22, 17, 13, 10, 6, 2], # Side line right (goal line)
-    16: [27, 28, 29],                    # Side line bottom
-    17: [7, 8],                          # Small rect. left top
-    18: [8, 20],                         # Small rect. left side
-    19: [20, 19],                        # Small rect. left bottom
-    20: [10, 9],                         # Small rect. right top
-    21: [9, 21],                         # Small rect. right side
-    22: [21, 22],                        # Small rect. right bottom
-}
-
-# Ground-plane line-line intersection pairs.
-# Each entry: (line_id_a, line_id_b) → (world_x, world_y, 0.0, keypoint_id).
-# keypoint_id is the PnLCalib keypoint that sits at this intersection;
-# if that keypoint is already detected, the intersection is skipped (no duplicate).
-LINE_INTERSECTIONS: dict[tuple[int, int], tuple[float, float, float, int]] = {
-    # Penalty area left corners
-    (0, 1):   (-36.00,  20.16, 0.0,  4),  # Big rect. left top × left side
-    (1, 2):   (-36.00, -20.16, 0.0, 24),  # Big rect. left side × left bottom
-    (0, 14):  (-52.50,  20.16, 0.0,  3),  # Big rect. left top × goal line left
-    (2, 14):  (-52.50, -20.16, 0.0, 23),  # Big rect. left bottom × goal line left
-    # Penalty area right corners
-    (3, 4):   ( 36.00,  20.16, 0.0,  5),  # Big rect. right top × right side
-    (4, 5):   ( 36.00, -20.16, 0.0, 25),  # Big rect. right side × right bottom
-    (3, 15):  ( 52.50,  20.16, 0.0,  6),  # Big rect. right top × goal line right
-    (5, 15):  ( 52.50, -20.16, 0.0, 26),  # Big rect. right bottom × goal line right
-    # Goal area left corners
-    (17, 18): (-47.00,   9.16, 0.0,  8),  # Small rect. left top × left side
-    (18, 19): (-47.00,  -9.16, 0.0, 20),  # Small rect. left side × left bottom
-    (17, 14): (-52.50,   9.16, 0.0,  7),  # Small rect. left top × goal line left
-    (19, 14): (-52.50,  -9.16, 0.0, 19),  # Small rect. left bottom × goal line left
-    # Goal area right corners
-    (20, 21): ( 47.00,   9.16, 0.0,  9),  # Small rect. right top × right side
-    (21, 22): ( 47.00,  -9.16, 0.0, 21),  # Small rect. right side × right bottom
-    (20, 15): ( 52.50,   9.16, 0.0, 10),  # Small rect. right top × goal line right
-    (22, 15): ( 52.50,  -9.16, 0.0, 22),  # Small rect. right bottom × goal line right
-    # Pitch corners
-    (13, 14): (-52.50,  34.00, 0.0,  0),  # Touchline top × goal line left
-    (13, 15): ( 52.50,  34.00, 0.0,  2),  # Touchline top × goal line right
-    (16, 14): (-52.50, -34.00, 0.0, 27),  # Touchline bottom × goal line left
-    (16, 15): ( 52.50, -34.00, 0.0, 29),  # Touchline bottom × goal line right
-    # Center line endpoints
-    (12, 13): (  0.00,  34.00, 0.0,  1),  # Center line × touchline top
-    (12, 16): (  0.00, -34.00, 0.0, 28),  # Center line × touchline bottom
-}
+# Re-exported for backward compat with code that imports
+# LINE_INTERSECTIONS from this module. Built lazily from FIFA defaults
+# since the legacy constant was the FIFA-spec table.
+LINE_INTERSECTIONS = build_field_template()[2]
 
 
 class PhysicalCalibrator:
@@ -341,13 +48,16 @@ class PhysicalCalibrator:
         ransac_reproj_error: float = 15.0,
         line_weight: float = 1.0,
         line_sample_points: int = 20,
+        min_line_length_px: float = 30.0,
         focal_bounds: tuple[float, float] = (1200.0, 2200.0),
         world_residual_weight: float = 0.0,
         world_error_threshold: float = 5.0,
         camera_position: tuple[float, float, float] | None = None,
         position_weight: float = 50.0,
+        lock_camera_position: bool = False,
         pitch_length: float = 105.0,
         pitch_width: float = 68.0,
+        pitch_dims: dict | None = None,
     ):
         """Initialize with image size and focal length guess.
 
@@ -363,11 +73,27 @@ class PhysicalCalibrator:
                 0 = disabled.
             world_error_threshold: World-space error threshold (meters) for iterative
                 outlier rejection. Set to float('inf') to disable.
+            min_line_length_px: Reject detected line segments shorter than this
+                in pixel space — short detections carry near-zero direction
+                information and pollute the LM. PnLCalib upstream uses 50.
             camera_position: Known camera position (x, y, z) in meters. If set, adds
                 residuals penalizing deviation from this position. None = no constraint.
+                Also enables the few-point (≥3) P3P init branch.
             position_weight: Weight for camera position residuals (pixels-equivalent).
+                Only used when lock_camera_position=False (soft constraint).
+            lock_camera_position: If True (and camera_position is set), tvec is
+                removed from optimization and recomputed every step as -R·C_target.
+                Reduces 7-DOF to 4-DOF (rvec, f). Use when position is known
+                to ≤cm accuracy. Otherwise keep False for soft constraint.
             pitch_length: Pitch length in meters (default 105 = FIFA standard).
+                Only used when ``pitch_dims`` is None.
             pitch_width: Pitch width in meters (default 68 = FIFA standard).
+                Only used when ``pitch_dims`` is None.
+            pitch_dims: Full pitch geometry override (penalty area, goal area,
+                goal frame, center circle, penalty mark distance). Keys not
+                present fall back to FIFA defaults. When given, overrides
+                ``pitch_length``/``pitch_width`` if those are in the dict.
+                Required for non-FIFA pitches (e.g. youth fields).
         """
         self.width, self.height = image_size
         # Fix principal point at image geometric center, zero distortion
@@ -380,17 +106,30 @@ class PhysicalCalibrator:
         self.ransac_reproj_error = ransac_reproj_error
         self.line_weight = line_weight
         self.line_sample_points = line_sample_points
+        self.min_line_length_px = min_line_length_px
         self.focal_bounds = focal_bounds
         self.world_residual_weight = world_residual_weight
         self.world_error_threshold = world_error_threshold
         self.camera_position = camera_position
         self.position_weight = position_weight
-        self.pitch_length = pitch_length
-        self.pitch_width = pitch_width
+        self.lock_camera_position = lock_camera_position and camera_position is not None
+
+        # Resolve pitch dims:
+        # - pitch_dims given → full override (FIFA fills missing keys).
+        # - else → length/width with FIFA markings.
+        if pitch_dims:
+            resolved = dict(pitch_dims)
+            resolved.setdefault("pitch_length", pitch_length)
+            resolved.setdefault("pitch_width", pitch_width)
+        else:
+            resolved = {"pitch_length": pitch_length, "pitch_width": pitch_width}
+        self.pitch_dims = resolved
+        self.pitch_length = resolved["pitch_length"]
+        self.pitch_width = resolved["pitch_width"]
 
         # Build field template (world coords, line defs, intersections)
         self._field_world_coords, self._field_line_defs, self._field_intersections = \
-            build_field_template(pitch_length, pitch_width)
+            build_field_template(resolved)
 
         self._keypoints: list[dict] = []
         self._lines: list[dict] = []
@@ -429,10 +168,13 @@ class PhysicalCalibrator:
         img_pts, world_pts, kp_ids, confidences = self._prepare_correspondences(
             keypoint_mapper, min_confidence
         )
-        if len(world_pts) < 6:
-            logger.debug("Too few keypoints (%d < 6), skipping", len(world_pts))
+        # With known camera_position we can solve from 3 points (P3P);
+        # without it the geometry needs 6 to disambiguate.
+        min_pts = 3 if self.camera_position is not None else 6
+        if len(world_pts) < min_pts:
+            logger.debug("Too few keypoints (%d < %d), skipping", len(world_pts), min_pts)
             self._last_debug = {
-                "failure_reason": f"too_few_keypoints ({len(world_pts)} < 6)",
+                "failure_reason": f"too_few_keypoints ({len(world_pts)} < {min_pts})",
                 "img_pts": img_pts,
                 "world_pts": world_pts,
                 "kp_ids": kp_ids,
@@ -445,7 +187,22 @@ class PhysicalCalibrator:
             kp_ids, img_pts, keypoint_mapper, line_mapper
         )
 
-        # Step 3: Get initial pose estimate (using detected keypoints only)
+        # Step 2b: Add line-line intersection points BEFORE PnP. With sparse
+        # detector output (e.g. 3 collinear kp + 5 lines) the intersections
+        # often supply the only non-collinear correspondences — without them
+        # P3P has no chance.
+        isect_img, isect_world, isect_ids = self._compute_line_intersections(
+            line_constraints, kp_ids
+        )
+        n_intersections = len(isect_ids)
+        if n_intersections > 0:
+            img_pts = np.vstack([img_pts, isect_img])
+            world_pts = np.vstack([world_pts, isect_world])
+            kp_ids = list(kp_ids) + isect_ids
+            logger.debug("Added %d line intersection points pre-PnP (total=%d)",
+                         n_intersections, len(kp_ids))
+
+        # Step 3: Get initial pose estimate
         ransac_info = None
         if initial_rvec is not None and initial_tvec is not None:
             # Warm-start from previous frame — skip PnP RANSAC
@@ -453,8 +210,13 @@ class PhysicalCalibrator:
             tvec_init = initial_tvec.copy().ravel()
             logger.debug("Using warm-start from previous frame")
         else:
-            # Cold start — PnP RANSAC initialization
-            pnp_result = self._pnp_ransac_init(world_pts, img_pts)
+            # Cold start. Few-point P3P branch when total points are scarce
+            # AND we have a position prior to disambiguate the multiple
+            # P3P solutions. Otherwise the standard multi-focal RANSAC.
+            if self.camera_position is not None and len(world_pts) < 6:
+                pnp_result = self._pnp_few_points_init(world_pts, img_pts)
+            else:
+                pnp_result = self._pnp_ransac_init(world_pts, img_pts)
             if pnp_result is None:
                 self._last_debug = {
                     "failure_reason": "pnp_ransac_failed",
@@ -465,18 +227,6 @@ class PhysicalCalibrator:
                 }
                 return None
             rvec_init, tvec_init, ransac_info = pnp_result
-
-        # Step 3b: Add line-line intersection points for refinement
-        isect_img, isect_world, isect_ids = self._compute_line_intersections(
-            line_constraints, kp_ids
-        )
-        n_intersections = len(isect_ids)
-        if n_intersections > 0:
-            img_pts = np.vstack([img_pts, isect_img])
-            world_pts = np.vstack([world_pts, isect_world])
-            kp_ids = list(kp_ids) + isect_ids
-            logger.debug("Added %d line intersection points (total=%d)",
-                         n_intersections, len(kp_ids))
 
         # Step 4: 7-DOF joint point+line optimization (rvec, tvec, f)
         # with iterative world-error-based outlier rejection
@@ -527,7 +277,7 @@ class PhysicalCalibrator:
                     break
 
                 # Need at least 6 points to continue
-                if int(np.sum(keep_mask)) < 6:
+                if int(np.sum(keep_mask)) < min_pts:
                     break
 
                 logger.debug("World-error iter %d: removed %d points (threshold=%.1fm)",
@@ -672,11 +422,28 @@ class PhysicalCalibrator:
         )
 
     def _derive_lines_from_keypoints(self, kp_ids, kp_img, keypoint_mapper, line_mapper):
-        """Derive line constraints from detected keypoints on field lines.
+        """Build line constraints, preferring line detector output over kp-derived ones.
 
-        For each ground line, if >=2 of its keypoints are detected, connect the
-        two most extreme ones in image space and sample points along that segment.
+        For each ground line, image endpoints come from (in priority order):
+        1. The line detector's own (x1, y1, x2, y2) when that line ID is in
+           ``self._lines``. Without this path, line head output is wasted
+           whenever <2 of a line's keypoints are detected.
+        2. Fallback: connect the two most extreme detected keypoints on
+           that line — works when a single keypoint isn't enough.
+
+        Either way we sample N evenly-spaced points along both the 3D world
+        line and the 2D image segment. Segments shorter than
+        ``self.min_line_length_px`` in image space are dropped — short
+        detections carry near-zero direction information.
         """
+        # Index detector lines by id so we can look them up cheaply.
+        detected_lines_by_id = {}
+        for ln in self._lines:
+            lid = ln.get("id")
+            if lid is None:
+                continue
+            detected_lines_by_id[lid] = ln
+
         detected = {}
         for i, kid in enumerate(kp_ids):
             detected[kid] = kp_img[i]
@@ -684,10 +451,36 @@ class PhysicalCalibrator:
         constraints = []
         non_ground = keypoint_mapper.NON_GROUND_KEYPOINTS
 
-        for line_id, kp_list in LINE_KEYPOINTS.items():
-            found = [(kid, detected[kid]) for kid in kp_list
-                     if kid in detected and kid not in non_ground]
-            if len(found) < 2:
+        for line_id in LINE_KEYPOINTS.keys():
+            # Skip non-ground lines (crossbars / posts)
+            if line_id not in self._field_line_defs:
+                continue
+
+            # Source 1: line detector
+            img_p1 = img_p2 = None
+            if line_id in detected_lines_by_id:
+                ln = detected_lines_by_id[line_id]
+                img_p1 = (float(ln["x1"]), float(ln["y1"]))
+                img_p2 = (float(ln["x2"]), float(ln["y2"]))
+            else:
+                # Source 2: kp fallback (need ≥2 kp on this line)
+                kp_list = LINE_KEYPOINTS.get(line_id, [])
+                found = [(kid, detected[kid]) for kid in kp_list
+                         if kid in detected and kid not in non_ground]
+                if len(found) >= 2:
+                    img_p1 = (float(found[0][1][0]), float(found[0][1][1]))
+                    img_p2 = (float(found[-1][1][0]), float(found[-1][1][1]))
+
+            if img_p1 is None:
+                continue
+
+            # Reject short image segments. A line carries useful direction
+            # only when its endpoints are far apart in pixel space — at
+            # 8-15 px length, ~1 px endpoint noise rotates the inferred
+            # direction by 4-8°, polluting LM with high-variance constraints.
+            seg_len = ((img_p1[0] - img_p2[0]) ** 2
+                       + (img_p1[1] - img_p2[1]) ** 2) ** 0.5
+            if seg_len < self.min_line_length_px:
                 continue
 
             # Get world line endpoints
@@ -697,7 +490,6 @@ class PhysicalCalibrator:
             polyline_3d = np.array([p1_w, p2_w])
             cum_lengths = compute_cumulated_lengths(polyline_3d)
 
-            # Sample N evenly spaced 3D points along the world line
             total_len = cum_lengths[-1]
             if total_len < 1e-6:
                 continue
@@ -707,12 +499,8 @@ class PhysicalCalibrator:
                 for t in t_values
             ])
 
-            # Image line: connect first and last detected keypoint
-            first_img = found[0][1]
-            last_img = found[-1][1]
             img_samples = sample_points_on_image_line(
-                float(first_img[0]), float(first_img[1]),
-                float(last_img[0]), float(last_img[1]),
+                img_p1[0], img_p1[1], img_p2[0], img_p2[1],
                 n_points=self.line_sample_points,
             )
 
@@ -746,7 +534,14 @@ class PhysicalCalibrator:
             line_endpoints[lid] = (img[0], img[-1])
 
         existing_set = set(existing_kp_ids)
-        margin = 50  # pixels outside image to still accept
+        # When the camera's FOV cuts a line endpoint off, the line's
+        # extrapolated intersection lands well outside the frame yet is
+        # still a valid 3D-2D correspondence (the world point is unique;
+        # only the pixel location is extrapolated). Allow ±1.5× image
+        # extents — far enough to cover useful out-of-frame intersections,
+        # tight enough to reject parallel-line numerical blowups.
+        margin_x = self.width * 1.5
+        margin_y = self.height * 1.5
 
         int_img = []
         int_world = []
@@ -779,10 +574,12 @@ class PhysicalCalibrator:
             ix = x1 + t * (x2 - x1)
             iy = y1 + t * (y2 - y1)
 
-            # Skip if outside image bounds (with margin)
-            if ix < -margin or ix > self.width + margin:
+            # Skip if extrapolation lands absurdly far from the frame —
+            # signals near-parallel detector lines whose computed
+            # intersection has huge numerical error.
+            if ix < -margin_x or ix > self.width + margin_x:
                 continue
-            if iy < -margin or iy > self.height + margin:
+            if iy < -margin_y or iy > self.height + margin_y:
                 continue
 
             int_img.append([ix, iy])
@@ -899,10 +696,170 @@ class PhysicalCalibrator:
                       len(inlier_indices), len(img_pts), ransac_info["mean_all_error"])
         return rvec.ravel(), tvec.ravel(), ransac_info
 
-    def _refine_7dof(self, rvec_init, tvec_init, img_pts, world_pts, line_constraints):
-        """7-DOF bounded optimization with point+line residuals.
+    def _pnp_few_points_init(self, world_pts, img_pts):
+        """Initialize pose from 3-5 points using camera_position to disambiguate.
 
-        State vector: [rvec(3), tvec(3), f] — 7 parameters.
+        With ≥6 points the multi-focal RANSAC sweep handles initialization
+        robustly. Below that the geometry is under-constrained: P3P returns
+        up to 4 candidate poses, EPnP can lock onto a mirror solution. We
+        use the known camera position as a tiebreaker: project each
+        candidate's camera center, pick the one closest to the prior.
+
+        Returns:
+            (rvec, tvec, ransac_info) or None on failure.
+        """
+        assert self.camera_position is not None, "few-points branch requires camera_position"
+        n = len(world_pts)
+        if n < 3:
+            return None
+
+        cx, cy = self.K[0, 2], self.K[1, 2]
+        dist = self.dist_coeffs
+        pos_target = np.array(self.camera_position, dtype=np.float64)
+
+        # Sample focal candidates densely — P3P is highly sensitive to f,
+        # and the right answer can sit between sparse profile-anchored
+        # samples. Walk the allowed range in fixed steps.
+        f_min, f_max = self.focal_bounds
+        focal_step = max(100.0, (f_max - f_min) / 20.0)
+        focal_candidates = list(np.arange(f_min, f_max + 1.0, focal_step))
+
+        # P3P needs exactly 3 points; for n>3 try multiple subsets so
+        # disambiguation has more signal. Cap at 4 subsets for speed.
+        obj_for_p3p_indices = [list(range(3))]
+        if n >= 4:
+            obj_for_p3p_indices += [
+                [0, 1, n - 1],
+                [0, n - 2, n - 1],
+            ]
+            if n == 5:
+                obj_for_p3p_indices.append([1, 2, 3])
+
+        best = None
+        best_score = float("inf")
+
+        for f_try in focal_candidates:
+            K_try = np.array(
+                [[f_try, 0, cx], [0, f_try, cy], [0, 0, 1]], dtype=np.float64,
+            )
+            for subset in obj_for_p3p_indices:
+                obj_sub = world_pts[subset].astype(np.float64).reshape(-1, 1, 3)
+                img_sub = img_pts[subset].astype(np.float64).reshape(-1, 1, 2)
+
+                try:
+                    n_sol, rvecs, tvecs = cv2.solveP3P(
+                        obj_sub, img_sub, K_try, dist, flags=cv2.SOLVEPNP_P3P,
+                    )
+                except cv2.error:
+                    n_sol = 0
+
+                if n_sol <= 0:
+                    continue
+
+                for rv, tv in zip(rvecs, tvecs):
+                    R0, _ = cv2.Rodrigues(rv)
+                    cc0 = (-R0.T @ tv.ravel()).ravel()
+                    if cc0[2] <= 0.1:
+                        continue  # below ground
+
+                    # Cheap LM polish on ALL points so we score how well a
+                    # candidate explains the full set, not just the P3P
+                    # subset. Without this, a mis-focal P3P can luck into
+                    # fitting the 3 chosen points perfectly while the other
+                    # n-3 points blow up.
+                    try:
+                        rv_pol, tv_pol = cv2.solvePnPRefineLM(
+                            world_pts.astype(np.float64).reshape(-1, 1, 3),
+                            img_pts.astype(np.float64).reshape(-1, 1, 2),
+                            K_try, dist, rv.copy(), tv.copy(),
+                            (cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 50, 1e-4),
+                        )
+                    except cv2.error:
+                        rv_pol, tv_pol = rv, tv
+
+                    R, _ = cv2.Rodrigues(rv_pol)
+                    cam_center = (-R.T @ tv_pol.ravel()).ravel()
+                    if cam_center[2] <= 0.1:
+                        continue
+
+                    proj = project_points_2d(world_pts, rv_pol, tv_pol, K_try, dist)
+                    reproj_err = float(np.mean(np.linalg.norm(proj - img_pts, axis=1)))
+                    pos_err = float(np.linalg.norm(cam_center - pos_target))
+
+                    # Position deviation is in meters, reproj in pixels.
+                    # Both matter — weight position heavily since the prior
+                    # is the whole reason we're in this branch.
+                    score = pos_err * 10.0 + reproj_err
+
+                    if score < best_score:
+                        best_score = score
+                        best = (
+                            rv_pol.ravel(), tv_pol.ravel(), f_try,
+                            cam_center, reproj_err, pos_err,
+                        )
+
+        if best is None:
+            logger.debug("Few-point P3P found no valid candidate")
+            self._last_ransac_debug = {
+                "success": False,
+                "failure_reason": "p3p_no_valid_candidate",
+                "reprojection_threshold": float(self.ransac_reproj_error),
+                "total_points": int(len(img_pts)),
+                "inlier_count": 0,
+                "inlier_indices": [],
+            }
+            return None
+
+        rvec, tvec, best_f, cam_center, reproj_err, pos_err = best
+
+        # Update self.K so _refine_7dof starts from this f
+        self.K[0, 0] = best_f
+        self.K[1, 1] = best_f
+
+        K_best = np.array([[best_f, 0, cx], [0, best_f, cy], [0, 0, 1]], dtype=np.float64)
+        projected = project_points_2d(world_pts, rvec, tvec, K_best, dist)
+        per_point_errors = np.linalg.norm(projected - img_pts, axis=1)
+        inlier_mask = per_point_errors < self.ransac_reproj_error
+        inlier_indices = np.where(inlier_mask)[0].tolist()
+
+        logger.debug(
+            "Few-point P3P: n=%d, f=%.0f, cam=(%.1f,%.1f,%.1f) [target=(%.1f,%.1f,%.1f)], "
+            "pos_err=%.2fm, reproj=%.2fpx",
+            n, best_f, cam_center[0], cam_center[1], cam_center[2],
+            pos_target[0], pos_target[1], pos_target[2], pos_err, reproj_err,
+        )
+
+        n_in = int(np.sum(inlier_mask))
+        n_out = int(np.sum(~inlier_mask))
+        ransac_info = {
+            "success": True,
+            "method": "few_points_p3p",
+            "reprojection_threshold": float(self.ransac_reproj_error),
+            "total_points": int(len(img_pts)),
+            "inlier_count": int(len(inlier_indices)),
+            "outlier_count": int(len(img_pts) - len(inlier_indices)),
+            "inlier_indices": inlier_indices,
+            "inlier_mask": inlier_mask,
+            "per_point_errors": per_point_errors,
+            "mean_inlier_error": float(np.mean(per_point_errors[inlier_mask])) if n_in else 0.0,
+            "mean_outlier_error": float(np.mean(per_point_errors[~inlier_mask])) if n_out else 0.0,
+            "mean_all_error": float(np.mean(per_point_errors)),
+            "rvec_init": rvec.copy(),
+            "tvec_init": tvec.copy(),
+            "position_prior_error_m": float(pos_err),
+        }
+        return rvec, tvec, ransac_info
+
+    def _refine_7dof(self, rvec_init, tvec_init, img_pts, world_pts, line_constraints):
+        """Bounded LM refinement with point + line + (optional position) residuals.
+
+        Two modes:
+        - Standard: state = [rvec(3), tvec(3), f] (7-DOF). camera_position
+          is enforced as a soft residual (cauchy + replicated copies).
+        - Locked (lock_camera_position=True): state = [rvec(3), f] (4-DOF).
+          tvec is recomputed every step as -R · C_target, removing the
+          focal/distance ambiguity entirely.
+
         cx/cy fixed at image center, distortion fixed at zero.
         """
         f_init = self.K[0, 0]
@@ -910,7 +867,16 @@ class PhysicalCalibrator:
         cy_fixed = self.K[1, 2]
         dist_zero = np.zeros(5, dtype=np.float64)
 
-        x0 = np.concatenate([rvec_init.ravel(), tvec_init.ravel(), [f_init]])
+        locked = self.lock_camera_position
+        pos_target = (
+            np.array(self.camera_position, dtype=np.float64)
+            if self.camera_position is not None else None
+        )
+
+        if locked:
+            x0 = np.concatenate([rvec_init.ravel(), [f_init]])
+        else:
+            x0 = np.concatenate([rvec_init.ravel(), tvec_init.ravel(), [f_init]])
 
         # Pre-compute line normals from detected endpoints (constant during optimization)
         line_normals = []
@@ -932,13 +898,23 @@ class PhysicalCalibrator:
         n_samples = self.line_sample_points
         per_sample_weight = self.line_weight / np.sqrt(n_samples) if n_samples > 0 else 0.0
 
+        def unpack(x):
+            if locked:
+                rvec = x[:3]
+                f = x[3]
+                R, _ = cv2.Rodrigues(rvec)
+                tvec = -R @ pos_target
+            else:
+                rvec = x[:3]
+                tvec = x[3:6]
+                f = x[6]
+            return rvec, tvec, f
+
         def cost_fn(x):
-            rvec = x[:3]
-            tvec = x[3:6]
-            f = x[6]
+            rvec, tvec, f = unpack(x)
             K_cur = np.array([[f, 0, cx_fixed], [0, f, cy_fixed], [0, 0, 1]], dtype=np.float64)
 
-            # Point residuals: projected - detected
+            # Point residuals
             projected = project_points_2d(
                 world_pts, rvec, tvec, K_cur, dist_zero,
             )
@@ -946,7 +922,7 @@ class PhysicalCalibrator:
 
             all_residuals = [point_residuals]
 
-            # Line residuals (zero out degenerate projections outside image bounds)
+            # Line residuals (zero out projections far outside image bounds)
             if valid_lc:
                 img_bound = max(self.width, self.height) * 3
                 for i, lc in enumerate(valid_lc):
@@ -959,7 +935,7 @@ class PhysicalCalibrator:
                     distances[~valid] = 0.0
                     all_residuals.append(distances * per_sample_weight)
 
-            # World-space back-projection residuals (vectorized)
+            # World-space back-projection residuals
             if self.world_residual_weight > 0:
                 R_cur, _ = cv2.Rodrigues(rvec)
                 cam_center = -R_cur.T @ tvec.ravel()
@@ -976,13 +952,12 @@ class PhysicalCalibrator:
                 diff_xy[invalid] = 0.0
                 all_residuals.append(diff_xy.ravel())
 
-            # Camera position constraint (x, y, z)
+            # Camera position SOFT constraint (skipped when hard-locked).
             # Replicate into many small residuals so cauchy loss doesn't
             # suppress them — each copy stays near the quadratic regime.
-            if self.camera_position is not None:
+            if pos_target is not None and not locked:
                 R_cur, _ = cv2.Rodrigues(rvec)
                 cam_center = -R_cur.T @ tvec.ravel()
-                pos_target = np.array(self.camera_position)
                 n_copies = 50
                 w_per_copy = self.position_weight / np.sqrt(n_copies)
                 pos_single = (cam_center - pos_target) * w_per_copy
@@ -990,16 +965,23 @@ class PhysicalCalibrator:
 
             return np.concatenate(all_residuals)
 
-        bounds = (
-            [-np.inf] * 6 + [self.focal_bounds[0]],
-            [+np.inf] * 6 + [self.focal_bounds[1]],
-        )
+        if locked:
+            bounds = (
+                [-np.inf] * 3 + [self.focal_bounds[0]],
+                [+np.inf] * 3 + [self.focal_bounds[1]],
+            )
+        else:
+            bounds = (
+                [-np.inf] * 6 + [self.focal_bounds[0]],
+                [+np.inf] * 6 + [self.focal_bounds[1]],
+            )
         result = least_squares(
             cost_fn, x0, method="trf", bounds=bounds,
             loss="cauchy", f_scale=15.0, max_nfev=300,
         )
 
-        return result.x[:3], result.x[3:6], float(result.x[6])
+        rvec_opt, tvec_opt, f_opt = unpack(result.x)
+        return rvec_opt, tvec_opt, f_opt
 
     def _compute_reprojection_stats(self, rvec, tvec, img_pts, world_pts, K=None, dist=None):
         """Compute reprojection error statistics."""
@@ -1121,11 +1103,21 @@ class PhysicalCalibrator:
         cy_fixed = self.K[1, 2]
         dist_zero = np.zeros(5, dtype=np.float64)
 
-        # State vector: [f] + [per-frame rvec(3), tvec(3)] × N = 1 + 6N parameters
+        locked = self.lock_camera_position
+        pos_target_arr = (
+            np.array(self.camera_position, dtype=np.float64)
+            if self.camera_position is not None else None
+        )
+        per_frame_dof = 3 if locked else 6
+
+        # State vector: [f] + [per-frame extrinsics] × N
+        # locked  : per-frame = rvec(3)            → 1 + 3N params
+        # default : per-frame = rvec(3), tvec(3)   → 1 + 6N params
         x0_parts = [np.array([f_init])]
         for fd in frame_data_list:
             x0_parts.append(fd["rvec"].ravel())
-            x0_parts.append(fd["tvec"].ravel())
+            if not locked:
+                x0_parts.append(fd["tvec"].ravel())
         x0 = np.concatenate(x0_parts)
 
         # Pre-compute line normals per frame (constant during optimization)
@@ -1157,9 +1149,13 @@ class PhysicalCalibrator:
             all_residuals = []
 
             for i, fd in enumerate(frame_data_list):
-                offset = N_INTRINSICS + i * 6
+                offset = N_INTRINSICS + i * per_frame_dof
                 rvec = x[offset:offset + 3].reshape(3, 1)
-                tvec = x[offset + 3:offset + 6].reshape(3, 1)
+                if locked:
+                    R_cur, _ = cv2.Rodrigues(rvec)
+                    tvec = (-R_cur @ pos_target_arr).reshape(3, 1)
+                else:
+                    tvec = x[offset + 3:offset + 6].reshape(3, 1)
                 img_pts = fd["img_pts"]
                 world_pts = fd["world_pts"]
 
@@ -1197,14 +1193,13 @@ class PhysicalCalibrator:
                     diff_xy[invalid] = 0.0
                     all_residuals.append(diff_xy.ravel())
 
-                # Camera position constraint (x, y, z) — replicated for cauchy robustness
-                if self.camera_position is not None:
+                # Camera position SOFT constraint (skipped when hard-locked).
+                if pos_target_arr is not None and not locked:
                     R_cur, _ = cv2.Rodrigues(rvec)
                     cam_center = -R_cur.T @ tvec.ravel()
-                    pos_target = np.array(self.camera_position)
                     n_copies = 200
                     w_per_copy = self.position_weight / np.sqrt(n_copies)
-                    pos_single = (cam_center - pos_target) * w_per_copy
+                    pos_single = (cam_center - pos_target_arr) * w_per_copy
                     all_residuals.append(np.tile(pos_single, n_copies))
 
             return np.concatenate(all_residuals)
@@ -1213,8 +1208,8 @@ class PhysicalCalibrator:
         lb = [self.focal_bounds[0]]
         ub = [self.focal_bounds[1]]
         for _ in range(n_frames):
-            lb.extend([-np.inf] * 6)
-            ub.extend([+np.inf] * 6)
+            lb.extend([-np.inf] * per_frame_dof)
+            ub.extend([+np.inf] * per_frame_dof)
 
         logger.info("Joint optimization: %d frames, %d params", n_frames, len(x0))
         result = least_squares(
@@ -1228,9 +1223,13 @@ class PhysicalCalibrator:
 
         per_frame = []
         for i in range(n_frames):
-            offset = N_INTRINSICS + i * 6
+            offset = N_INTRINSICS + i * per_frame_dof
             rvec_i = result.x[offset:offset + 3]
-            tvec_i = result.x[offset + 3:offset + 6]
+            if locked:
+                R_i, _ = cv2.Rodrigues(rvec_i)
+                tvec_i = -R_i @ pos_target_arr
+            else:
+                tvec_i = result.x[offset + 3:offset + 6]
             per_frame.append({"rvec": rvec_i, "tvec": tvec_i})
 
         logger.info("Joint result: f=%.1f, cost=%.2f", f_opt, result.cost)
