@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import shutil
 import subprocess
 import time
@@ -193,7 +194,14 @@ def _build_docker_cmd(
     output_abs = output_path.resolve()
     out_dir = output_abs.parent
 
-    # Mount input file and output directory
+    # All paths and v2x_args are interpolated into a `bash -c` string for the
+    # driver-symlink fixup, so shell-quote every value that came from event
+    # metadata, config, or filenames. Without this, a clip filename containing
+    # shell metacharacters would inject commands into the docker exec.
+    quoted_in = shlex.quote(f"/data/input/{input_abs.name}")
+    quoted_out = shlex.quote(f"/data/output/{output_abs.name}")
+    quoted_args = " ".join(shlex.quote(a) for a in v2x_args)
+
     cmd = [
         "docker", "run", "--rm",
         "--gpus", "all",
@@ -203,11 +211,8 @@ def _build_docker_cmd(
         "--entrypoint", "bash",
         image,
         "-c",
-        # Fix nvidia driver symlinks, then run video2x
         f'{_DOCKER_DRIVER_FIX} && '
-        f'/usr/bin/video2x -i /data/input/{input_abs.name} '
-        f'-o /data/output/{output_abs.name} '
-        + " ".join(v2x_args),
+        f'/usr/bin/video2x -i {quoted_in} -o {quoted_out} {quoted_args}',
     ]
     return cmd
 
