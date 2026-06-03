@@ -34,48 +34,59 @@ class PnLCalibWeightDownloader:
     CACHE_DIR = Path.home() / ".cache" / "goal-insight" / "pnlcalib"
     BASE_URL = "https://github.com/mguti97/PnLCalib/releases/download/v1.0.0/"
 
-    # Available weight files and their expected sizes (for validation)
-    # Note: PnLCalib release files don't have .pth extension
+    # Available weight files. Set ``sha256`` once you've downloaded a release
+    # and hashed it locally (``sha256sum SV_kp``). Files are unpickled by
+    # ``torch.load(weights_only=False)`` downstream, so a tampered release
+    # would mean RCE on first run — empty-string sha256 logs a warning;
+    # filling it in turns the warning into a hard failure on mismatch.
     AVAILABLE_WEIGHTS: dict[str, dict[str, Any]] = {
         "SV_kp": {
             "filename": "SV_kp",
             "description": "Single-view keypoint detector (recommended)",
             "type": "keypoint",
+            "sha256": "",
         },
         "SV_lines": {
             "filename": "SV_lines",
             "description": "Single-view line detector (recommended)",
             "type": "line",
+            "sha256": "",
         },
         "SV_FT_WC14_kp": {
             "filename": "SV_FT_WC14_kp",
             "description": "WorldCup 2014 fine-tuned keypoint detector",
             "type": "keypoint",
+            "sha256": "",
         },
         "SV_FT_WC14_lines": {
             "filename": "SV_FT_WC14_lines",
             "description": "WorldCup 2014 fine-tuned line detector",
             "type": "line",
+            "sha256": "",
         },
         "SV_FT_TSWC_kp": {
             "filename": "SV_FT_TSWC_kp",
             "description": "TS World Cup fine-tuned keypoint detector",
             "type": "keypoint",
+            "sha256": "",
         },
         "SV_FT_TSWC_lines": {
             "filename": "SV_FT_TSWC_lines",
             "description": "TS World Cup fine-tuned line detector",
             "type": "line",
+            "sha256": "",
         },
         "MV_kp": {
             "filename": "MV_kp",
             "description": "Multi-view keypoint detector",
             "type": "keypoint",
+            "sha256": "",
         },
         "MV_lines": {
             "filename": "MV_lines",
             "description": "Multi-view line detector",
             "type": "line",
+            "sha256": "",
         },
     }
 
@@ -120,7 +131,8 @@ class PnLCalibWeightDownloader:
 
         # Download weights
         url = self.BASE_URL + filename
-        self._download_file(url, local_path)
+        expected_sha256 = weight_info.get("sha256", "")
+        self._download_file(url, local_path, expected_sha256=expected_sha256)
 
         return local_path
 
@@ -129,20 +141,28 @@ class PnLCalibWeightDownloader:
         url: str,
         dest_path: Path,
         timeout: float = 300.0,
+        expected_sha256: str = "",
     ) -> None:
         """Download a file from URL to local path.
+
+        Computes SHA-256 while streaming. If ``expected_sha256`` is set, the
+        download is rejected on mismatch (the temp file is removed). If it's
+        empty, the actual hash is logged so the user can pin it.
 
         Args:
             url: URL to download from.
             dest_path: Local destination path.
             timeout: Download timeout in seconds.
+            expected_sha256: Pinned hex SHA-256, or "" to skip verification.
 
         Raises:
-            RuntimeError: If download fails.
+            RuntimeError: If download fails or SHA-256 mismatches.
         """
         logger.info(f"Downloading weights from {url}")
         logger.info(f"Saving to {dest_path}")
 
+        hasher = hashlib.sha256()
+        temp_path = dest_path.with_suffix(".tmp")
         try:
             with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as response:
                 response.raise_for_status()
@@ -150,24 +170,40 @@ class PnLCalibWeightDownloader:
                 total_size = int(response.headers.get("content-length", 0))
                 downloaded = 0
 
-                # Download to temp file first
-                temp_path = dest_path.with_suffix(".tmp")
                 with open(temp_path, "wb") as f:
                     for chunk in response.iter_bytes(chunk_size=8192):
                         f.write(chunk)
+                        hasher.update(chunk)
                         downloaded += len(chunk)
                         if total_size > 0:
                             progress = downloaded / total_size * 100
                             if downloaded % (1024 * 1024 * 10) < 8192:  # Log every ~10MB
                                 logger.info(f"Download progress: {progress:.1f}%")
 
-                # Move to final location
-                temp_path.rename(dest_path)
-                logger.info(f"Download complete: {dest_path}")
+            actual_sha256 = hasher.hexdigest()
+            if expected_sha256:
+                if actual_sha256 != expected_sha256:
+                    temp_path.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"SHA-256 mismatch for {url}: "
+                        f"expected {expected_sha256}, got {actual_sha256}. "
+                        "Refusing to load (the file will be unpickled by "
+                        "torch.load and a tampered release means RCE)."
+                    )
+                logger.info(f"SHA-256 verified: {actual_sha256}")
+            else:
+                logger.warning(
+                    "No SHA-256 pinned for %s; downloaded file has hash %s. "
+                    "Add this to AVAILABLE_WEIGHTS in weight_downloader.py to "
+                    "verify future downloads.",
+                    dest_path.name, actual_sha256,
+                )
+
+            temp_path.rename(dest_path)
+            logger.info(f"Download complete: {dest_path}")
 
         except httpx.HTTPError as e:
-            if dest_path.with_suffix(".tmp").exists():
-                dest_path.with_suffix(".tmp").unlink()
+            temp_path.unlink(missing_ok=True)
             raise RuntimeError(f"Failed to download weights from {url}: {e}")
 
     def get_keypoint_weights(

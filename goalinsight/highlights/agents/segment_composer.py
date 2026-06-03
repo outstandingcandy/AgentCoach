@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,16 @@ from .._types import AnalyzedEvent, ClipSegment
 from .base import BaseClipComposer
 
 logger = logging.getLogger(__name__)
+
+# Restrict clip filenames to a safe charset. Components are derived from
+# event metadata, which downstream code passes into a `bash -c` string for
+# the video_enhancement docker mode; without sanitisation, a hostile
+# events.json could inject shell commands.
+_SAFE_NAME_COMPONENT = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _sanitize(part: str) -> str:
+    return _SAFE_NAME_COMPONENT.sub("_", str(part))
 
 
 class _UpscaledFrameReader:
@@ -84,8 +95,8 @@ class SegmentComposer(BaseClipComposer):
 
         event = analyzed.event
         clip_name = (
-            f"{event.event_type}_{event.frame}"
-            f"_{event.metadata.get('goal_side', '')}.mp4"
+            f"{_sanitize(event.event_type)}_{_sanitize(event.frame)}"
+            f"_{_sanitize(event.metadata.get('goal_side', ''))}.mp4"
         )
         output_path = output_dir / clip_name
 
