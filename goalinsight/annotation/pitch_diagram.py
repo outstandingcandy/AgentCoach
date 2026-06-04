@@ -197,13 +197,17 @@ def create_pitch_diagram(
             return "HALFWAY"
         return "DEFAULT"
 
-    # Nudge overlapping goal posts apart so their labels don't overlap.
-    # In y-up world, +y = top; goal post tops (crossbar, NOT_ON_PLANE ids 0,1,24,25)
-    # get a slight +y (toward top of screen); grounded posts (2,3,26,27) get -y.
-    GOAL_POST_DISPLAY_OFFSET = {
-        0: 1.5, 1: 1.5, 24: 1.5, 25: 1.5,
-        2: -1.5, 3: -1.5, 26: -1.5, 27: -1.5,
-    }
+    # Goal-post overlap on the ground plane.
+    # The 4 keypoints per goal collapse onto 2 unique (x, y) screen
+    # positions because each post has a "crossbar end" (z=-G_H) and a
+    # "ground end" (z=0) at the same (x, y). The two posts of one goal
+    # already differ in y (+G_HW vs -G_HW), so only crossbar-vs-ground
+    # needs a screen-side nudge. We push the crossbar end *outward* (away
+    # from pitch center) and the ground end *inward* — clicking either
+    # picks the right kp without ambiguity.
+    NOT_ON_PLANE_SET = set(NOT_ON_PLANE)  # {0, 1, 24, 25} crossbar tops
+    LEFT_GOAL_IDS = {0, 1, 2, 3}
+    POST_OFFSET_M = 1.4    # at scale=7 → ~10 px lateral nudge, > radius
 
     hrnet_pitch_points = _pk.PITCH_POINTS
     for idx, name in INTERSECTON_TO_PITCH_POINTS.items():
@@ -211,8 +215,19 @@ def create_pitch_diagram(
             continue
         pt = hrnet_pitch_points[name]
         wx, wy = float(pt[0]), float(pt[1])
-        display_wy = wy + GOAL_POST_DISPLAY_OFFSET.get(idx, 0)
-        px, py = world_to_px(wx, display_wy)
+        # Goal-post posts: nudge in screen-x to disambiguate crossbar
+        # (z<0) from ground (z=0) ends that share (x, y).
+        if 0 <= idx <= 3 or 24 <= idx <= 27:
+            is_left = idx in LEFT_GOAL_IDS
+            is_crossbar = idx in NOT_ON_PLANE_SET
+            # Outward = away from pitch center.
+            outward = -1.0 if is_left else +1.0
+            sign = +1.0 if is_crossbar else -1.0  # crossbar outward, ground inward
+            display_wx = wx + sign * outward * POST_OFFSET_M
+            display_wy = wy
+        else:
+            display_wx, display_wy = wx, wy
+        px, py = world_to_px(display_wx, display_wy)
 
         if name in annotated_keypoints:
             color = (0, 255, 0)
@@ -227,49 +242,35 @@ def create_pitch_diagram(
         cv2.circle(img, (px, py), radius, color, -1)
         cv2.circle(img, (px, py), radius + 1, (0, 0, 0), 1)
 
-        pnl_id = pitch_name_to_pnlcalib_id(name)
-        if pnl_id < 0:
-            primary = "-"
-        elif idx in [0, 1, 24, 25]:
-            primary = f"{pnl_id}T"
-        elif idx in [2, 3, 26, 27]:
-            primary = f"{pnl_id}B"
-        else:
-            primary = str(pnl_id)
-        secondary = f"(h{idx})"
+        # Per-keypoint label only for the currently-selected one — clicks
+        # use this image as a picker, not a reference chart, so the
+        # densely-packed pnlcalib/hrnet-id labels were noise. The dropdown
+        # already shows the chosen name; the highlight ring is enough
+        # visual feedback.
+        if highlight_keypoint and name == highlight_keypoint:
+            pnl_id = pitch_name_to_pnlcalib_id(name)
+            label = name if pnl_id < 0 else f"{name} (id {pnl_id})"
+            font_scale = 0.4
+            (lw_, lh_), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+            label_x = px + 8
+            label_y = py - 6
+            cv2.rectangle(
+                img,
+                (label_x - 2, label_y - lh_ - 2),
+                (label_x + lw_ + 2, label_y + 2),
+                (0, 0, 0), -1,
+            )
+            cv2.putText(img, label, (label_x, label_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
 
-        font_scale = 0.32
-        label_x = px + 6
-        label_y = py - 4
-
-        (pw, ph), _ = cv2.getTextSize(primary, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
-        (sw, sh), _ = cv2.getTextSize(secondary, cv2.FONT_HERSHEY_SIMPLEX, 0.26, 1)
-        total_w = pw + sw + 4
-        bg_color = (0, 80, 0) if name in annotated_keypoints else (40, 40, 40)
-        cv2.rectangle(
-            img,
-            (label_x - 1, label_y - ph - 1),
-            (label_x + total_w + 1, label_y + 1),
-            bg_color, -1,
-        )
-        cv2.putText(img, primary, (label_x, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-        cv2.putText(img, secondary, (label_x + pw + 4, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.26, (170, 170, 170), 1)
-
-    legend_y = height - 75
-    cv2.putText(img, "PnLCalib channel id (0-indexed) | gray (hN) = HRNet index",
+    legend_y = height - 30
+    cv2.putText(img, "Click to pick keypoint  |  Red = selected  |  Green = annotated",
                 (10, legend_y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-    cv2.putText(img, "Numbers match HRNet output channels; '-' = no PnLCalib counterpart",
-                (10, legend_y + 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 200, 200), 1)
-    cv2.putText(img, "Pts: Red=Selected | Green=Annotated",
-                (10, legend_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
     count_color = (0, 255, 0) if len(annotated_keypoints) >= 4 else (255, 100, 100)
     cv2.putText(img, f"Annotated: {len(annotated_keypoints)}/4+ needed",
-                (10, legend_y + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.35, count_color, 1)
+                (10, legend_y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, count_color, 1)
 
     legend_x = width - 120
     legend_y = 20
@@ -367,19 +368,17 @@ def create_lines_diagram(
             cv2.circle(img, p1, 7, (255, 255, 255), 1)
             cv2.circle(img, p2, 7, (255, 255, 255), 1)
 
-        if is_annotated:
-            label = abbreviate_line_name(line_name) + " *"
-            font_scale = 0.45
-        elif is_highlight:
-            label = abbreviate_line_name(line_name)
-            font_scale = 0.5
-        else:
-            label = abbreviate_line_name(line_name)
-            font_scale = 0.35
-        _draw_line_label(img, p1, p2, label, color,
-                         font_scale=font_scale,
-                         thickness=2 if is_highlight else 1,
-                         offset=12, bg_pad=3)
+        # Only label the currently-selected line and (compactly) any
+        # already-annotated ones — every-line abbreviated labels were
+        # cluttering up clicks.
+        if is_highlight:
+            _draw_line_label(img, p1, p2, abbreviate_line_name(line_name),
+                             color=color, font_scale=0.5, thickness=2,
+                             offset=12, bg_pad=3)
+        elif is_annotated:
+            _draw_line_label(img, p1, p2, "*", color=color,
+                             font_scale=0.45, thickness=1,
+                             offset=10, bg_pad=2)
 
     # Header / legend
     cv2.putText(img, f"Pitch Lines ({len(pitch_lines)}) - pick from the dropdown",
@@ -391,3 +390,79 @@ def create_lines_diagram(
                 (220, 220, 220), 1)
 
     return img
+
+
+# ----------------------------------------------------------------------
+# Layout helpers — return pixel coordinates of every clickable element on
+# the reference diagrams, mirroring the exact same scale/margin/offsets
+# used in create_pitch_diagram / create_lines_diagram. The frontend
+# click-to-pick UI uses these to hit-test image clicks.
+# ----------------------------------------------------------------------
+
+# Goal-post offset (mirror of create_pitch_diagram). Kept here so the
+# frontend hit-test sees the same screen positions the user sees.
+_NOT_ON_PLANE_SET = set(NOT_ON_PLANE)
+_LEFT_GOAL_IDS = {0, 1, 2, 3}
+_POST_OFFSET_M = 1.4
+
+
+def compute_pitch_layout() -> dict:
+    """Pixel coordinates of every keypoint on the reference pitch diagram.
+
+    Returns ``{width, height, keypoints: [{name, hrnet_index, x, y}, ...]}``
+    matching ``create_pitch_diagram`` exactly (scale=7, margin=50, with
+    crossbar-vs-ground horizontal nudge for the 8 goal posts).
+    """
+    scale = 7
+    _, world_to_px, width, height = make_pitch_canvas(scale=scale, margin=50)
+
+    keypoints = []
+    hrnet_pitch_points = _pk.PITCH_POINTS
+    for idx, name in INTERSECTON_TO_PITCH_POINTS.items():
+        if name not in hrnet_pitch_points:
+            continue
+        pt = hrnet_pitch_points[name]
+        wx, wy = float(pt[0]), float(pt[1])
+        if 0 <= idx <= 3 or 24 <= idx <= 27:
+            is_left = idx in _LEFT_GOAL_IDS
+            is_crossbar = idx in _NOT_ON_PLANE_SET
+            outward = -1.0 if is_left else +1.0
+            sign = +1.0 if is_crossbar else -1.0
+            display_wx = wx + sign * outward * _POST_OFFSET_M
+            display_wy = wy
+        else:
+            display_wx, display_wy = wx, wy
+        px, py = world_to_px(display_wx, display_wy)
+        keypoints.append({
+            "name": name,
+            "hrnet_index": int(idx),
+            "x": int(px),
+            "y": int(py),
+        })
+
+    return {"width": int(width), "height": int(height), "keypoints": keypoints}
+
+
+def compute_lines_layout(pitch_lines: dict | None = None) -> dict:
+    """Pixel coordinates of every line on the reference lines diagram.
+
+    Returns ``{width, height, lines: [{name, x1,y1,x2,y2}, ...]}`` matching
+    ``create_lines_diagram`` (scale=7, margin=60).
+    """
+    if pitch_lines is None:
+        pitch_lines = pitch_constants.PITCH_LINES
+
+    scale = 7
+    _, world_to_px, width, height = make_pitch_canvas(scale=scale, margin=60)
+
+    lines = []
+    for line_name, ((x1, y1), (x2, y2)) in pitch_lines.items():
+        p1 = world_to_px(x1, y1)
+        p2 = world_to_px(x2, y2)
+        lines.append({
+            "name": line_name,
+            "x1": int(p1[0]), "y1": int(p1[1]),
+            "x2": int(p2[0]), "y2": int(p2[1]),
+        })
+
+    return {"width": int(width), "height": int(height), "lines": lines}

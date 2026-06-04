@@ -47,7 +47,7 @@
   .right h3 { margin: 0 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; display: flex; justify-content: space-between; align-items: center; }
   .right h3 .h3-actions { display: flex; gap: 4px; }
   .right .panel { padding: 8px; }
-  .pitch-images img { width: 100%; display: block; border-radius: 3px; }
+  .pitch-images img { width: 100%; display: block; border-radius: 3px; cursor: crosshair; }
   .pitch-images { display: flex; flex-direction: column; gap: 8px; }
   button, select, input[type=number] {
     background: #2d3034; color: var(--text); border: 1px solid var(--border);
@@ -463,11 +463,64 @@ async function jumpTo(videoName, frameIdx) {
   }
 }
 
+// Reference-image click → pick keypoint/line from dropdown.
+// Hit-tests the rendered jpg pixel coords (from /api/pitch_layout)
+// against the click position on the displayed image, scaling for
+// browser-side resizing.
+let pitchLayout = null;  // {pitch: {width, height, keypoints}, lines: {width, height, lines}}
+
+function imgClickToImgPx(evt, img) {
+  const rect = img.getBoundingClientRect();
+  // Map CSS-displayed click to natural-image coordinates.
+  const sx = img.naturalWidth / rect.width;
+  const sy = img.naturalHeight / rect.height;
+  return [(evt.clientX - rect.left) * sx, (evt.clientY - rect.top) * sy];
+}
+
+function nearestKeypoint(px, py) {
+  if (!pitchLayout) return null;
+  let best = null, bestD2 = Infinity;
+  for (const kp of pitchLayout.pitch.keypoints) {
+    const dx = px - kp.x, dy = py - kp.y;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < bestD2) { bestD2 = d2; best = kp; }
+  }
+  // Reject clicks farther than ~25 px from any keypoint (scale=7 → keypoint
+  // radius is 4-8 px; 25 px allows generous tolerance without crossing into
+  // the next keypoint's area).
+  return Math.sqrt(bestD2) <= 25 ? best : null;
+}
+
+function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const len2 = dx * dx + dy * dy;
+  if (len2 < 1e-9) {
+    const ddx = px - x1, ddy = py - y1;
+    return Math.sqrt(ddx * ddx + ddy * ddy);
+  }
+  let t = ((px - x1) * dx + (py - y1) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const fx = x1 + t * dx, fy = y1 + t * dy;
+  const ddx = px - fx, ddy = py - fy;
+  return Math.sqrt(ddx * ddx + ddy * ddy);
+}
+
+function nearestLine(px, py) {
+  if (!pitchLayout) return null;
+  let best = null, bestD = Infinity;
+  for (const ln of pitchLayout.lines.lines) {
+    const d = pointToSegmentDistance(px, py, ln.x1, ln.y1, ln.x2, ln.y2);
+    if (d < bestD) { bestD = d; best = ln; }
+  }
+  return bestD <= 12 ? best : null;
+}
+
 async function init() {
   info = await api("GET", "/api/info");
 
   keypoints = await api("GET", "/api/keypoints");
   lines = await api("GET", "/api/lines");
+  pitchLayout = await api("GET", "/api/pitch_layout");
 
   const kpSel = $("#kp-select");
   for (const kp of keypoints) {
@@ -490,6 +543,27 @@ async function init() {
     lineSel.appendChild(opt);
   }
   lineSel.addEventListener("change", () => refreshPitch({ highlight_line: lineSel.value }));
+
+  // Click on the keypoints reference image → pick nearest keypoint into
+  // the dropdown. Saves a trip through the dropdown on every annotation.
+  $("#pitch-img").addEventListener("click", (e) => {
+    const [px, py] = imgClickToImgPx(e, e.target);
+    const kp = nearestKeypoint(px, py);
+    if (kp) {
+      kpSel.value = kp.name;
+      kpSel.dispatchEvent(new Event("change"));
+    }
+  });
+
+  // Click on the lines reference image → pick nearest line.
+  $("#lines-img").addEventListener("click", (e) => {
+    const [px, py] = imgClickToImgPx(e, e.target);
+    const ln = nearestLine(px, py);
+    if (ln) {
+      lineSel.value = ln.name;
+      lineSel.dispatchEvent(new Event("change"));
+    }
+  });
 
   // Buttons
   $("#mode-point").addEventListener("click", async () => applyState(await api("POST", "/api/mode", { mode: "point" })));
