@@ -180,6 +180,20 @@ def create_app(
         return Response(content=data, media_type="image/jpeg",
                         headers={"Cache-Control": "no-store"})
 
+    @app.get("/api/pitch_layout")
+    def pitch_layout() -> JSONResponse:
+        """Pixel coords of every keypoint and line on the reference diagrams.
+
+        Mirrors the exact scale + margin used in render_pitch_diagram_jpeg /
+        render_lines_diagram_jpeg, so frontend click hit-tests work
+        directly on the rendered jpeg pixels.
+        """
+        from .pitch_diagram import compute_pitch_layout, compute_lines_layout
+        return JSONResponse({
+            "pitch": compute_pitch_layout(),
+            "lines": compute_lines_layout(),
+        })
+
     # ------------------------------------------------------------------
     # Mutating actions
     # ------------------------------------------------------------------

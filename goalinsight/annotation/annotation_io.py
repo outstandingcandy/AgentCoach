@@ -42,6 +42,12 @@ def load_frame_annotation(frame_dir: Path, frame_idx: int) -> dict | None:
         "keypoint_names": [],
         "annotated_lines": [],
         "derived_points": [],
+        # Saved derived points carry their accepted state so reload can
+        # match against newly-recomputed intersections by world coord
+        # (lines may have been re-resolved to a different active pitch).
+        # List of (world_xy, accepted) pairs — index-aligned with
+        # ``derived_points`` in this result dict.
+        "derived_saved_accepted": [],
         "reprojection_error": float(data.get("reprojection_error", 0.0)),
         "H0": None,
     }
@@ -71,11 +77,16 @@ def load_frame_annotation(frame_dir: Path, frame_idx: int) -> dict | None:
         })
 
     for dp in data.get("derived_points", []):
+        world = tuple(dp["world"])
         result["derived_points"].append((
             tuple(dp["pixel"]),
-            tuple(dp["world"]),
+            world,
             dp["name"],
         ))
+        # Legacy default: pre-fix saves only persisted accepted points,
+        # so a missing field means "this point was accepted at save time".
+        accepted = bool(dp.get("accepted", True))
+        result["derived_saved_accepted"].append((world, accepted))
 
     h0_path = frame_dir / f"frame_{frame_idx}.npy"
     if h0_path.exists():
@@ -102,6 +113,7 @@ def save_frame_annotation(
     current_frame: np.ndarray | None,
     vis_frame: np.ndarray | None = None,
     auto_projected_points: list[tuple] | None = None,
+    derived_accepted: list[bool] | None = None,
 ) -> bool:
     """Save annotation artifacts for a frame.
 
@@ -149,12 +161,20 @@ def save_frame_annotation(
                 "name": line["name"],
             })
 
-        for pixel, world, name in derived_points:
-            annotations_data["derived_points"].append({
+        for i, (pixel, world, name) in enumerate(derived_points):
+            entry = {
                 "pixel": [float(x) for x in pixel],
                 "world": [float(x) for x in world],
                 "name": name,
-            })
+            }
+            # Persist accepted state per point. Defaults to True for callers
+            # that filtered to accepted-only before passing the list (legacy
+            # behavior — the data they handed us was implicitly accepted).
+            if derived_accepted is not None and i < len(derived_accepted):
+                entry["accepted"] = bool(derived_accepted[i])
+            else:
+                entry["accepted"] = True
+            annotations_data["derived_points"].append(entry)
 
         with open(frame_dir / f"frame_{frame_idx}.json", "w") as f:
             json.dump(annotations_data, f, indent=2)
@@ -198,7 +218,14 @@ def save_frame_annotation(
                     all_points_data["manual_points"].append(pt_data)
                     all_points_data["all_points"].append(pt_data)
 
-            for pixel, world, name in derived_points:
+            for i, (pixel, world, name) in enumerate(derived_points):
+                # Only accepted derived points feed finetune. When the
+                # caller didn't supply a flag list, treat every entry as
+                # accepted (legacy behavior — they'd already filtered).
+                if (derived_accepted is not None
+                        and i < len(derived_accepted)
+                        and not derived_accepted[i]):
+                    continue
                 pnl_id = pitch_name_to_pnlcalib_id(name)
                 pt_data = {
                     "pixel": [float(x) for x in pixel],

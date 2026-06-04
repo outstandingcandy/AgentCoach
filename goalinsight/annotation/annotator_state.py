@@ -214,6 +214,21 @@ class AnchorAnnotator:
         # annotated_lines so their world coords reflect the active pitch.
         _compute_line_intersections(self)
 
+        # Restore accept/reject state from saved JSON. Match by world
+        # coordinate (0.1 m tolerance) — pixel coords would be brittle
+        # under pitch re-resolution, but world coords are stable enough.
+        # Newly-computed points with no saved match default to False
+        # (the unaccepted-pending convention from compute_line_intersections).
+        saved_acc = data.get("derived_saved_accepted", [])
+        if saved_acc:
+            for i, (_pixel, world, _name) in enumerate(self.derived_points):
+                wx, wy = float(world[0]), float(world[1])
+                for saved_world, accepted in saved_acc:
+                    sx, sy = float(saved_world[0]), float(saved_world[1])
+                    if abs(wx - sx) < 0.1 and abs(wy - sy) < 0.1:
+                        self.derived_accepted[i] = bool(accepted)
+                        break
+
         if pitch_changed:
             # Stale H0 was computed under a different pitch — recompute
             # against the refreshed world coords so the overlay reappears
@@ -233,9 +248,11 @@ class AnchorAnnotator:
         if self.H0 is not None:
             vis = draw_pitch_projection(vis, self.H0)
 
-        accepted_derived = [
-            pt for pt, ok in zip(self.derived_points, self.derived_accepted) if ok
-        ]
+        # Persist all derived points plus their accepted flags so that
+        # reload can restore the user's accept/reject decisions. (Auto
+        # points still go through accepted-only filtering — only the H
+        # solver and the _all_points artifact consume them, no reload
+        # state to preserve there yet.)
         accepted_auto = [
             pt for pt, ok in zip(self.auto_projected_points, self.auto_accepted) if ok
         ]
@@ -249,7 +266,8 @@ class AnchorAnnotator:
             world_points=self.world_points,
             keypoint_names=self.keypoint_names,
             annotated_lines=self.annotated_lines,
-            derived_points=accepted_derived,
+            derived_points=list(self.derived_points),
+            derived_accepted=list(self.derived_accepted),
             reprojection_error=self.reprojection_error,
             H0=self.H0,
             current_frame=self.current_frame,
