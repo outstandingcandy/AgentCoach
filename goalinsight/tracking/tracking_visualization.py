@@ -78,19 +78,27 @@ def draw_topdown_pitch(
     lw = max(1, int(scale * 0.25))
     font = cv2.FONT_HERSHEY_SIMPLEX
 
+    # Read inner-pitch markings (PA / GA / center-circle radius) from the
+    # active pitch when one is set; fall back to FIFA-vs-pitch-frame clamps
+    # for callers that pass a non-default outer frame but never configured
+    # the active pitch (legacy programmatic tests).
+    from ..annotation import pitch_constants as _pc
+    _ap = _pc.get_active_pitch()
+    pa_w = min(_ap.PENALTY_AREA_WIDTH / 2.0, half_w)
+    pa_d = min(_ap.PENALTY_AREA_LENGTH, half_l * 0.5)
+    ga_w = min(_ap.GOAL_AREA_WIDTH / 2.0, half_w)
+    ga_d = min(_ap.GOAL_AREA_LENGTH, half_l * 0.5)
+    cr = min(_ap.CENTER_CIRCLE_RADIUS, half_w * 0.9)
+
     # Pitch markings
     cv2.rectangle(pitch, w2p(-half_l, half_w), w2p(half_l, -half_w), lc, lw)
     cv2.line(pitch, w2p(0, half_w), w2p(0, -half_w), lc, lw)
-    cv2.circle(pitch, w2p(0, 0), int(9.15 * scale), lc, lw)
+    cv2.circle(pitch, w2p(0, 0), int(cr * scale), lc, lw)
     cv2.circle(pitch, w2p(0, 0), max(2, int(0.3 * scale)), lc, -1)
     # Penalty areas
-    pa_w = min(20.16, half_w)
-    pa_d = min(16.5, half_l * 0.35)
     cv2.rectangle(pitch, w2p(-half_l, pa_w), w2p(-half_l + pa_d, -pa_w), lc, lw)
     cv2.rectangle(pitch, w2p(half_l - pa_d, pa_w), w2p(half_l, -pa_w), lc, lw)
     # Goal areas
-    ga_w = min(9.16, half_w * 0.5)
-    ga_d = min(5.5, half_l * 0.12)
     cv2.rectangle(pitch, w2p(-half_l, ga_w), w2p(-half_l + ga_d, -ga_w), lc, lw)
     cv2.rectangle(pitch, w2p(half_l - ga_d, ga_w), w2p(half_l, -ga_w), lc, lw)
 

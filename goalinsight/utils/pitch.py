@@ -56,6 +56,16 @@ def get_pitch_template_points(pitch_length=None, pitch_width=None):
     PS_DIST = active.GOAL_LINE_TO_PENALTY_MARK
     CR = active.CENTER_CIRCLE_RADIUS
 
+    # Penalty arc visible-segment half-angle = acos((PA_DEPTH - PS_DIST) / CR).
+    # Hardcoding ±0.93 rad (~53°) was a FIFA coincidence and clipped the arc on
+    # non-FIFA pitches (kids: ~±73°). Falls back to ±90° when geometry yields a
+    # full half-circle (PA-front past the arc tangent).
+    _arc_dx = PA_DEPTH - PS_DIST
+    if CR > 0 and -1.0 < _arc_dx / CR < 1.0:
+        _arc_half = float(np.arccos(_arc_dx / CR))
+    else:
+        _arc_half = float(np.pi / 2.0)
+
     return {
         'pitch_outline': [
             (-half_l, -half_w), (half_l, -half_w),
@@ -76,11 +86,11 @@ def get_pitch_template_points(pitch_length=None, pitch_width=None):
                             (half_l - GA_DEPTH, GA_HW), (half_l, GA_HW)],
         'left_penalty_arc': [
             (-half_l + PS_DIST + CR * np.cos(a), CR * np.sin(a))
-            for a in np.linspace(-0.93, 0.93, 20)
+            for a in np.linspace(-_arc_half, _arc_half, 20)
         ],
         'right_penalty_arc': [
             (half_l - PS_DIST - CR * np.cos(a), CR * np.sin(a))
-            for a in np.linspace(-0.93, 0.93, 20)
+            for a in np.linspace(-_arc_half, _arc_half, 20)
         ],
     }
 

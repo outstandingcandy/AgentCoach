@@ -25,6 +25,10 @@ class EventDetectionContext:
     fps: float
     pitch_length: float
     pitch_width: float
+    # Goal-frame geometry (FIFA defaults — non-FIFA pitches override via
+    # video_info metadata or constructor kwargs).
+    goal_length: float = 7.32
+    goal_height: float = 2.44
 
     # Pre-computed by orchestrator
     ball_states: list[BallState] = field(default_factory=list)
@@ -63,11 +67,19 @@ class EventDetectionContext:
     def from_output_dir(
         cls,
         pipeline_output_dir: str | Path,
-        pitch_length: float = 105.0,
-        pitch_width: float = 68.0,
+        pitch_length: float | None = None,
+        pitch_width: float | None = None,
+        goal_length: float | None = None,
+        goal_height: float | None = None,
         fps: float | None = None,
     ) -> EventDetectionContext:
-        """Build context from a pipeline output directory."""
+        """Build context from a pipeline output directory.
+
+        Pitch / goal dimensions resolve in this order: caller override →
+        ``calibration_metadata.video_info`` → FIFA defaults. ``None`` means
+        "fall through to the next source"; the previous sentinel-on-105.0
+        scheme silently ignored real FIFA configs.
+        """
         d = Path(pipeline_output_dir)
 
         ball_tracks = _load_json(d, "tracking", "ball_tracks.json") or {}
@@ -79,21 +91,13 @@ class EventDetectionContext:
             d, "field_registration", "camera_poses.json"
         )
 
-        # Auto-detect fps and pitch dimensions from metadata
+        # Auto-detect fps and pitch dimensions from metadata.
         meta = _load_json(
             d, "field_registration", "calibration_metadata.json"
         )
-        if meta:
-            vi = meta.get("video_info", {})
-            if fps is None:
-                fps = vi.get("fps", 30.0)
-            if pitch_length == 105.0 and "pitch_length" in vi:
-                pitch_length = vi["pitch_length"]
-            if pitch_width == 68.0 and "pitch_width" in vi:
-                pitch_width = vi["pitch_width"]
-
+        vi = meta.get("video_info", {}) if meta else {}
         if fps is None:
-            fps = 30.0
+            fps = vi.get("fps", 30.0)
 
         return cls(
             ball_tracks=ball_tracks,
@@ -101,8 +105,7 @@ class EventDetectionContext:
             team_assignments=team_assignments,
             camera_poses=camera_poses,
             fps=fps,
-            pitch_length=pitch_length,
-            pitch_width=pitch_width,
+            **_resolve_dims(vi, pitch_length, pitch_width, goal_length, goal_height),
         )
 
     @classmethod
@@ -110,11 +113,16 @@ class EventDetectionContext:
         cls,
         tracking_dir: str | Path,
         calibration_dir: str | Path | None = None,
-        pitch_length: float = 105.0,
-        pitch_width: float = 68.0,
+        pitch_length: float | None = None,
+        pitch_width: float | None = None,
+        goal_length: float | None = None,
+        goal_height: float | None = None,
         fps: float | None = None,
     ) -> EventDetectionContext:
-        """Build context from separate stage directories."""
+        """Build context from separate stage directories.
+
+        See :meth:`from_output_dir` for the dim resolution order.
+        """
         tracking_dir = Path(tracking_dir)
         ball_tracks = _load_json_file(tracking_dir / "ball_tracks.json") or {}
         player_tracks = _load_json_file(tracking_dir / "tracks.json") or {}
@@ -123,18 +131,14 @@ class EventDetectionContext:
         )
 
         camera_poses = None
+        vi: dict = {}
         if calibration_dir:
             cal = Path(calibration_dir)
             camera_poses = _load_json_file(cal / "camera_poses.json")
             meta = _load_json_file(cal / "calibration_metadata.json")
-            if meta:
-                vi = meta.get("video_info", {})
-                if fps is None:
-                    fps = vi.get("fps", 30.0)
-                if pitch_length == 105.0 and "pitch_length" in vi:
-                    pitch_length = vi["pitch_length"]
-                if pitch_width == 68.0 and "pitch_width" in vi:
-                    pitch_width = vi["pitch_width"]
+            vi = meta.get("video_info", {}) if meta else {}
+            if fps is None:
+                fps = vi.get("fps", 30.0)
 
         if fps is None:
             fps = 30.0
@@ -145,8 +149,7 @@ class EventDetectionContext:
             team_assignments=team_assignments,
             camera_poses=camera_poses,
             fps=fps,
-            pitch_length=pitch_length,
-            pitch_width=pitch_width,
+            **_resolve_dims(vi, pitch_length, pitch_width, goal_length, goal_height),
         )
 
 
@@ -180,3 +183,37 @@ def _load_json_file(path: Path) -> dict | None:
         return None
     with open(path) as f:
         return json.load(f)
+
+
+# FIFA fallback for pitch / goal dims when neither caller nor metadata supplied
+# them. Kept here (not imported) so the events package stays self-contained.
+_FIFA_FALLBACK = {
+    "pitch_length": 105.0,
+    "pitch_width": 68.0,
+    "goal_length": 7.32,
+    "goal_height": 2.44,
+}
+
+
+def _resolve_dims(
+    video_info: dict,
+    pitch_length: float | None,
+    pitch_width: float | None,
+    goal_length: float | None,
+    goal_height: float | None,
+) -> dict[str, float]:
+    """Resolve pitch / goal dims with caller > video_info > FIFA priority."""
+    out = {}
+    for key, override in (
+        ("pitch_length", pitch_length),
+        ("pitch_width", pitch_width),
+        ("goal_length", goal_length),
+        ("goal_height", goal_height),
+    ):
+        if override is not None:
+            out[key] = float(override)
+        elif key in video_info:
+            out[key] = float(video_info[key])
+        else:
+            out[key] = _FIFA_FALLBACK[key]
+    return out

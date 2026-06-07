@@ -14,26 +14,114 @@ from typing import Any
 
 import numpy as np
 
-# Standard FIFA pitch dimensions (in meters, centered at origin)
-PITCH_LENGTH = 105.0
-PITCH_WIDTH = 68.0
-HALF_L = PITCH_LENGTH / 2  # 52.5
-HALF_W = PITCH_WIDTH / 2   # 34.0
+# FIFA defaults — used only as a fallback when no pitch_dims is passed.
+# Live consumers (kids / 7-a-side / etc.) override per-instance.
+_FIFA_DEFAULTS: dict[str, float] = {
+    "pitch_length": 105.0,
+    "pitch_width": 68.0,
+    "penalty_area_length": 16.5,
+    "penalty_area_width": 40.32,
+    "goal_area_length": 5.5,
+    "goal_area_width": 18.32,
+    "goal_length": 7.32,
+    "goal_height": 2.44,
+}
 
-# Penalty area dimensions
-PENALTY_AREA_WIDTH = 40.32  # 16.5m from each side of goal
-PENALTY_AREA_DEPTH = 16.5
-PENALTY_HALF_W = PENALTY_AREA_WIDTH / 2  # 20.16
 
-# Goal area dimensions
-GOAL_AREA_WIDTH = 18.32  # 5.5m from each side of goal
-GOAL_AREA_DEPTH = 5.5
-GOAL_HALF_W = GOAL_AREA_WIDTH / 2  # 9.16
+def _build_line_definitions(pitch_dims: dict | None) -> dict[int, dict[str, Any]]:
+    """Materialize the 23-line table for a given pitch geometry."""
+    d = dict(_FIFA_DEFAULTS)
+    if pitch_dims:
+        d.update({k: v for k, v in pitch_dims.items() if k in _FIFA_DEFAULTS})
+    hl = d["pitch_length"] / 2.0
+    hw = d["pitch_width"] / 2.0
+    pa_d = d["penalty_area_length"]
+    pa_hw = d["penalty_area_width"] / 2.0
+    ga_d = d["goal_area_length"]
+    ga_hw = d["goal_area_width"] / 2.0
+    g_hw = d["goal_length"] / 2.0
+    g_h = d["goal_height"]
 
-# Goal dimensions
-GOAL_WIDTH = 7.32
-GOAL_HEIGHT = 2.44
-GOAL_HALF_W_ACTUAL = GOAL_WIDTH / 2  # 3.66
+    return {
+        # Penalty area (Big rect.) - Left
+        0: {"name": "Big rect. left top",
+            "p1": (-hl, pa_hw, 0), "p2": (-hl + pa_d, pa_hw, 0)},
+        1: {"name": "Big rect. left side",
+            "p1": (-hl + pa_d, pa_hw, 0), "p2": (-hl + pa_d, -pa_hw, 0)},
+        2: {"name": "Big rect. left bottom",
+            "p1": (-hl + pa_d, -pa_hw, 0), "p2": (-hl, -pa_hw, 0)},
+        # Penalty area (Big rect.) - Right
+        3: {"name": "Big rect. right top",
+            "p1": (hl, pa_hw, 0), "p2": (hl - pa_d, pa_hw, 0)},
+        4: {"name": "Big rect. right side",
+            "p1": (hl - pa_d, pa_hw, 0), "p2": (hl - pa_d, -pa_hw, 0)},
+        5: {"name": "Big rect. right bottom",
+            "p1": (hl - pa_d, -pa_hw, 0), "p2": (hl, -pa_hw, 0)},
+        # Goal frame - Left
+        6: {"name": "Goal left crossbar",
+            "p1": (-hl, -g_hw, g_h), "p2": (-hl, g_hw, g_h)},
+        7: {"name": "Goal left post left",
+            "p1": (-hl, -g_hw, 0), "p2": (-hl, -g_hw, g_h)},
+        8: {"name": "Goal left post right",
+            "p1": (-hl, g_hw, 0), "p2": (-hl, g_hw, g_h)},
+        # Goal frame - Right
+        9: {"name": "Goal right crossbar",
+            "p1": (hl, -g_hw, g_h), "p2": (hl, g_hw, g_h)},
+        10: {"name": "Goal right post left",
+             "p1": (hl, -g_hw, 0), "p2": (hl, -g_hw, g_h)},
+        11: {"name": "Goal right post right",
+             "p1": (hl, g_hw, 0), "p2": (hl, g_hw, g_h)},
+        # Center line
+        12: {"name": "Middle line",
+             "p1": (0, -hw, 0), "p2": (0, hw, 0)},
+        # Touchlines / goal lines
+        13: {"name": "Side line top",
+             "p1": (-hl, hw, 0), "p2": (hl, hw, 0)},
+        14: {"name": "Side line left",
+             "p1": (-hl, -hw, 0), "p2": (-hl, hw, 0)},
+        15: {"name": "Side line right",
+             "p1": (hl, -hw, 0), "p2": (hl, hw, 0)},
+        16: {"name": "Side line bottom",
+             "p1": (-hl, -hw, 0), "p2": (hl, -hw, 0)},
+        # Goal area (Small rect.) - Left
+        17: {"name": "Small rect. left top",
+             "p1": (-hl, ga_hw, 0), "p2": (-hl + ga_d, ga_hw, 0)},
+        18: {"name": "Small rect. left side",
+             "p1": (-hl + ga_d, ga_hw, 0), "p2": (-hl + ga_d, -ga_hw, 0)},
+        19: {"name": "Small rect. left bottom",
+             "p1": (-hl + ga_d, -ga_hw, 0), "p2": (-hl, -ga_hw, 0)},
+        # Goal area (Small rect.) - Right
+        20: {"name": "Small rect. right top",
+             "p1": (hl, ga_hw, 0), "p2": (hl - ga_d, ga_hw, 0)},
+        21: {"name": "Small rect. right side",
+             "p1": (hl - ga_d, ga_hw, 0), "p2": (hl - ga_d, -ga_hw, 0)},
+        22: {"name": "Small rect. right bottom",
+             "p1": (hl - ga_d, -ga_hw, 0), "p2": (hl, -ga_hw, 0)},
+    }
+
+
+# Default (FIFA) table — used by the `@classmethod` accessors that don't have
+# an instance. Names and ground/non-ground membership are pitch-independent.
+_DEFAULT_LINE_DEFINITIONS = _build_line_definitions(None)
+
+
+# --- Legacy module-level constants (FIFA-only; kept for back-compat with --
+# `hough_line_matcher.py` and any downstream code that still imports them).
+# New code should call `_build_line_definitions(pitch_dims)` or instantiate
+# ``LineMapper(pitch_dims=...)`` instead.
+PITCH_LENGTH = _FIFA_DEFAULTS["pitch_length"]
+PITCH_WIDTH = _FIFA_DEFAULTS["pitch_width"]
+HALF_L = PITCH_LENGTH / 2
+HALF_W = PITCH_WIDTH / 2
+PENALTY_AREA_WIDTH = _FIFA_DEFAULTS["penalty_area_width"]
+PENALTY_AREA_DEPTH = _FIFA_DEFAULTS["penalty_area_length"]
+PENALTY_HALF_W = PENALTY_AREA_WIDTH / 2
+GOAL_AREA_WIDTH = _FIFA_DEFAULTS["goal_area_width"]
+GOAL_AREA_DEPTH = _FIFA_DEFAULTS["goal_area_length"]
+GOAL_HALF_W = GOAL_AREA_WIDTH / 2
+GOAL_WIDTH = _FIFA_DEFAULTS["goal_length"]
+GOAL_HEIGHT = _FIFA_DEFAULTS["goal_height"]
+GOAL_HALF_W_ACTUAL = GOAL_WIDTH / 2
 
 
 class LineMapper:
@@ -50,155 +138,28 @@ class LineMapper:
         17-22: Goal area lines (Small rect.)
     """
 
-    # Line definitions: {id: {"name": str, "p1": (x, y, z), "p2": (x, y, z)}}
-    # Coordinates are in meters, origin at center of pitch
-    # x-axis: along length (positive = right goal)
-    # y-axis: along width (positive = top)
-    # z-axis: vertical (positive = up)
+    # The class-level table is the FIFA fallback; instances override it via
+    # ``__init__`` when a non-default pitch is configured. Both names and
+    # ground/non-ground membership are pitch-independent — only the (x, y, z)
+    # endpoints depend on the active pitch geometry.
+    LINE_DEFINITIONS = _DEFAULT_LINE_DEFINITIONS
 
-    LINE_DEFINITIONS = {
-        # Penalty area (Big rect.) - Left side (x = -HALF_L)
-        0: {  # Big rect. left top
-            "name": "Big rect. left top",
-            "p1": (-HALF_L, PENALTY_HALF_W, 0),
-            "p2": (-HALF_L + PENALTY_AREA_DEPTH, PENALTY_HALF_W, 0),
-        },
-        1: {  # Big rect. left side
-            "name": "Big rect. left side",
-            "p1": (-HALF_L + PENALTY_AREA_DEPTH, PENALTY_HALF_W, 0),
-            "p2": (-HALF_L + PENALTY_AREA_DEPTH, -PENALTY_HALF_W, 0),
-        },
-        2: {  # Big rect. left bottom
-            "name": "Big rect. left bottom",
-            "p1": (-HALF_L + PENALTY_AREA_DEPTH, -PENALTY_HALF_W, 0),
-            "p2": (-HALF_L, -PENALTY_HALF_W, 0),
-        },
-
-        # Penalty area (Big rect.) - Right side (x = +HALF_L)
-        3: {  # Big rect. right top
-            "name": "Big rect. right top",
-            "p1": (HALF_L, PENALTY_HALF_W, 0),
-            "p2": (HALF_L - PENALTY_AREA_DEPTH, PENALTY_HALF_W, 0),
-        },
-        4: {  # Big rect. right side
-            "name": "Big rect. right side",
-            "p1": (HALF_L - PENALTY_AREA_DEPTH, PENALTY_HALF_W, 0),
-            "p2": (HALF_L - PENALTY_AREA_DEPTH, -PENALTY_HALF_W, 0),
-        },
-        5: {  # Big rect. right bottom
-            "name": "Big rect. right bottom",
-            "p1": (HALF_L - PENALTY_AREA_DEPTH, -PENALTY_HALF_W, 0),
-            "p2": (HALF_L, -PENALTY_HALF_W, 0),
-        },
-
-        # Goal posts and crossbar - Left goal (x = -HALF_L)
-        6: {  # Goal left crossbar (z = GOAL_HEIGHT)
-            "name": "Goal left crossbar",
-            "p1": (-HALF_L, -GOAL_HALF_W_ACTUAL, GOAL_HEIGHT),
-            "p2": (-HALF_L, GOAL_HALF_W_ACTUAL, GOAL_HEIGHT),
-        },
-        7: {  # Goal left post left (near y = -GOAL_HALF_W_ACTUAL)
-            "name": "Goal left post left",
-            "p1": (-HALF_L, -GOAL_HALF_W_ACTUAL, 0),
-            "p2": (-HALF_L, -GOAL_HALF_W_ACTUAL, GOAL_HEIGHT),
-        },
-        8: {  # Goal left post right (near y = +GOAL_HALF_W_ACTUAL)
-            "name": "Goal left post right",
-            "p1": (-HALF_L, GOAL_HALF_W_ACTUAL, 0),
-            "p2": (-HALF_L, GOAL_HALF_W_ACTUAL, GOAL_HEIGHT),
-        },
-
-        # Goal posts and crossbar - Right goal (x = +HALF_L)
-        9: {  # Goal right crossbar (z = GOAL_HEIGHT)
-            "name": "Goal right crossbar",
-            "p1": (HALF_L, -GOAL_HALF_W_ACTUAL, GOAL_HEIGHT),
-            "p2": (HALF_L, GOAL_HALF_W_ACTUAL, GOAL_HEIGHT),
-        },
-        10: {  # Goal right post left
-            "name": "Goal right post left",
-            "p1": (HALF_L, -GOAL_HALF_W_ACTUAL, 0),
-            "p2": (HALF_L, -GOAL_HALF_W_ACTUAL, GOAL_HEIGHT),
-        },
-        11: {  # Goal right post right
-            "name": "Goal right post right",
-            "p1": (HALF_L, GOAL_HALF_W_ACTUAL, 0),
-            "p2": (HALF_L, GOAL_HALF_W_ACTUAL, GOAL_HEIGHT),
-        },
-
-        # Center line
-        12: {  # Middle line (center line at x=0)
-            "name": "Middle line",
-            "p1": (0, -HALF_W, 0),
-            "p2": (0, HALF_W, 0),
-        },
-
-        # Touchlines and goal lines (Side lines)
-        13: {  # Side line top (y = +HALF_W)
-            "name": "Side line top",
-            "p1": (-HALF_L, HALF_W, 0),
-            "p2": (HALF_L, HALF_W, 0),
-        },
-        14: {  # Side line left (goal line, x = -HALF_L)
-            "name": "Side line left",
-            "p1": (-HALF_L, -HALF_W, 0),
-            "p2": (-HALF_L, HALF_W, 0),
-        },
-        15: {  # Side line right (goal line, x = +HALF_L)
-            "name": "Side line right",
-            "p1": (HALF_L, -HALF_W, 0),
-            "p2": (HALF_L, HALF_W, 0),
-        },
-        16: {  # Side line bottom (y = -HALF_W)
-            "name": "Side line bottom",
-            "p1": (-HALF_L, -HALF_W, 0),
-            "p2": (HALF_L, -HALF_W, 0),
-        },
-
-        # Goal area (Small rect.) - Left side
-        17: {  # Small rect. left top
-            "name": "Small rect. left top",
-            "p1": (-HALF_L, GOAL_HALF_W, 0),
-            "p2": (-HALF_L + GOAL_AREA_DEPTH, GOAL_HALF_W, 0),
-        },
-        18: {  # Small rect. left side
-            "name": "Small rect. left side",
-            "p1": (-HALF_L + GOAL_AREA_DEPTH, GOAL_HALF_W, 0),
-            "p2": (-HALF_L + GOAL_AREA_DEPTH, -GOAL_HALF_W, 0),
-        },
-        19: {  # Small rect. left bottom
-            "name": "Small rect. left bottom",
-            "p1": (-HALF_L + GOAL_AREA_DEPTH, -GOAL_HALF_W, 0),
-            "p2": (-HALF_L, -GOAL_HALF_W, 0),
-        },
-
-        # Goal area (Small rect.) - Right side
-        20: {  # Small rect. right top
-            "name": "Small rect. right top",
-            "p1": (HALF_L, GOAL_HALF_W, 0),
-            "p2": (HALF_L - GOAL_AREA_DEPTH, GOAL_HALF_W, 0),
-        },
-        21: {  # Small rect. right side
-            "name": "Small rect. right side",
-            "p1": (HALF_L - GOAL_AREA_DEPTH, GOAL_HALF_W, 0),
-            "p2": (HALF_L - GOAL_AREA_DEPTH, -GOAL_HALF_W, 0),
-        },
-        22: {  # Small rect. right bottom
-            "name": "Small rect. right bottom",
-            "p1": (HALF_L - GOAL_AREA_DEPTH, -GOAL_HALF_W, 0),
-            "p2": (HALF_L, -GOAL_HALF_W, 0),
-        },
-    }
-
-    # Lines that are NOT on the ground plane (z != 0)
-    # These include crossbars and goal posts
-    NON_GROUND_LINES = {6, 7, 8, 9, 10, 11}  # Goal crossbars and posts
-
-    # Ground-only lines (z = 0 for both endpoints)
+    # Lines that are NOT on the ground plane (z != 0): goal crossbars + posts.
+    NON_GROUND_LINES = {6, 7, 8, 9, 10, 11}
     GROUND_LINES = set(range(23)) - NON_GROUND_LINES
 
-    def __init__(self):
-        """Initialize line mapper."""
-        pass
+    def __init__(self, pitch_dims: dict | None = None):
+        """Initialize line mapper.
+
+        Args:
+            pitch_dims: Pitch geometry overrides (FIFA when omitted).
+                Recognized keys mirror :data:`_FIFA_DEFAULTS`. Drives
+                ``self.LINE_DEFINITIONS`` so non-FIFA pitches get correct
+                world endpoints — the class-level attribute is only used
+                when no instance is available (e.g. classmethod accessors).
+        """
+        # Shadow the class attribute on this instance only.
+        self.LINE_DEFINITIONS = _build_line_definitions(pitch_dims)
 
     def get_line_world_coords(self, line_id: int) -> dict[str, Any] | None:
         """Get world coordinates for a line by its ID.

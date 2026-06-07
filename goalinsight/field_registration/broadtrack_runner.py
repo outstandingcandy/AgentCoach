@@ -77,7 +77,7 @@ def run_stage1_broadtrack(
     # Line detector is optional — lines can be derived from keypoints
     use_line_model = bt_config.get("use_line_model", False)
     line_detector = None
-    line_mapper = LineMapper()
+    line_mapper = LineMapper(pitch_dims=config.get("pitch") or None)
 
     if use_line_model:
         from . import LineDetector

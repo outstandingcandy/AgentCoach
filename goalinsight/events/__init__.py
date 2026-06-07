@@ -35,15 +35,24 @@ from ._types import (
 def detect_events_from_output(
     pipeline_output_dir: str | Path,
     config: dict[str, Any] | None = None,
-    pitch_length: float = 105.0,
-    pitch_width: float = 68.0,
+    pitch_length: float | None = None,
+    pitch_width: float | None = None,
+    goal_length: float | None = None,
+    goal_height: float | None = None,
     fps: float | None = None,
 ) -> list[MatchEvent]:
-    """Detect events from a pipeline output directory."""
+    """Detect events from a pipeline output directory.
+
+    Pitch / goal dims default to ``calibration_metadata.video_info`` when
+    omitted; falls back to FIFA only if neither caller nor metadata supply
+    them. Pass an explicit value to override metadata.
+    """
     ctx = EventDetectionContext.from_output_dir(
         pipeline_output_dir,
         pitch_length=pitch_length,
         pitch_width=pitch_width,
+        goal_length=goal_length,
+        goal_height=goal_height,
         fps=fps,
     )
     orchestrator = EventOrchestrator(config or {})
@@ -54,8 +63,10 @@ def detect_events_from_dirs(
     tracking_dir: str | Path,
     calibration_dir: str | Path | None = None,
     config: dict[str, Any] | None = None,
-    pitch_length: float = 105.0,
-    pitch_width: float = 68.0,
+    pitch_length: float | None = None,
+    pitch_width: float | None = None,
+    goal_length: float | None = None,
+    goal_height: float | None = None,
     fps: float | None = None,
 ) -> list[MatchEvent]:
     """Detect events from separate stage directories (pipeline stage use)."""
@@ -64,6 +75,8 @@ def detect_events_from_dirs(
         calibration_dir,
         pitch_length=pitch_length,
         pitch_width=pitch_width,
+        goal_length=goal_length,
+        goal_height=goal_height,
         fps=fps,
     )
     orchestrator = EventOrchestrator(config or {})
@@ -77,10 +90,16 @@ def detect_events_from_data(
     fps: float = 30.0,
     pitch_length: float = 105.0,
     pitch_width: float = 68.0,
+    goal_length: float = 7.32,
+    goal_height: float = 2.44,
     camera_poses: dict | None = None,
     config: dict[str, Any] | None = None,
 ) -> list[MatchEvent]:
-    """Detect events from pre-loaded data dicts."""
+    """Detect events from pre-loaded data dicts.
+
+    Pitch / goal dims default to FIFA — direct programmatic callers should
+    pass explicit values for non-FIFA pitches.
+    """
     ctx = EventDetectionContext(
         ball_tracks=ball_tracks,
         player_tracks=player_tracks,
@@ -89,6 +108,8 @@ def detect_events_from_data(
         fps=fps,
         pitch_length=pitch_length,
         pitch_width=pitch_width,
+        goal_length=goal_length,
+        goal_height=goal_height,
     )
     orchestrator = EventOrchestrator(config or {})
     return orchestrator.detect_all(ctx)
