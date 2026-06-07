@@ -37,6 +37,20 @@ from ._runner_base import (
 logger = logging.getLogger(__name__)
 
 
+def _stamp_source(vis: np.ndarray, label: str) -> None:
+    """Stamp a small bottom-left tag on the calibration vis to identify which
+    pipeline pass produced this frame's pose. Lets a reviewer scan the
+    calibration/ folder and see at a glance whether each frame came from
+    Pass 1 PnP, Pass 2 lock-C refit, joint-focal refit, or chain gap-fill.
+    """
+    if vis is None or vis.size == 0:
+        return
+    cv2.putText(
+        vis, label, (10, vis.shape[0] - 10),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA,
+    )
+
+
 class CameraStateTracker:
     """Temporal state tracker for camera pose warm-starting.
 
@@ -298,10 +312,19 @@ def run_stage1_physical(
         max_reproj_error=phys_config.get("max_reproj_error", 15.0),
     )
 
-    # Results storage
+    # Results storage. Forward goal_length / goal_height too so downstream
+    # consumers (events.shot, etc.) can pick non-FIFA goal frames out of the
+    # metadata without having to re-parse the original config.
+    extra_vi: dict[str, float] = {
+        "pitch_length": pitch_length,
+        "pitch_width": pitch_width,
+    }
+    for k in ("goal_length", "goal_height"):
+        if k in pitch_dims:
+            extra_vi[k] = pitch_dims[k]
     calibration_results = init_calibration_results(
         video_path, video, process_fps,
-        extra_video_info={"pitch_length": pitch_length, "pitch_width": pitch_width},
+        extra_video_info=extra_vi,
     )
     homographies = {}
     camera_poses = {}
@@ -338,9 +361,13 @@ def run_stage1_physical(
         batch_size=batch_size,
     )
 
-    # Phase B: Per-frame calibration (CPU only)
+    # Phase B: Per-frame calibration (CPU only).
+    # vis_interval=1 means every frame gets a calibration vis JPG so the
+    # calibration/ folder is a complete per-frame audit. Override to a
+    # larger number under field_registration.physical.vis_interval to
+    # save disk if needed.
     calibrated_count = 0
-    vis_interval = max(1, len(sampler) // 100)
+    vis_interval = int(phys_config.get("vis_interval", 1))
     joint_frame_data = []
 
     for idx, frame_idx in enumerate(tqdm(calib_frame_indices, desc="Stage 1 (Physical): Pass 1 - Per-frame")):
@@ -414,6 +441,7 @@ def run_stage1_physical(
                 keypoint_mapper, calibrator,
                 pitch_length=pitch_length, pitch_width=pitch_width,
             )
+            _stamp_source(vis, "Pass 1: PnP")
             cv2.imwrite(str(vis_calib_dir / fname), vis)
 
             frame_info = _build_frame_json(
@@ -425,6 +453,126 @@ def run_stage1_physical(
             json_str = json.dumps(frame_info, indent=2, default=_json_default)
             with open(vis_calib_dir / json_fname, "w") as jf:
                 jf.write(json_str)
+
+    # === Cross-frame camera-position lock (Pass 2, independent of joint f) ===
+    # The camera is fixed (zoom/pan/tilt only). Take the median of Pass 1's
+    # per-frame solved C, hard-lock it, and re-solve every frame at 4-DOF
+    # (rvec + focal). This forces a single shared C without coupling focal
+    # across frames, so the field-zoom case still works. Set
+    # `field_registration.physical.lock_position_pass2: false` to skip.
+    if (
+        phys_config.get("lock_position_pass2", True)
+        and len(joint_frame_data) >= 2
+    ):
+        # Filter to "trustworthy" Pass 1 frames before computing the median.
+        good = []
+        for fd in joint_frame_data:
+            finfo = calibration_results["frames"].get(fd["frame_idx"], {})
+            if finfo.get("reprojection_error", 9e9) < 50 and finfo.get("inliers", 0) >= 3:
+                good.append(fd)
+        if len(good) >= 2:
+            positions = []
+            for fd in good:
+                R_i, _ = cv2.Rodrigues(np.asarray(fd["rvec"]).reshape(3, 1))
+                positions.append(-R_i.T @ np.asarray(fd["tvec"]).ravel())
+            P = np.stack(positions, axis=0)
+            C_med = np.median(P, axis=0)
+            spread = float(np.max(np.linalg.norm(P - C_med, axis=1)))
+            logger.info(
+                "  Pass 2 (lock C): median C=(%.3f, %.3f, %.3f) m  spread=%.2f m  (%d frames)",
+                C_med[0], C_med[1], C_med[2], spread, len(good),
+            )
+
+            calibrator.camera_position = (
+                float(C_med[0]), float(C_med[1]), float(C_med[2]),
+            )
+            calibrator.lock_camera_position = True
+            tracker_lp = CameraStateTracker(
+                max_reproj_error=phys_config.get("max_reproj_error", 15.0),
+            )
+            warm = {fd["frame_idx"]: (fd["rvec"], fd["tvec"]) for fd in joint_frame_data}
+
+            calibrated_count = 0
+            calibration_results["frames"] = {}
+            homographies = {}
+            camera_poses = {}
+            joint_frame_data = []  # rebuild for the (optional) joint stage that follows
+
+            for idx, frame_idx in enumerate(tqdm(
+                calib_frame_indices,
+                desc="Stage 1 (Physical): Pass 2 - Locked C",
+            )):
+                det = detections.get(frame_idx)
+                if det is None:
+                    continue
+                frame, keypoints, lines = det
+                calibrator.update(keypoints, lines)
+                if frame_idx in warm:
+                    init_rvec, init_tvec = warm[frame_idx][0].copy(), warm[frame_idx][1].copy()
+                else:
+                    init_rvec, init_tvec = tracker_lp.get_initial_guess()
+                result = calibrator.calibrate(
+                    keypoint_mapper,
+                    line_mapper if use_line_model else None,
+                    min_confidence=pnl_config.get("keypoint_threshold", 0.3434),
+                    initial_rvec=init_rvec,
+                    initial_tvec=init_tvec,
+                )
+                if result is not None:
+                    homographies[frame_idx] = result["homography"]
+                    camera_poses[frame_idx] = result["camera_pose"]
+                    calibration_results["frames"][frame_idx] = {
+                        "calibrated": True,
+                        "num_keypoints": result["num_keypoints"],
+                        "num_lines": result["num_lines"],
+                        "num_intersections": result["num_intersections"],
+                        "total_points": result["total_points"],
+                        "inliers": result["inliers"],
+                        "reprojection_error": result["final_error"],
+                        "world_error": result.get("world_error"),
+                        "world_error_all": result.get("world_error_all"),
+                        "line_constraints": result["line_constraints_count"],
+                        "warm_start": init_rvec is not None,
+                    }
+                    calibrated_count += 1
+                    joint_frame_data.append({
+                        "frame_idx": frame_idx,
+                        "rvec": result["camera_params"]["rvec"].ravel(),
+                        "tvec": result["camera_params"]["tvec"].ravel(),
+                        "img_pts": result["img_pts"],
+                        "world_pts": result["world_pts"],
+                        "line_constraints": result.get("line_constraints", []),
+                        "f": result["camera_params"]["focal_length"],
+                    })
+                    tracker_lp.update(
+                        result["camera_params"]["rvec"],
+                        result["camera_params"]["tvec"],
+                        result["final_error"],
+                    )
+                else:
+                    calibration_results["frames"][frame_idx] = {"calibrated": False}
+                    tracker_lp.last_rvec = None
+                    tracker_lp.last_tvec = None
+
+                if idx % vis_interval == 0:
+                    fname = f"frame_{frame_idx:05d}.jpg"
+                    json_fname = f"frame_{frame_idx:05d}.json"
+                    vis_lp = _draw_physical_calibration(
+                        frame, keypoints, lines, result, pitch_template,
+                        keypoint_mapper, calibrator,
+                        pitch_length=pitch_length, pitch_width=pitch_width,
+                    )
+                    _stamp_source(vis_lp, "Pass 2: locked-C")
+                    cv2.imwrite(str(vis_calib_dir / fname), vis_lp)
+                    info = _build_frame_json(
+                        frame_idx, keypoints, lines, result,
+                        warm_start=init_rvec is not None,
+                        debug_info=calibrator._last_debug if result is None else None,
+                        image_size=(width, height),
+                    )
+                    with open(vis_calib_dir / json_fname, "w") as jf:
+                        jf.write(json.dumps(info, indent=2, default=_json_default))
+            tracker = tracker_lp
 
     # === Cross-frame joint intrinsic optimization ===
     joint_result = None
@@ -526,7 +674,7 @@ def run_stage1_physical(
                     tracker2.last_rvec = None
                     tracker2.last_tvec = None
 
-                # Save visualizations (Pass 2 overwrites Pass 1)
+                # Save visualizations (Pass 2 joint-intrinsics overwrites Pass 1)
                 if idx % vis_interval == 0:
                     fname = f"frame_{frame_idx:05d}.jpg"
                     json_fname = f"frame_{frame_idx:05d}.json"
@@ -537,6 +685,7 @@ def run_stage1_physical(
                         keypoint_mapper, calibrator,
                         pitch_length=pitch_length, pitch_width=pitch_width,
                     )
+                    _stamp_source(vis, "Pass 2: joint-f")
                     cv2.imwrite(str(vis_calib_dir / fname), vis)
                     frame_info = _build_frame_json(
                         frame_idx, keypoints, lines, result,
@@ -567,7 +716,31 @@ def run_stage1_physical(
             "n_frames": joint_result["n_frames"],
         }
 
-    # Interpolate poses for skipped frames
+    # === Optional SIFT-based gap-fill via ChainCalibrator ===
+    # Replaces (or supplements) the simple linear interpolation below for
+    # frames where calibration failed or was skipped. Uses the calibrated
+    # frames as anchors and propagates H through SIFT feature matches
+    # between consecutive frames — much more accurate than linear
+    # interpolation when the camera is panning / zooming, which is what
+    # the kids_soccer footage is doing across long stretches.
+    chain_cfg = phys_config.get("gap_fill_chain", {})
+    if chain_cfg.get("enabled", False) and camera_poses:
+        n_filled = _physical_chain_gap_fill(
+            chain_cfg, video_path, frame_indices,
+            calibration_results, homographies, camera_poses,
+            width=width, height=height, calibrator=calibrator,
+            vis_calib_dir=vis_calib_dir,
+            pitch_template=pitch_template,
+            keypoint_mapper=keypoint_mapper,
+            pitch_length=pitch_length,
+            pitch_width=pitch_width,
+            vis_interval=vis_interval,
+        )
+        if n_filled:
+            logger.info("  Chain gap-fill: filled %d frames via SIFT propagation", n_filled)
+
+    # Interpolate poses for skipped frames (linear; fallback for any frames
+    # the chain pass didn't cover or wasn't enabled).
     if calibration_skip > 1 and camera_poses:
         from ..tracking.pitch_projection import _interpolate_camera_poses
         skipped_indices = [f for f in frame_indices if f not in camera_poses]
@@ -649,6 +822,336 @@ def run_stage1_physical(
         logger.info(f"  Joint f={joint_result['f']:.1f}")
 
     return stats
+
+
+def _physical_chain_gap_fill(
+    chain_cfg: dict,
+    video_path: Path,
+    frame_indices: list[int],
+    calibration_results: dict,
+    homographies: dict[int, np.ndarray],
+    camera_poses: dict[int, dict],
+    width: int,
+    height: int,
+    calibrator=None,
+    vis_calib_dir: Path | None = None,
+    pitch_template=None,
+    keypoint_mapper=None,
+    pitch_length: float = 105.0,
+    pitch_width: float = 68.0,
+    vis_interval: int = 1,
+) -> int:
+    """SIFT-based per-frame gap fill for physical-backend outputs.
+
+    For each frame that needs filling:
+
+      1. Find the nearest left + right PnP anchor (bracketing fi).
+      2. SIFT-match anchor↔target image pairs.
+      3. Back-project the anchor's matched pixels to ground (z=0) via the
+         anchor's H to get world coords.
+      4. Run 4-DOF PnP (rvec + focal, lock C) on the target frame using
+         (target image pixels, ground-plane world coords) as the input.
+      5. Average left and right solutions weighted by frame-distance.
+
+    This avoids the chain-accumulation drift of ChainCalibrator (which
+    multiplied delta_H matrices into a non-rotational H, then we had to
+    SVD-project back onto SO(3), losing fidelity). Each chain-filled
+    frame here is independently solved with an over-determined PnP on
+    >= ~20 SIFT inliers; the locked C eliminates focal/distance ambiguity.
+    """
+    from .homography_chain.feature_matcher import FeatureMatcher
+    from ..tracking.pitch_projection import (
+        _interpolate_camera_poses as _lin_interp_poses,
+    )
+
+    ff = calibration_results["frames"]
+    anchor_max_err = float(chain_cfg.get("anchor_max_reproj_px", 30.0))
+    overwrite_above = float(chain_cfg.get("overwrite_above_reproj_px", 30.0))
+    chain_step = int(chain_cfg.get("frame_step", 3))
+    min_inliers = int(chain_cfg.get("min_sift_inliers", 12))
+    # Anchors farther than this many frames from the target are skipped —
+    # SIFT matches across a long camera-pan-and-zoom span lock onto background
+    # features (trees, buildings) instead of pitch-plane features, and the
+    # solved rvec/focal end up biased away from the local truth. With ~30 frame
+    # max distance the bracket covers ~1 second of motion which the camera
+    # operator can't pan out of meaningfully.
+    max_anchor_dist = int(chain_cfg.get("max_anchor_distance_frames", 30))
+
+    # Top of frame typically has a fixed scoreboard / banner overlay (OSD)
+    # that doesn't move with the camera, plus distant sky / buildings whose
+    # frame-to-frame parallax is sub-pixel. Both produce SIFT inliers with
+    # ~0 displacement that drown out the few real on-pitch matches in the
+    # RANSAC consensus. Mask off the top fraction so SIFT only sees the
+    # pitch + foreground. 0.25 = ignore top 25 % (270 px on 1080p).
+    sift_top_skip_frac = float(chain_cfg.get("sift_top_skip_frac", 0.25))
+    sift_mask = np.full((height, width), 255, dtype=np.uint8)
+    sift_mask_top = int(round(height * sift_top_skip_frac))
+    if sift_mask_top > 0:
+        sift_mask[:sift_mask_top, :] = 0
+    logger.info(
+        "  Chain gap-fill: SIFT mask blanks top %d px (top_skip_frac=%.2f) "
+        "to skip OSD overlay and far sky.",
+        sift_mask_top, sift_top_skip_frac,
+    )
+
+    # Collect anchors: calibrated, non-interpolated, low reprojection.
+    anchor_frames = sorted(
+        fi for fi, rec in ff.items()
+        if rec.get("calibrated")
+        and not rec.get("interpolated")
+        and (rec.get("reprojection_error") or 9e9) <= anchor_max_err
+    )
+    if len(anchor_frames) < 1:
+        logger.warning("  Chain gap-fill: no anchors after filtering — skipped")
+        return 0
+
+    # Need C lock for 4-DOF PnP.
+    C_target = (
+        np.array(calibrator.camera_position, dtype=np.float64)
+        if getattr(calibrator, "camera_position", None) is not None
+        else None
+    )
+    if C_target is None:
+        logger.warning("  Chain gap-fill: camera_position not set — skipped")
+        return 0
+
+    # Determine which target frames need filling.
+    target_lo = max(0, anchor_frames[0])
+    target_hi = min(max(frame_indices), anchor_frames[-1])
+    target_set = list(range(target_lo, target_hi + 1, chain_step))
+    targets = []
+    for fi in target_set:
+        if fi in anchor_frames:
+            continue  # don't touch anchors
+        existing = ff.get(fi, {})
+        is_interp = existing.get("interpolated", False)
+        existing_err = existing.get("reprojection_error", 9e9)
+        if not is_interp and existing_err <= overwrite_above and existing.get("calibrated"):
+            continue
+        targets.append(fi)
+
+    logger.info(
+        "  Chain gap-fill: %d anchors, %d targets in span [%d, %d], step=%d",
+        len(anchor_frames), len(targets), target_lo, target_hi, chain_step,
+    )
+
+    # Pre-load anchor frame images and their inverse-H (to back-project
+    # pixels -> ground). Anchor count is small (~30) so we keep them in RAM.
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        logger.warning("  Chain gap-fill: failed to open video — skipped")
+        return 0
+
+    anchor_imgs: dict[int, np.ndarray] = {}
+    anchor_H_inv: dict[int, np.ndarray] = {}
+    for af in anchor_frames:
+        H_a = homographies.get(af)
+        if H_a is None:
+            continue
+        try:
+            H_a_inv = np.linalg.inv(np.array(H_a, dtype=np.float64))
+        except np.linalg.LinAlgError:
+            continue
+        cap.set(cv2.CAP_PROP_POS_FRAMES, af)
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        anchor_imgs[af] = frame
+        anchor_H_inv[af] = H_a_inv
+
+    matcher = FeatureMatcher(n_features=2000, ratio_threshold=0.75, min_matches=min_inliers)
+
+    # Cache extracted SIFT features per anchor so we don't re-extract on
+    # every target. Only kp/desc are cached; raw image already in anchor_imgs.
+    anchor_feat: dict[int, tuple] = {}
+    for af, img in anchor_imgs.items():
+        anchor_feat[af] = matcher.extract_features(img, mask=sift_mask)
+
+    def _solve_one_anchor(target_img: np.ndarray, af: int) -> tuple[np.ndarray, float] | None:
+        """SIFT match anchor->target; run 4-DOF PnP. Returns (rvec, focal)."""
+        kp_a, desc_a = anchor_feat[af]
+        kp_t, desc_t = matcher.extract_features(target_img, mask=sift_mask)
+        if desc_a is None or desc_t is None:
+            return None
+        matches = matcher.match_features(kp_a, desc_a, kp_t, desc_t)
+        if len(matches) < min_inliers:
+            return None
+        # Compute homography for inlier mask only.
+        _H, mask, meta = matcher.compute_homography(matches)
+        if mask is None or int(mask.sum()) < min_inliers:
+            return None
+        # Anchor pixels (inliers) and target pixels (inliers)
+        inlier = mask.flatten().astype(bool)
+        pts_a = np.float32([m[0].pt for m in matches])[inlier]
+        pts_t = np.float32([m[1].pt for m in matches])[inlier]
+        # Back-project anchor pixels to ground via H_a_inv (image -> world).
+        H_inv = anchor_H_inv[af]
+        ones = np.ones((len(pts_a), 1), dtype=np.float64)
+        ph = np.hstack([pts_a, ones])              # (N, 3) homogeneous img coords
+        wh = (H_inv @ ph.T).T                      # (N, 3)
+        # Filter degenerate w<=0 entries
+        good = np.abs(wh[:, 2]) > 1e-9
+        if good.sum() < min_inliers:
+            return None
+        wh = wh[good]; pts_t = pts_t[good]
+        world_xy = wh[:, :2] / wh[:, 2:3]          # (N, 2) world ground coords
+        # Pitch sanity: keep only matches whose ground projection is on/near pitch
+        L_half = float(getattr(calibrator, "_pitch_length_half", 60.0))
+        W_half = float(getattr(calibrator, "_pitch_width_half", 40.0))
+        on_pitch = (
+            (np.abs(world_xy[:, 0]) <= L_half + 30) &
+            (np.abs(world_xy[:, 1]) <= W_half + 30)
+        )
+        if on_pitch.sum() < min_inliers:
+            return None
+        world_xy = world_xy[on_pitch]; pts_t = pts_t[on_pitch]
+        world_3d = np.hstack([world_xy, np.zeros((len(world_xy), 1))])
+
+        # Use anchor's pose as warm-start (rvec, focal).
+        pose_a = camera_poses[af]
+        rvec_init = np.array(pose_a["rvec"], dtype=np.float64)
+        f_init = float(pose_a["K"][0][0])
+        # Run the 4-DOF refine. _refine_7dof reads K[0,0] as f_init and
+        # mutates internal state, so save/restore.
+        K_save = calibrator.K.copy()
+        focal_save = calibrator.focal_bounds
+        try:
+            calibrator.K = np.array(
+                [[f_init, 0, width / 2.0], [0, f_init, height / 2.0], [0, 0, 1]],
+                dtype=np.float64,
+            )
+            # Allow focal to move freely within the configured bounds — anchor
+            # focal is a good seed but the target may have zoomed a touch.
+            tvec_init = -cv2.Rodrigues(rvec_init)[0] @ C_target
+            rvec_opt, _tvec_opt, f_opt = calibrator._refine_7dof(
+                rvec_init, tvec_init, pts_t.astype(np.float64), world_3d, [],
+            )
+        finally:
+            calibrator.K = K_save
+            calibrator.focal_bounds = focal_save
+        return rvec_opt, float(f_opt)
+
+    # Iterate targets; for each, find bracketing anchors and solve.
+    n_updated = 0
+    updated_frames: list[int] = []
+    for fi in targets:
+        # Bracket — but reject anchors that are too far away. Long-distance
+        # SIFT matches snap to background landmarks (buildings / trees) which
+        # is fine geometrically but biases the 4-DOF PnP toward whatever
+        # plane the anchor's H projects those landmarks to. Limiting anchors
+        # to a ~1-second window keeps the matched features mostly on-pitch.
+        left = max((a for a in anchor_frames if a <= fi), default=None)
+        right = min((a for a in anchor_frames if a >= fi), default=None)
+        if left is not None and (fi - left) > max_anchor_dist:
+            left = None
+        if right is not None and (right - fi) > max_anchor_dist:
+            right = None
+        candidates = [a for a in (left, right) if a is not None and a in anchor_imgs]
+        if not candidates:
+            continue
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        ok, target_img = cap.read()
+        if not ok:
+            continue
+        solutions = []
+        for af in candidates:
+            sol = _solve_one_anchor(target_img, af)
+            if sol is not None:
+                solutions.append((af, sol[0], sol[1]))
+        if not solutions:
+            continue
+        # Distance-weighted average of rvec / focal.
+        weights = np.array(
+            [1.0 / max(abs(fi - af), 1) for af, _, _ in solutions], dtype=np.float64,
+        )
+        weights /= weights.sum()
+        rvec_avg = sum(w * r for w, (_, r, _) in zip(weights, solutions))
+        f_avg = sum(w * f for w, (_, _, f) in zip(weights, solutions))
+        # Build pose with locked C.
+        R_avg, _ = cv2.Rodrigues(rvec_avg)
+        t_locked = -R_avg @ C_target
+        K_out = np.array(
+            [[f_avg, 0, width / 2.0], [0, f_avg, height / 2.0], [0, 0, 1]],
+            dtype=np.float64,
+        )
+        H_locked = K_out @ np.column_stack(
+            [R_avg[:, 0], R_avg[:, 1], t_locked]
+        )
+        if abs(H_locked[2, 2]) > 1e-10:
+            H_locked = H_locked / H_locked[2, 2]
+        homographies[fi] = H_locked
+        camera_poses[fi] = {
+            "K": K_out.tolist(),
+            "rvec": rvec_avg.ravel().tolist(),
+            "tvec": t_locked.ravel().tolist(),
+            "dist_coeffs": [0.0] * 5,
+        }
+        ff[fi] = {
+            "calibrated": True,
+            "interpolated": False,
+            "chain_filled": True,
+            "reprojection_error": None,
+            "source": "sift_pnp_left+right" if len(solutions) == 2 else "sift_pnp_one_anchor",
+        }
+        n_updated += 1
+        updated_frames.append(fi)
+
+    cap.release()
+    logger.info("  Chain gap-fill: solved %d / %d targets via single-step SIFT+PnP",
+                n_updated, len(targets))
+
+    # Re-render calibration vis for chain-filled frames so the JPGs reflect
+    # the new (better) projection. Open the video once and seek for each
+    # frame that needs a fresh vis.
+    if (
+        vis_calib_dir is not None
+        and pitch_template is not None
+        and keypoint_mapper is not None
+        and calibrator is not None
+        and updated_frames
+    ):
+        cap = cv2.VideoCapture(str(video_path))
+        if cap.isOpened():
+            n_vis = 0
+            for idx, fi in enumerate(sorted(updated_frames)):
+                # Honour the same vis_interval as Pass 1/2 so we don't
+                # explode disk by writing every chain-filled frame.
+                if vis_interval > 1 and (idx % vis_interval) != 0:
+                    continue
+                cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                pose = camera_poses[fi]
+                rvec_p = np.array(pose["rvec"], dtype=np.float64)
+                R_p, _ = cv2.Rodrigues(rvec_p)
+                synth_result = {
+                    "homography": homographies[fi],
+                    "camera_params": {
+                        "K": np.array(pose["K"], dtype=np.float64),
+                        "rvec": rvec_p,
+                        "tvec": np.array(pose["tvec"], dtype=np.float64),
+                        "dist_coeffs": np.array(pose["dist_coeffs"], dtype=np.float64),
+                        "R": R_p,
+                    },
+                }
+                vis = _draw_physical_calibration(
+                    frame, [], [], synth_result, pitch_template,
+                    keypoint_mapper, calibrator,
+                    pitch_length=pitch_length, pitch_width=pitch_width,
+                )
+                # Stamp a marker so we know this came from chain
+                src_lbl = ff[fi].get("source", "chain")
+                _stamp_source(vis, f"Chain: {src_lbl}")
+                cv2.imwrite(str(vis_calib_dir / f"frame_{fi:05d}.jpg"), vis)
+                n_vis += 1
+            cap.release()
+            logger.info(
+                "  Chain gap-fill: re-rendered %d vis frames in %s",
+                n_vis, vis_calib_dir,
+            )
+
+    return n_updated
 
 
 def _batch_detect_all_frames(
