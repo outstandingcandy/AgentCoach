@@ -166,7 +166,24 @@ def compute_homography(state: "AnchorAnnotator") -> str:
     if H is None:
         return "Homography computation failed."
 
-    state.reprojection_error = mean_error
+    # Reject degenerate solutions: solve_camera can return mean_error=inf when
+    # the LM optimizer fails to descend (e.g. all keypoints clustered in one
+    # half of the frame after a rename/move that introduced a co-linear set).
+    # Letting this through would cascade an `inf` through state_dict() and
+    # break JSON serialization downstream.
+    import math
+    if not math.isfinite(float(mean_error)):
+        state.H0 = None
+        state.reprojection_error = 0.0
+        state.auto_projected_points = []
+        state.auto_accepted = []
+        return (
+            f"PnP solver returned a degenerate solution (mean_error=inf). "
+            f"Re-check the recent edit — manual points may now be co-linear "
+            f"or covering only one half of the pitch."
+        )
+
+    state.reprojection_error = float(mean_error)
     state.H0 = H
     compute_auto_projections(state)
 

@@ -94,7 +94,7 @@ def _draw_lines_pixel(
 
 def render_tactical_view(state: "AnchorAnnotator") -> np.ndarray:
     """Render a tactical-style view of all annotations (y-up world)."""
-    scale = 8
+    scale = 7  # match create_pitch_diagram / create_lines_diagram for visual parity
     img, to_px, _width, height = make_pitch_canvas(scale=scale, margin=50)
     draw_pitch_structure(img, to_px, scale=scale, landmark_radius=4)
 

@@ -4,6 +4,7 @@ World convention is y-up (top = +W/2); the rendering flips y so that points
 with y > 0 appear at the top of the image.
 """
 
+import math
 from typing import Callable
 
 import cv2
@@ -79,7 +80,7 @@ def draw_pitch_structure(
 
     cv2.rectangle(img, to_px(-L, pa_w), to_px(-L + pa_d, -pa_w), color, thickness)
     cv2.rectangle(img, to_px(L - pa_d, pa_w), to_px(L, -pa_w), color, thickness)
-    cv2.rectangle(img, to_px(-L, ga_w), to_px(-L + ga_d, ga_w), color, thickness)
+    cv2.rectangle(img, to_px(-L, ga_w), to_px(-L + ga_d, -ga_w), color, thickness)
     cv2.rectangle(img, to_px(L - ga_d, ga_w), to_px(L, -ga_w), color, thickness)
 
     if draw_landmarks:
@@ -88,9 +89,29 @@ def draw_pitch_structure(
         cv2.circle(img, to_px(L - pen, 0), landmark_radius, color, -1)
 
     if draw_arcs:
+        # Penalty-arc visible-segment half-angle, from the geometry of the
+        # circle (centered on the penalty mark) intersecting the PA-front
+        # line. cos(theta) = (pa_d - pen) / ccr. Falls back to a full circle
+        # if the front line is inside the circle (non-FIFA pitches where
+        # ccr > pa_d - pen far enough that the arc wraps), and skips
+        # entirely if the front line never reaches the circle.
         r = int(ccr * scale)
-        cv2.ellipse(img, to_px(-L + pen, 0), (r, r), 0, -60, 60, color, thickness)
-        cv2.ellipse(img, to_px(L - pen, 0), (r, r), 0, 120, 240, color, thickness)
+        dx = pa_d - pen
+        ratio = dx / ccr if ccr > 0 else 1.0
+        if -1.0 < ratio < 1.0:
+            half = math.degrees(math.acos(ratio))
+            # Left arc opens toward +x; right arc opens toward -x. The y-up
+            # canvas flips angles, so the left arc is drawn at [-half, +half]
+            # and the right at [180-half, 180+half].
+            cv2.ellipse(img, to_px(-L + pen, 0), (r, r), 0,
+                        -half, half, color, thickness)
+            cv2.ellipse(img, to_px(L - pen, 0), (r, r), 0,
+                        180 - half, 180 + half, color, thickness)
+        elif ratio <= -1.0:
+            # PA-front farther than ccr from goal — arc is entirely inside.
+            cv2.ellipse(img, to_px(-L + pen, 0), (r, r), 0, 0, 360, color, thickness)
+            cv2.ellipse(img, to_px(L - pen, 0), (r, r), 0, 0, 360, color, thickness)
+        # ratio >= 1.0 → arc never crosses front line; skip.
 
 
 def _draw_line_label(

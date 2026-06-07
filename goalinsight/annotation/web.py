@@ -64,16 +64,22 @@ def create_app(
     # Static files
     # ------------------------------------------------------------------
 
+    # Browsers aggressively cache HTML/JS by default; the annotator UI is
+    # iterated frequently so we always force a re-fetch. Otherwise users hit
+    # stale UIs after a server restart and silently lose new endpoints
+    # (Apply / Promote / drag) without any error feedback.
+    _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+
     @app.get("/")
     def index_page() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+        return FileResponse(STATIC_DIR / "index.html", headers=_NO_CACHE)
 
     @app.get("/static/{filename}")
     def static_file(filename: str) -> FileResponse:
         path = STATIC_DIR / filename
         if not path.exists():
             raise HTTPException(404, "Not found")
-        return FileResponse(path)
+        return FileResponse(path, headers=_NO_CACHE)
 
     # ------------------------------------------------------------------
     # Read-only metadata
@@ -230,7 +236,9 @@ def create_app(
         target_frame = int(frame_idx) if frame_idx is not None else 0
         try:
             if video_name == annotator.video_name:
-                if target_frame and not annotator.goto_frame(target_frame):
+                # NB: must call goto_frame even when target_frame == 0; the
+                # value is a real frame index, not a "no-op" sentinel.
+                if not annotator.goto_frame(target_frame):
                     raise HTTPException(400, f"Invalid frame_idx: {target_frame}")
             else:
                 annotator.switch_video(str(path), frame_idx=target_frame)
@@ -326,6 +334,33 @@ def create_app(
     async def manual_delete(request: Request) -> JSONResponse:
         payload = await request.json()
         return _ok(annotator.delete_manual_point(int(payload["idx"])))
+
+    @app.post("/api/manual/update_pixel")
+    async def manual_update_pixel(request: Request) -> JSONResponse:
+        payload = await request.json()
+        return _ok(annotator.update_manual_pixel(
+            int(payload["idx"]),
+            float(payload["x"]),
+            float(payload["y"]),
+        ))
+
+    @app.post("/api/manual/update_name")
+    async def manual_update_name(request: Request) -> JSONResponse:
+        payload = await request.json()
+        return _ok(annotator.update_manual_name(
+            int(payload["idx"]),
+            str(payload["name"]),
+        ))
+
+    @app.post("/api/derived/promote")
+    async def derived_promote(request: Request) -> JSONResponse:
+        payload = await request.json()
+        return _ok(annotator.promote_derived_to_manual(int(payload["idx"])))
+
+    @app.post("/api/auto/promote")
+    async def auto_promote(request: Request) -> JSONResponse:
+        payload = await request.json()
+        return _ok(annotator.promote_auto_to_manual(int(payload["idx"])))
 
     @app.post("/api/line/select")
     async def line_select(request: Request) -> JSONResponse:

@@ -21,6 +21,7 @@ the public method surface that the FastAPI ``web.py`` endpoints call.
 """
 
 import json
+import math
 from pathlib import Path
 
 import cv2
@@ -464,6 +465,124 @@ class AnchorAnnotator:
         self.selected_manual_idx = None
         return "" if idx is None else f"Selected line L{idx + 1}"
 
+    def update_manual_pixel(self, idx: int, px: float, py: float) -> str:
+        """Move an existing manual point to a new pixel location.
+
+        Refuses while a line is being drawn (the second click would be lost),
+        clamps off-frame coords, and re-validates H0 if it was already solved.
+        """
+        if not (0 <= idx < len(self.clicked_points)):
+            return f"Invalid manual idx: {idx}"
+        if self.line_clicks:
+            return "Finish (or cancel) the in-progress line first."
+        if self.current_frame is None:
+            return "No frame loaded."
+        h, w = self.current_frame.shape[:2]
+        px = float(max(0, min(w - 1, px)))
+        py = float(max(0, min(h - 1, py)))
+        self.clicked_points[idx] = (px, py)
+        self._invalidate_homography()
+        name = (self.keypoint_names[idx]
+                if idx < len(self.keypoint_names) else "(pending)")
+        return f"Moved P{idx + 1} ({name}) → ({px:.0f}, {py:.0f})"
+
+    def update_manual_name(self, idx: int, new_name: str) -> str:
+        """Rename a manual point. World coord auto-updates from the new name."""
+        if not (0 <= idx < len(self.clicked_points)):
+            return f"Invalid manual idx: {idx}"
+        if new_name not in _pk.PITCH_POINTS:
+            return f"Invalid keypoint: {new_name}"
+        # No-op if unchanged.
+        if (idx < len(self.keypoint_names)
+                and self.keypoint_names[idx] == new_name):
+            return f"P{idx + 1} already named {new_name}"
+        # Reject if another manual point already owns this name.
+        for j, existing in enumerate(self.keypoint_names):
+            if j != idx and existing == new_name:
+                return f"{new_name} already on P{j + 1}"
+
+        pt = _pk.PITCH_POINTS[new_name]
+        world = (float(pt[0]), float(pt[1]))
+        if idx < len(self.keypoint_names):
+            self.keypoint_names[idx] = new_name
+            self.world_points[idx] = world
+        else:
+            # Was a pending point — promote it now.
+            self.keypoint_names.append(new_name)
+            self.world_points.append(world)
+        self._invalidate_homography()
+        return f"Renamed P{idx + 1} → {new_name}"
+
+    def promote_derived_to_manual(self, idx: int) -> str:
+        """Convert a derived intersection into a manual anchor.
+
+        Pixel is preserved; the derived's auto-resolved name carries over
+        unless it would clash with an existing manual point, in which case
+        the new manual entry is left in pending state for the user to name
+        via the dropdown.
+        """
+        if not (0 <= idx < len(self.derived_points)):
+            return f"Invalid derived idx: {idx}"
+        pixel, world, name = self.derived_points.pop(idx)
+        if idx < len(self.derived_accepted):
+            self.derived_accepted.pop(idx)
+
+        self.clicked_points.append((float(pixel[0]), float(pixel[1])))
+        clash = name in self.keypoint_names
+        if not clash and name in _pk.PITCH_POINTS:
+            pt = _pk.PITCH_POINTS[name]
+            self.world_points.append((float(pt[0]), float(pt[1])))
+            self.keypoint_names.append(name)
+            status = f"Promoted D{idx + 1} → P{len(self.clicked_points)} ({name})"
+        else:
+            # Pending: pixel only, user picks the real name from the dropdown.
+            status = (f"Promoted D{idx + 1} → P{len(self.clicked_points)} "
+                      f"(pending — pick a name)")
+        self.selected_manual_idx = len(self.clicked_points) - 1
+        self._invalidate_homography()
+        return status
+
+    def promote_auto_to_manual(self, idx: int) -> str:
+        """Convert an auto-projected point into a manual anchor."""
+        if not (0 <= idx < len(self.auto_projected_points)):
+            return f"Invalid auto idx: {idx}"
+        pixel, world, name, _hrnet_idx, _is_ground = (
+            self.auto_projected_points.pop(idx)
+        )
+        if idx < len(self.auto_accepted):
+            self.auto_accepted.pop(idx)
+
+        self.clicked_points.append((float(pixel[0]), float(pixel[1])))
+        if name in self.keypoint_names or name not in _pk.PITCH_POINTS:
+            status = (f"Promoted auto → P{len(self.clicked_points)} "
+                      f"(pending — pick a name)")
+        else:
+            pt = _pk.PITCH_POINTS[name]
+            self.world_points.append((float(pt[0]), float(pt[1])))
+            self.keypoint_names.append(name)
+            status = f"Promoted auto → P{len(self.clicked_points)} ({name})"
+        self.selected_manual_idx = len(self.clicked_points) - 1
+        self._invalidate_homography()
+        return status
+
+    def _invalidate_homography(self) -> None:
+        """Mark H0 stale after a manual-edit op.
+
+        Compute_homography is a *user-driven* validation step (the "is my
+        annotation good?" button), not a side effect of editing. Any edit
+        that changes the anchor set just drops H0 + auto projections so the
+        UI badge flips back to "no homography"; the user re-clicks Compute
+        to get a fresh solution. This keeps Apply / drag / promote fast and
+        prevents a degenerate post-edit anchor set from booting the user out
+        of the API with a 500.
+        """
+        if self.H0 is None:
+            return
+        self.H0 = None
+        self.reprojection_error = 0.0
+        self.auto_projected_points = []
+        self.auto_accepted = []
+
     def delete_manual_point(self, idx: int) -> str:
         if not (0 <= idx < len(self.clicked_points)):
             return f"Invalid manual idx: {idx}"
@@ -620,7 +739,14 @@ class AnchorAnnotator:
             "derived_points": derived,
             "auto_projected_points": auto_projected,
             "homography_computed": self.H0 is not None,
-            "reprojection_error": float(self.reprojection_error),
+            # Coerce non-finite (NaN/inf) errors to 0 — the FastAPI
+            # JSONResponse encoder rejects them and would 500 the entire
+            # request, masking whatever computation just produced them.
+            "reprojection_error": (
+                float(self.reprojection_error)
+                if math.isfinite(float(self.reprojection_error))
+                else 0.0
+            ),
             "show_projection": bool(self.show_projection),
             "selected_manual_idx": self.selected_manual_idx,
             "selected_line_idx": self.selected_line_idx,
