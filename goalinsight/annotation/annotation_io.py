@@ -252,7 +252,34 @@ def save_frame_annotation(
                 all_points_data["auto_projected_points"].append(pt_data)
                 all_points_data["all_points"].append(pt_data)
 
-            all_points_data["total_points"] = len(all_points_data["all_points"])
+            # Defense in depth: deduplicate by keypoint_name. The finetune
+            # dataloader writes one heatmap channel per name — if a derived
+            # snap (or stale legacy state) attaches the same name twice with
+            # *different* worlds, training would supervise that channel at
+            # two image positions simultaneously. Manual wins over derived
+            # wins over auto.
+            priority = {"manual": 0, "derived": 1, "auto_projected": 2}
+            seen: dict[str, int] = {}
+            deduped: list[dict] = []
+            for p in all_points_data["all_points"]:
+                key = p["keypoint_name"]
+                pr = priority.get(p["source"], 99)
+                if key in seen and pr >= seen[key]:
+                    continue
+                seen[key] = pr
+                deduped.append(p)
+            all_points_data["all_points"] = deduped
+            # Rebuild per-source views so they stay consistent with all_points.
+            all_points_data["manual_points"] = [
+                p for p in deduped if p["source"] == "manual"
+            ]
+            all_points_data["derived_points"] = [
+                p for p in deduped if p["source"] == "derived"
+            ]
+            all_points_data["auto_projected_points"] = [
+                p for p in deduped if p["source"] == "auto_projected"
+            ]
+            all_points_data["total_points"] = len(deduped)
 
             with open(frame_dir / f"frame_{frame_idx}_all_points.json", "w") as f:
                 json.dump(all_points_data, f, indent=2)

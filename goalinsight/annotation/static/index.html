@@ -330,13 +330,21 @@ function applyState(state) {
   const fmtPt = (p, idx) => {
     const sel = idx === selM ? "active" : "";
     if (p.pending) {
+      const applyBtn = idx === selM
+        ? `<button class="tiny" data-manual-apply="${idx}" title="Assign current dropdown name">Apply</button>`
+        : "";
       return `<li class="pending ${sel}" data-manual-idx="${idx}">
         <span class="body">P${idx + 1}. (${p.pixel[0].toFixed(0)}, ${p.pixel[1].toFixed(0)}) → pending</span>
+        ${applyBtn}
         <button class="tiny danger" data-manual-del="${idx}" title="Delete">✕</button>
       </li>`;
     }
+    const applyBtn = idx === selM
+      ? `<button class="tiny" data-manual-apply="${idx}" title="Rename to current dropdown selection">Apply</button>`
+      : "";
     return `<li class="${sel}" data-manual-idx="${idx}">
       <span class="body">[${p.hrnet_index}] ${p.name} → (${p.pixel[0].toFixed(0)}, ${p.pixel[1].toFixed(0)}) ⇒ (${p.world[0].toFixed(1)}, ${p.world[1].toFixed(1)})</span>
+      ${applyBtn}
       <button class="tiny danger" data-manual-del="${idx}" title="Delete">✕</button>
     </li>`;
   };
@@ -359,6 +367,7 @@ function applyState(state) {
     const btnCls = dp.accepted ? "accept-btn accepted tiny" : "accept-btn tiny";
     return `<li class="${cls}" data-derived-idx="${i}" title="Click to toggle">
       <span class="body derived">D${i + 1}. ${dp.name} → (${dp.pixel[0].toFixed(0)}, ${dp.pixel[1].toFixed(0)}) ⇒ (${dp.world[0].toFixed(1)}, ${dp.world[1].toFixed(1)})</span>
+      <button class="tiny" data-derived-promote="${i}" title="Promote to manual">↑M</button>
       <button class="${btnCls}">${btn}</button>
     </li>`;
   }).join("") || "<li>(none)</li>";
@@ -372,6 +381,7 @@ function applyState(state) {
     const tag = ap.is_ground ? "" : "T";
     return `<li class="${cls}" data-auto-idx="${i}" title="Click to toggle">
       <span class="body ${flavor}">[${ap.hrnet_index}]${tag} ${ap.name} → (${ap.pixel[0].toFixed(0)}, ${ap.pixel[1].toFixed(0)})</span>
+      <button class="tiny" data-auto-promote="${i}" title="Promote to manual">↑M</button>
       <button class="${btnCls}">${btn}</button>
     </li>`;
   }).join("") || "<li>(none)</li>";
@@ -599,13 +609,28 @@ async function init() {
     applyState(await api("POST", "/api/auto/reject_all")); refreshFrame();
   });
 
-  // Manual points: click body to select/toggle, click ✕ to delete
+  // Manual points: click body to select, click Apply to rename, click ✕ to delete
   $("#manual-points").addEventListener("click", async (e) => {
     const delBtn = e.target.closest("button[data-manual-del]");
     if (delBtn) {
       e.stopPropagation();
       applyState(await api("POST", "/api/manual/delete", { idx: Number(delBtn.dataset.manualDel) }));
       refreshFrame();
+      return;
+    }
+    const applyBtn = e.target.closest("button[data-manual-apply]");
+    if (applyBtn) {
+      e.stopPropagation();
+      const name = $("#kp-select").value;
+      if (!name) return;
+      const state = await apiOrStatus("POST", "/api/manual/update_name", {
+        idx: Number(applyBtn.dataset.manualApply),
+        name,
+      });
+      if (state) {
+        applyState(state);
+        refreshFrame();
+      }
       return;
     }
     const li = e.target.closest("li[data-manual-idx]");
@@ -641,12 +666,26 @@ async function init() {
 
   // Per-row toggles (delegated; whole row is clickable)
   $("#derived-points").addEventListener("click", async (e) => {
+    const promoteBtn = e.target.closest("button[data-derived-promote]");
+    if (promoteBtn) {
+      e.stopPropagation();
+      applyState(await api("POST", "/api/derived/promote", { idx: Number(promoteBtn.dataset.derivedPromote) }));
+      refreshFrame();
+      return;
+    }
     const li = e.target.closest("li[data-derived-idx]");
     if (!li) return;
     applyState(await api("POST", "/api/derived/toggle", { idx: Number(li.dataset.derivedIdx) }));
     refreshFrame();
   });
   $("#auto-points").addEventListener("click", async (e) => {
+    const promoteBtn = e.target.closest("button[data-auto-promote]");
+    if (promoteBtn) {
+      e.stopPropagation();
+      applyState(await api("POST", "/api/auto/promote", { idx: Number(promoteBtn.dataset.autoPromote) }));
+      refreshFrame();
+      return;
+    }
     const li = e.target.closest("li[data-auto-idx]");
     if (!li) return;
     applyState(await api("POST", "/api/auto/toggle", { idx: Number(li.dataset.autoIdx) }));
@@ -671,8 +710,72 @@ async function init() {
   $("#frame-slider").addEventListener("change", (e) => gotoFrame(e.target.value));
   $("#frame-input").addEventListener("change", (e) => gotoFrame(e.target.value));
 
-  // Image click
-  $("#frame-img").addEventListener("click", onImageClick);
+  // Image interaction: click adds a point; mousedown on an existing manual
+  // point starts a drag that re-positions it on mouseup.
+  (function attachFrameImgInput() {
+    const img = $("#frame-img");
+    const HIT_RADIUS_PX = 14;       // natural-image pixels
+    const DRAG_THRESHOLD_PX = 3;    // anything below this is treated as a click
+    let drag = null;                // { idx, downX, downY, lastX, lastY }
+
+    function hitTest(natPt) {
+      if (!lastState || !lastState.manual_points) return -1;
+      let best = -1, bestD2 = HIT_RADIUS_PX * HIT_RADIUS_PX;
+      lastState.manual_points.forEach((p, i) => {
+        const dx = p.pixel[0] - natPt.x, dy = p.pixel[1] - natPt.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) { bestD2 = d2; best = i; }
+      });
+      return best;
+    }
+
+    img.addEventListener("mousedown", (evt) => {
+      if (evt.button !== 0) return;
+      const natPt = imgToFrameCoords(evt);
+      if (!natPt) return;
+      const idx = hitTest(natPt);
+      if (idx < 0) return;          // empty space → fall through to click handler
+      drag = { idx, downX: natPt.x, downY: natPt.y, lastX: natPt.x, lastY: natPt.y };
+      img.style.cursor = "grabbing";
+      evt.preventDefault();
+    });
+
+    window.addEventListener("mousemove", (evt) => {
+      if (!drag) return;
+      const natPt = imgToFrameCoords(evt);
+      if (!natPt) return;
+      drag.lastX = natPt.x; drag.lastY = natPt.y;
+    });
+
+    window.addEventListener("mouseup", async (evt) => {
+      if (!drag) return;
+      const natPt = imgToFrameCoords(evt) || { x: drag.lastX, y: drag.lastY };
+      const dx = natPt.x - drag.downX, dy = natPt.y - drag.downY;
+      const moved = Math.hypot(dx, dy) >= DRAG_THRESHOLD_PX;
+      const idx = drag.idx;
+      drag = null;
+      img.style.cursor = "";
+      if (!moved) return;           // treat as a click; click handler also fires
+      const state = await apiOrStatus("POST", "/api/manual/update_pixel", {
+        idx, x: natPt.x, y: natPt.y,
+      });
+      if (state) {
+        applyState(state);
+        refreshFrame();
+      }
+    });
+
+    // Suppress the click that follows a drag (browsers fire click after mouseup).
+    img.addEventListener("click", (evt) => {
+      // If the mouseup just-now moved us, the drag handler already POSTed and
+      // cleared `drag`. We use the last natPt vs lastState position to decide.
+      if (lastState && lastState.manual_points) {
+        const natPt = imgToFrameCoords(evt);
+        if (natPt && hitTest(natPt) >= 0) return;  // landed on a point — no add
+      }
+      onImageClick(evt);
+    });
+  })();
 
   // Keyboard shortcuts
   window.addEventListener("keydown", (e) => {

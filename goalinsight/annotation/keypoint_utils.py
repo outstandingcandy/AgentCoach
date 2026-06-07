@@ -35,12 +35,53 @@ def parse_keypoint_choice(choice: str) -> tuple[int, str]:
     return idx, name
 
 
+# Cached snap threshold, keyed by id() of the active PITCH_POINTS dict so
+# `set_active_pitch` (which rebuilds the dict) implicitly invalidates it.
+_THRESH_CACHE: tuple[int, float] | None = None
+
+
+def _active_threshold() -> float:
+    """Half the smallest neighbour gap on the active pitch, capped at 5 m.
+
+    Kids-spec pitches put PA-front and GA-front only ~4.13 m apart, so the
+    legacy fixed 5 m radius pulls cross-side intersections in. Sweeping all
+    57 keypoint pairs once and halving the minimum non-zero gap keeps every
+    real intersection inside its own basin while still rejecting noise.
+    """
+    global _THRESH_CACHE
+    pts = list(_pk.PITCH_POINTS.values())
+    key = id(_pk.PITCH_POINTS)
+    if _THRESH_CACHE is not None and _THRESH_CACHE[0] == key:
+        return _THRESH_CACHE[1]
+
+    min_gap = float("inf")
+    for i, a in enumerate(pts):
+        ax, ay = float(a[0]), float(a[1])
+        for b in pts[i + 1:]:
+            bx, by = float(b[0]), float(b[1])
+            d = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+            if 1e-3 < d < min_gap:
+                min_gap = d
+
+    thr = 5.0 if min_gap == float("inf") else max(0.25, min(5.0, 0.5 * min_gap))
+    _THRESH_CACHE = (key, thr)
+    return thr
+
+
 def find_nearest_keypoint(
     wx: float,
     wy: float,
-    threshold: float = 5.0,
+    threshold: float | None = None,
 ) -> tuple[str | None, int | None]:
-    """Find the nearest HRNet keypoint within `threshold` meters."""
+    """Find the nearest HRNet keypoint within `threshold` meters.
+
+    When ``threshold`` is None, uses ``_active_threshold()`` — half the
+    smallest pairwise gap on the active pitch. Pass an explicit value to
+    override (e.g. legacy callers that already verified the candidate).
+    """
+    if threshold is None:
+        threshold = _active_threshold()
+
     min_dist = float("inf")
     nearest_name = None
     nearest_idx = None
