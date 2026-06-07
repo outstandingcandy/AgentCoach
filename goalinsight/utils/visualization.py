@@ -225,59 +225,6 @@ class Visualizer:
 
         return result
 
-    def create_pitch_template(
-        self,
-        width: int = 1050,
-        height: int = 680,
-    ) -> np.ndarray:
-        """Create a blank 2D pitch template image.
-
-        Args:
-            width: Image width in pixels.
-            height: Image height in pixels.
-
-        Returns:
-            Pitch template image (BGR).
-        """
-        # Green background
-        pitch = np.zeros((height, width, 3), dtype=np.uint8)
-        pitch[:] = (34, 139, 34)  # Forest green
-
-        # Draw pitch markings (simplified)
-        cx, cy = width // 2, height // 2
-        scale = min(width / 115, height / 78)
-
-        # Boundary
-        margin = 50
-        cv2.rectangle(
-            pitch,
-            (margin, margin),
-            (width - margin, height - margin),
-            (255, 255, 255),
-            2,
-        )
-
-        # Center line
-        cv2.line(pitch, (cx, margin), (cx, height - margin), (255, 255, 255), 2)
-
-        # Center circle
-        cv2.circle(pitch, (cx, cy), int(9.15 * scale), (255, 255, 255), 2)
-        cv2.circle(pitch, (cx, cy), 3, (255, 255, 255), -1)
-
-        # Penalty areas
-        pa_w = int(16.5 * scale)
-        pa_h = int(40.32 * scale / 2)
-        cv2.rectangle(pitch, (margin, cy - pa_h), (margin + pa_w, cy + pa_h), (255, 255, 255), 2)
-        cv2.rectangle(pitch, (width - margin - pa_w, cy - pa_h), (width - margin, cy + pa_h), (255, 255, 255), 2)
-
-        # Goal areas
-        ga_w = int(5.5 * scale)
-        ga_h = int(18.32 * scale / 2)
-        cv2.rectangle(pitch, (margin, cy - ga_h), (margin + ga_w, cy + ga_h), (255, 255, 255), 2)
-        cv2.rectangle(pitch, (width - margin - ga_w, cy - ga_h), (width - margin, cy + ga_h), (255, 255, 255), 2)
-
-        return pitch
-
     def save_video(
         self,
         frames: list[np.ndarray],

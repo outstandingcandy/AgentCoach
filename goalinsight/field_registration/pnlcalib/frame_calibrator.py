@@ -32,11 +32,17 @@ from .camera import Camera, is_good_camera
 logger = logging.getLogger(__name__)
 
 
-# Standard FIFA pitch dimensions (in meters)
-PITCH_LENGTH = 105.0
-PITCH_WIDTH = 68.0
-HALF_L = PITCH_LENGTH / 2  # 52.5
-HALF_W = PITCH_WIDTH / 2   # 34.0
+# FIFA defaults — used only as a fallback when no pitch_dims dict is passed
+# to FramebyFrameCalib. Live consumers (kids / 7-a-side / etc.) override per
+# instance via the `pitch_dims` kwarg.
+_FIFA_DEFAULTS: dict[str, float] = {
+    "pitch_length": 105.0,
+    "pitch_width": 68.0,
+    "penalty_area_length": 16.5,
+    "penalty_area_width": 40.32,
+    "goal_area_length": 5.5,
+    "goal_area_width": 18.32,
+}
 
 
 def iterative_pnp_calibrate(
@@ -238,6 +244,7 @@ class FramebyFrameCalib:
         self,
         image_size: tuple[int, int] = (960, 540),
         alpha: float = 0.7,
+        pitch_dims: dict | None = None,
     ):
         """Initialize calibrator.
 
@@ -245,10 +252,26 @@ class FramebyFrameCalib:
             image_size: Image dimensions (width, height).
             alpha: Weight for line error vs point error in optimization.
                    Higher alpha = more weight on line constraints.
+            pitch_dims: Pitch geometry overrides (FIFA when omitted). Recognized
+                keys: ``pitch_length``, ``pitch_width``, ``penalty_area_length``,
+                ``penalty_area_width``, ``goal_area_length``, ``goal_area_width``.
+                Drives the world coords returned by
+                ``_get_valid_intersection_pairs``.
         """
         self.image_size = image_size
         self.alpha = alpha
         self.w, self.h = image_size
+
+        # Resolve pitch geometry (FIFA fallback for missing keys).
+        d = dict(_FIFA_DEFAULTS)
+        if pitch_dims:
+            d.update({k: v for k, v in pitch_dims.items() if k in _FIFA_DEFAULTS})
+        self._half_l = d["pitch_length"] / 2.0
+        self._half_w = d["pitch_width"] / 2.0
+        self._pa_d = d["penalty_area_length"]
+        self._pa_hw = d["penalty_area_width"] / 2.0
+        self._ga_d = d["goal_area_length"]
+        self._ga_hw = d["goal_area_width"] / 2.0
 
         # Current frame data
         self.keypoints = []
@@ -349,51 +372,45 @@ class FramebyFrameCalib:
         # 15: Right goal line, 16: Bottom touchline
         # 17-19: Left goal area, 20-22: Right goal area
 
-        pairs = {}
+        hl, hw = self._half_l, self._half_w
+        pa_d, pa_hw = self._pa_d, self._pa_hw
+        ga_d, ga_hw = self._ga_d, self._ga_hw
+
+        pairs: dict[tuple[int, int], tuple[float, float]] = {}
 
         # Penalty area corners (left)
-        # Line 0 (Big rect left top) x Line 1 (Big rect left side)
-        pairs[(0, 1)] = (-HALF_L + 16.5, 20.16)  # Top-left inner corner
-        # Line 1 x Line 2 (Big rect left bottom)
-        pairs[(1, 2)] = (-HALF_L + 16.5, -20.16)  # Bottom-left inner corner
-        # Line 0 x Line 14 (Left goal line)
-        pairs[(0, 14)] = (-HALF_L, 20.16)  # Top-left outer corner
-        # Line 2 x Line 14
-        pairs[(2, 14)] = (-HALF_L, -20.16)  # Bottom-left outer corner
+        pairs[(0, 1)] = (-hl + pa_d, pa_hw)   # Top-left inner corner
+        pairs[(1, 2)] = (-hl + pa_d, -pa_hw)  # Bottom-left inner corner
+        pairs[(0, 14)] = (-hl, pa_hw)         # Top-left outer corner
+        pairs[(2, 14)] = (-hl, -pa_hw)        # Bottom-left outer corner
 
         # Penalty area corners (right)
-        pairs[(3, 4)] = (HALF_L - 16.5, 20.16)
-        pairs[(4, 5)] = (HALF_L - 16.5, -20.16)
-        pairs[(3, 15)] = (HALF_L, 20.16)
-        pairs[(5, 15)] = (HALF_L, -20.16)
+        pairs[(3, 4)] = (hl - pa_d, pa_hw)
+        pairs[(4, 5)] = (hl - pa_d, -pa_hw)
+        pairs[(3, 15)] = (hl, pa_hw)
+        pairs[(5, 15)] = (hl, -pa_hw)
 
         # Center line intersections
-        # Line 12 (Center) x Line 13 (Top touchline)
-        pairs[(12, 13)] = (0, HALF_W)
-        # Line 12 x Line 16 (Bottom touchline)
-        pairs[(12, 16)] = (0, -HALF_W)
+        pairs[(12, 13)] = (0, hw)
+        pairs[(12, 16)] = (0, -hw)
 
         # Pitch corners
-        # Line 13 (Top) x Line 14 (Left goal line)
-        pairs[(13, 14)] = (-HALF_L, HALF_W)
-        # Line 13 x Line 15 (Right goal line)
-        pairs[(13, 15)] = (HALF_L, HALF_W)
-        # Line 14 x Line 16
-        pairs[(14, 16)] = (-HALF_L, -HALF_W)
-        # Line 15 x Line 16
-        pairs[(15, 16)] = (HALF_L, -HALF_W)
+        pairs[(13, 14)] = (-hl, hw)
+        pairs[(13, 15)] = (hl, hw)
+        pairs[(14, 16)] = (-hl, -hw)
+        pairs[(15, 16)] = (hl, -hw)
 
         # Goal area corners (left)
-        pairs[(17, 18)] = (-HALF_L + 5.5, 9.16)
-        pairs[(18, 19)] = (-HALF_L + 5.5, -9.16)
-        pairs[(17, 14)] = (-HALF_L, 9.16)
-        pairs[(19, 14)] = (-HALF_L, -9.16)
+        pairs[(17, 18)] = (-hl + ga_d, ga_hw)
+        pairs[(18, 19)] = (-hl + ga_d, -ga_hw)
+        pairs[(17, 14)] = (-hl, ga_hw)
+        pairs[(19, 14)] = (-hl, -ga_hw)
 
         # Goal area corners (right)
-        pairs[(20, 21)] = (HALF_L - 5.5, 9.16)
-        pairs[(21, 22)] = (HALF_L - 5.5, -9.16)
-        pairs[(20, 15)] = (HALF_L, 9.16)
-        pairs[(22, 15)] = (HALF_L, -9.16)
+        pairs[(20, 21)] = (hl - ga_d, ga_hw)
+        pairs[(21, 22)] = (hl - ga_d, -ga_hw)
+        pairs[(20, 15)] = (hl, ga_hw)
+        pairs[(22, 15)] = (hl, -ga_hw)
 
         return pairs
 
@@ -587,12 +604,13 @@ class FramebyFrameCalib:
             True if homography is geometrically plausible.
         """
         # Project a grid of pitch points and check basic sanity
+        hl, hw = self._half_l, self._half_w
         test_points = np.array([
-            [0.0, 0.0, 1.0],          # Center
-            [-HALF_L, 0.0, 1.0],      # Left goal line center
-            [HALF_L, 0.0, 1.0],       # Right goal line center
-            [0.0, HALF_W, 1.0],       # Top touchline center
-            [0.0, -HALF_W, 1.0],      # Bottom touchline center
+            [0.0, 0.0, 1.0],   # Center
+            [-hl, 0.0, 1.0],   # Left goal line center
+            [hl, 0.0, 1.0],    # Right goal line center
+            [0.0, hw, 1.0],    # Top touchline center
+            [0.0, -hw, 1.0],   # Bottom touchline center
         ])
 
         valid_projections = 0

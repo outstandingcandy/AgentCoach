@@ -76,7 +76,7 @@ def _run_stage1_pnlcalib(
     # When disabled, calibration relies purely on keypoints.
     use_lines = pnl_config.get("use_lines", False)
     line_detector = None
-    line_mapper = LineMapper()
+    line_mapper = LineMapper(pitch_dims=config.get("pitch") or None)
     if use_lines:
         logger.info("Stage 1: Initializing line detector (HRNet/PnLCalib)...")
         line_config = {
@@ -105,8 +105,14 @@ def _run_stage1_pnlcalib(
     calibration_results = init_calibration_results(video_path, video, process_fps)
     homographies = {}
 
-    # Create calibrator once (image_size and alpha don't change per frame)
-    calibrator = FramebyFrameCalib(image_size=(width, height), alpha=0.7)
+    # Create calibrator once (image_size and alpha don't change per frame).
+    # Forward pitch_dims so non-FIFA youth/7-a-side configs drive the line
+    # intersection world coords correctly.
+    pitch_cfg_legacy = config.get("pitch", {})
+    calibrator = FramebyFrameCalib(
+        image_size=(width, height), alpha=0.7,
+        pitch_dims=pitch_cfg_legacy or None,
+    )
 
     # Create visualization subdirectories
     vis_kp_dir = vis_dir / "keypoints"

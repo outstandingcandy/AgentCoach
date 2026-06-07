@@ -20,9 +20,9 @@ from ._utils import find_nearest_player
 
 logger = logging.getLogger(__name__)
 
-# FIFA fixed goal dimensions
-GOAL_HALF_WIDTH = 3.66  # meters (7.32m total)
-GOAL_HEIGHT = 2.44  # meters
+# Goal-frame dimensions read from EventDetectionContext (ctx.goal_length /
+# ctx.goal_height) — these were FIFA-only constants; non-FIFA pitches now flow
+# their goal geometry through `_classify_crossing` / `_validate_with_crossbar`.
 
 
 @register_detector
@@ -72,6 +72,8 @@ class ShotDetector(BaseEventDetector):
             result = _classify_crossing(
                 crossing, ctx.ball_states, half_length, ctx.fps,
                 ctx.camera_poses, approach_window_sec,
+                goal_half_width=ctx.goal_length / 2.0,
+                goal_height=ctx.goal_height,
             )
             if result is None:
                 continue
@@ -537,6 +539,9 @@ def _classify_crossing(
     fps: float,
     camera_poses: dict | None,
     approach_window_seconds: float = 1.0,
+    *,
+    goal_half_width: float,
+    goal_height: float,
 ) -> tuple[ShotOutcome, dict] | None:
     """Validate a crossing and determine outcome.
 
@@ -566,8 +571,8 @@ def _classify_crossing(
             return None
 
     # Determine outcome
-    within_width = abs(cross_y) <= GOAL_HALF_WIDTH
-    within_height = cross_h <= GOAL_HEIGHT + 0.5
+    within_width = abs(cross_y) <= goal_half_width
+    within_height = cross_h <= goal_height + 0.5
 
     if within_width and within_height:
         outcome = ShotOutcome.GOAL
@@ -578,7 +583,8 @@ def _classify_crossing(
     crossbar_valid = None
     if camera_poses is not None:
         crossbar_valid = _validate_with_crossbar(
-            crossing, half_length, camera_poses
+            crossing, half_length, camera_poses,
+            goal_half_width=goal_half_width, goal_height=goal_height,
         )
 
     prev = crossing["prev"]
@@ -612,6 +618,9 @@ def _validate_with_crossbar(
     crossing: dict,
     half_length: float,
     camera_poses: dict,
+    *,
+    goal_half_width: float,
+    goal_height: float,
 ) -> dict | None:
     """Validate ball pixel against projected goal frame."""
     from ...utils.projection import project_points_2d
@@ -632,10 +641,10 @@ def _validate_with_crossbar(
     )
     goal_3d = np.array(
         [
-            [goal_x, GOAL_HALF_WIDTH, 0],
-            [goal_x, GOAL_HALF_WIDTH, -GOAL_HEIGHT],
-            [goal_x, -GOAL_HALF_WIDTH, 0],
-            [goal_x, -GOAL_HALF_WIDTH, -GOAL_HEIGHT],
+            [goal_x, goal_half_width, 0],
+            [goal_x, goal_half_width, -goal_height],
+            [goal_x, -goal_half_width, 0],
+            [goal_x, -goal_half_width, -goal_height],
         ],
         dtype=np.float64,
     )
