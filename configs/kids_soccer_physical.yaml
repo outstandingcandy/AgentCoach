@@ -36,20 +36,51 @@ field_registration:
     joint_optimize: false             # camera zooms during clip — keep per-frame f
     world_error_threshold: 5.0
 
-    # Camera at (bottom touchline × center line), 2 m above the ground.
-    # World frame: pitch center origin, y-up. bottom touchline y = -W/2.
-    camera_position: [-4.0, -21.575, 2.0]
-    lock_camera_position: true        # treated as cm-level prior
+    # Camera position. Iterative refinement via Pass 2 lock-C:
+    #   measured prior:    (-4.000, -21.575, 2.000)
+    #   iter 1 converged:  (-5.116, -22.069, 2.844)
+    #   iter 2 converged:  (-5.557, -21.926, 2.820)  ← current (best stable point)
+    #   iter 3 converged:  (-5.906, -21.714, 2.765)  — x kept drifting -0.35m
+    # x didn't converge (left-half KPs over-represented in train set), so we
+    # stop at iter 2: y / z had stabilized, reproj already at 10.85 px median.
+    # Diff vs measured: x ≈ -1.6, y ≈ -0.35, z +0.82 (camera is taller).
+    camera_position: [-5.557, -21.926, 2.820]
+    # SOFT prior — frames with only 3 (often near-collinear) keypoints can't
+    # all reproject to zero under hard-lock + 4-DOF (only rvec + focal free),
+    # they settle for a ~22 px three-point compromise. With soft, the LM is
+    # allowed to nudge tvec away from this prior to make the visible anchors
+    # fit while position_weight pulls it back.
+    lock_camera_position: false
+    position_weight: 10.0             # pixels-equivalent; raise to keep tighter to prior
 
     pitch_length: 66.28
     pitch_width: 43.15
 
     calibration_skip: 2
 
+    # SIFT-based gap fill: replace linearly-interpolated frames with chained
+    # H propagation from high-quality anchors. Much more accurate when the
+    # camera is panning/zooming during a multi-second gap.
+    gap_fill_chain:
+      enabled: true
+      anchor_max_reproj_px: 30.0      # only frames with reproj<=30px become anchors
+      overwrite_above_reproj_px: 30.0 # don't overwrite frames already <=30px
+      method: improved
+      smoothing_window: 5
+      use_masking: false
+      max_gap_frames: 60
+      max_anchor_distance_frames: 120  # extended further to cover the 192-frame gap between anchors 30 and 222
+      sift_top_skip_frac: 0.25        # mask top 25% (OSD + sky)
+
   # Reuse the finetuned kids_soccer keypoint + line heads. The physical
   # runner pulls model paths from this block.
   pnlcalib:
-    keypoint_model_path: "data/finetuned_models/run_20260531_024941/models/best_model.pt"
+    # v2 KP best after full 100-epoch run on kids_soccer_v2 (clean manual
+    # annotations). 83.3% recall (30/36) / 0 phantoms, mean err 2.8 px on
+    # the v2 train set; baseline run_20260531_024941 was 71% / 3 phantoms.
+    # Left-goal z=-G_H channels (11 / 12 / 16) still don't activate above
+    # conf=0.05 — limitation of SV_kp pretrained head, not training data.
+    keypoint_model_path: "data/finetuned_models/run_20260605_073045/models/best_model_final.pt"
     keypoint_weights: "SV_kp"
     keypoint_threshold: 0.15
     use_lines: true

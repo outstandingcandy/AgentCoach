@@ -11,6 +11,7 @@ Available stages:
 """
 
 import argparse
+import logging
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,15 @@ from goalinsight.utils.config import get_default_config, load_config, merge_conf
 
 
 def main():
+    # Stream INFO from goalinsight.* loggers to stderr so module-level
+    # progress (chain calibration, joint optimization, etc.) is visible
+    # without each script having to set up its own logging config.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+            stream=sys.stderr,
+        )
     parser = argparse.ArgumentParser(
         description="Run GoalInsight pipeline"
     )
