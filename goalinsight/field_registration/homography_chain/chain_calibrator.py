@@ -15,12 +15,24 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
+from ...annotation import pitch_constants as _pc
 from .bidirectional_smoother import BidirectionalSmoother
 from .camera_param_converter import CameraParamConverter
 from .drift_detector import DriftDetector
 from .dynamic_masker import DynamicMasker
 from .feature_matcher import FeatureMatcher
 from .homography_propagator import HomographyPropagator
+
+
+def _active_pitch_geom() -> tuple[float, float, float, float, float, float, float]:
+    """Return (HL, HW, pa_d, pa_hw, ga_d, ga_hw, ccr) for the active pitch."""
+    p = _pc.get_active_pitch()
+    return (
+        p.PITCH_LENGTH / 2.0, p.PITCH_WIDTH / 2.0,
+        p.PENALTY_AREA_LENGTH, p.PENALTY_AREA_WIDTH / 2.0,
+        p.GOAL_AREA_LENGTH, p.GOAL_AREA_WIDTH / 2.0,
+        p.CENTER_CIRCLE_RADIUS,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -748,30 +760,31 @@ class ChainCalibrator:
                 y = K[1,1] * p[1] / p[2] + K[1,2]
                 return (int(x), int(y))
 
+            HL, HW, pa_d, pa_hw, _ga_d, _ga_hw, ccr = _active_pitch_geom()
+
             # Draw center circle
-            r = 9.15
             for i in range(36):
                 a1 = 2 * np.pi * i / 36
                 a2 = 2 * np.pi * (i + 1) / 36
-                p1 = project((r * np.cos(a1), r * np.sin(a1), 0))
-                p2 = project((r * np.cos(a2), r * np.sin(a2), 0))
+                p1 = project((ccr * np.cos(a1), ccr * np.sin(a1), 0))
+                p2 = project((ccr * np.cos(a2), ccr * np.sin(a2), 0))
                 if p1 and p2:
                     if 0 <= p1[0] < width and 0 <= p1[1] < height:
                         if 0 <= p2[0] < width and 0 <= p2[1] < height:
                             cv2.line(frame, p1, p2, color, thickness)
 
             # Draw center line
-            p1 = project((0, -34, 0))
-            p2 = project((0, 34, 0))
+            p1 = project((0, -HW, 0))
+            p2 = project((0, HW, 0))
             if p1 and p2:
                 cv2.line(frame, p1, p2, color, thickness)
 
             # Draw penalty areas
             for sign in [-1, 1]:
-                x = sign * 52.5
+                x = sign * HL
                 pts = [
-                    (x, -20.16, 0), (x - sign*16.5, -20.16, 0),
-                    (x - sign*16.5, 20.16, 0), (x, 20.16, 0)
+                    (x, -pa_hw, 0), (x - sign * pa_d, -pa_hw, 0),
+                    (x - sign * pa_d, pa_hw, 0), (x, pa_hw, 0),
                 ]
                 for i in range(len(pts)):
                     p1 = project(pts[i])
@@ -828,43 +841,44 @@ class ChainCalibrator:
                 x2, y2 = max(-200, min(w+200, p2[0])), max(-200, min(h+200, p2[1]))
                 cv2.line(frame, (x1, y1), (x2, y2), color, thickness)
 
+        HL, HW, pa_d, pa_hw, ga_d, ga_hw, ccr = _active_pitch_geom()
+
         # Draw center circle
-        r = 9.15
         prev_pt = None
         for i in range(37):
             a = 2 * np.pi * i / 36
-            pt = project((r * np.cos(a), r * np.sin(a)))
+            pt = project((ccr * np.cos(a), ccr * np.sin(a)))
             if prev_pt:
                 draw_line(prev_pt, pt)
             prev_pt = pt
 
         # Draw center line
-        draw_line(project((0, -34)), project((0, 34)))
+        draw_line(project((0, -HW)), project((0, HW)))
 
         # Draw touchlines
-        for y in [-34, 34]:
-            draw_line(project((-52.5, y)), project((52.5, y)))
+        for y in [-HW, HW]:
+            draw_line(project((-HL, y)), project((HL, y)))
 
         # Draw goal lines
-        for x in [-52.5, 52.5]:
-            draw_line(project((x, -34)), project((x, 34)))
+        for x in [-HL, HL]:
+            draw_line(project((x, -HW)), project((x, HW)))
 
         # Draw penalty areas
         for sign in [-1, 1]:
-            x = sign * 52.5
+            x = sign * HL
             pts = [
-                (x, -20.16), (x - sign*16.5, -20.16),
-                (x - sign*16.5, 20.16), (x, 20.16), (x, -20.16)
+                (x, -pa_hw), (x - sign * pa_d, -pa_hw),
+                (x - sign * pa_d, pa_hw), (x, pa_hw), (x, -pa_hw),
             ]
             for i in range(len(pts) - 1):
                 draw_line(project(pts[i]), project(pts[i+1]))
 
         # Draw goal areas
         for sign in [-1, 1]:
-            x = sign * 52.5
+            x = sign * HL
             pts = [
-                (x, -9.16), (x - sign*5.5, -9.16),
-                (x - sign*5.5, 9.16), (x, 9.16), (x, -9.16)
+                (x, -ga_hw), (x - sign * ga_d, -ga_hw),
+                (x - sign * ga_d, ga_hw), (x, ga_hw), (x, -ga_hw),
             ]
             for i in range(len(pts) - 1):
                 draw_line(project(pts[i]), project(pts[i+1]))
