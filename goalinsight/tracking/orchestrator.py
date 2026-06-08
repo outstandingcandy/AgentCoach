@@ -1040,6 +1040,9 @@ def run_tracking(
             height=height,
             pitch_length=pitch_length,
             pitch_width=pitch_width,
+            vis_frame_stride=int(
+                config.get("tracking", {}).get("vis_frame_stride", 10)
+            ),
         )
     else:
         out.release()
@@ -1078,6 +1081,7 @@ def _render_tracking_video(
     height: int,
     pitch_length: float,
     pitch_width: float,
+    vis_frame_stride: int = 10,
 ) -> None:
     """Render the tracking visualization video with ball + raw-track overlays.
 
@@ -1163,14 +1167,15 @@ def _render_tracking_video(
 
         fname = f"frame_{frame_idx:05d}"
         _write_queue.put(("video", combined))
-        _write_queue.put(("image", str(vis_frames_dir / f"{fname}.jpg"), combined))
-        _write_queue.put(("json", str(vis_frames_dir / f"{fname}.json"), {
-            "frame_idx": int(frame_idx),
-            "timestamp_sec": round(frame_idx / fps, 3),
-            "num_tracks": len(frame_tracks),
-            "tracks": frame_tracks,
-            "ball": ball_track_this,
-        }))
+        if vis_frame_stride <= 1 or frame_idx % vis_frame_stride == 0:
+            _write_queue.put(("image", str(vis_frames_dir / f"{fname}.jpg"), combined))
+            _write_queue.put(("json", str(vis_frames_dir / f"{fname}.json"), {
+                "frame_idx": int(frame_idx),
+                "timestamp_sec": round(frame_idx / fps, 3),
+                "num_tracks": len(frame_tracks),
+                "tracks": frame_tracks,
+                "ball": ball_track_this,
+            }))
 
     _write_queue.put(None)
     _writer.join()

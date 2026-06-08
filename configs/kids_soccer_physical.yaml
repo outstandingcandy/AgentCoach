@@ -58,6 +58,13 @@ field_registration:
 
     calibration_skip: 2
 
+    # Per-frame vis JPG sink stride (sample-frame indices, not video-frame
+    # indices). Sample stride is 6 video frames here (process_fps 10 + skip
+    # 2), so vis_interval=2 gives a calibration JPG roughly every 12 video
+    # frames — close to "every 10th frame" for offline auditing while
+    # keeping the disk footprint small.
+    vis_interval: 2
+
     # SIFT-based gap fill: replace linearly-interpolated frames with chained
     # H propagation from high-quality anchors. Much more accurate when the
     # camera is panning/zooming during a multi-second gap.
@@ -91,6 +98,18 @@ field_registration:
 
 device: "cuda"
 
+# Per-stage visualization sinks. mp4 outputs are always written every
+# frame; these only thin out per-frame .jpg/.json on disk.
+tracking:
+  vis_frame_stride: 10        # save tracks/frames/frame_NNN.jpg every 10 video frames
+
+events:
+  vis_frame_stride: 10        # save events/frames/frame_NNN.jpg every 10 video frames
+
 pipeline:
   stages:
     - field_registration
+    - tracking
+    - event_detection
+    - track_consolidation
+    - highlights
