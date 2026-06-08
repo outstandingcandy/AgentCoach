@@ -113,6 +113,17 @@ device: "cuda"
 # stage never actually processed. Override per stage if you want a
 # different cadence.
 
+track_consolidation:
+  # 200 sampled frames total; at default=30 the threshold needs each tid to
+  # cover 15% of the clip, but tracker fragments under occlusion (one player
+  # → 3 short tids) so plenty of real players never hit it. 10 frames is
+  # ~5% — enough to filter genuine 1-2-frame YOLO false positives but lets
+  # fragmented player tids through.
+  min_track_frames: 10
+  # Reuse the LLM scene/jersey votes from the previous run when re-running
+  # this stage for vis tweaks — Claude calls cost real money.
+  reuse_cached_votes: true
+
 pipeline:
   stages:
     - field_registration
