@@ -92,6 +92,36 @@ goalinsight \
   --stages field_registration,tracking,event_detection,highlights
 ```
 
+### Reproducing the kids_soccer demo
+
+The 60-second `kids_soccer_clip_1250_1310` demo and its fine-tuned KP/line
+models are not in git (~520 MB). They live in S3; export the bucket
+name via env var and pull them down:
+
+```bash
+export GOALINSIGHT_S3_BUCKET=<your-bucket>   # see internal docs
+
+mkdir -p data/raw_videos \
+         data/finetuned_models/run_20260605_073045/models \
+         data/finetuned_line_models/run_20260605_073744/models
+
+aws s3 cp "s3://${GOALINSIGHT_S3_BUCKET}/raw_videos/kids_soccer_clip_1250_1310.mp4" \
+          data/raw_videos/
+aws s3 cp "s3://${GOALINSIGHT_S3_BUCKET}/finetuned_models/run_20260605_073045/best_model_final.pt" \
+          data/finetuned_models/run_20260605_073045/models/
+aws s3 cp "s3://${GOALINSIGHT_S3_BUCKET}/finetuned_line_models/run_20260605_073744/best_model_final.pt" \
+          data/finetuned_line_models/run_20260605_073744/models/
+
+goalinsight \
+  --video data/raw_videos/kids_soccer_clip_1250_1310.mp4 \
+  --output output/kids_demo \
+  --config configs/kids_soccer_physical.yaml
+```
+
+The 7-frame v2 finetune training set is checked in
+under `output/annotations/kids_soccer_v2/`, so you can reproduce the
+KP/line fine-tunes locally without re-annotating.
+
 Outputs land under `output/<run-name>-<timestamp>/`:
 
 ```
