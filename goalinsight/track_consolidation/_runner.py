@@ -465,6 +465,7 @@ def run_track_consolidation(
     ref_clusters, ref_map = _build_officiating_clusters(
         referee_tracks, linesman_tracks,
         track_features=track_features,
+        cooccur_pairs=cooccur_pairs,
     )
     clusters.extend(ref_clusters)
     track_to_player.update(ref_map)
@@ -783,21 +784,32 @@ def _build_officiating_clusters(
     referee_tids: list[int],
     linesman_tids: list[int],
     track_features: dict[str, list[list[float]]],
+    cooccur_pairs: set[tuple[int, int]] | None = None,
 ) -> tuple[list[PlayerCluster], dict[int, str]]:
-    """Bundle all referee tracks into one cluster and all linesman tracks
-    into individual clusters (usually 2 linesmen on a pitch).
+    """Bundle referee tracks into co-occurrence-respecting clusters and
+    linesman tracks into a single cluster.
 
     Strategy:
-      - **Referees**: collapse all into a single cluster ``REF-01``.
-        In practice there is only one main referee; if two are detected
-        they'll share the ID.  OSNet cannot reliably separate them on
-        Veo footage, so we don't try.
-      - **Linesmen**: split into per-side clusters ``LIN-01``, ``LIN-02``
-        based on median pitch y (one runs each touchline).  If we can't
-        tell, lump into ``LIN-01``.
+      - **Referees**: greedy cluster — each tid joins the first existing
+        REF cluster that doesn't share a frame with it. Tids whose
+        timeline overlaps every existing cluster start a new one
+        (REF-02, REF-03, ...). On a clean clip this still ends up as a
+        single REF-01; when the pool is polluted by sideline ghosts
+        Claude routed via the kit-mismatch fallback rule, those pile
+        into separate REFs and the real ref keeps REF-01.
+      - **Linesmen**: collapse into a single cluster (typical match has
+        2 but we don't try to split them; OSNet can't tell on Veo).
     """
     clusters: list[PlayerCluster] = []
     track_map: dict[int, str] = {}
+    cooccur_pairs = cooccur_pairs or set()
+
+    def _conflicts(group: list[int], tid: int) -> bool:
+        for other in group:
+            lo, hi = (other, tid) if other < tid else (tid, other)
+            if (lo, hi) in cooccur_pairs:
+                return True
+        return False
 
     def _centroid_of(tids: list[int]) -> np.ndarray | None:
         embs: list[list[float]] = []
@@ -806,18 +818,30 @@ def _build_officiating_clusters(
         return compute_centroid(embs) if embs else None
 
     if referee_tids:
-        c = PlayerCluster(
-            player_id="REF-01",
-            team="referee",
-            role="referee",
-            jersey_number=None,
-            jersey_confidence=0.0,
-            source_tracks=list(referee_tids),
-            reid_centroid=_centroid_of(referee_tids),
-        )
-        clusters.append(c)
+        ref_groups: list[list[int]] = []
         for tid in referee_tids:
-            track_map[tid] = c.player_id
+            placed = False
+            for g in ref_groups:
+                if not _conflicts(g, tid):
+                    g.append(tid)
+                    placed = True
+                    break
+            if not placed:
+                ref_groups.append([tid])
+        for i, group in enumerate(ref_groups, 1):
+            pid = f"REF-{i:02d}"
+            c = PlayerCluster(
+                player_id=pid,
+                team="referee",
+                role="referee",
+                jersey_number=None,
+                jersey_confidence=0.0,
+                source_tracks=list(group),
+                reid_centroid=_centroid_of(group),
+            )
+            clusters.append(c)
+            for tid in group:
+                track_map[tid] = pid
 
     if linesman_tids:
         # Single lumped linesman cluster — per-side split would need
