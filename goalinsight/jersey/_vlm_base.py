@@ -57,7 +57,13 @@ class BaseVLMRecognizer(BaseJerseyRecognizer):
     def __init__(self, config: dict[str, Any] | None = None):
         self.config = config or {}
         self.max_retries = int(self.config.get("max_retries", 2))
-        self.max_tokens = int(self.config.get("max_tokens", 128))
+        # 128 was just barely enough for a 7-field JSON reply; longer
+        # reasoning strings or multi-line target_kit_description got
+        # truncated mid-sentence and hit the parser's "no json" fallback,
+        # so the track came back as role/team=unknown despite the model
+        # having actually identified the kit. 256 leaves headroom and
+        # is still cheap (each call is ~$0.001).
+        self.max_tokens = int(self.config.get("max_tokens", 256))
         self.jpeg_quality = int(self.config.get("jpeg_quality", 85))
         self.max_crop_dim = int(self.config.get("max_crop_dim", 384))
         self.max_concurrency = int(self.config.get("max_concurrency", 4))
