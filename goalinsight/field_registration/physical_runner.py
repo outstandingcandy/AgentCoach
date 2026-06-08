@@ -876,6 +876,13 @@ def _physical_chain_gap_fill(
     # max distance the bracket covers ~1 second of motion which the camera
     # operator can't pan out of meaningfully.
     max_anchor_dist = int(chain_cfg.get("max_anchor_distance_frames", 30))
+    # When only one anchor (left OR right) is available — typically at the
+    # video boundaries — relax the distance limit to this. SIFT match quality
+    # degrades with distance but a wide-window match is still better than the
+    # linear-extrapolation fallback those edge frames would otherwise get.
+    max_anchor_dist_oneside = int(
+        chain_cfg.get("max_anchor_distance_oneside_frames", max_anchor_dist * 2)
+    )
 
     # Top of frame typically has a fixed scoreboard / banner overlay (OSD)
     # that doesn't move with the camera, plus distant sky / buildings whose
@@ -915,9 +922,15 @@ def _physical_chain_gap_fill(
         logger.warning("  Chain gap-fill: camera_position not set — skipped")
         return 0
 
-    # Determine which target frames need filling.
-    target_lo = max(0, anchor_frames[0])
-    target_hi = min(max(frame_indices), anchor_frames[-1])
+    # Determine which target frames need filling. We previously clamped to
+    # the anchor span, but that left frames after the last anchor with only
+    # linear interpolation (which is meaningless on a one-sided edge — there
+    # is no right anchor to interpolate toward). Now we let chain extend
+    # past the last anchor; the per-frame anchor selection below uses
+    # max_anchor_distance_frames to bail out cleanly when the only available
+    # anchor is too far away.
+    target_lo = 0
+    target_hi = max(frame_indices)
     target_set = list(range(target_lo, target_hi + 1, chain_step))
     targets = []
     for fi in target_set:
@@ -1042,9 +1055,14 @@ def _physical_chain_gap_fill(
         # to a ~1-second window keeps the matched features mostly on-pitch.
         left = max((a for a in anchor_frames if a <= fi), default=None)
         right = min((a for a in anchor_frames if a >= fi), default=None)
-        if left is not None and (fi - left) > max_anchor_dist:
+        # Two-sided regime gets the strict limit; if only one side exists
+        # (boundary frames before the first anchor or after the last), the
+        # remaining anchor is allowed up to max_anchor_dist_oneside.
+        has_two = left is not None and right is not None
+        limit = max_anchor_dist if has_two else max_anchor_dist_oneside
+        if left is not None and (fi - left) > limit:
             left = None
-        if right is not None and (right - fi) > max_anchor_dist:
+        if right is not None and (right - fi) > limit:
             right = None
         candidates = [a for a in (left, right) if a is not None and a in anchor_imgs]
         if not candidates:
