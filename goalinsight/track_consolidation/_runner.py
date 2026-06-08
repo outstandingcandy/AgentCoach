@@ -87,10 +87,19 @@ def run_track_consolidation(
     # Pre-compute a textual movement summary per candidate track so the
     # VLM can use motion (range, sideline-hugging, goal-tightness) as
     # the primary cue for goalkeeper / referee / linesman.
+    #
+    # Short tracks (< min_frames_for_pattern) get an empty description.
+    # Their x/y range is unreliably small just because we have few
+    # samples — labelling a 20-frame yellow-jersey fragment as
+    # tight_near_goal lets the prompt's "exclusive to goalkeeper" rule
+    # override the visual evidence and route real outfielders to A-GK.
     movement_by_track = _compute_movement_descriptions(
         positions_by_track,
         pitch_length=pitch_length,
         pitch_width=pitch_width,
+        min_frames_for_pattern=int(
+            config.get("min_frames_for_movement_pattern", 40)),
+        frame_count_by_track=frame_count_by_track,
     )
 
     # --- Team classification ------------------------------------------
@@ -135,6 +144,31 @@ def run_track_consolidation(
             flush=True,
         )
 
+    # --- Identify candidates missing from cached votes --------------
+    # When use_cached=True but the caller has lowered min_track_frames
+    # (or otherwise widened the candidate pool), the cache won't cover
+    # the new tids. We sample + LLM-vote those missing tids only —
+    # everything already in the cache is reused as-is.
+    cached_vote_tids: set[int] = set()
+    if use_cached:
+        try:
+            cached_vote_tids = {
+                int(k) for k in json.loads(
+                    cached_votes_path.read_text()).keys()
+            }
+        except Exception:
+            cached_vote_tids = set()
+    missing_candidates = [
+        tid for tid in candidates if tid not in cached_vote_tids
+    ]
+    needs_incremental_llm = use_cached and bool(missing_candidates)
+    if needs_incremental_llm:
+        print(
+            f"  Cache covers {len(cached_vote_tids)} tids; "
+            f"{len(missing_candidates)} new candidates need fresh votes.",
+            flush=True,
+        )
+
     # --- Sample crops (skip when reusing cached votes — sampler is the
     # second-most expensive step after the LLM) ----------------------
     sampler_cfg = config.get("sampler", {})
@@ -152,10 +186,42 @@ def run_track_consolidation(
             upper_ratio=float(sampler_cfg.get("upper_body_ratio", 0.65)),
         )
         print(f"  Sampling done in {time.time() - t0:.1f}s", flush=True)
+    elif needs_incremental_llm:
+        # Sample missing candidates AND the cached scene.json's
+        # ref_tids — the latter feed team_exemplars so the LLM has
+        # team-kit anchors when judging the new tids. Without these,
+        # _pick_team_exemplars_from_refs returns empty and the LLM
+        # falls back to free-text colour reasoning, which on this clip
+        # mis-routes goal-side yellow players to A-GK / B-GK.
+        cached_scene_for_sample = json.loads(cached_scene_path.read_text()) \
+            if cached_scene_path.exists() else {}
+        ref_tids = list({
+            *cached_scene_for_sample.get("team_A_ref_ids", []),
+            *cached_scene_for_sample.get("team_B_ref_ids", []),
+        })
+        sample_targets = list({*missing_candidates, *ref_tids})
+        print(
+            f"  Sampling {k} crops × {len(sample_targets)} tracks "
+            f"({len(missing_candidates)} new + {len(ref_tids)} ref)...",
+            flush=True,
+        )
+        t0 = time.time()
+        sampled = sample_crops_for_tracks(
+            video_path=video_path,
+            tracks_by_frame=tracks_by_frame,
+            track_ids=sample_targets,
+            k=k,
+            min_bbox_height=int(sampler_cfg.get("min_bbox_height", 80)),
+            upper_ratio=float(sampler_cfg.get("upper_body_ratio", 0.65)),
+        )
+        print(f"  Sampling done in {time.time() - t0:.1f}s", flush=True)
 
     # --- Jersey recognition via Claude -------------------------------
     jersey_cfg = config.get("jersey", {})
-    recognizer = _build_recognizer(jersey_cfg) if not use_cached else None
+    # Build the recognizer when we're going to call the LLM — either
+    # full pass or incremental top-up over the cache.
+    recognizer = _build_recognizer(jersey_cfg) \
+        if (not use_cached or needs_incremental_llm) else None
     votes: dict[int, dict[str, Any]] = {}
     concurrency = int(jersey_cfg.get("max_concurrency", 8))
 
@@ -201,7 +267,22 @@ def run_track_consolidation(
     for tid in scene.get("team_B_ref_ids", []):
         team_by_track[tid] = "team_B"
 
-    if not use_cached:
+    # Load cached votes up front so we can route around tids that
+    # already have a verdict.
+    if use_cached:
+        cached = json.loads(cached_votes_path.read_text())
+        for k_str, v in cached.items():
+            try:
+                votes[int(k_str)] = v
+            except (TypeError, ValueError):
+                continue
+            t_lab = v.get("team")
+            if t_lab in ("team_A", "team_B"):
+                team_by_track.setdefault(int(k_str), t_lab)
+
+    # Pick team exemplars + LLM call helper. Used by both the full
+    # (no-cache) pass and the incremental top-up over a partial cache.
+    def _do_jersey_recognition(target_tids: list[int]) -> None:
         n_exemplars = int(jersey_cfg.get("team_exemplars_per_team", 5))
         team_exemplars = _pick_team_exemplars_from_refs(
             sampled=sampled,
@@ -243,12 +324,12 @@ def run_track_consolidation(
             )
 
         backend_name = jersey_cfg.get("backend", "claude")
-        print(f"  Jersey recognition: {len(candidates)} tracks × {k} crops "
+        print(f"  Jersey recognition: {len(target_tids)} tracks × {k} crops "
               f"(backend={backend_name}, concurrency={concurrency})...",
               flush=True)
         t0 = time.time()
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futs = [pool.submit(_call, tid) for tid in candidates]
+            futs = [pool.submit(_call, tid) for tid in target_tids]
             for i, fut in enumerate(as_completed(futs), 1):
                 try:
                     tid, (num, conf, reason, role, team) = fut.result()
@@ -266,26 +347,23 @@ def run_track_consolidation(
                 }
                 if team in ("team_A", "team_B") and tid not in team_by_track:
                     team_by_track[tid] = team
-                if i % 20 == 0 or i == len(candidates):
+                if i % 20 == 0 or i == len(target_tids):
                     elapsed = time.time() - t0
                     rate = i / elapsed if elapsed > 0 else 0
-                    print(f"    [{i}/{len(candidates)}] {rate:.1f} req/s",
+                    print(f"    [{i}/{len(target_tids)}] {rate:.1f} req/s",
                           flush=True)
         print(f"  Jersey recognition done in {time.time() - t0:.1f}s",
               flush=True)
 
+    if not use_cached:
+        _do_jersey_recognition(candidates)
         with open(output_dir / "jersey_votes.json", "w") as f:
             json.dump({str(tid): v for tid, v in votes.items()}, f, indent=2)
-    else:
-        cached = json.loads(cached_votes_path.read_text())
-        for k_str, v in cached.items():
-            try:
-                votes[int(k_str)] = v
-            except (TypeError, ValueError):
-                continue
-            t_lab = v.get("team")
-            if t_lab in ("team_A", "team_B"):
-                team_by_track.setdefault(int(k_str), t_lab)
+    elif needs_incremental_llm:
+        _do_jersey_recognition(missing_candidates)
+        # Persist the merged cache so the next run sees a complete set.
+        with open(output_dir / "jersey_votes.json", "w") as f:
+            json.dump({str(tid): v for tid, v in votes.items()}, f, indent=2)
         print(f"  Reused {len(votes)} cached votes.", flush=True)
 
     # --- Build metas + consolidate -----------------------------------
@@ -793,6 +871,8 @@ def _compute_movement_descriptions(
     positions_by_track: dict[int, list[list[float]]],
     pitch_length: float,
     pitch_width: float,
+    min_frames_for_pattern: int = 40,
+    frame_count_by_track: dict[int, int] | None = None,
 ) -> dict[int, str]:
     """Summarise each track's movement on the pitch in plain English so
     the VLM can use it as a strong role cue.
@@ -829,6 +909,11 @@ def _compute_movement_descriptions(
 
     for tid, poss in positions_by_track.items():
         if not poss:
+            out[tid] = ""
+            continue
+        # Skip pattern classification for short tracks — see caller note.
+        if (frame_count_by_track is not None
+                and frame_count_by_track.get(tid, 0) < min_frames_for_pattern):
             out[tid] = ""
             continue
         arr = np.asarray(poss, dtype=np.float32)
