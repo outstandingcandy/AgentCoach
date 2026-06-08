@@ -43,13 +43,21 @@ ROLE_COLOR = {
     "goalkeeper": (255, 200, 0),   # cyan-ish
     "referee":    (255, 255, 255), # white
     "linesman":   (180, 180, 180), # grey
+    "other":      (255, 96, 32),   # blue-ish — unmapped/short/non-player
 }
 DEFAULT_COLOR = (180, 180, 180)
+UNMAPPED_COLOR = (255, 96, 32)     # same blue as role=other
 
 
-def _player_color(player: dict | None) -> tuple[int, int, int]:
+def _player_color(
+    player: dict | None, track: dict | None = None,
+) -> tuple[int, int, int]:
+    """Pick a box colour. Unmapped tracks (role==other or no cluster) go
+    blue so they read as 'detection only, no consolidated identity'."""
+    if track is not None and str(track.get("role", "")) == "other":
+        return UNMAPPED_COLOR
     if not player:
-        return DEFAULT_COLOR
+        return UNMAPPED_COLOR
     role = player.get("role", "player")
     if role in ROLE_COLOR:
         return ROLE_COLOR[role]
@@ -180,7 +188,7 @@ def render_consolidated_video(
             tid = str(t["track_id"])
             visible_ids.add(tid)
             player = player_by_id.get(tid)
-            color = _player_color(player)
+            color = _player_color(player, t)
             label = _player_label(tid, player)
             x1, y1, x2, y2 = (int(v) for v in t["bbox"])
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)

@@ -1065,13 +1065,20 @@ def _rewrite_tracking(
     # tracks.json
     tracks_by_frame = _load_json(tracks_path) or {}
     for fk, tracks in tracks_by_frame.items():
-        filtered: list[dict[str, Any]] = []
+        kept: list[dict[str, Any]] = []
         for t in tracks:
             tid = int(t["track_id"])
             pid = track_to_player.get(tid)
             if pid is None:
-                # Track was not a consolidation candidate — drop it so HUD
-                # doesn't render phantom short tracks.
+                # Unmapped track (short or Claude-rejected). Keep with
+                # role=other + a synthetic id so rendering can show a
+                # neutral box rather than a hole — real player attribution
+                # still requires a real cluster.
+                t["orig_track_id"] = tid
+                t["track_id"] = f"unmapped-{tid}"
+                t["role"] = "other"
+                t["team"] = "unknown"
+                kept.append(t)
                 continue
             cluster = by_player.get(pid)
             t["orig_track_id"] = tid
@@ -1082,8 +1089,8 @@ def _rewrite_tracking(
             if cluster:
                 t["role"] = cluster.role
                 t["team"] = cluster.team
-            filtered.append(t)
-        tracks_by_frame[fk] = filtered
+            kept.append(t)
+        tracks_by_frame[fk] = kept
     with open(tracks_path, "w") as f:
         json.dump(tracks_by_frame, f)
 
