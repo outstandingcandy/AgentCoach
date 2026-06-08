@@ -1053,6 +1053,16 @@ def _physical_chain_gap_fill(
         finally:
             calibrator.K = K_save
             calibrator.focal_bounds = focal_save
+        # Reject pathological LM solutions. A normal rvec for this scene has
+        # |rvec_i| ≤ ~π. Anything that wandered far past 2π is a degenerate
+        # local minimum — it can satisfy the SIFT residuals on outlier
+        # ground points but produces a rotation that wraps the camera
+        # around several times. Without this guard such a frame would
+        # contaminate hop-2 averaging and project the entire pitch off-frame.
+        rvec_norm = float(np.linalg.norm(rvec_opt))
+        delta = float(np.linalg.norm(rvec_opt - rvec_init))
+        if rvec_norm > 6.0 or delta > 1.5:
+            return None
         return rvec_opt, float(f_opt)
 
     # Iterate targets across multiple hops: each hop tries to solve all
