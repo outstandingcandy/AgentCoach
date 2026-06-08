@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>GoalInsight — Library</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; background: #101418; color: #e6e9ee;
+                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { padding: 20px; overflow-y: auto; height: 100vh; }
+    h1, h2 { margin: 0 0 12px; color: #fff; font-weight: 600; }
+    h1 { font-size: 20px; }
+    h2 { font-size: 15px; margin-top: 24px; color: #cfe3ff; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+    button { background: #3b82f6; color: white; border: 0; border-radius: 6px;
+             padding: 8px 14px; font-weight: 600; cursor: pointer; font-size: 13px; }
+    button:hover { background: #2563eb; }
+    button:disabled { background: #2a323c; color: #6b7380; cursor: not-allowed; }
+    button.secondary { background: #2a323c; color: #cfe3ff; }
+    button.secondary:hover { background: #364250; }
+    button.danger { background: #b91c1c; }
+    input[type=text], select {
+      background: #0d1116; color: #e6e9ee; border: 1px solid #2a323c;
+      border-radius: 6px; padding: 8px; font-size: 13px; min-width: 140px;
+    }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 12px; }
+    .card { background: #161b21; border: 1px solid #262b33; border-radius: 8px;
+            padding: 14px; display: flex; flex-direction: column; gap: 6px; }
+    .card .name { color: #fff; font-weight: 600; word-break: break-all; }
+    .card .meta { color: #9aa3ad; font-size: 12px; }
+    .card .actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 3px;
+             font-size: 11px; font-weight: 600; margin-right: 4px; }
+    .badge.done { background: #14532d; color: #86efac; }
+    .badge.pending { background: #1e242b; color: #6b7380; border: 1px solid #2a323c; }
+    .empty { color: #6b7380; padding: 12px; font-style: italic; }
+    #drop { border: 2px dashed #2a4661; border-radius: 8px; padding: 30px;
+            text-align: center; cursor: pointer; transition: border-color 0.2s; }
+    #drop.dragover { border-color: #3b82f6; background: rgba(59,130,246,0.05); }
+    #toast { position: fixed; bottom: 16px; right: 16px;
+             background: #161b21; border: 1px solid #2a323c;
+             padding: 10px 14px; border-radius: 6px; font-size: 13px;
+             color: #cfe3ff; opacity: 0; transition: opacity 0.2s;
+             pointer-events: none; max-width: 360px; }
+    #toast.show { opacity: 1; pointer-events: auto; }
+  </style>
+</head>
+<body>
+  <h1>Library</h1>
+
+  <h2>Upload video</h2>
+  <div id="drop" onclick="document.getElementById('file').click()">
+    Click or drop an .mp4 / .mov / .mkv / .avi file here
+    <input id="file" type="file" accept=".mp4,.mov,.mkv,.avi" style="display:none">
+  </div>
+
+  <h2>Videos</h2>
+  <div id="videos" class="grid"></div>
+
+  <h2>Runs</h2>
+  <div class="row">
+    <input type="text" id="new-run-name" placeholder="new run name (e.g. demo_1)">
+    <select id="new-run-video"></select>
+    <select id="new-run-config"></select>
+    <button onclick="createRun()">Create run</button>
+  </div>
+  <div id="runs" class="grid"></div>
+
+  <div id="toast"></div>
+
+  <script>
+    const $ = (q) => document.querySelector(q);
+    const toast = $("#toast");
+    function flash(msg, ms = 2400) {
+      toast.textContent = msg;
+      toast.classList.add('show');
+      clearTimeout(flash._t);
+      flash._t = setTimeout(() => toast.classList.remove('show'), ms);
+    }
+
+    function badge(state, label) {
+      return `<span class="badge ${state ? 'done' : 'pending'}">${label}</span>`;
+    }
+
+    async function api(method, path, body) {
+      const opts = { method, headers: {} };
+      if (body) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
+      }
+      const r = await fetch(path, opts);
+      const data = r.headers.get('content-type')?.includes('json')
+                   ? await r.json() : await r.text();
+      if (!r.ok) throw new Error((data && data.detail) || r.statusText);
+      return data;
+    }
+
+    async function refreshVideos() {
+      const videos = await api('GET', '/api/library/videos');
+      const grid = $("#videos");
+      grid.innerHTML = videos.length
+        ? videos.map(v => {
+            const dur = v.duration_s ? `${v.duration_s.toFixed(1)}s` : '?';
+            const wh = v.width ? `${v.width}×${v.height}` : '';
+            const fps = v.fps ? `@${v.fps.toFixed(1)} fps` : '';
+            return `<div class="card">
+              <div class="name">${v.name}</div>
+              <div class="meta">${dur} ${wh} ${fps}</div>
+              <div class="meta">${(v.size_bytes / 1024 / 1024).toFixed(1)} MB</div>
+              <div class="actions">
+                <button class="secondary" onclick="annotate('${v.name}')">Annotate</button>
+                <button onclick="seedNewRun('${v.name}')">Use in new run</button>
+              </div>
+            </div>`;
+          }).join('')
+        : '<div class="empty">No videos uploaded yet.</div>';
+
+      const sel = $("#new-run-video");
+      sel.innerHTML = '<option value="">(no video)</option>' +
+        videos.map(v => `<option value="${v.name}">${v.name}</option>`).join('');
+    }
+
+    async function refreshConfigs() {
+      const cfgs = await api('GET', '/api/library/configs');
+      const sel = $("#new-run-config");
+      sel.innerHTML = cfgs.map(c => {
+        const sel = c.name === 'default.yaml' ? ' selected' : '';
+        return `<option value="${c.name}"${sel}>${c.name}</option>`;
+      }).join('');
+    }
+
+    async function refreshRuns() {
+      const runs = await api('GET', '/api/library/runs');
+      const grid = $("#runs");
+      grid.innerHTML = runs.length
+        ? runs.map(r => {
+            const s = r.stages || {};
+            const stageBadges = [
+              ['field_registration', 'field_reg'],
+              ['tracking', 'track'],
+              ['track_consolidation', 'consol'],
+              ['event_detection', 'events'],
+              ['highlights', 'highlights'],
+              ['annotated_video', 'video'],
+              ['consolidated_overlay', 'overlay'],
+            ].map(([k, lbl]) => badge(!!s[k], lbl)).join(' ');
+            return `<div class="card">
+              <div class="name">${r.run_name}</div>
+              <div>${stageBadges}</div>
+              <div class="actions">
+                <button onclick="goPipeline('${r.run_name}')">Pipeline</button>
+                <button class="secondary" onclick="goInsights('${r.run_name}')">Insights</button>
+                <button class="danger" onclick="deleteRun('${r.run_name}')">Delete</button>
+              </div>
+            </div>`;
+          }).join('')
+        : '<div class="empty">No runs yet. Create one below.</div>';
+    }
+
+    function annotate(name) {
+      // Annotator opens by stem; jump there directly.
+      window.top.location = '/annotate';
+    }
+    function goPipeline(run) {
+      window.top.location = `/pipeline?run=${encodeURIComponent(run)}`;
+    }
+    function goInsights(run) {
+      window.top.location = `/insights/${encodeURIComponent(run)}`;
+    }
+
+    function seedNewRun(videoName) {
+      $("#new-run-video").value = videoName;
+      $("#new-run-name").focus();
+    }
+
+    async function createRun() {
+      const run_name = $("#new-run-name").value.trim();
+      const video_name = $("#new-run-video").value || null;
+      const config_name = $("#new-run-config").value || 'default.yaml';
+      if (!run_name) { flash('Run name required'); return; }
+      try {
+        await api('POST', '/api/library/runs', { run_name, video_name, config_name });
+        $("#new-run-name").value = '';
+        flash('Run created');
+        refreshRuns();
+      } catch (e) { flash('Create failed: ' + e.message); }
+    }
+
+    async function deleteRun(name) {
+      if (!confirm(`Delete run ${name}? This removes its outputs from disk.`)) return;
+      try {
+        await api('DELETE', '/api/library/runs/' + encodeURIComponent(name));
+        flash('Deleted');
+        refreshRuns();
+      } catch (e) { flash('Delete failed: ' + e.message); }
+    }
+
+    // Upload (click + drag-and-drop)
+    const drop = $("#drop");
+    const fileInput = $("#file");
+    fileInput.addEventListener('change', () => uploadFiles(fileInput.files));
+    drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('dragover'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
+    drop.addEventListener('drop', e => {
+      e.preventDefault();
+      drop.classList.remove('dragover');
+      uploadFiles(e.dataTransfer.files);
+    });
+
+    async function uploadFiles(files) {
+      for (const f of files) {
+        const form = new FormData();
+        form.append('file', f);
+        flash(`Uploading ${f.name}…`, 60_000);
+        try {
+          const r = await fetch('/api/library/upload', { method: 'POST', body: form });
+          if (!r.ok) {
+            const d = await r.json().catch(() => ({}));
+            throw new Error(d.detail || r.statusText);
+          }
+          flash(`Uploaded ${f.name}`);
+        } catch (e) { flash('Upload failed: ' + e.message); }
+      }
+      refreshVideos();
+    }
+
+    refreshConfigs();
+    refreshVideos();
+    refreshRuns();
+  </script>
+</body>
+</html>

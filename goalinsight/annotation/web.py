@@ -1,8 +1,17 @@
 """FastAPI backend for the pitch annotator UI.
 
-Replaces the previous Gradio app. The frontend is a single static HTML page
-served from goalinsight/annotation/static/, and all interaction goes through
-JSON endpoints under /api/* (plus a few image endpoints that return JPEGs).
+The frontend is a single static HTML page served from
+goalinsight/annotation/static/, and all interaction goes through JSON
+endpoints under ``{prefix}/...`` (default ``/api``) plus a few image
+endpoints that return JPEGs.
+
+Two surfaces are exposed:
+
+- ``create_app(...)`` — stand-alone server (used by ``run_server`` /
+  ``goalinsight/annotation/index.py`` for the legacy single-page launcher).
+- ``register_annotation_routes(app, annotator, *, prefix)`` — mounts the
+  same routes onto a FastAPI app that already exists. Used by the unified
+  workspace app so the annotator and the viewer share one process.
 """
 
 from __future__ import annotations
@@ -37,55 +46,29 @@ def _discover_videos(videos_root: Path) -> list[Path]:
     return sorted(out, key=lambda p: p.name)
 
 
-def create_app(
-    videos_root: str,
-    annotations_dir: str,
-    start_frame: int = 0,
-    pitch: SoccerPitch | None = None,
-) -> FastAPI:
-    videos_root_path = Path(videos_root)
-    annotator = AnchorAnnotator(annotations_dir=annotations_dir, pitch=pitch)
-    # Share the annotator's index — a separate instance would never see
-    # frames added by ``_save_frame_annotation`` because each AnnotationIndex
-    # caches its own copy of index.json in memory.
+def register_annotation_routes(
+    app: FastAPI,
+    annotator: AnchorAnnotator,
+    videos_root: Path,
+    *,
+    prefix: str = "/api",
+) -> None:
+    """Mount annotator JSON + JPEG endpoints onto an existing FastAPI app.
+
+    The annotator state is shared via *annotator*; the caller is responsible
+    for opening the initial video. *prefix* lets the unified app expose the
+    annotator under ``/api/annotate/...`` to avoid colliding with the
+    viewer's ``/api/*`` namespace.
+    """
     index = annotator.index
-
-    discovered = _discover_videos(videos_root_path)
-    if not discovered:
-        raise RuntimeError(
-            f"No videos found in --videos-root: {videos_root_path}",
-        )
-    first_video = discovered[0]
-    annotator.open_video(str(first_video), start_frame=start_frame)
-
-    app = FastAPI(title="Soccer Pitch Annotator")
-
-    # ------------------------------------------------------------------
-    # Static files
-    # ------------------------------------------------------------------
-
-    # Browsers aggressively cache HTML/JS by default; the annotator UI is
-    # iterated frequently so we always force a re-fetch. Otherwise users hit
-    # stale UIs after a server restart and silently lose new endpoints
-    # (Apply / Promote / drag) without any error feedback.
-    _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
-
-    @app.get("/")
-    def index_page() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html", headers=_NO_CACHE)
-
-    @app.get("/static/{filename}")
-    def static_file(filename: str) -> FileResponse:
-        path = STATIC_DIR / filename
-        if not path.exists():
-            raise HTTPException(404, "Not found")
-        return FileResponse(path, headers=_NO_CACHE)
+    videos_root_path = Path(videos_root)
+    p = prefix.rstrip("/")
 
     # ------------------------------------------------------------------
     # Read-only metadata
     # ------------------------------------------------------------------
 
-    @app.get("/api/keypoints")
+    @app.get(f"{p}/keypoints")
     def keypoints() -> JSONResponse:
         out = []
         for idx, name in INTERSECTON_TO_PITCH_POINTS.items():
@@ -100,7 +83,7 @@ def create_app(
             })
         return JSONResponse(out)
 
-    @app.get("/api/lines")
+    @app.get(f"{p}/lines")
     def lines() -> JSONResponse:
         out = []
         for name in get_all_line_names():
@@ -113,24 +96,24 @@ def create_app(
             })
         return JSONResponse(out)
 
-    @app.get("/api/state")
+    @app.get(f"{p}/state")
     def state() -> JSONResponse:
         return JSONResponse(annotator.state_dict())
 
-    @app.get("/api/info")
+    @app.get(f"{p}/info")
     def info() -> JSONResponse:
         return JSONResponse({
             "videos_root": str(videos_root_path),
             "video_path": annotator.video_path,
             "video_name": annotator.video_name,
             "total_frames": annotator.total_frames,
-            "annotations_dir": str(annotations_dir),
+            "annotations_dir": str(annotator.annotations_dir),
             "active_frame": annotator.current_frame_idx,
         })
 
-    @app.get("/api/videos")
+    @app.get(f"{p}/videos")
     def videos() -> JSONResponse:
-        on_disk = {p.stem: p for p in _discover_videos(videos_root_path)}
+        on_disk = {pp.stem: pp for pp in _discover_videos(videos_root_path)}
         in_index = set(index.get_all_video_names())
         names = sorted(set(on_disk) | in_index)
         out = []
@@ -147,7 +130,7 @@ def create_app(
             })
         return JSONResponse(out)
 
-    @app.get("/api/annotated_frames")
+    @app.get(f"{p}/annotated_frames")
     def annotated_frames() -> JSONResponse:
         return JSONResponse(index.get_annotated_frame_stats())
 
@@ -155,7 +138,7 @@ def create_app(
     # Image endpoints
     # ------------------------------------------------------------------
 
-    @app.get("/api/frame.jpg")
+    @app.get(f"{p}/frame.jpg")
     def frame_jpg(overlay: int = 1) -> Response:
         try:
             data = annotator.render_frame_jpeg(with_overlay=bool(overlay))
@@ -164,7 +147,7 @@ def create_app(
         return Response(content=data, media_type="image/jpeg",
                         headers={"Cache-Control": "no-store"})
 
-    @app.get("/api/pitch.jpg")
+    @app.get(f"{p}/pitch.jpg")
     def pitch_jpg(highlight_keypoint: str | None = None,
                   highlight_line: str | None = None) -> Response:
         data = annotator.render_pitch_diagram_jpeg(
@@ -174,26 +157,20 @@ def create_app(
         return Response(content=data, media_type="image/jpeg",
                         headers={"Cache-Control": "no-store"})
 
-    @app.get("/api/tactical.jpg")
+    @app.get(f"{p}/tactical.jpg")
     def tactical_jpg() -> Response:
         data = annotator.render_tactical_jpeg()
         return Response(content=data, media_type="image/jpeg",
                         headers={"Cache-Control": "no-store"})
 
-    @app.get("/api/lines.jpg")
+    @app.get(f"{p}/lines.jpg")
     def lines_jpg(highlight_line: str | None = None) -> Response:
         data = annotator.render_lines_diagram_jpeg(highlight_line=highlight_line)
         return Response(content=data, media_type="image/jpeg",
                         headers={"Cache-Control": "no-store"})
 
-    @app.get("/api/pitch_layout")
+    @app.get(f"{p}/pitch_layout")
     def pitch_layout() -> JSONResponse:
-        """Pixel coords of every keypoint and line on the reference diagrams.
-
-        Mirrors the exact scale + margin used in render_pitch_diagram_jpeg /
-        render_lines_diagram_jpeg, so frontend click hit-tests work
-        directly on the rendered jpeg pixels.
-        """
         from .pitch_diagram import compute_pitch_layout, compute_lines_layout
         return JSONResponse({
             "pitch": compute_pitch_layout(),
@@ -209,7 +186,7 @@ def create_app(
         body["status"] = message
         return JSONResponse(body)
 
-    @app.post("/api/goto")
+    @app.post(f"{p}/goto")
     async def goto(request: Request) -> JSONResponse:
         payload = await request.json()
         idx = int(payload.get("frame_idx", 0))
@@ -217,7 +194,7 @@ def create_app(
             raise HTTPException(400, f"Invalid frame_idx: {idx}")
         return _ok(f"Switched to frame {idx}")
 
-    @app.post("/api/jump")
+    @app.post(f"{p}/jump")
     async def jump(request: Request) -> JSONResponse:
         payload = await request.json()
         video_name = payload.get("video_name")
@@ -225,7 +202,7 @@ def create_app(
         if not video_name:
             raise HTTPException(400, "video_name is required")
 
-        on_disk = {p.stem: p for p in _discover_videos(videos_root_path)}
+        on_disk = {pp.stem: pp for pp in _discover_videos(videos_root_path)}
         path = on_disk.get(video_name)
         if path is None:
             raise HTTPException(
@@ -236,8 +213,6 @@ def create_app(
         target_frame = int(frame_idx) if frame_idx is not None else 0
         try:
             if video_name == annotator.video_name:
-                # NB: must call goto_frame even when target_frame == 0; the
-                # value is a real frame index, not a "no-op" sentinel.
                 if not annotator.goto_frame(target_frame):
                     raise HTTPException(400, f"Invalid frame_idx: {target_frame}")
             else:
@@ -246,7 +221,7 @@ def create_app(
             raise HTTPException(400, str(exc))
         return _ok(f"Jumped to {video_name} frame {annotator.current_frame_idx}")
 
-    @app.post("/api/mode")
+    @app.post(f"{p}/mode")
     async def mode(request: Request) -> JSONResponse:
         payload = await request.json()
         try:
@@ -255,87 +230,81 @@ def create_app(
             raise HTTPException(400, str(exc))
         return _ok(f"Mode: {annotator.annotation_mode}")
 
-    @app.post("/api/click")
+    @app.post(f"{p}/click")
     async def click(request: Request) -> JSONResponse:
         payload = await request.json()
         msg = annotator.click(float(payload["x"]), float(payload["y"]))
         return _ok(msg)
 
-    @app.post("/api/add_keypoint")
+    @app.post(f"{p}/add_keypoint")
     async def add_keypoint(request: Request) -> JSONResponse:
         payload = await request.json()
         msg = annotator.add_keypoint(payload["name"])
         return _ok(msg)
 
-    @app.post("/api/add_line")
+    @app.post(f"{p}/add_line")
     async def add_line(request: Request) -> JSONResponse:
         payload = await request.json()
         msg = annotator.add_line(payload["name"])
         return _ok(msg)
 
-    @app.post("/api/undo")
+    @app.post(f"{p}/undo")
     async def undo() -> JSONResponse:
         return _ok(annotator.undo())
 
-    @app.post("/api/reset")
+    @app.post(f"{p}/reset")
     async def reset() -> JSONResponse:
         annotator.reset()
         return _ok("All annotations reset")
 
-    @app.post("/api/compute")
+    @app.post(f"{p}/compute")
     async def compute() -> JSONResponse:
         return _ok(annotator.compute_homography())
 
-    @app.post("/api/save")
+    @app.post(f"{p}/save")
     async def save() -> JSONResponse:
         return _ok(annotator.save())
 
-    # Confirm / reject for derived points -------------------------------
-
-    @app.post("/api/derived/toggle")
+    @app.post(f"{p}/derived/toggle")
     async def derived_toggle(request: Request) -> JSONResponse:
         payload = await request.json()
         msg = annotator.toggle_derived(int(payload["idx"]))
         return _ok(msg)
 
-    @app.post("/api/derived/accept_all")
+    @app.post(f"{p}/derived/accept_all")
     async def derived_accept_all() -> JSONResponse:
         return _ok(annotator.accept_all_derived())
 
-    @app.post("/api/derived/reject_all")
+    @app.post(f"{p}/derived/reject_all")
     async def derived_reject_all() -> JSONResponse:
         return _ok(annotator.reject_all_derived())
 
-    # Confirm / reject for auto-projected points ------------------------
-
-    @app.post("/api/auto/toggle")
+    @app.post(f"{p}/auto/toggle")
     async def auto_toggle(request: Request) -> JSONResponse:
         payload = await request.json()
         msg = annotator.toggle_auto(int(payload["idx"]))
         return _ok(msg)
 
-    @app.post("/api/auto/accept_all")
+    @app.post(f"{p}/auto/accept_all")
     async def auto_accept_all() -> JSONResponse:
         return _ok(annotator.accept_all_auto())
 
-    @app.post("/api/auto/reject_all")
+    @app.post(f"{p}/auto/reject_all")
     async def auto_reject_all() -> JSONResponse:
         return _ok(annotator.reject_all_auto())
 
-    # Selection + deletion of manual points / lines ---------------------
-
-    @app.post("/api/manual/select")
+    @app.post(f"{p}/manual/select")
     async def manual_select(request: Request) -> JSONResponse:
         payload = await request.json()
         idx = payload.get("idx")
         return _ok(annotator.select_manual_point(None if idx is None else int(idx)))
 
-    @app.post("/api/manual/delete")
+    @app.post(f"{p}/manual/delete")
     async def manual_delete(request: Request) -> JSONResponse:
         payload = await request.json()
         return _ok(annotator.delete_manual_point(int(payload["idx"])))
 
-    @app.post("/api/manual/update_pixel")
+    @app.post(f"{p}/manual/update_pixel")
     async def manual_update_pixel(request: Request) -> JSONResponse:
         payload = await request.json()
         return _ok(annotator.update_manual_pixel(
@@ -344,7 +313,7 @@ def create_app(
             float(payload["y"]),
         ))
 
-    @app.post("/api/manual/update_name")
+    @app.post(f"{p}/manual/update_name")
     async def manual_update_name(request: Request) -> JSONResponse:
         payload = await request.json()
         return _ok(annotator.update_manual_name(
@@ -352,32 +321,66 @@ def create_app(
             str(payload["name"]),
         ))
 
-    @app.post("/api/derived/promote")
+    @app.post(f"{p}/derived/promote")
     async def derived_promote(request: Request) -> JSONResponse:
         payload = await request.json()
         return _ok(annotator.promote_derived_to_manual(int(payload["idx"])))
 
-    @app.post("/api/auto/promote")
+    @app.post(f"{p}/auto/promote")
     async def auto_promote(request: Request) -> JSONResponse:
         payload = await request.json()
         return _ok(annotator.promote_auto_to_manual(int(payload["idx"])))
 
-    @app.post("/api/line/select")
+    @app.post(f"{p}/line/select")
     async def line_select(request: Request) -> JSONResponse:
         payload = await request.json()
         idx = payload.get("idx")
         return _ok(annotator.select_line(None if idx is None else int(idx)))
 
-    @app.post("/api/line/delete")
+    @app.post(f"{p}/line/delete")
     async def line_delete(request: Request) -> JSONResponse:
         payload = await request.json()
         return _ok(annotator.delete_line(int(payload["idx"])))
 
-    @app.post("/api/projection")
+    @app.post(f"{p}/projection")
     async def set_projection(request: Request) -> JSONResponse:
         payload = await request.json()
         return _ok(annotator.set_show_projection(bool(payload.get("show", True))))
 
+
+def create_app(
+    videos_root: str,
+    annotations_dir: str,
+    start_frame: int = 0,
+    pitch: SoccerPitch | None = None,
+) -> FastAPI:
+    """Stand-alone annotator server (legacy launcher)."""
+    videos_root_path = Path(videos_root)
+    annotator = AnchorAnnotator(annotations_dir=annotations_dir, pitch=pitch)
+
+    discovered = _discover_videos(videos_root_path)
+    if not discovered:
+        raise RuntimeError(
+            f"No videos found in --videos-root: {videos_root_path}",
+        )
+    annotator.open_video(str(discovered[0]), start_frame=start_frame)
+
+    app = FastAPI(title="Soccer Pitch Annotator")
+
+    _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+
+    @app.get("/")
+    def index_page() -> FileResponse:
+        return FileResponse(STATIC_DIR / "index.html", headers=_NO_CACHE)
+
+    @app.get("/static/{filename}")
+    def static_file(filename: str) -> FileResponse:
+        path = STATIC_DIR / filename
+        if not path.exists():
+            raise HTTPException(404, "Not found")
+        return FileResponse(path, headers=_NO_CACHE)
+
+    register_annotation_routes(app, annotator, videos_root_path, prefix="/api")
     return app
 
 
