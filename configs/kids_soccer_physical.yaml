@@ -1,5 +1,14 @@
 video:
-  process_fps: 10
+  process_fps: 10            # 30 fps source / 10 fps process = sample every 3 video frames
+
+# Single source of truth for "compute every Nth video frame" used both
+# for the per-stage compute path and for the per-frame jpg/json vis
+# sink. Keeping these in sync means the vis sample lines up exactly
+# with what each stage actually processed — no missing-detection holes
+# (e.g. the old vis_frame_stride=10 falling on frame 10, which was
+# never sampled because process_fps gave step=3).
+sample:
+  stride: 3                  # video frames between samples; tracks every Nth frame
 
 # Long-focal sideline cam (fx=2448, hfov ≈ 43°). See kids_soccer.yaml.
 intrinsics:
@@ -56,14 +65,14 @@ field_registration:
     pitch_length: 66.28
     pitch_width: 43.15
 
-    calibration_skip: 2
+    # Single sample stride for the whole pipeline lives at top-level
+    # `sample.stride`. calibration_skip=1 means physical runs PnP on
+    # every sampled frame (no second decimation on top of process_fps).
+    calibration_skip: 1
 
-    # Per-frame vis JPG sink stride (sample-frame indices, not video-frame
-    # indices). Sample stride is 6 video frames here (process_fps 10 + skip
-    # 2), so vis_interval=2 gives a calibration JPG roughly every 12 video
-    # frames — close to "every 10th frame" for offline auditing while
-    # keeping the disk footprint small.
-    vis_interval: 2
+    # Per-frame vis JPG sink stride (sample-frame indices, not video).
+    # 1 = save a calibration JPG for every sampled frame.
+    vis_interval: 1
 
     # SIFT-based gap fill: replace linearly-interpolated frames with chained
     # H propagation from high-quality anchors. Much more accurate when the
@@ -98,13 +107,11 @@ field_registration:
 
 device: "cuda"
 
-# Per-stage visualization sinks. mp4 outputs are always written every
-# frame; these only thin out per-frame .jpg/.json on disk.
-tracking:
-  vis_frame_stride: 10        # save tracks/frames/frame_NNN.jpg every 10 video frames
-
-events:
-  vis_frame_stride: 10        # save events/frames/frame_NNN.jpg every 10 video frames
+# Per-stage vis sinks. mp4 outputs are full-rate; the per-frame jpg/json
+# stride matches sample.stride (set at top-level) so vis frames line up
+# exactly with sampled frames — no overlay gaps from picking a frame the
+# stage never actually processed. Override per stage if you want a
+# different cadence.
 
 pipeline:
   stages:
