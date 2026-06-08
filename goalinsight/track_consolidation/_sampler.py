@@ -149,6 +149,15 @@ def sample_crops_for_tracks(
                     # only filter at the LLM input layer.
                     if crop.shape[0] < min_bbox_height:
                         continue
+                    # Aspect ratio gate — a real upright person clusters
+                    # around h/w ≈ 2-4. Detections with h/w < 1.5 are
+                    # almost always YOLO grouping a chunk of crowd /
+                    # bench / OSD into one giant near-square box; LLM
+                    # then sees a yellow patch in the foreground and
+                    # confidently calls it "team_B player".
+                    h, w = crop.shape[:2]
+                    if w > 0 and h / w < 1.5:
+                        continue
                     upper = _upper_body(crop, upper_ratio)
                     if upper.size == 0:
                         continue
