@@ -37,6 +37,7 @@ from ..utils.serialization import json_default as _json_default_impl, sanitize_f
 from ..utils.prefetcher import FramePrefetcher
 from .detector import PlayerDetector
 from .strongsort_tracker import StrongSORTTracker
+from .botsort_tracker import BoTSORTTracker
 from .ball_detector import BallDetector
 from .ball_tracker import BallTracker
 from .unified_detector import UnifiedDetector
@@ -204,24 +205,38 @@ def run_tracking(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Initialize StrongSORT tracker
-    logger.info("Stage 2: Initializing StrongSORT tracker...")
-    # Frame interval: native_fps / process_fps (e.g., 30/10 = 3.0)
-    # Scales Kalman noise so gating works correctly at lower fps
+    # Initialize tracker — backend selectable via tracking.backend
+    # ("strongsort" default, or "botsort" for camera-motion-compensated
+    # BoT-SORT, useful on panning amateur footage).
     effective_fps = process_fps if process_fps and process_fps < fps else fps
     frame_interval = fps / effective_fps if effective_fps > 0 else 1.0
     tracking_cfg = config.get("tracking", {}) if config else {}
-    tracker = StrongSORTTracker({
-        "max_age": tracking_cfg.get("max_age", 50),
-        "n_init": tracking_cfg.get("min_hits", 3),
-        "max_iou_distance": 0.7,
-        "max_cosine_distance": 0.3,  # Tighter cosine distance
-        "feature_alpha": 0.9,
-        "frame_interval": frame_interval,
-        "stationary_window": tracking_cfg.get("stationary_window", 30),
-        "stationary_max_pixels": tracking_cfg.get(
-            "stationary_max_pixels", 5.0),
-    })
+    tracker_backend = str(tracking_cfg.get("backend", "strongsort")).lower()
+    if tracker_backend == "botsort":
+        logger.info("Stage 2: Initializing BoT-SORT tracker...")
+        bot_cfg = tracking_cfg.get("botsort", {})
+        tracker = BoTSORTTracker({
+            "max_age": tracking_cfg.get("max_age", 50),
+            "max_cosine_distance": 0.3,
+            "feature_alpha": 0.9,
+            "frame_rate": int(round(effective_fps or fps or 30)),
+            **bot_cfg,
+        })
+    else:
+        logger.info("Stage 2: Initializing StrongSORT tracker...")
+        # Frame interval: native_fps / process_fps (e.g., 30/10 = 3.0)
+        # Scales Kalman noise so gating works correctly at lower fps
+        tracker = StrongSORTTracker({
+            "max_age": tracking_cfg.get("max_age", 50),
+            "n_init": tracking_cfg.get("min_hits", 3),
+            "max_iou_distance": 0.7,
+            "max_cosine_distance": 0.3,  # Tighter cosine distance
+            "feature_alpha": 0.9,
+            "frame_interval": frame_interval,
+            "stationary_window": tracking_cfg.get("stationary_window", 30),
+            "stationary_max_pixels": tracking_cfg.get(
+                "stationary_max_pixels", 5.0),
+        })
     tracker.img_w = width
     tracker.img_h = height
 
