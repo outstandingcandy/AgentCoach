@@ -116,6 +116,113 @@ def _draw_side_panel(
     return np.hstack([frame, panel])
 
 
+def render_consolidated_video(
+    video_path: Path,
+    tracking_dir: Path,
+    consolidation_dir: Path,
+    output_path: Path,
+    show_panel: bool = True,
+    max_frames: int | None = None,
+    vis_frame_stride: int = 0,
+) -> dict:
+    """Render the tracking video with consolidated player_ids overlaid.
+
+    Reusable from both this CLI and the pipeline's TrackConsolidationStage.
+    Returns a stats dict (also written next to ``output_path``).
+
+    ``vis_frame_stride`` > 0 saves ``output_path.parent / 'frames' /
+    frame_NNN.jpg`` every Nth video frame for offline auditing.
+    """
+    with open(tracking_dir / "tracks.json") as f:
+        all_tracks: dict = json.load(f)
+    with open(consolidation_dir / "players.json") as f:
+        players: list[dict] = json.load(f)
+    player_by_id = {p["player_id"]: p for p in players}
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"can't open {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    out_w = width + (360 if show_panel else 0)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (out_w, height))
+
+    frames_dir = output_path.parent / "frames"
+    if vis_frame_stride > 0:
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+    appearance: Counter[str] = Counter()
+    for tracks_in_frame in all_tracks.values():
+        for t in tracks_in_frame:
+            appearance[str(t["track_id"])] += 1
+    logger.info("players: %d total, %d appear in video",
+                len(players), sum(1 for p in players if p["player_id"] in appearance))
+
+    frame_idx = 0
+    n_processed = 0
+    pbar = tqdm(total=max_frames or total_frames, desc="Consolidated render")
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if max_frames and n_processed >= max_frames:
+            break
+
+        tracks_now = all_tracks.get(str(frame_idx), [])
+        visible_ids: set[str] = set()
+        for t in tracks_now:
+            tid = str(t["track_id"])
+            visible_ids.add(tid)
+            player = player_by_id.get(tid)
+            color = _player_color(player)
+            label = _player_label(tid, player)
+            x1, y1, x2, y2 = (int(v) for v in t["bbox"])
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 6, y1), color, -1)
+            cv2.putText(frame, label, (x1 + 3, y1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+        cv2.putText(frame, f"frame {frame_idx}  |  visible: {len(visible_ids)}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        if show_panel:
+            frame = _draw_side_panel(frame, players, visible_ids)
+
+        writer.write(frame)
+        if vis_frame_stride > 0 and frame_idx % vis_frame_stride == 0:
+            cv2.imwrite(str(frames_dir / f"frame_{frame_idx:05d}.jpg"), frame)
+
+        frame_idx += 1
+        n_processed += 1
+        pbar.update(1)
+
+    pbar.close()
+    cap.release()
+    writer.release()
+    logger.info("wrote %s (%d frames, %dx%d @ %.1f fps)",
+                output_path, n_processed, out_w, height, fps)
+
+    stats = {
+        "total_players": len(players),
+        "visible_in_video": sum(1 for p in players if p["player_id"] in appearance),
+        "by_team": dict(Counter(p.get("team", "unknown") for p in players)),
+        "by_role": dict(Counter(p.get("role", "unknown") for p in players)),
+        "appearance_counts": dict(appearance.most_common()),
+    }
+    stats_path = output_path.with_suffix(".stats.json")
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    logger.info("stats → %s", stats_path)
+    return stats
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -130,100 +237,23 @@ def main() -> int:
     parser.add_argument("--show-panel", action="store_true", default=True,
                         help="Append a right-side roster panel (default on)")
     parser.add_argument("--no-panel", dest="show_panel", action="store_false")
+    parser.add_argument("--vis-frame-stride", type=int, default=0,
+                        help="Save frames/frame_NNN.jpg every Nth video frame "
+                             "(0 = mp4 only, default).")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s: %(message)s")
 
-    tracking_dir = Path(args.tracking_dir)
-    consolidation_dir = Path(args.consolidation_dir)
-
-    with open(tracking_dir / "tracks.json") as f:
-        all_tracks: dict = json.load(f)
-    with open(consolidation_dir / "players.json") as f:
-        players: list[dict] = json.load(f)
-    player_by_id = {p["player_id"]: p for p in players}
-
-    cap = cv2.VideoCapture(args.video)
-    if not cap.isOpened():
-        raise SystemExit(f"can't open {args.video}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    out_w = width + (360 if args.show_panel else 0)
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (out_w, height))
-
-    # Tally appearance count per player (for the panel)
-    appearance: Counter[str] = Counter()
-    for tracks_in_frame in all_tracks.values():
-        for t in tracks_in_frame:
-            appearance[str(t["track_id"])] += 1
-    logger.info("players: %d total, %d appear in video",
-                len(players), sum(1 for p in players if p["player_id"] in appearance))
-
-    frame_idx = 0
-    n_processed = 0
-    pbar = tqdm(total=args.max_frames or total_frames, desc="Rendering")
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if args.max_frames and n_processed >= args.max_frames:
-            break
-
-        # tracks.json keys are stringified frame indices
-        tracks_now = all_tracks.get(str(frame_idx), [])
-        visible_ids: set[str] = set()
-
-        for t in tracks_now:
-            tid = str(t["track_id"])
-            visible_ids.add(tid)
-            player = player_by_id.get(tid)
-            color = _player_color(player)
-            label = _player_label(tid, player)
-
-            x1, y1, x2, y2 = (int(v) for v in t["bbox"])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-            cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 6, y1), color, -1)
-            cv2.putText(frame, label, (x1 + 3, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-
-        # HUD: frame counter and visible player count
-        cv2.putText(frame, f"frame {frame_idx}  |  visible: {len(visible_ids)}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        if args.show_panel:
-            frame = _draw_side_panel(frame, players, visible_ids)
-
-        writer.write(frame)
-        frame_idx += 1
-        n_processed += 1
-        pbar.update(1)
-
-    pbar.close()
-    cap.release()
-    writer.release()
-    logger.info("wrote %s (%d frames, %dx%d @ %.1f fps)",
-                out_path, n_processed, out_w, height, fps)
-
-    # Also write a stats summary
-    stats_path = out_path.with_suffix(".stats.json")
-    stats = {
-        "total_players": len(players),
-        "visible_in_video": sum(1 for p in players if p["player_id"] in appearance),
-        "by_team": Counter(p.get("team", "unknown") for p in players),
-        "by_role": Counter(p.get("role", "unknown") for p in players),
-        "appearance_counts": dict(appearance.most_common()),
-    }
-    with open(stats_path, "w") as f:
-        json.dump(stats, f, indent=2)
-    logger.info("stats → %s", stats_path)
+    render_consolidated_video(
+        video_path=Path(args.video),
+        tracking_dir=Path(args.tracking_dir),
+        consolidation_dir=Path(args.consolidation_dir),
+        output_path=Path(args.output),
+        show_panel=args.show_panel,
+        max_frames=args.max_frames,
+        vis_frame_stride=args.vis_frame_stride,
+    )
     return 0
 
 

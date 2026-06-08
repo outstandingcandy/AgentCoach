@@ -210,12 +210,46 @@ class TrackConsolidationStage(Stage):
 
         out = ctx.stage_dir(self.name)
         config = ctx.config.get("track_consolidation", {}) if ctx.config else {}
-        return run_track_consolidation(
+        result = run_track_consolidation(
             output_dir=out,
             pipeline_output_dir=ctx.output_dir,
             video_path=ctx.video_path,
             config=config,
         )
+
+        # Render mp4 + per-frame jpg with consolidated player IDs overlaid.
+        # The stage itself only emits JSON (players.json / player_map.json /
+        # ...); without this hook track_consolidation/ has no visualization.
+        tracking_dir = ctx.stage_dir("tracking")
+        if (tracking_dir / "tracks.json").exists() and (out / "players.json").exists():
+            try:
+                # scripts/ isn't a python package, so import from disk.
+                import importlib.util as _ilu
+                from pathlib import Path as _P
+                _spec = _ilu.spec_from_file_location(
+                    "_render_consolidated",
+                    _P(__file__).resolve().parents[2] / "scripts" / "render_consolidated_tracking.py",
+                )
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                stride = int(config.get("vis_frame_stride", 10))
+                _mod.render_consolidated_video(
+                    video_path=ctx.video_path,
+                    tracking_dir=tracking_dir,
+                    consolidation_dir=out,
+                    output_path=out / "consolidated.mp4",
+                    show_panel=True,
+                    vis_frame_stride=stride,
+                )
+            except Exception as exc:
+                # Vis failure is non-fatal — the stage's JSON outputs are
+                # what downstream stages depend on.
+                import logging as _lg
+                _lg.getLogger(__name__).warning(
+                    "  track_consolidation vis skipped: %s", exc,
+                )
+
+        return result
 
     def should_skip(self, ctx: PipelineContext) -> bool:
         return ctx.skip_existing and (ctx.stage_dir(self.name) / "player_map.json").exists()
