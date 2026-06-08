@@ -883,6 +883,12 @@ def _physical_chain_gap_fill(
     max_anchor_dist_oneside = int(
         chain_cfg.get("max_anchor_distance_oneside_frames", max_anchor_dist * 2)
     )
+    # When neither a PnP nor previously chain-solved anchor is near enough,
+    # promote already-solved chain frames into the anchor pool and try again.
+    # Each chain frame stores its hop_count (PnP anchor = 0); a target's
+    # solution gets hop = min(neighbour hop) + 1. Cap the depth so errors
+    # don't snowball across the video.
+    max_chain_hops = int(chain_cfg.get("max_chain_hops", 3))
 
     # Top of frame typically has a fixed scoreboard / banner overlay (OSD)
     # that doesn't move with the camera, plus distant sky / buildings whose
@@ -1008,9 +1014,14 @@ def _physical_chain_gap_fill(
             return None
         wh = wh[good]; pts_t = pts_t[good]
         world_xy = wh[:, :2] / wh[:, 2:3]          # (N, 2) world ground coords
-        # Pitch sanity: keep only matches whose ground projection is on/near pitch
-        L_half = float(getattr(calibrator, "_pitch_length_half", 60.0))
-        W_half = float(getattr(calibrator, "_pitch_width_half", 40.0))
+        # Pitch sanity: keep only matches whose ground projection is on/near pitch.
+        # pitch_length / pitch_width are the helper's params (forwarded from
+        # the runner) — earlier code used a 60/40 FIFA fallback that on a
+        # kids pitch let "ground" points 80–100 m behind the actual goal line
+        # count as on-pitch, while still failing to gather ≥min_inliers true
+        # on-pitch points. With kids dims (33×22) the buffer is much tighter.
+        L_half = float(pitch_length) / 2.0
+        W_half = float(pitch_width) / 2.0
         on_pitch = (
             (np.abs(world_xy[:, 0]) <= L_half + 30) &
             (np.abs(world_xy[:, 1]) <= W_half + 30)
@@ -1044,75 +1055,136 @@ def _physical_chain_gap_fill(
             calibrator.focal_bounds = focal_save
         return rvec_opt, float(f_opt)
 
-    # Iterate targets; for each, find bracketing anchors and solve.
+    # Iterate targets across multiple hops: each hop tries to solve all
+    # remaining targets using the current anchor pool. Successfully solved
+    # chain frames join the pool (with hop_count = parent hop + 1) so they
+    # can serve as bracketing anchors for further-out targets in the next
+    # hop. Stop when no progress is made or we hit max_chain_hops.
+    #
+    # hop_count tracks how many SIFT-PnP steps a frame is removed from a
+    # real PnP anchor. PnP anchors = 0; first-hop chain = 1; etc. A frame
+    # at hop k can only be used as anchor for new targets if k < max_chain_hops.
+    hop_count: dict[int, int] = {af: 0 for af in anchor_frames}
+    extended_anchor_imgs: dict[int, np.ndarray] = dict(anchor_imgs)
+    extended_anchor_H_inv: dict[int, np.ndarray] = dict(anchor_H_inv)
+    extended_anchor_feat: dict[int, tuple] = dict(anchor_feat)
+    pending = set(targets)
     n_updated = 0
     updated_frames: list[int] = []
-    for fi in targets:
-        # Bracket — but reject anchors that are too far away. Long-distance
-        # SIFT matches snap to background landmarks (buildings / trees) which
-        # is fine geometrically but biases the 4-DOF PnP toward whatever
-        # plane the anchor's H projects those landmarks to. Limiting anchors
-        # to a ~1-second window keeps the matched features mostly on-pitch.
-        left = max((a for a in anchor_frames if a <= fi), default=None)
-        right = min((a for a in anchor_frames if a >= fi), default=None)
-        # Two-sided regime gets the strict limit; if only one side exists
-        # (boundary frames before the first anchor or after the last), the
-        # remaining anchor is allowed up to max_anchor_dist_oneside.
-        has_two = left is not None and right is not None
-        limit = max_anchor_dist if has_two else max_anchor_dist_oneside
-        if left is not None and (fi - left) > limit:
-            left = None
-        if right is not None and (right - fi) > limit:
-            right = None
-        candidates = [a for a in (left, right) if a is not None and a in anchor_imgs]
-        if not candidates:
-            continue
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
-        ok, target_img = cap.read()
-        if not ok:
-            continue
-        solutions = []
-        for af in candidates:
-            sol = _solve_one_anchor(target_img, af)
-            if sol is not None:
-                solutions.append((af, sol[0], sol[1]))
-        if not solutions:
-            continue
-        # Distance-weighted average of rvec / focal.
-        weights = np.array(
-            [1.0 / max(abs(fi - af), 1) for af, _, _ in solutions], dtype=np.float64,
+
+    for hop in range(max_chain_hops):
+        # Build the per-hop anchor pool: PnP anchors are always available;
+        # chain-promoted anchors are available only if their hop_count < hop+1
+        # (we don't allow a chain anchor to seed something at the same hop
+        # before all hop-h targets settle, otherwise the order of iteration
+        # would non-deterministically affect results).
+        usable_anchors = sorted(
+            af for af, hc in hop_count.items() if hc <= hop
         )
-        weights /= weights.sum()
-        rvec_avg = sum(w * r for w, (_, r, _) in zip(weights, solutions))
-        f_avg = sum(w * f for w, (_, _, f) in zip(weights, solutions))
-        # Build pose with locked C.
-        R_avg, _ = cv2.Rodrigues(rvec_avg)
-        t_locked = -R_avg @ C_target
-        K_out = np.array(
-            [[f_avg, 0, width / 2.0], [0, f_avg, height / 2.0], [0, 0, 1]],
-            dtype=np.float64,
+        if not usable_anchors:
+            break
+
+        solved_this_hop: list[int] = []
+        for fi in sorted(pending):
+            left = max((a for a in usable_anchors if a <= fi), default=None)
+            right = min((a for a in usable_anchors if a >= fi), default=None)
+            has_two = left is not None and right is not None
+            limit = max_anchor_dist if has_two else max_anchor_dist_oneside
+            if left is not None and (fi - left) > limit:
+                left = None
+            if right is not None and (right - fi) > limit:
+                right = None
+            candidates = [
+                a for a in (left, right)
+                if a is not None and a in extended_anchor_imgs
+            ]
+            if not candidates:
+                continue
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ok, target_img = cap.read()
+            if not ok:
+                continue
+
+            # Patch the closures so _solve_one_anchor sees the extended pool.
+            anchor_imgs.update(extended_anchor_imgs)
+            anchor_H_inv.update(extended_anchor_H_inv)
+            anchor_feat.update(extended_anchor_feat)
+
+            solutions = []
+            for af in candidates:
+                sol = _solve_one_anchor(target_img, af)
+                if sol is not None:
+                    solutions.append((af, sol[0], sol[1]))
+            if not solutions:
+                continue
+            weights = np.array(
+                [1.0 / max(abs(fi - af), 1) for af, _, _ in solutions],
+                dtype=np.float64,
+            )
+            weights /= weights.sum()
+            rvec_avg = sum(w * r for w, (_, r, _) in zip(weights, solutions))
+            f_avg = sum(w * f for w, (_, _, f) in zip(weights, solutions))
+            R_avg, _ = cv2.Rodrigues(rvec_avg)
+            t_locked = -R_avg @ C_target
+            K_out = np.array(
+                [[f_avg, 0, width / 2.0], [0, f_avg, height / 2.0], [0, 0, 1]],
+                dtype=np.float64,
+            )
+            H_locked = K_out @ np.column_stack(
+                [R_avg[:, 0], R_avg[:, 1], t_locked]
+            )
+            if abs(H_locked[2, 2]) > 1e-10:
+                H_locked = H_locked / H_locked[2, 2]
+            homographies[fi] = H_locked
+            camera_poses[fi] = {
+                "K": K_out.tolist(),
+                "rvec": rvec_avg.ravel().tolist(),
+                "tvec": t_locked.ravel().tolist(),
+                "dist_coeffs": [0.0] * 5,
+            }
+            # hop_count for fi = min hop of its parent anchors + 1
+            parent_hops = [hop_count[af] for af, _, _ in solutions if af in hop_count]
+            new_hop = (min(parent_hops) if parent_hops else hop) + 1
+            hop_count[fi] = new_hop
+
+            src_label = (
+                "sift_pnp_left+right" if len(solutions) == 2
+                else "sift_pnp_one_anchor"
+            )
+            if new_hop > 1:
+                src_label += f"_h{new_hop}"
+            ff[fi] = {
+                "calibrated": True,
+                "interpolated": False,
+                "chain_filled": True,
+                "reprojection_error": None,
+                "source": src_label,
+            }
+            n_updated += 1
+            updated_frames.append(fi)
+            solved_this_hop.append(fi)
+
+            # Promote into the anchor pool for the next hop. We need the H
+            # to back-project SIFT inliers (computed above as H_locked) plus
+            # the target image's SIFT features (re-extract once, cached).
+            extended_anchor_imgs[fi] = target_img.copy()
+            try:
+                extended_anchor_H_inv[fi] = np.linalg.inv(H_locked)
+            except np.linalg.LinAlgError:
+                continue
+            kp_fi, desc_fi = matcher.extract_features(target_img, mask=sift_mask)
+            extended_anchor_feat[fi] = (kp_fi, desc_fi)
+
+        if not solved_this_hop:
+            logger.info("  Chain gap-fill: hop %d converged (no new solves)", hop + 1)
+            break
+        logger.info(
+            "  Chain gap-fill: hop %d solved %d frames; %d remaining",
+            hop + 1, len(solved_this_hop), len(pending) - len(solved_this_hop),
         )
-        H_locked = K_out @ np.column_stack(
-            [R_avg[:, 0], R_avg[:, 1], t_locked]
-        )
-        if abs(H_locked[2, 2]) > 1e-10:
-            H_locked = H_locked / H_locked[2, 2]
-        homographies[fi] = H_locked
-        camera_poses[fi] = {
-            "K": K_out.tolist(),
-            "rvec": rvec_avg.ravel().tolist(),
-            "tvec": t_locked.ravel().tolist(),
-            "dist_coeffs": [0.0] * 5,
-        }
-        ff[fi] = {
-            "calibrated": True,
-            "interpolated": False,
-            "chain_filled": True,
-            "reprojection_error": None,
-            "source": "sift_pnp_left+right" if len(solutions) == 2 else "sift_pnp_one_anchor",
-        }
-        n_updated += 1
-        updated_frames.append(fi)
+        pending -= set(solved_this_hop)
+        if not pending:
+            break
 
     cap.release()
     logger.info("  Chain gap-fill: solved %d / %d targets via single-step SIFT+PnP",
