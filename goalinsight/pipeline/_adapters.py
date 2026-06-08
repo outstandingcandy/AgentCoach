@@ -11,6 +11,21 @@ from ._registry import register_stage
 logger = logging.getLogger(__name__)
 
 
+def _default_vis_stride(config: dict[str, Any] | None) -> int:
+    """Pipeline-wide default vis stride: top-level ``sample.stride``.
+
+    Per-stage ``<stage>.vis_frame_stride`` takes precedence if set. The
+    point of having one source of truth is so vis frames line up with
+    the frames each stage actually computed — picking a vis stride that
+    isn't a multiple of the compute sample causes overlay holes (frame
+    appears in vis but no detection / pose was computed for it).
+    """
+    if not config:
+        return 1
+    sample = config.get("sample") or {}
+    return int(sample.get("stride", 1))
+
+
 def _should_run_remote(stage_name: str, config: dict[str, Any] | None) -> bool:
     """Honor the ``execution.remote_stages`` opt-in list in config.
 
@@ -152,13 +167,14 @@ class EventDetectionStage(Stage):
         # Render annotated video
         from ..events.visualization import render_event_video
         events_cfg = ctx.config.get("events", {}) if ctx.config else {}
+        default_stride = _default_vis_stride(ctx.config)
         render_event_video(
             video_path=ctx.video_path,
             events=event_dicts,
             output_path=out / "events.mp4",
             tracking_dir=tracking_dir if tracking_dir.exists() else None,
             banner_duration_sec=events_cfg.get("banner_duration_sec", 3.0),
-            vis_frame_stride=int(events_cfg.get("vis_frame_stride", 10)),
+            vis_frame_stride=int(events_cfg.get("vis_frame_stride", default_stride)),
         )
 
         by_type = {}
@@ -232,7 +248,7 @@ class TrackConsolidationStage(Stage):
                 )
                 _mod = _ilu.module_from_spec(_spec)
                 _spec.loader.exec_module(_mod)
-                stride = int(config.get("vis_frame_stride", 10))
+                stride = int(config.get("vis_frame_stride", _default_vis_stride(ctx.config)))
                 _mod.render_consolidated_video(
                     video_path=ctx.video_path,
                     tracking_dir=tracking_dir,

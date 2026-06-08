@@ -1041,7 +1041,10 @@ def run_tracking(
             pitch_length=pitch_length,
             pitch_width=pitch_width,
             vis_frame_stride=int(
-                config.get("tracking", {}).get("vis_frame_stride", 10)
+                config.get("tracking", {}).get(
+                    "vis_frame_stride",
+                    (config.get("sample") or {}).get("stride", 1),
+                )
             ),
         )
     else:
