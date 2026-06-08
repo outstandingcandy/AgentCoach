@@ -41,7 +41,7 @@ TEAM_COLOR = {
 }
 ROLE_COLOR = {
     "goalkeeper": (255, 200, 0),   # cyan-ish
-    "referee":    (255, 255, 255), # white
+    "referee":    (60, 200, 60),   # green
     "linesman":   (180, 180, 180), # grey
     "other":      (255, 96, 32),   # blue-ish — unmapped/short/non-player
 }
