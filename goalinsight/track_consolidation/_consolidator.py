@@ -94,6 +94,7 @@ def consolidate(
     same_person_threshold: float = 0.0,
     orphan_absorb_threshold: float = 0.92,
     min_jersey_confidence: float = 0.6,
+    cooccur_pairs: set[tuple[int, int]] | None = None,
 ) -> tuple[dict[int, str], list[PlayerCluster]]:
     """Return (track_id → player_id map, cluster list).
 
@@ -113,7 +114,22 @@ def consolidate(
             glued onto the nearest team-matched player centroid.
         min_jersey_confidence: below this Claude confidence, the jersey
             number is treated as unknown (goes to orphan stage).
+        cooccur_pairs: set of (lo_tid, hi_tid) pairs that were ever
+            visible in the same video frame. Two such tids cannot be the
+            same person (one body, one place) — :func:`_can_merge`
+            rejects any merge whose target cluster contains a
+            co-occurring source tid. Pass ``None`` to disable the guard.
     """
+    cooccur_pairs = cooccur_pairs or set()
+
+    def _conflicts(cluster: PlayerCluster, m: TrackMeta) -> bool:
+        """True if merging ``m`` into ``cluster`` would put two
+        co-occurring tids in the same player_id."""
+        for tid in cluster.source_tracks:
+            lo, hi = (tid, m.track_id) if tid < m.track_id else (m.track_id, tid)
+            if (lo, hi) in cooccur_pairs:
+                return True
+        return False
     clusters: list[PlayerCluster] = []
     track_to_player: dict[int, str] = {}
 
@@ -140,9 +156,15 @@ def consolidate(
         group_sorted = sorted(group, key=lambda g: -g.frame_count)
         local_clusters: list[PlayerCluster] = []
         for m in group_sorted:
+            # Pick the most-similar cluster that doesn't co-occur with m.
+            # If two tids in this same-jersey group were on screen at the
+            # same time, Claude misread the number on at least one of them
+            # — keep them as separate clusters (will get -a/-b suffix).
             best_cluster: PlayerCluster | None = None
             best_sim = -1.0
             for c in local_clusters:
+                if _conflicts(c, m):
+                    continue
                 sim = cosine(m.reid_centroid, c.reid_centroid)
                 if sim > best_sim:
                     best_sim = sim
@@ -170,11 +192,15 @@ def consolidate(
     # unknown players; tiny fragments get absorbed into them).
     orphans.sort(key=lambda m: -m.frame_count)
     for m in orphans:
-        # Try to absorb into a same-team confident cluster
+        # Try to absorb into a same-team confident cluster — but skip
+        # clusters that share a frame with m (they belong to a different
+        # body even if ReID looks similar).
         best_cluster: PlayerCluster | None = None
         best_sim = -1.0
         for c in clusters:
             if c.team != m.team:
+                continue
+            if _conflicts(c, m):
                 continue
             sim = cosine(m.reid_centroid, c.reid_centroid)
             if sim > best_sim:
@@ -190,6 +216,8 @@ def consolidate(
         best_sim = -1.0
         for c in clusters:
             if c.team != m.team or c.jersey_number is not None:
+                continue
+            if _conflicts(c, m):
                 continue
             sim = cosine(m.reid_centroid, c.reid_centroid)
             if sim > best_sim:

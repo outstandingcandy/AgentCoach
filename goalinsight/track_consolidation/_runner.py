@@ -59,13 +59,24 @@ def run_track_consolidation(
     # Role / team are assigned here (tracker no longer writes them).
     frame_count_by_track: dict[int, int] = Counter()
     positions_by_track: dict[int, list[list[float]]] = {}
+    cooccur_pairs: set[tuple[int, int]] = set()  # tids ever in same frame
     for fk, tracks in tracks_by_frame.items():
+        tids_here: list[int] = []
         for t in tracks:
             tid = int(t["track_id"])
             frame_count_by_track[tid] += 1
+            tids_here.append(tid)
             pp = t.get("pitch_position")
             if pp is not None:
                 positions_by_track.setdefault(tid, []).append(pp)
+        # Any pair of tids visible in the same frame can't be the same
+        # person — record them so consolidate() refuses to merge them.
+        for i, a in enumerate(tids_here):
+            for b in tids_here[i + 1:]:
+                if a == b:
+                    continue
+                lo, hi = (a, b) if a < b else (b, a)
+                cooccur_pairs.add((lo, hi))
 
     pitch_length, pitch_width = _pitch_dims(pipeline_output_dir)
 
@@ -440,8 +451,9 @@ def run_track_consolidation(
     track_to_player, clusters = consolidate(
         metas,
         same_person_threshold=float(reid_cfg.get("same_person_threshold", 0.55)),
-        orphan_absorb_threshold=float(reid_cfg.get("orphan_absorb_threshold", 0.65)),
+        orphan_absorb_threshold=float(reid_cfg.get("orphan_absorb_threshold", 0.80)),
         min_jersey_confidence=float(jersey_cfg.get("min_confidence", 0.6)),
+        cooccur_pairs=cooccur_pairs,
     )
     logger.info("Consolidated %d tracks → %d players", len(metas), len(clusters))
     print(f"  Consolidated {len(metas)} tracks → {len(clusters)} players "
