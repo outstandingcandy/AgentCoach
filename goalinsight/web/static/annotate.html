@@ -179,6 +179,17 @@
         <div id="frames-groups"></div>
       </div>
 
+      <div class="panel" id="overrides-hint">
+        <h3>Per-video overrides</h3>
+        <div style="font-size:11px; color:var(--muted); line-height:1.45;">
+          Pitch dims and camera position are read from
+          <code style="font-size:11px;">workspace/annotations/&lt;stem&gt;/overrides.yaml</code>.
+          Edit that file by hand — only fields that differ from your base
+          config need to be there. Restart the server (or jump videos) for
+          pitch changes to take effect.
+        </div>
+      </div>
+
       <div class="panel pitch-images">
         <h3>Reference: keypoints</h3>
         <img id="pitch-img" />
@@ -794,6 +805,7 @@ async function init() {
   applyState(state);
   refreshFrame();
 }
+
 
 init().catch(err => {
   $("#status").textContent = "Init failed: " + err.message;

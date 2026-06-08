@@ -21,7 +21,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import pitch_constants
+from . import per_video_settings, pitch_constants
 from .pitch import keypoints as _pk
 from .pitch.geometry import SoccerPitch
 from .pitch.keypoints import (
@@ -63,6 +63,25 @@ def register_annotation_routes(
     index = annotator.index
     videos_root_path = Path(videos_root)
     p = prefix.rstrip("/")
+
+    # Auto-apply per-video pitch on every video open. Must run BEFORE
+    # _check_pitch_consistency in the annotator so the active pitch matches
+    # the saved coords. We wrap open_video at registration time; switch_video
+    # delegates to it, so one hook covers both.
+    _orig_open_video = annotator.open_video
+
+    def _open_video_with_settings(video_path: str, start_frame: int = 0) -> int:
+        stem = Path(video_path).stem
+        pitch = per_video_settings.load_pitch(annotator.annotations_dir, stem)
+        if pitch:
+            try:
+                pitch_constants.set_active_pitch(SoccerPitch(**pitch))
+            except TypeError:
+                # Unknown keys in overrides.yaml — fall through.
+                pass
+        return _orig_open_video(video_path, start_frame=start_frame)
+
+    annotator.open_video = _open_video_with_settings  # type: ignore[assignment]
 
     # ------------------------------------------------------------------
     # Read-only metadata
@@ -346,7 +365,6 @@ def register_annotation_routes(
     async def set_projection(request: Request) -> JSONResponse:
         payload = await request.json()
         return _ok(annotator.set_show_projection(bool(payload.get("show", True))))
-
 
 def create_app(
     videos_root: str,

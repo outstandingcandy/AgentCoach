@@ -41,6 +41,7 @@ from typing import Any, Iterable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
+from ..annotation import per_video_settings
 from ..pipeline import Pipeline
 from ..utils.config import get_default_config, load_config, merge_configs
 from ._workspace import Workspace
@@ -212,6 +213,14 @@ class JobManager:
         config = get_default_config()
         if p.get("config_path"):
             config = merge_configs(config, load_config(p["config_path"]))
+        # Per-video annotator overrides win over the YAML config so a user
+        # who tweaks pitch/camera in the Annotate panel sees the same
+        # numbers in the Pipeline run without editing the YAML.
+        config = _merge_per_video_overrides(
+            config,
+            annotations_dir=self.workspace.annotations_dir,
+            video_path=Path(p["video_path"]),
+        )
         if p.get("keypoint_model"):
             config.setdefault("field_registration", {}) \
                   .setdefault("pnlcalib", {})["keypoint_model_path"] = p["keypoint_model"]
@@ -359,6 +368,25 @@ class JobManager:
         return [j.to_public() for j in
                 sorted(self.jobs.values(),
                        key=lambda r: r.created_at, reverse=True)]
+
+
+def _merge_per_video_overrides(
+    config: dict[str, Any],
+    *,
+    annotations_dir: Path,
+    video_path: Path,
+) -> dict[str, Any]:
+    """Deep-merge ``annotations_dir/<stem>/overrides.yaml`` into *config*.
+
+    The overrides file is a sparse hand-edited yaml — any subset of the
+    full config tree is allowed. We trust the user's keys and let
+    ``merge_configs`` apply the diff. Original config is left untouched.
+    """
+    stem = video_path.stem
+    overrides = per_video_settings.load(annotations_dir, stem)
+    if not overrides:
+        return config
+    return merge_configs(config, overrides)
 
 
 class _LogCapture:

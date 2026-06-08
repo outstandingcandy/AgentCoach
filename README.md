@@ -101,26 +101,64 @@ name via env var and pull them down:
 ```bash
 export GOALINSIGHT_S3_BUCKET=<your-bucket>   # see internal docs
 
-mkdir -p data/raw_videos \
+mkdir -p workspace/videos workspace/annotations \
          data/finetuned_models/run_20260605_073045/models \
          data/finetuned_line_models/run_20260605_073744/models
 
+# Demo video → workspace/videos/ (picked up by `goalinsight-web` Library tab)
 aws s3 cp "s3://${GOALINSIGHT_S3_BUCKET}/raw_videos/kids_soccer_clip_1250_1310.mp4" \
-          data/raw_videos/
+          workspace/videos/
+
+# Fine-tuned weights → data/finetuned_*/ (paths are hard-coded in
+# configs/kids_soccer_physical.yaml, so don't relocate these)
 aws s3 cp "s3://${GOALINSIGHT_S3_BUCKET}/finetuned_models/run_20260605_073045/best_model_final.pt" \
           data/finetuned_models/run_20260605_073045/models/
 aws s3 cp "s3://${GOALINSIGHT_S3_BUCKET}/finetuned_line_models/run_20260605_073744/best_model_final.pt" \
           data/finetuned_line_models/run_20260605_073744/models/
 
 goalinsight \
-  --video data/raw_videos/kids_soccer_clip_1250_1310.mp4 \
+  --video workspace/videos/kids_soccer_clip_1250_1310.mp4 \
   --output output/kids_demo \
   --config configs/kids_soccer_physical.yaml
 ```
 
-The 7-frame v2 finetune training set is checked in
-under `output/annotations/kids_soccer_v2/`, so you can reproduce the
-KP/line fine-tunes locally without re-annotating.
+#### Annotations land in `workspace/annotations/`
+
+`goalinsight-web` (the unified Library / Annotate / Pipeline / Insights
+UI) reads annotations from `workspace/annotations/<video_stem>/`. Save
+new annotations there directly — the Annotate tab does this for you when
+you `goalinsight-web --workspace ./workspace`.
+
+The 7-frame v2 finetune training set is checked into git under
+`output/annotations/kids_soccer_v2/` for reproducibility. To see it in
+the Annotate UI, link it into the workspace and bootstrap the index
+(`AnnotationIndex` only enumerates frames listed in `index.json` —
+it does not scan):
+
+```bash
+ln -s "$PWD/output/annotations/kids_soccer_v2" workspace/annotations/
+
+python3 - <<'PY'
+import json, re
+from pathlib import Path
+base = Path("workspace/annotations")
+ann = {}
+for sub in sorted(base.iterdir()):
+    if not sub.is_dir():
+        continue
+    frames = sorted(int(m.group(1)) for p in sub.iterdir()
+                    if (m := re.match(r"^frame_(\d+)\.json$", p.name)))
+    if frames:
+        ann[sub.name] = {"frames": frames, "last_modified": ""}
+(base / "index.json").write_text(
+    json.dumps({"version": "2.0", "annotations": ann}, indent=2)
+)
+PY
+```
+
+You can now reproduce the KP/line fine-tunes locally (or via the
+**Pipeline** tab's `finetune_keypoints` / `finetune_lines` cards) without
+re-annotating.
 
 Outputs land under `output/<run-name>-<timestamp>/`:
 
