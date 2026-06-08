@@ -49,6 +49,7 @@ httpx>=0.24.0
 # Annotation UI + web viewer (FastAPI + HTML/JS, no Gradio)
 fastapi>=0.110
 uvicorn>=0.29
+python-multipart>=0.0.9    # POST /api/library/upload (multipart)
 pydantic>=2.0
 
 # Testing

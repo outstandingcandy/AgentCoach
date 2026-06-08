@@ -9,6 +9,7 @@ requires-python = ">=3.12"
 
 [project.scripts]
 goalinsight = "goalinsight.cli:main"
+goalinsight-web = "goalinsight.web.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["goalinsight*"]
