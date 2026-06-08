@@ -323,6 +323,45 @@ def parse_single_response(response: str) -> int | None:
 _VALID_TEAMS = {"team_A", "team_B", "referee", "none", "unknown"}
 
 
+def _try_parse_truncated(json_text: str) -> dict[str, Any] | None:
+    """Best-effort recovery when ``max_tokens`` cut the JSON mid-reply.
+
+    Walks the prefix character by character keeping {...} and "..." nesting
+    state; when a parse fails, drops the trailing fragment back to the
+    last complete key:value pair, closes the object, and retries.
+    Returns the dict on success, ``None`` if nothing parseable remains.
+    """
+    last_safe_end = -1
+    in_str = False
+    escape = False
+    depth = 0
+    for i, ch in enumerate(json_text):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        elif ch == "," and depth == 1:
+            # We just finished a top-level "key":value pair — safe rewind point.
+            last_safe_end = i
+    if last_safe_end < 0:
+        return None
+    candidate = json_text[:last_safe_end] + "}"
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+
 def parse_multi_response(
     raw: str,
 ) -> tuple[int | None, float, str, str, str]:
@@ -333,13 +372,24 @@ def parse_multi_response(
     ``reasoning`` so it survives downstream auditing.
     """
     text = raw.strip()
+    # First try to find a complete {…} block. If max_tokens cut the
+    # reply mid-string, fall back to the prefix from the first '{' and
+    # let _try_parse_truncated stitch a syntactically-valid JSON out of
+    # whatever fields fully completed before truncation.
     m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        return (None, 0.0, f"no json: {text[:80]}", "unknown", "unknown")
+    if m:
+        json_text = m.group(0)
+    else:
+        i = text.find("{")
+        if i < 0:
+            return (None, 0.0, f"no json: {text[:80]}", "unknown", "unknown")
+        json_text = text[i:]
     try:
-        obj = json.loads(m.group(0))
-    except json.JSONDecodeError as exc:
-        return (None, 0.0, f"bad json: {exc}", "unknown", "unknown")
+        obj = json.loads(json_text)
+    except json.JSONDecodeError:
+        obj = _try_parse_truncated(json_text)
+        if obj is None:
+            return (None, 0.0, f"bad json: {text[:80]}", "unknown", "unknown")
     num_raw = obj.get("jersey_number")
     num: int | None
     if num_raw in (None, "none", "null"):
