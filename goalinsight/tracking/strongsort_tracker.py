@@ -551,20 +551,31 @@ class StrongSORTTracker:
 
         self.tracks = [t for t in self.tracks if t.status != TrackStatus.DELETED]
 
-        # Return confirmed + tentative tracks (tentative flagged for backfill)
+        # Return confirmed + tentative tracks (tentative flagged for backfill).
+        # Skip tracks that didn't get a measurement this frame — their bbox
+        # is a Kalman extrapolation, not a real detection. After 5-10 coast
+        # steps the constant-velocity model produces grossly wrong bboxes
+        # (e.g. a 30x40 player extrapolated for 18 sample-frames at +24px/h
+        # ends up 480x600 covering OSD + bench), and tracks.json would
+        # otherwise leak those into downstream stages as "real" detections.
+        # The track itself is kept alive — it just doesn't emit a bbox on
+        # coast frames; when YOLO re-detects it the same tid resumes.
         result = []
         for t in self.tracks:
-            if t.status in (TrackStatus.CONFIRMED, TrackStatus.TENTATIVE):
-                result.append({
-                    "track_id": t.track_id,
-                    "bbox": t.bbox,
-                    "confidence": t.confidence,
-                    "class_id": t.class_id,
-                    "team": t.team,
-                    "jersey_number": t.jersey_number,
-                    "role": t.role,
-                    "confirmed": t.status == TrackStatus.CONFIRMED,
-                })
+            if t.status not in (TrackStatus.CONFIRMED, TrackStatus.TENTATIVE):
+                continue
+            if t.time_since_update > 0:
+                continue
+            result.append({
+                "track_id": t.track_id,
+                "bbox": t.bbox,
+                "confidence": t.confidence,
+                "class_id": t.class_id,
+                "team": t.team,
+                "jersey_number": t.jersey_number,
+                "role": t.role,
+                "confirmed": t.status == TrackStatus.CONFIRMED,
+            })
         return result
 
     def _in_kill_zone(self, cx: float, cy: float) -> bool:
