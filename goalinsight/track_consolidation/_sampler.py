@@ -140,14 +140,15 @@ def sample_crops_for_tracks(
                     if x2 <= x1 or y2 <= y1:
                         continue
                     crop = frame[y1:y2, x1:x2]
+                    # Hard size gate — bbox height < min_bbox_height is
+                    # almost always an OSD glyph, sideline banner pixel,
+                    # or distant spectator that survived YOLO. Upscaling
+                    # them just hands the LLM a blurry square of red/
+                    # yellow background and gets a confident wrong vote.
+                    # Tracker keeps the detection (recall matters); we
+                    # only filter at the LLM input layer.
                     if crop.shape[0] < min_bbox_height:
-                        scale = max(1.0, min_bbox_height / crop.shape[0])
-                        crop = cv2.resize(
-                            crop,
-                            (int(crop.shape[1] * scale),
-                             int(crop.shape[0] * scale)),
-                            interpolation=cv2.INTER_CUBIC,
-                        )
+                        continue
                     upper = _upper_body(crop, upper_ratio)
                     if upper.size == 0:
                         continue
