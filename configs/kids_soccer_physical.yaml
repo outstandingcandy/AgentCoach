@@ -84,7 +84,8 @@ field_registration:
     keypoint_weights: "SV_kp"
     keypoint_threshold: 0.15
     use_lines: true
-    line_model_path: "data/finetuned_line_models/run_20260601_142205/models/best_model.pt"
+    # v2 line head from kids_soccer_v2 freeze_backbone training (200 ep).
+    line_model_path: "data/finetuned_line_models/run_20260605_073744/models/best_model_final.pt"
     line_weights: "SV_lines"
     line_threshold: 0.10
 
