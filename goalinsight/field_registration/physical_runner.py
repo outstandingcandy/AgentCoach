@@ -1031,21 +1031,53 @@ def _physical_chain_gap_fill(
         world_xy = world_xy[on_pitch]; pts_t = pts_t[on_pitch]
         world_3d = np.hstack([world_xy, np.zeros((len(world_xy), 1))])
 
-        # Use anchor's pose as warm-start (rvec, focal).
+        # Use anchor's pose as fallback warm-start.
         pose_a = camera_poses[af]
-        rvec_init = np.array(pose_a["rvec"], dtype=np.float64)
+        rvec_anchor = np.array(pose_a["rvec"], dtype=np.float64)
         f_init = float(pose_a["K"][0][0])
-        # Run the 4-DOF refine. _refine_7dof reads K[0,0] as f_init and
-        # mutates internal state, so save/restore.
+        K_init = np.array(
+            [[f_init, 0, width / 2.0], [0, f_init, height / 2.0], [0, 0, 1]],
+            dtype=np.float64,
+        )
+
+        # ===== Second RANSAC: PnP-on-ground =====
+        # The first RANSAC (inside compute_homography above) verified
+        # image-to-image consistency only — it can't tell genuine ground
+        # features from off-ground SIFT matches (rooftops, scoreboards
+        # behind the goal). Those non-ground points get reprojected to
+        # bogus world coords by H_a^-1 and bias the 4-DOF LM into a
+        # wrap-around rvec.
+        # solvePnPRansac re-checks consistency in 3D: each random 4-pt
+        # EPNP draws a full 6-DOF (R, t) and only points on the actual
+        # ground plane stay in the inlier set. Then we feed the cleaned
+        # subset to the 4-DOF refine, with the RANSAC's own (rvec, tvec)
+        # as warm-start (already near target's true pose, not anchor's).
+        n_pts = len(world_3d)
+        if n_pts < 4:
+            return None
+        ok, rvec_pnp, tvec_pnp, inlier_idx = cv2.solvePnPRansac(
+            objectPoints=world_3d.astype(np.float64),
+            imagePoints=pts_t.astype(np.float64),
+            cameraMatrix=K_init,
+            distCoeffs=np.zeros(5, dtype=np.float64),
+            iterationsCount=200,
+            reprojectionError=8.0,
+            confidence=0.99,
+            flags=cv2.SOLVEPNP_EPNP,
+        )
+        if not ok or inlier_idx is None or len(inlier_idx) < min_inliers:
+            return None
+        inlier_idx = inlier_idx.flatten()
+        world_3d = world_3d[inlier_idx]
+        pts_t = pts_t[inlier_idx]
+        rvec_init = rvec_pnp.ravel()
+        # ========================================
+
+        # 4-DOF LM refine (rvec + focal; tvec = -R·C_locked).
         K_save = calibrator.K.copy()
         focal_save = calibrator.focal_bounds
         try:
-            calibrator.K = np.array(
-                [[f_init, 0, width / 2.0], [0, f_init, height / 2.0], [0, 0, 1]],
-                dtype=np.float64,
-            )
-            # Allow focal to move freely within the configured bounds — anchor
-            # focal is a good seed but the target may have zoomed a touch.
+            calibrator.K = K_init.copy()
             tvec_init = -cv2.Rodrigues(rvec_init)[0] @ C_target
             rvec_opt, _tvec_opt, f_opt = calibrator._refine_7dof(
                 rvec_init, tvec_init, pts_t.astype(np.float64), world_3d, [],
@@ -1053,15 +1085,27 @@ def _physical_chain_gap_fill(
         finally:
             calibrator.K = K_save
             calibrator.focal_bounds = focal_save
-        # Reject pathological LM solutions. A normal rvec for this scene has
-        # |rvec_i| ≤ ~π. Anything that wandered far past 2π is a degenerate
-        # local minimum — it can satisfy the SIFT residuals on outlier
-        # ground points but produces a rotation that wraps the camera
-        # around several times. Without this guard such a frame would
-        # contaminate hop-2 averaging and project the entire pitch off-frame.
-        rvec_norm = float(np.linalg.norm(rvec_opt))
-        delta = float(np.linalg.norm(rvec_opt - rvec_init))
-        if rvec_norm > 6.0 or delta > 1.5:
+
+        # Final reprojection error gate (Plan A complement). The PnP
+        # RANSAC already filtered most outliers, but the LM step may
+        # have drifted slightly under cauchy loss; if median reproj
+        # error is still high after refine, the solution isn't trust-
+        # worthy enough to either keep or promote into hop-2 anchor.
+        R_chk, _ = cv2.Rodrigues(rvec_opt)
+        t_chk = -R_chk @ C_target
+        K_chk = np.array(
+            [[f_opt, 0, width / 2.0], [0, f_opt, height / 2.0], [0, 0, 1]],
+            dtype=np.float64,
+        )
+        proj, _ = cv2.projectPoints(
+            world_3d, rvec_opt, t_chk.reshape(3, 1),
+            K_chk, np.zeros(5, dtype=np.float64),
+        )
+        reproj_err = float(np.median(
+            np.linalg.norm(proj.reshape(-1, 2) - pts_t, axis=1)
+        ))
+        max_reproj = float(chain_cfg.get("solve_max_reproj_px", 30.0))
+        if reproj_err > max_reproj:
             return None
         return rvec_opt, float(f_opt)
 
