@@ -1,0 +1,97 @@
+{
+  "frame_idx": 0,
+  "video_name": "kids_soccer_clip_1250_1310",
+  "reprojection_error": 0.0,
+  "saved_at": "2026-06-05T06:10:31.469725",
+  "manual_points": [
+    {
+      "pixel": [
+        1858.508102905964,
+        643.8781669016964
+      ],
+      "world": [
+        0.0,
+        21.575
+      ],
+      "keypoint_name": "T_TOUCH_AND_HALFWAY_LINES_INTERSECTION",
+      "hrnet_index": 15,
+      "pnlcalib_id": 1,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        155.2662721893491,
+        588.8757396449704
+      ],
+      "world": [
+        -33.14,
+        21.575
+      ],
+      "keypoint_name": "TL_PITCH_CORNER",
+      "hrnet_index": 13,
+      "pnlcalib_id": 0,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        372.11554912153724,
+        635.7859429070852
+      ],
+      "world": [
+        -23.18,
+        10.92
+      ],
+      "keypoint_name": "L_PENALTY_AREA_TR_CORNER",
+      "hrnet_index": 9,
+      "pnlcalib_id": 4,
+      "source": "manual"
+    }
+  ],
+  "derived_points": [],
+  "auto_projected_points": [],
+  "all_points": [
+    {
+      "pixel": [
+        1858.508102905964,
+        643.8781669016964
+      ],
+      "world": [
+        0.0,
+        21.575
+      ],
+      "keypoint_name": "T_TOUCH_AND_HALFWAY_LINES_INTERSECTION",
+      "hrnet_index": 15,
+      "pnlcalib_id": 1,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        155.2662721893491,
+        588.8757396449704
+      ],
+      "world": [
+        -33.14,
+        21.575
+      ],
+      "keypoint_name": "TL_PITCH_CORNER",
+      "hrnet_index": 13,
+      "pnlcalib_id": 0,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        372.11554912153724,
+        635.7859429070852
+      ],
+      "world": [
+        -23.18,
+        10.92
+      ],
+      "keypoint_name": "L_PENALTY_AREA_TR_CORNER",
+      "hrnet_index": 9,
+      "pnlcalib_id": 4,
+      "source": "manual"
+    }
+  ],
+  "total_points": 3
+}

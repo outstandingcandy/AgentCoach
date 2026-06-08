@@ -1,0 +1,69 @@
+{
+  "frame_idx": 564,
+  "video_name": "kids_soccer_clip_1250_1310",
+  "reprojection_error": 0.0,
+  "saved_at": "2026-06-05T06:39:34.822382",
+  "manual_points": [
+    {
+      "pixel": [
+        189.3491124260355,
+        604.0236686390532
+      ],
+      "world": [
+        -33.14,
+        21.575
+      ],
+      "keypoint_name": "TL_PITCH_CORNER",
+      "hrnet_index": 13,
+      "pnlcalib_id": 0,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        506.86630270140677,
+        687.1791965884613
+      ],
+      "world": [
+        -23.18,
+        10.92
+      ],
+      "keypoint_name": "L_PENALTY_AREA_TR_CORNER",
+      "hrnet_index": 9,
+      "pnlcalib_id": 4,
+      "source": "manual"
+    }
+  ],
+  "derived_points": [],
+  "auto_projected_points": [],
+  "all_points": [
+    {
+      "pixel": [
+        189.3491124260355,
+        604.0236686390532
+      ],
+      "world": [
+        -33.14,
+        21.575
+      ],
+      "keypoint_name": "TL_PITCH_CORNER",
+      "hrnet_index": 13,
+      "pnlcalib_id": 0,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        506.86630270140677,
+        687.1791965884613
+      ],
+      "world": [
+        -23.18,
+        10.92
+      ],
+      "keypoint_name": "L_PENALTY_AREA_TR_CORNER",
+      "hrnet_index": 9,
+      "pnlcalib_id": 4,
+      "source": "manual"
+    }
+  ],
+  "total_points": 2
+}

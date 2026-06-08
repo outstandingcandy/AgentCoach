@@ -18,6 +18,35 @@ output/
 *.pth
 *.onnx
 
+# Whitelist the kids_soccer_v2 finetune training set so a fresh clone can
+# reproduce the model. v2 is a symlink dir; we also un-ignore the source
+# files it points into (kids_soccer_clip_1250_1310 + kids_soccer_match
+# frame_64020).
+!output/
+output/*
+!output/annotations/
+output/annotations/*
+!output/annotations/kids_soccer_v2/
+!output/annotations/kids_soccer_v2/**
+!output/annotations/kids_soccer_clip_1250_1310/
+output/annotations/kids_soccer_clip_1250_1310/*
+!output/annotations/kids_soccer_clip_1250_1310/frame_0_*
+!output/annotations/kids_soccer_clip_1250_1310/frame_0.json
+!output/annotations/kids_soccer_clip_1250_1310/frame_83_*
+!output/annotations/kids_soccer_clip_1250_1310/frame_83.json
+!output/annotations/kids_soccer_clip_1250_1310/frame_126_*
+!output/annotations/kids_soccer_clip_1250_1310/frame_126.json
+!output/annotations/kids_soccer_clip_1250_1310/frame_246_*
+!output/annotations/kids_soccer_clip_1250_1310/frame_246.json
+!output/annotations/kids_soccer_clip_1250_1310/frame_338_*
+!output/annotations/kids_soccer_clip_1250_1310/frame_338.json
+!output/annotations/kids_soccer_clip_1250_1310/frame_564_*
+!output/annotations/kids_soccer_clip_1250_1310/frame_564.json
+!output/annotations/kids_soccer_match/
+output/annotations/kids_soccer_match/*
+!output/annotations/kids_soccer_match/frame_64020_*
+!output/annotations/kids_soccer_match/frame_64020.json
+
 # Temp test / diagnostic files
 test_*.py
 test_*.jpg

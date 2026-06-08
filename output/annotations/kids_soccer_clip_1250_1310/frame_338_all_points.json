@@ -1,0 +1,265 @@
+{
+  "frame_idx": 338,
+  "video_name": "kids_soccer_clip_1250_1310",
+  "reprojection_error": 12.883634076879934,
+  "saved_at": "2026-06-05T07:10:41.179745",
+  "manual_points": [
+    {
+      "pixel": [
+        206.11218568665376,
+        756.3104448742746
+      ],
+      "world": [
+        -23.18,
+        -10.92
+      ],
+      "keypoint_name": "L_PENALTY_AREA_BR_CORNER",
+      "hrnet_index": 8,
+      "pnlcalib_id": 24,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        390.0591715976331,
+        444.9704142011834
+      ],
+      "world": [
+        -33.14,
+        -2.22
+      ],
+      "keypoint_name": "L_GOAL_TL_POST",
+      "hrnet_index": 0,
+      "pnlcalib_id": 16,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        384.37869822485203,
+        611.5976331360946
+      ],
+      "world": [
+        -33.14,
+        -2.22
+      ],
+      "keypoint_name": "L_GOAL_BL_POST",
+      "hrnet_index": 2,
+      "pnlcalib_id": 15,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        683.5502958579881,
+        450.6508875739645
+      ],
+      "world": [
+        -33.14,
+        2.22
+      ],
+      "keypoint_name": "L_GOAL_TR_POST",
+      "hrnet_index": 1,
+      "pnlcalib_id": 12,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        679.7633136094674,
+        602.1301775147929
+      ],
+      "world": [
+        -33.14,
+        2.22
+      ],
+      "keypoint_name": "L_GOAL_BR_POST",
+      "hrnet_index": 3,
+      "pnlcalib_id": 11,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        113.09236947791165,
+        620.722891566265
+      ],
+      "world": [
+        -33.14,
+        -5.895
+      ],
+      "keypoint_name": "L_GOAL_AREA_BL_CORNER",
+      "hrnet_index": 6,
+      "pnlcalib_id": 19,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1072.6606442454422,
+        584.8039274765541
+      ],
+      "world": [
+        -33.14,
+        10.92
+      ],
+      "keypoint_name": "L_PENALTY_AREA_TL_CORNER",
+      "hrnet_index": 11,
+      "pnlcalib_id": 3,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1396.9477911646586,
+        571.8875502008032
+      ],
+      "world": [
+        -33.14,
+        21.575
+      ],
+      "keypoint_name": "TL_PITCH_CORNER",
+      "hrnet_index": 13,
+      "pnlcalib_id": 0,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1584.7820905045828,
+        633.6635707592284
+      ],
+      "world": [
+        -23.18,
+        10.92
+      ],
+      "keypoint_name": "L_PENALTY_AREA_TR_CORNER",
+      "hrnet_index": 9,
+      "pnlcalib_id": 4,
+      "source": "manual"
+    }
+  ],
+  "derived_points": [],
+  "auto_projected_points": [],
+  "all_points": [
+    {
+      "pixel": [
+        206.11218568665376,
+        756.3104448742746
+      ],
+      "world": [
+        -23.18,
+        -10.92
+      ],
+      "keypoint_name": "L_PENALTY_AREA_BR_CORNER",
+      "hrnet_index": 8,
+      "pnlcalib_id": 24,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        390.0591715976331,
+        444.9704142011834
+      ],
+      "world": [
+        -33.14,
+        -2.22
+      ],
+      "keypoint_name": "L_GOAL_TL_POST",
+      "hrnet_index": 0,
+      "pnlcalib_id": 16,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        384.37869822485203,
+        611.5976331360946
+      ],
+      "world": [
+        -33.14,
+        -2.22
+      ],
+      "keypoint_name": "L_GOAL_BL_POST",
+      "hrnet_index": 2,
+      "pnlcalib_id": 15,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        683.5502958579881,
+        450.6508875739645
+      ],
+      "world": [
+        -33.14,
+        2.22
+      ],
+      "keypoint_name": "L_GOAL_TR_POST",
+      "hrnet_index": 1,
+      "pnlcalib_id": 12,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        679.7633136094674,
+        602.1301775147929
+      ],
+      "world": [
+        -33.14,
+        2.22
+      ],
+      "keypoint_name": "L_GOAL_BR_POST",
+      "hrnet_index": 3,
+      "pnlcalib_id": 11,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        113.09236947791165,
+        620.722891566265
+      ],
+      "world": [
+        -33.14,
+        -5.895
+      ],
+      "keypoint_name": "L_GOAL_AREA_BL_CORNER",
+      "hrnet_index": 6,
+      "pnlcalib_id": 19,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1072.6606442454422,
+        584.8039274765541
+      ],
+      "world": [
+        -33.14,
+        10.92
+      ],
+      "keypoint_name": "L_PENALTY_AREA_TL_CORNER",
+      "hrnet_index": 11,
+      "pnlcalib_id": 3,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1396.9477911646586,
+        571.8875502008032
+      ],
+      "world": [
+        -33.14,
+        21.575
+      ],
+      "keypoint_name": "TL_PITCH_CORNER",
+      "hrnet_index": 13,
+      "pnlcalib_id": 0,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1584.7820905045828,
+        633.6635707592284
+      ],
+      "world": [
+        -23.18,
+        10.92
+      ],
+      "keypoint_name": "L_PENALTY_AREA_TR_CORNER",
+      "hrnet_index": 9,
+      "pnlcalib_id": 4,
+      "source": "manual"
+    }
+  ],
+  "total_points": 9
+}
