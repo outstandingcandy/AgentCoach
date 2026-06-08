@@ -168,13 +168,21 @@ def create_app(run_dir: Path, video_path: Path | None = None) -> FastAPI:
 # ---------------------------------------------------------------------------
 
 
-def create_workspace_app(workspace_dir: str | Path) -> FastAPI:
+def create_workspace_app(
+    workspace_dir: str | Path,
+    *,
+    pitch: "SoccerPitch | None" = None,
+) -> FastAPI:
     """Build the unified web app rooted at *workspace_dir*.
 
     This is the entry point used by ``goalinsight-web``. The skeleton mounts
     static assets and a placeholder index page; route packs (annotator,
     library, jobs, analytics, per-run viewer) are attached by their own
     modules below.
+
+    *pitch* overrides the annotator's default FIFA pitch — required when
+    annotations were saved against a non-FIFA pitch (e.g. youth fields
+    where ``configs/kids_soccer_physical.yaml`` ships dims like 66.28×43.15).
     """
     ws = resolve_workspace(workspace_dir)
 
@@ -190,7 +198,9 @@ def create_workspace_app(workspace_dir: str | Path) -> FastAPI:
         register_annotation_routes,
     )
 
-    annotator = AnchorAnnotator(annotations_dir=str(ws.annotations_dir))
+    annotator = AnchorAnnotator(
+        annotations_dir=str(ws.annotations_dir), pitch=pitch,
+    )
     initial = sorted(
         [p for ext in _ANNOT_VIDEO_EXTS for p in ws.videos_dir.glob(f"*{ext}")],
         key=lambda p: p.name,
