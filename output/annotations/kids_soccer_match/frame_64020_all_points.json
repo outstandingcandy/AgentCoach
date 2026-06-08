@@ -1,0 +1,237 @@
+{
+  "frame_idx": 64020,
+  "video_name": "kids_soccer_match",
+  "reprojection_error": 10.919991995098137,
+  "saved_at": "2026-06-05T06:40:49.065914",
+  "manual_points": [
+    {
+      "pixel": [
+        1421.6116248348744,
+        535.5515191545575
+      ],
+      "world": [
+        33.14,
+        2.22
+      ],
+      "keypoint_name": "R_GOAL_TL_POST",
+      "hrnet_index": 24,
+      "pnlcalib_id": 14,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1424.1479524438573,
+        724.507926023778
+      ],
+      "world": [
+        33.14,
+        2.22
+      ],
+      "keypoint_name": "R_GOAL_BL_POST",
+      "hrnet_index": 26,
+      "pnlcalib_id": 13,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1827.4240422721268,
+        529.2107001321003
+      ],
+      "world": [
+        33.14,
+        -2.22
+      ],
+      "keypoint_name": "R_GOAL_TR_POST",
+      "hrnet_index": 25,
+      "pnlcalib_id": 18,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1828.692206076618,
+        732.1169088507265
+      ],
+      "world": [
+        33.14,
+        -2.22
+      ],
+      "keypoint_name": "R_GOAL_BR_POST",
+      "hrnet_index": 27,
+      "pnlcalib_id": 17,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        180.67936342290565,
+        762.9807006938631
+      ],
+      "world": [
+        23.18,
+        10.92
+      ],
+      "keypoint_name": "R_PENALTY_AREA_TL_CORNER",
+      "hrnet_index": 17,
+      "pnlcalib_id": 5,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        948.5865257595773,
+        740.9940554821665
+      ],
+      "world": [
+        29.01,
+        5.895
+      ],
+      "keypoint_name": "R_GOAL_AREA_TL_CORNER",
+      "hrnet_index": 21,
+      "pnlcalib_id": 9,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        831.0933592975048,
+        713.3507170729098
+      ],
+      "world": [
+        33.14,
+        10.92
+      ],
+      "keypoint_name": "R_PENALTY_AREA_TR_CORNER",
+      "hrnet_index": 19,
+      "pnlcalib_id": 6,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1155.123859087589,
+        720.4611042156389
+      ],
+      "world": [
+        33.14,
+        5.895
+      ],
+      "keypoint_name": "R_GOAL_AREA_TR_CORNER",
+      "hrnet_index": 23,
+      "pnlcalib_id": 10,
+      "source": "manual"
+    }
+  ],
+  "derived_points": [],
+  "auto_projected_points": [],
+  "all_points": [
+    {
+      "pixel": [
+        1421.6116248348744,
+        535.5515191545575
+      ],
+      "world": [
+        33.14,
+        2.22
+      ],
+      "keypoint_name": "R_GOAL_TL_POST",
+      "hrnet_index": 24,
+      "pnlcalib_id": 14,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1424.1479524438573,
+        724.507926023778
+      ],
+      "world": [
+        33.14,
+        2.22
+      ],
+      "keypoint_name": "R_GOAL_BL_POST",
+      "hrnet_index": 26,
+      "pnlcalib_id": 13,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1827.4240422721268,
+        529.2107001321003
+      ],
+      "world": [
+        33.14,
+        -2.22
+      ],
+      "keypoint_name": "R_GOAL_TR_POST",
+      "hrnet_index": 25,
+      "pnlcalib_id": 18,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1828.692206076618,
+        732.1169088507265
+      ],
+      "world": [
+        33.14,
+        -2.22
+      ],
+      "keypoint_name": "R_GOAL_BR_POST",
+      "hrnet_index": 27,
+      "pnlcalib_id": 17,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        180.67936342290565,
+        762.9807006938631
+      ],
+      "world": [
+        23.18,
+        10.92
+      ],
+      "keypoint_name": "R_PENALTY_AREA_TL_CORNER",
+      "hrnet_index": 17,
+      "pnlcalib_id": 5,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        948.5865257595773,
+        740.9940554821665
+      ],
+      "world": [
+        29.01,
+        5.895
+      ],
+      "keypoint_name": "R_GOAL_AREA_TL_CORNER",
+      "hrnet_index": 21,
+      "pnlcalib_id": 9,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        831.0933592975048,
+        713.3507170729098
+      ],
+      "world": [
+        33.14,
+        10.92
+      ],
+      "keypoint_name": "R_PENALTY_AREA_TR_CORNER",
+      "hrnet_index": 19,
+      "pnlcalib_id": 6,
+      "source": "manual"
+    },
+    {
+      "pixel": [
+        1155.123859087589,
+        720.4611042156389
+      ],
+      "world": [
+        33.14,
+        5.895
+      ],
+      "keypoint_name": "R_GOAL_AREA_TR_CORNER",
+      "hrnet_index": 23,
+      "pnlcalib_id": 10,
+      "source": "manual"
+    }
+  ],
+  "total_points": 8
+}

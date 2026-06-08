@@ -1,0 +1,41 @@
+{
+  "frame_idx": 83,
+  "video_name": "kids_soccer_clip_1250_1310",
+  "reprojection_error": 0.0,
+  "saved_at": "2026-06-05T06:29:43.192341",
+  "manual_points": [
+    {
+      "pixel": [
+        803.90649445444,
+        639.8102451103202
+      ],
+      "world": [
+        0.0,
+        21.575
+      ],
+      "keypoint_name": "T_TOUCH_AND_HALFWAY_LINES_INTERSECTION",
+      "hrnet_index": 15,
+      "pnlcalib_id": 1,
+      "source": "manual"
+    }
+  ],
+  "derived_points": [],
+  "auto_projected_points": [],
+  "all_points": [
+    {
+      "pixel": [
+        803.90649445444,
+        639.8102451103202
+      ],
+      "world": [
+        0.0,
+        21.575
+      ],
+      "keypoint_name": "T_TOUCH_AND_HALFWAY_LINES_INTERSECTION",
+      "hrnet_index": 15,
+      "pnlcalib_id": 1,
+      "source": "manual"
+    }
+  ],
+  "total_points": 1
+}

@@ -1,0 +1,41 @@
+{
+  "frame_idx": 126,
+  "video_name": "kids_soccer_clip_1250_1310",
+  "reprojection_error": 0.0,
+  "saved_at": "2026-06-05T06:30:03.204001",
+  "manual_points": [
+    {
+      "pixel": [
+        1266.9252784251203,
+        634.8827199393171
+      ],
+      "world": [
+        -33.14,
+        -2.22
+      ],
+      "keypoint_name": "L_GOAL_TL_POST",
+      "hrnet_index": 0,
+      "pnlcalib_id": 16,
+      "source": "manual"
+    }
+  ],
+  "derived_points": [],
+  "auto_projected_points": [],
+  "all_points": [
+    {
+      "pixel": [
+        1266.9252784251203,
+        634.8827199393171
+      ],
+      "world": [
+        -33.14,
+        -2.22
+      ],
+      "keypoint_name": "L_GOAL_TL_POST",
+      "hrnet_index": 0,
+      "pnlcalib_id": 16,
+      "source": "manual"
+    }
+  ],
+  "total_points": 1
+}
