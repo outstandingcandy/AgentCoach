@@ -151,14 +151,14 @@ class EventDetectionStage(Stage):
 
         # Render annotated video
         from ..events.visualization import render_event_video
+        events_cfg = ctx.config.get("events", {}) if ctx.config else {}
         render_event_video(
             video_path=ctx.video_path,
             events=event_dicts,
             output_path=out / "events.mp4",
             tracking_dir=tracking_dir if tracking_dir.exists() else None,
-            banner_duration_sec=ctx.config.get("events", {}).get(
-                "banner_duration_sec", 3.0
-            ) if ctx.config else 3.0,
+            banner_duration_sec=events_cfg.get("banner_duration_sec", 3.0),
+            vis_frame_stride=int(events_cfg.get("vis_frame_stride", 10)),
         )
 
         by_type = {}

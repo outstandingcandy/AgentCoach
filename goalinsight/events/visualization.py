@@ -54,6 +54,7 @@ def render_event_video(
     tracking_dir: Path | None = None,
     fps: float | None = None,
     banner_duration_sec: float = 3.0,
+    vis_frame_stride: int = 10,
 ) -> None:
     """Render full video with event annotations.
 
@@ -75,6 +76,11 @@ def render_event_video(
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(str(output_path), fourcc, out_fps, (width, height))
+
+    # Per-frame jpg sink at fixed stride for inspection. mp4 stays full-rate.
+    frames_dir = output_path.parent / "frames"
+    if vis_frame_stride > 0:
+        frames_dir.mkdir(parents=True, exist_ok=True)
 
     # Build frame-indexed event lookup: frame -> list of active events
     banner_frames = int(banner_duration_sec * video_fps)
@@ -126,10 +132,14 @@ def render_event_video(
         )
 
         out.write(frame)
+        if vis_frame_stride > 0 and frame_idx % vis_frame_stride == 0:
+            cv2.imwrite(str(frames_dir / f"frame_{frame_idx:05d}.jpg"), frame)
 
     cap.release()
     out.release()
     print(f"  Event video saved: {output_path}")
+    if vis_frame_stride > 0:
+        print(f"  Event per-frame jpg @ every {vis_frame_stride}th: {frames_dir}/")
 
 
 def _build_event_index(
