@@ -26,9 +26,11 @@ from .gates import INF, Gate, apply_gates
 from .track import Track
 
 
-# Type alias for a cost function: (tracks, detections, embeddings) → (T, D) array.
+# Type alias for a cost function: (tracks, detections) → (T, D) array.
+# Detection ReID embeddings are read from ``det['embedding']`` when
+# present (the tracker injects them at update() entry).
 CostFn = Callable[
-    [list[Track], list[dict], np.ndarray | None],
+    [list[Track], list[dict]],
     np.ndarray,
 ]
 
@@ -36,33 +38,41 @@ CostFn = Callable[
 def cosine_cost(
     tracks: list[Track],
     detections: list[dict],
-    embeddings: np.ndarray | None,
 ) -> np.ndarray:
-    """ReID cosine distance between track ``smooth_feature`` and detection
-    embedding. Tracks without ``smooth_feature`` get an INF row.
+    """ReID cosine distance between track ``smooth_feature`` and
+    detection ``embedding``. Tracks/detections missing either feature
+    get an INF row/column.
     """
-    if embeddings is None or not tracks or not detections:
+    if not tracks or not detections:
         return np.zeros((len(tracks), len(detections)))
+    det_embs = []
+    valid_dets = []
+    for j, d in enumerate(detections):
+        e = d.get("embedding")
+        if e is not None:
+            det_embs.append(e)
+            valid_dets.append(j)
+    if not det_embs:
+        return np.full((len(tracks), len(detections)), INF, dtype=np.float64)
     feats = []
-    valid = []
+    valid_tracks = []
     for i, t in enumerate(tracks):
         if t.smooth_feature is not None:
             feats.append(t.smooth_feature)
-            valid.append(i)
+            valid_tracks.append(i)
     if not feats:
         return np.full((len(tracks), len(detections)), INF, dtype=np.float64)
-    feats_arr = np.asarray(feats)
-    sub = cdist(feats_arr, embeddings, metric="cosine")
+    sub = cdist(np.asarray(feats), np.asarray(det_embs), metric="cosine")
     cost = np.full((len(tracks), len(detections)), INF, dtype=np.float64)
-    for k, i in enumerate(valid):
-        cost[i] = sub[k]
+    for k, i in enumerate(valid_tracks):
+        for m, j in enumerate(valid_dets):
+            cost[i, j] = sub[k, m]
     return cost
 
 
 def iou_cost(
     tracks: list[Track],
     detections: list[dict],
-    embeddings: np.ndarray | None = None,
 ) -> np.ndarray:
     """1 - IoU between track bbox and detection bbox."""
     if not tracks or not detections:
@@ -114,7 +124,6 @@ def run_stage(
     stage: MatchingStage,
     tracks: list[Track],
     detections: list[dict],
-    embeddings: np.ndarray | None,
     unmatched_track_ids: set[int],
     unmatched_det_idx: set[int],
 ) -> list[tuple[Track, int]]:
@@ -122,14 +131,12 @@ def run_stage(
 
     ``unmatched_track_ids`` and ``unmatched_det_idx`` are mutated in
     place so subsequent stages see only the leftovers.
-
-    Tracks must come from a stable list — we use ``id(track)`` as key
-    in the unmatched set, so the caller is responsible for tracking
-    object identity (typically by passing in ``self.tracks`` directly).
+    ``unmatched_track_ids`` keys on ``Track.track_id`` (which is unique
+    and stable for the lifetime of a track).
     """
     candidates = [
         t for t in tracks
-        if id(t) in unmatched_track_ids and stage.track_filter(t)
+        if t.track_id in unmatched_track_ids and stage.track_filter(t)
     ]
     if not candidates or not detections:
         return []
@@ -138,11 +145,8 @@ def run_stage(
     if not det_indices:
         return []
     sub_dets = [detections[i] for i in det_indices]
-    sub_embs = (
-        embeddings[det_indices] if embeddings is not None else None
-    )
 
-    cost = stage.cost_fn(candidates, sub_dets, sub_embs)
+    cost = stage.cost_fn(candidates, sub_dets)
     if cost.size == 0:
         return []
 
@@ -153,7 +157,7 @@ def run_stage(
     # single good one).
     cost[cost > stage.threshold] = INF
 
-    apply_gates(cost, stage.gates, candidates, sub_dets, sub_embs)
+    apply_gates(cost, stage.gates, candidates, sub_dets)
 
     rows, cols = linear_sum_assignment(cost)
 
@@ -164,6 +168,6 @@ def run_stage(
         track = candidates[r]
         det_idx = det_indices[c]
         matches.append((track, det_idx))
-        unmatched_track_ids.discard(id(track))
+        unmatched_track_ids.discard(track.track_id)
         unmatched_det_idx.discard(det_idx)
     return matches
