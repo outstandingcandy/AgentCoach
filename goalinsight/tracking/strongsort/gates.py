@@ -30,13 +30,17 @@ INF = 1e5
 
 
 class Gate(Protocol):
-    """A gate is callable; returns True to allow the pair, False to veto."""
+    """A gate is callable; returns True to allow the pair, False to veto.
+
+    Detection ReID embeddings (when needed) are read from
+    ``detection['embedding']`` — the tracker injects them at update()
+    entry so gates / cost functions don't need a parallel array.
+    """
 
     def __call__(
         self,
         track: Track,
         detection: dict,
-        embedding: np.ndarray | None,
     ) -> bool: ...
 
 
@@ -56,12 +60,7 @@ class PitchGate:
         self.threshold_m = float(threshold_m)
         self._threshold_sq = self.threshold_m ** 2
 
-    def __call__(
-        self,
-        track: Track,
-        detection: dict,
-        embedding: np.ndarray | None = None,
-    ) -> bool:
+    def __call__(self, track: Track, detection: dict) -> bool:
         if track.pitch_pos is None:
             return True
         det_pp = detection.get("pitch_pos")
@@ -77,7 +76,6 @@ def apply_gates(
     gates: list[Gate],
     tracks: list[Track],
     detections: list[dict],
-    embeddings: np.ndarray | None,
 ) -> np.ndarray:
     """Set ``cost_matrix[r, c] = INF`` for any pair where any gate vetoes.
 
@@ -93,9 +91,8 @@ def apply_gates(
             if cost_matrix[r, c] >= INF:
                 continue
             det = detections[c]
-            emb = embeddings[c] if embeddings is not None and c < len(embeddings) else None
             for gate in gates:
-                if not gate(tracks[r], det, emb):
+                if not gate(tracks[r], det):
                     cost_matrix[r, c] = INF
                     break
     return cost_matrix

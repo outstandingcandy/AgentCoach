@@ -68,7 +68,7 @@ class TrackLifecycle:
             if track.status == TrackStatus.DELETED:
                 continue
             track.age += 1
-            if id(track) not in updated_ids:
+            if track.track_id not in updated_ids:
                 track.time_since_update += 1
 
     def cleanup(self, tracks: list[Track]) -> list[Track]:

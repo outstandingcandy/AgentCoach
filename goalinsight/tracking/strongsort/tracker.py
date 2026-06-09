@@ -138,13 +138,10 @@ class StrongSORTTracker:
     def _apply_match(
         self,
         track: Track,
-        det_idx: int,
-        detections: list[dict[str, Any]],
-        embeddings: np.ndarray | None,
+        det: dict[str, Any],
     ) -> None:
         """Apply a (track, detection) match: Kalman update, feature
         EMA, pitch_pos refresh, hits++ and tentative-promotion."""
-        det = detections[det_idx]
         track.kalman_state = self.kalman.update(track.kalman_state, det["bbox"])
         track.bbox = det["bbox"]
         track.confidence = det.get("confidence", 1.0)
@@ -153,20 +150,16 @@ class StrongSORTTracker:
         self._record_center(track)
         if det.get("pitch_pos") is not None:
             track.pitch_pos = tuple(det["pitch_pos"])
-        if embeddings is not None and det_idx < len(embeddings):
-            track.update_feature(embeddings[det_idx], self.feature_alpha)
+        emb = det.get("embedding")
+        if emb is not None:
+            track.update_feature(emb, self.feature_alpha)
         if (
             track.status == TrackStatus.TENTATIVE
             and track.hits >= self.n_init
         ):
             track.status = TrackStatus.CONFIRMED
 
-    def _spawn_track(
-        self,
-        det: dict[str, Any],
-        det_idx: int,
-        embeddings: np.ndarray | None,
-    ) -> Track:
+    def _spawn_track(self, det: dict[str, Any]) -> Track:
         """Create a fresh TENTATIVE track from an unmatched detection."""
         track = Track(
             track_id=self.next_id,
@@ -179,8 +172,9 @@ class StrongSORTTracker:
         self._record_center(track)
         if det.get("pitch_pos") is not None:
             track.pitch_pos = tuple(det["pitch_pos"])
-        if embeddings is not None and det_idx < len(embeddings):
-            track.update_feature(embeddings[det_idx], self.feature_alpha)
+        emb = det.get("embedding")
+        if emb is not None:
+            track.update_feature(emb, self.feature_alpha)
         self.tracks.append(track)
         self.next_id += 1
         return track
@@ -206,8 +200,19 @@ class StrongSORTTracker:
         """
         self.predict()
 
+        # Fold the parallel embeddings array into each detection dict so
+        # downstream code (cost_fn, gates, _apply_match, _spawn_track)
+        # can read ``det['embedding']`` directly. Shallow-copy each
+        # detection to avoid mutating the caller's list.
+        if embeddings is not None:
+            detections = [
+                {**d, "embedding": embeddings[i]}
+                if i < len(embeddings) else dict(d)
+                for i, d in enumerate(detections)
+            ]
+
         # ---- Match ---------------------------------------------------
-        unmatched_track_ids: set[int] = {id(t) for t in self.tracks}
+        unmatched_track_ids: set[int] = {t.track_id for t in self.tracks}
         unmatched_det_idx: set[int] = set(range(len(detections)))
         # Tracks that received a real detection update this frame —
         # used at end-of-update so the time_since_update bump only
@@ -225,25 +230,25 @@ class StrongSORTTracker:
         confirmed_matches: list[tuple[Track, int]] = []
         for stage in stages:
             stage_matches = run_stage(
-                stage, self.tracks, detections, embeddings,
+                stage, self.tracks, detections,
                 unmatched_track_ids, unmatched_det_idx,
-            )
+            )  # embeddings live on each detection dict
             if stage.name.startswith("confirmed-"):
                 confirmed_matches.extend(stage_matches)
             else:
                 # Apply confirmed matches before the tentative stage so
                 # spawn() decisions match the original ordering.
                 for track, det_idx in confirmed_matches:
-                    self._apply_match(track, det_idx, detections, embeddings)
-                    updated_this_frame.add(id(track))
+                    self._apply_match(track, detections[det_idx])
+                    updated_this_frame.add(track.track_id)
                 confirmed_matches = []
                 for track, det_idx in stage_matches:
-                    self._apply_match(track, det_idx, detections, embeddings)
-                    updated_this_frame.add(id(track))
+                    self._apply_match(track, detections[det_idx])
+                    updated_this_frame.add(track.track_id)
         # Any leftover confirmed matches (no tentative stage ran).
         for track, det_idx in confirmed_matches:
-            self._apply_match(track, det_idx, detections, embeddings)
-            updated_this_frame.add(id(track))
+            self._apply_match(track, detections[det_idx])
+            updated_this_frame.add(track.track_id)
 
         # ---- Spawn new tracks for unmatched detections --------------
         # Suppress any detection landing inside a kill-zone left behind
@@ -257,8 +262,8 @@ class StrongSORTTracker:
             dcy = (y1 + y2) / 2.0
             if self._in_kill_zone(dcx, dcy):
                 continue
-            track = self._spawn_track(det, i, embeddings)
-            updated_this_frame.add(id(track))
+            track = self._spawn_track(det)
+            updated_this_frame.add(track.track_id)
 
         # ---- Tick + cleanup -----------------------------------------
         self.lifecycle.tick(self.tracks, updated_this_frame)
