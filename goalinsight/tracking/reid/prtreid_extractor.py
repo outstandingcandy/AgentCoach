@@ -67,10 +67,26 @@ class PRTReIDExtractor(BaseReIDExtractor):
         if self._prtreid_available is not None:
             return self._prtreid_available
 
+        # PRTReID eager-imports prtreid.data → albumentations.functional,
+        # a name albumentations >= 2.0 dropped. Install a dummy module
+        # on the namespace before importing prtreid; the random-
+        # occlusion code path that uses it is training-time dataset
+        # augmentation, never invoked at inference.
+        try:
+            import sys as _sys
+            import types as _t
+            import albumentations as _al
+            if not hasattr(_al, "functional"):
+                _stub = _t.ModuleType("albumentations.functional")
+                _al.functional = _stub
+                _sys.modules["albumentations.functional"] = _stub
+        except ImportError:
+            pass
+
         try:
             import prtreid  # noqa: F401
             self._prtreid_available = True
-        except ImportError:
+        except (ImportError, AttributeError):
             self._prtreid_available = False
 
         return self._prtreid_available
