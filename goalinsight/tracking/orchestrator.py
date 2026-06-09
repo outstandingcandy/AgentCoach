@@ -127,6 +127,35 @@ def run_tracking(
     tracking_fps = config.get("video", {}).get("tracking_fps")
     process_fps = tracking_fps or get_process_fps_from_config(config)
 
+    # Push the resolved pitch geometry into the global active-pitch state.
+    # field_registration runners already do this when they execute, but the
+    # tracking stage often runs in its own process invocation
+    # (``--stages tracking`` after field_registration has been cached) and
+    # the global default is FIFA — visualizers like draw_topdown_pitch read
+    # PA / GA / center-circle from active_pitch and would render FIFA
+    # boundaries on a non-FIFA pitch otherwise. Mirrors the same setup in
+    # field_registration/physical_runner.py.
+    _top_pitch = config.get("pitch", {}) or {}
+    _phys_pitch = config.get("field_registration", {}).get("physical", {}) or {}
+    _pitch_dims = dict(_top_pitch)
+    if "pitch_length" in _phys_pitch:
+        _pitch_dims["pitch_length"] = _phys_pitch["pitch_length"]
+    if "pitch_width" in _phys_pitch:
+        _pitch_dims["pitch_width"] = _phys_pitch["pitch_width"]
+    _non_default_dims = (
+        _pitch_dims.get("pitch_length", 105.0) != 105.0
+        or _pitch_dims.get("pitch_width", 68.0) != 68.0
+        or any(k not in ("pitch_length", "pitch_width") for k in _pitch_dims)
+    )
+    if _non_default_dims:
+        from ..annotation.pitch.geometry import SoccerPitch as _SP
+        from ..annotation import pitch_constants as _pc
+        _pc.set_active_pitch(_SP.from_dict(_pitch_dims))
+        logger.info(
+            f"  Active pitch geometry set: {_pitch_dims.get('pitch_length', 105)}"
+            f"x{_pitch_dims.get('pitch_width', 68)}m + custom markings"
+        )
+
     # Load calibration data (supports both physical camera poses and legacy homographies)
     homographies = {}
     camera_poses = {}
