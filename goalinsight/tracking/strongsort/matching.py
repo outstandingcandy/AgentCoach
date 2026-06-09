@@ -86,6 +86,36 @@ def iou_cost(
     return cost
 
 
+def pitch_distance_cost(
+    tracks: list[Track],
+    detections: list[dict],
+) -> np.ndarray:
+    """Pitch-space distance (metres) between track and detection.
+
+    Used for TENTATIVE-track matching where IoU fails on fast-moving
+    or distant players (a 30 px/sample winger has zero bbox overlap
+    across samples even though his pitch displacement is < 1 m). When
+    either side lacks a pitch projection (calibration failure) the
+    pair is marked INF — the IoU stage above this one will catch
+    those cases.
+    """
+    if not tracks or not detections:
+        return np.zeros((len(tracks), len(detections)))
+    cost = np.full((len(tracks), len(detections)), INF, dtype=np.float64)
+    for i, t in enumerate(tracks):
+        if t.pitch_pos is None:
+            continue
+        tx, ty = t.pitch_pos
+        for j, d in enumerate(detections):
+            det_pp = d.get("pitch_pos")
+            if det_pp is None:
+                continue
+            dx = tx - det_pp[0]
+            dy = ty - det_pp[1]
+            cost[i, j] = (dx * dx + dy * dy) ** 0.5
+    return cost
+
+
 def _iou(box1: list, box2: list) -> float:
     x1 = max(box1[0], box2[0])
     y1 = max(box1[1], box2[1])

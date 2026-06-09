@@ -17,7 +17,13 @@ import numpy as np
 from .gates import PitchGate
 from .kalman import KalmanFilter
 from .lifecycle import TrackLifecycle
-from .matching import MatchingStage, cosine_cost, iou_cost, run_stage
+from .matching import (
+    MatchingStage,
+    cosine_cost,
+    iou_cost,
+    pitch_distance_cost,
+    run_stage,
+)
 from .track import Track, TrackStatus
 
 
@@ -101,12 +107,23 @@ class StrongSORTTracker:
     def _matching_stages(self) -> list[MatchingStage]:
         """Build the cascaded matching pipeline for this update().
 
-        Three stages — same behaviour as the original DeepSORT cascade
-        — but expressed as data so adding/swapping a stage is local:
+        Stages, in order:
 
-        1. Confirmed × ReID cosine, gated by pitch distance.
-        2. Confirmed remaining × IoU (Kalman-predicted bbox).
-        3. Tentative × IoU only (no ReID, EMA isn't stable yet).
+        1. ``confirmed-reid``: confirmed × ReID cosine, gated by
+           pitch distance. Fine-grained appearance matching for tracks
+           with stable EMA features.
+        2. ``confirmed-iou``: confirmed leftovers × IoU. Bridges short
+           ReID drops where the track and detection are clearly the
+           same bbox geometry.
+        3. ``tentative-iou``: tentative × IoU. Cheap path for
+           slow-moving new tracks where bbox overlap is reliable.
+        4. ``tentative-pitch``: tentative leftovers × pitch distance,
+           gated. Catches fast-moving / distant players whose bbox
+           displacement exceeds bbox width — IoU goes to zero so step
+           3 fails, but pitch displacement stays under 3 m so the
+           same physical player can be re-attached. Without this stage
+           edge-running players accumulate a fresh tid every sample
+           and never reach n_init=3 hits to confirm.
         """
         return [
             MatchingStage(
@@ -132,6 +149,13 @@ class StrongSORTTracker:
                 cost_fn=iou_cost,
                 gates=[],
                 threshold=self.max_iou_distance,
+            ),
+            MatchingStage(
+                name="tentative-pitch",
+                track_filter=lambda t: t.status == TrackStatus.TENTATIVE,
+                cost_fn=pitch_distance_cost,
+                gates=[PitchGate(self.pitch_gate_m)],
+                threshold=self.pitch_gate_m,
             ),
         ]
 
