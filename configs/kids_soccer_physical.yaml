@@ -107,6 +107,15 @@ field_registration:
 
 device: "cuda"
 
+# PRTReID is fine-tuned on SoccerNet (player-level), 256-dim with HRNet32.
+# Our same-jersey discrimination test on OSNet showed cross-player cosine
+# at 0.85 — too close to true-continuation cosine (0.85) for Hungarian to
+# pick correctly under team-uniform conditions. PRTReID's part-based
+# embedding (separate body parts) should give better same-jersey
+# discrimination on the kids clip.
+reid:
+  backend: "prtreid"
+
 # Per-stage vis sinks. mp4 outputs are full-rate; the per-frame jpg/json
 # stride matches sample.stride (set at top-level) so vis frames line up
 # exactly with sampled frames — no overlay gaps from picking a frame the
