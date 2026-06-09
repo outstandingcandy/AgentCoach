@@ -761,6 +761,31 @@ def run_tracking(
         detections = _filtered_dets.get(frame_idx, [])
         embeddings = _precomputed_embeds.get(frame_idx)
 
+        # Project each detection's foot-point onto the pitch BEFORE
+        # tracking so StrongSORT's gating can reject implausible
+        # matches in metric space (e.g. a 3m+ jump between same-jersey
+        # players that the pixel-space aspect-ratio gate misses). When
+        # calibration is unavailable for this frame ``pitch_pos`` is
+        # left None and the tracker skips gating for that detection.
+        for _det in detections:
+            _bbox = _det["bbox"]
+            _foot = np.array([
+                [(_bbox[0] + _bbox[2]) / 2.0, _bbox[3]],
+            ])
+            _pp = None
+            if frame_idx in camera_poses:
+                _pp = _undistort_and_project_to_pitch(
+                    _foot, camera_poses[frame_idx])
+            elif H is not None:
+                # H is already img→world (orchestrator inverted
+                # H_world2img above)
+                pt_h = np.array([_foot[0, 0], _foot[0, 1], 1.0])
+                world_h = H @ pt_h
+                if abs(world_h[2]) > 1e-6:
+                    _pp = [float(world_h[0] / world_h[2]),
+                           float(world_h[1] / world_h[2])]
+            _det["pitch_pos"] = _pp
+
         # Update tracker (returns both confirmed and tentative tracks).
         # Only BoT-SORT with GMC enabled actually uses the raw frame;
         # StrongSORT.update() ignores the kwarg.
