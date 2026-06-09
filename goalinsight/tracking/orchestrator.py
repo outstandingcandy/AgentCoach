@@ -64,6 +64,11 @@ from .tracking_visualization import (
     draw_ball_track,
 )
 
+from ..utils.pitch import (
+    get_pitch_template_points,
+    project_pitch_to_image,
+)
+
 
 _FramePrefetcher = FramePrefetcher  # backward compat alias
 
@@ -1148,6 +1153,7 @@ def run_tracking(
             height=height,
             pitch_length=pitch_length,
             pitch_width=pitch_width,
+            camera_poses=camera_poses,
             vis_frame_stride=int(
                 config.get("tracking", {}).get(
                     "vis_frame_stride",
@@ -1192,18 +1198,30 @@ def _render_tracking_video(
     height: int,
     pitch_length: float,
     pitch_width: float,
+    camera_poses: dict | None = None,
     vis_frame_stride: int = 10,
 ) -> None:
     """Render the tracking visualization video with ball + raw-track overlays.
 
     Team colours are not yet known at this stage (assigned by the
     track_consolidation stage); bboxes are drawn with default colours.
+
+    When ``camera_poses`` is supplied, each frame's pitch lines are
+    re-projected onto the image using that frame's calibration — same
+    yellow overlay shown by the field_registration vis. This makes it
+    easy to eyeball whether tracker bboxes line up with the pitch the
+    tracker is seeing.
     """
     logger.info("Generating raw tracking visualization...")
     team_assignments: dict[int, str] = {}
 
     render_prefetcher = _FramePrefetcher(video_path, list(sampler), prefetch_size=4)
     track_history = {}
+
+    pitch_template = (
+        get_pitch_template_points(pitch_length, pitch_width)
+        if camera_poses else None
+    )
 
     vis_frames_dir = output_dir / "frames"
     vis_frames_dir.mkdir(exist_ok=True)
@@ -1237,6 +1255,51 @@ def _render_tracking_video(
 
         frame_tracks = all_tracks.get(frame_idx, [])
         vis = draw_tracks(frame, frame_tracks, track_history, team_assignments)
+
+        # Project pitch lines onto the image using this frame's calibration
+        # — same yellow overlay as field_registration vis. Lets us eyeball
+        # whether the tracker's bboxes are sitting where the calibration
+        # expects pitch landmarks to be.
+        if pitch_template is not None and camera_poses is not None \
+                and frame_idx in camera_poses:
+            _pose = camera_poses[frame_idx]
+            R, _ = cv2.Rodrigues(np.array(_pose["rvec"], dtype=np.float64))
+            K = np.array(_pose["K"], dtype=np.float64)
+            tvec = np.array(_pose["tvec"], dtype=np.float64).flatten()
+            H = K @ np.column_stack([R[:, 0], R[:, 1], tvec])
+            cam_params = {
+                "rvec": np.array(_pose["rvec"], dtype=np.float64),
+                "tvec": np.array(_pose["tvec"], dtype=np.float64),
+                "K": K,
+                "dist_coeffs": np.array(_pose["dist_coeffs"], dtype=np.float64),
+            }
+            try:
+                projected = project_pitch_to_image(H, pitch_template, cam_params)
+            except Exception:
+                projected = None
+            if projected:
+                _h, _w = vis.shape[:2]
+                _margin = 200
+                for _name, _pts in projected.items():
+                    for _i in range(len(_pts) - 1):
+                        if _pts[_i] is None or _pts[_i + 1] is None:
+                            continue
+                        try:
+                            _p1 = (int(_pts[_i][0]), int(_pts[_i][1]))
+                            _p2 = (int(_pts[_i + 1][0]), int(_pts[_i + 1][1]))
+                        except (ValueError, OverflowError, TypeError):
+                            continue
+                        # Skip phantom segments (both endpoints far off-frame).
+                        _p1_in = -_margin < _p1[0] < _w + _margin and -_margin < _p1[1] < _h + _margin
+                        _p2_in = -_margin < _p2[0] < _w + _margin and -_margin < _p2[1] < _h + _margin
+                        if not _p1_in and not _p2_in:
+                            continue
+                        ok, c1, c2 = cv2.clipLine(
+                            (-_margin, -_margin, _w + 2 * _margin, _h + 2 * _margin),
+                            _p1, _p2,
+                        )
+                        if ok:
+                            cv2.line(vis, c1, c2, (0, 255, 255), 2)
 
         # Draw ball
         ball_track_this = None
