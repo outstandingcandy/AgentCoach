@@ -126,6 +126,43 @@ def run_track_consolidation(
         tid: "player" for tid in frame_count_by_track
     }
 
+    # Pre-filter: drop tracks that spent most of their lifetime
+    # outside the playing area (substitutes / sideline staff / fans
+    # detected by YOLO whose pitch projection consistently lands beyond
+    # the touchline). Without this, the candidate set is polluted with
+    # off-pitch person detections that survive size/aspect filters but
+    # represent neither players nor officials. The filter requires both
+    # a minimum sample count and a high outside-fraction so brief
+    # excursions over the touchline (throw-ins, corner kicks) don't
+    # remove real players.
+    off_cfg = config.get("off_field_filter", {}) or {}
+    if off_cfg.get("enabled", True):
+        off_field_tids = _detect_off_field_tracks(
+            positions_by_track,
+            pitch_length=pitch_length,
+            pitch_width=pitch_width,
+            margin=float(off_cfg.get("margin_m", 1.5)),
+            min_outside_fraction=float(off_cfg.get("min_outside_fraction", 0.85)),
+            min_observations=int(off_cfg.get("min_observations", 10)),
+        )
+        if off_field_tids:
+            logger.info(
+                "Off-field tracks dropped (%d): %s",
+                len(off_field_tids), sorted(off_field_tids),
+            )
+            print(
+                f"  Off-field filter: dropped {len(off_field_tids)} tracks "
+                f"({sorted(off_field_tids)})",
+                flush=True,
+            )
+            tracks_by_frame = _filter_tracks_by_id(tracks_by_frame, off_field_tids)
+            for tid in off_field_tids:
+                frame_count_by_track.pop(tid, None)
+                positions_by_track.pop(tid, None)
+                position_label_by_track.pop(tid, None)
+                movement_by_track.pop(tid, None)
+                role_by_track.pop(tid, None)
+
     min_frames = int(config.get("min_track_frames", 30))
     # All tracks with enough observations go to Claude, regardless of
     # KMeans team label or pitch position — Claude decides the final
@@ -1033,33 +1070,49 @@ def _compute_movement_descriptions(
     return out
 
 
-def _drop_off_field(
-    tracks_by_frame: dict[str, list[dict[str, Any]]],
+def _detect_off_field_tracks(
     positions_by_track: dict[int, list[list[float]]],
     pitch_length: float,
     pitch_width: float,
     margin: float,
-) -> dict[str, list[dict[str, Any]]]:
-    """Drop tracks whose median pitch position sits outside the playing
-    area (substitutes warming up, sideline staff).  Returns a filtered
-    copy of tracks_by_frame.
+    min_outside_fraction: float,
+    min_observations: int,
+) -> set[int]:
+    """Identify tracks that spent most of their lifetime outside the
+    playing area (substitutes warming up, sideline staff, observers).
+
+    A track is flagged off-field iff it has at least ``min_observations``
+    pitch projections AND at least ``min_outside_fraction`` of them fall
+    beyond ``half_pitch + margin`` in either x or y.
+
+    Tracks that briefly stray over the touchline (e.g. a winger taking
+    a throw-in) are NOT flagged — only persistently-outside tracks are.
+    Tracks with no projections at all are skipped (calibration failure
+    isn't grounds for filtering).
     """
     half_l = pitch_length / 2
     half_w = pitch_width / 2
-    mean_pos = {
-        tid: np.median(np.asarray(poss, dtype=np.float32), axis=0)
-        for tid, poss in positions_by_track.items() if poss
-    }
-    off_field = {
-        tid for tid, pos in mean_pos.items()
-        if abs(pos[0]) > half_l + margin or abs(pos[1]) > half_w + margin
-    }
-    if off_field:
-        logger.info("  Off-field tracks removed: %s", sorted(off_field))
-        print(f"  Off-field filter: dropped {len(off_field)} tracks",
-              flush=True)
+    off: set[int] = set()
+    for tid, poss in positions_by_track.items():
+        if not poss or len(poss) < min_observations:
+            continue
+        arr = np.asarray(poss, dtype=np.float32)
+        outside = (
+            (np.abs(arr[:, 0]) > half_l + margin)
+            | (np.abs(arr[:, 1]) > half_w + margin)
+        )
+        if outside.mean() >= min_outside_fraction:
+            off.add(tid)
+    return off
+
+
+def _filter_tracks_by_id(
+    tracks_by_frame: dict[str, list[dict[str, Any]]],
+    drop: set[int],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return a copy of ``tracks_by_frame`` with all dropped tids removed."""
     return {
-        fk: [t for t in ts if int(t["track_id"]) not in off_field]
+        fk: [t for t in ts if int(t["track_id"]) not in drop]
         for fk, ts in tracks_by_frame.items()
     }
 
