@@ -49,8 +49,9 @@ output/annotations/kids_soccer_match/*
 !output/annotations/kids_soccer_match/frame_64020_*
 !output/annotations/kids_soccer_match/frame_64020.json
 
-# Temp test / diagnostic files
-test_*.py
+# Temp test / diagnostic files (repo-root + scripts/ scratch only — tests/ is committed)
+/test_*.py
+/scripts/test_*.py
 test_*.jpg
 debug_*.py
 diag_*.py
