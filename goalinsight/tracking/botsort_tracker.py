@@ -119,8 +119,13 @@ class BoTSORTTracker:
                 # users didn't override — 1 - 0.3 = 0.7.
                 1.0 - cfg.get("max_cosine_distance", 0.3),
             ),
-            # We always supply external embeddings, so 'auto' is fine —
-            # BOTSORT only triggers internal ReID when 'with_reid' is True.
+            # Forced off: Ultralytics' BOTSORT.init_track expects
+            # feats to be a list of GPU tensors produced by its own
+            # YOLO predictor and calls .cpu() on them. We hand it numpy
+            # OSNet centroids, which crash that path. The wrapper
+            # instead folds external embeddings into a per-tid centroid
+            # for downstream consolidation (see _fold_in_embeddings)
+            # and lets BoT-SORT match on IoU + (optional) GMC alone.
             with_reid=False,
             model="auto",
         )
@@ -192,11 +197,11 @@ class BoTSORTTracker:
 
         results = _DetResults(xyxy=xyxy, conf=conf, cls=cls)
 
-        # Feed embeddings only when the upstream code path can use them
-        # — currently with_reid=False, so feats=None. We instead bind
-        # embeddings to detections by IoU-overlap below.
-        feats = None
-        out = self._tracker.update(results, img=img, feats=feats)
+        # BoT-SORT internal matching is IoU + GMC only (see with_reid
+        # comment in __init__). External embeddings flow through
+        # _fold_in_embeddings into per-tid centroids consumed by
+        # track_consolidation.
+        out = self._tracker.update(results, img=img, feats=None)
 
         # ``out`` is shape (M, 7+): [x1, y1, x2, y2, track_id, conf, cls, ...]
         tracks: list[dict[str, Any]] = []
