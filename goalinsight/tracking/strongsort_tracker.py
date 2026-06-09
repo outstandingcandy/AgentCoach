@@ -300,18 +300,23 @@ class StrongSORTTracker:
         self.next_id = 1
 
     def predict(self):
-        """Predict track states for current frame."""
+        """Predict track states for current frame.
+
+        Tracks whose Kalman prediction crosses the image border are NOT
+        immediately deleted — a player walking off-screen briefly (then
+        coming back) was getting wiped within one frame because the
+        constant-velocity model overshoots the edge by a few pixels.
+        ``time_since_update > max_age`` already provides natural
+        cleanup; an off-screen-then-reappearing player can re-match by
+        ReID + pitch-position when they come back into the field of
+        view, preserving their tid.
+        """
         for track in self.tracks:
             if track.kalman_state is not None:
                 track.kalman_state = self.kalman.predict(track.kalman_state)
                 track.bbox = self.kalman.state_to_bbox(
                     track.kalman_state, self.img_w, self.img_h
                 )
-
-                # Mark tracks as deleted if predicted center is outside frame
-                cx, cy = track.kalman_state.mean[0], track.kalman_state.mean[1]
-                if cx < 0 or cx > self.img_w or cy < 0 or cy > self.img_h:
-                    track.status = TrackStatus.DELETED
 
     def update(
         self,
