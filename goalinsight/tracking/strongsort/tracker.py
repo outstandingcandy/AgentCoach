@@ -140,7 +140,15 @@ class StrongSORTTracker:
                 name="confirmed-iou",
                 track_filter=lambda t: t.status == TrackStatus.CONFIRMED,
                 cost_fn=iou_cost,
-                gates=[],
+                # Same PitchGate as confirmed-reid — without it, IoU
+                # alone can match a track to a distant detection just
+                # because their predict-shifted bboxes happen to overlap
+                # in pixels (e.g. f162 in the kids clip: tid=9 anchored
+                # at pitch (-17.6, 2.9) got eaten by a 5.7 m-away
+                # background detection on bbox-only IoU, then dragged
+                # tid=9's pitch_pos to (-20.4, 7.9) and broke its later
+                # gating).
+                gates=[PitchGate(self.pitch_gate_m)],
                 threshold=self.max_iou_distance,
             ),
             MatchingStage(
