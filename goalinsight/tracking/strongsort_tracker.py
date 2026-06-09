@@ -418,6 +418,13 @@ class StrongSORTTracker:
         # Update matched tracks
         matched_track_indices = set()
         matched_det_indices = set()
+        # Tracks that received a real detection update this frame —
+        # used at end-of-update so the time_since_update bump only
+        # applies to truly unmatched tracks. Without this, tentative
+        # matches and freshly-created tracks would tick to >0 right
+        # after creation and the emit-stage coast filter would drop
+        # them, hiding the first n_init frames of every track.
+        updated_this_frame: set[int] = set()
 
         for track_idx, det_idx in matches:
             track = confirmed_tracks[track_idx]
@@ -437,6 +444,7 @@ class StrongSORTTracker:
 
             matched_track_indices.add(track_idx)
             matched_det_indices.add(det_idx)
+            updated_this_frame.add(id(track))
 
         # Step 3: Match tentative tracks using IoU only
         unmatched_det_after_confirmed = [
@@ -473,6 +481,7 @@ class StrongSORTTracker:
                             track.status = TrackStatus.CONFIRMED
 
                         matched_det_indices.add(det_idx)
+                        updated_this_frame.add(id(track))
 
         # Create new tracks for unmatched detections — but suppress any
         # detection landing inside a kill-zone left behind by the
@@ -501,13 +510,16 @@ class StrongSORTTracker:
 
             self.tracks.append(track)
             self.next_id += 1
+            updated_this_frame.add(id(track))
 
-        # Update unmatched tracks
+        # Update unmatched tracks — bump time_since_update only on
+        # tracks that didn't get a measurement this frame.
         for track in self.tracks:
-            if track.status != TrackStatus.DELETED:
-                track.age += 1
-                if track not in [confirmed_tracks[i] for i in matched_track_indices if i < len(confirmed_tracks)]:
-                    track.time_since_update += 1
+            if track.status == TrackStatus.DELETED:
+                continue
+            track.age += 1
+            if id(track) not in updated_this_frame:
+                track.time_since_update += 1
 
         # Delete old tracks
         self.tracks = [
