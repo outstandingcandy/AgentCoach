@@ -717,7 +717,37 @@ def run_tracking(
                     best_idx = i
         return best_idx
 
-    # Tracking loop — pure CPU, no frame data needed
+    # Tracking loop — pure CPU when GMC is off; opens a second cap
+    # for sequential frame reads when the tracker needs raw frames
+    # (BoT-SORT GMC). Seeking is sequential so the cost is just one
+    # extra video pass, ~5-10s per minute of clip.
+    _tracker_needs_frames = (
+        tracker_backend == "botsort"
+        and str(tracking_cfg.get("botsort", {}).get("gmc_method", "none")).lower()
+        != "none"
+    )
+    _frame_cap = cv2.VideoCapture(str(video_path)) if _tracker_needs_frames else None
+    _frame_cur = -1  # next frame the cap will read on cap.read()
+
+    def _seek_frame(target_idx: int) -> np.ndarray | None:
+        nonlocal _frame_cur
+        if _frame_cap is None:
+            return None
+        if target_idx < _frame_cur:
+            # Backwards seek — rare, but reset.
+            _frame_cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+            _frame_cur = target_idx
+        # Skip-grab forward to target_idx.
+        while _frame_cur < target_idx:
+            if not _frame_cap.grab():
+                return None
+            _frame_cur += 1
+        ok, fr = _frame_cap.read()
+        if not ok:
+            return None
+        _frame_cur += 1
+        return fr
+
     for idx, frame_idx in enumerate(tqdm(_frame_indices_list, desc="Stage 2: Tracking")):
 
         H_world2img = homographies.get(frame_idx)
@@ -731,8 +761,14 @@ def run_tracking(
         detections = _filtered_dets.get(frame_idx, [])
         embeddings = _precomputed_embeds.get(frame_idx)
 
-        # Update tracker (returns both confirmed and tentative tracks)
-        tracks = tracker.update(detections, embeddings)
+        # Update tracker (returns both confirmed and tentative tracks).
+        # Only BoT-SORT with GMC enabled actually uses the raw frame;
+        # StrongSORT.update() ignores the kwarg.
+        if tracker_backend == "botsort":
+            _img = _seek_frame(frame_idx) if _tracker_needs_frames else None
+            tracks = tracker.update(detections, embeddings, img=_img)
+        else:
+            tracks = tracker.update(detections, embeddings)
         confirmed_tracks = [t for t in tracks if t.get("confirmed", True)]
         tentative_tracks_now = [t for t in tracks if not t.get("confirmed", True)]
 
@@ -858,6 +894,9 @@ def run_tracking(
 
         # Note: Team classification is deferred until all tracking is complete
         # This allows using trajectory-averaged features for better clustering
+
+    if _frame_cap is not None:
+        _frame_cap.release()
 
     # Free pre-computed detection/feature caches
     del _precomputed_ball_dets, _filtered_dets, _precomputed_embeds, all_ball_detections
