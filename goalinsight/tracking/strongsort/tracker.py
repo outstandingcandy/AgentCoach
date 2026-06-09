@@ -57,10 +57,14 @@ class StrongSORTTracker:
         self.max_cosine_distance = config.get("max_cosine_distance", 0.3)
         self.feature_alpha = config.get("feature_alpha", 0.9)
         # Pitch-space gating threshold (metres). At process_fps=10 a
-        # full-sprint 8 m/s player travels ~0.8m/sample; 3m leaves
+        # full-sprint 8 m/s player travels ~0.8 m/sample; 4 m leaves
         # comfortable headroom for projection jitter on distant
-        # players. Calibration failures skip the gate entirely.
-        self.pitch_gate_m = float(config.get("pitch_gate_m", 3.0))
+        # players AND for one-frame "anchor poisoning" (when a track
+        # mis-matches to a wrong detection one sample, its pitch_pos
+        # is dragged a couple of metres — 4 m gives the next-frame
+        # real detection enough slack to re-attach without spawning a
+        # fresh tid). Calibration failures skip the gate entirely.
+        self.pitch_gate_m = float(config.get("pitch_gate_m", 4.0))
 
         self.lifecycle = TrackLifecycle(
             max_age=config.get("max_age", 30),
@@ -140,15 +144,7 @@ class StrongSORTTracker:
                 name="confirmed-iou",
                 track_filter=lambda t: t.status == TrackStatus.CONFIRMED,
                 cost_fn=iou_cost,
-                # Same PitchGate as confirmed-reid — without it, IoU
-                # alone can match a track to a distant detection just
-                # because their predict-shifted bboxes happen to overlap
-                # in pixels (e.g. f162 in the kids clip: tid=9 anchored
-                # at pitch (-17.6, 2.9) got eaten by a 5.7 m-away
-                # background detection on bbox-only IoU, then dragged
-                # tid=9's pitch_pos to (-20.4, 7.9) and broke its later
-                # gating).
-                gates=[PitchGate(self.pitch_gate_m)],
+                gates=[],
                 threshold=self.max_iou_distance,
             ),
             MatchingStage(
