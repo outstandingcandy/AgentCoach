@@ -16,6 +16,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 
+from .gates import INF, PitchGate, apply_gates
 from .kalman import KalmanFilter
 from .track import Track, TrackStatus
 
@@ -151,41 +152,26 @@ class StrongSORTTracker:
                 # Compute cosine distance
                 cost_matrix = cdist(track_features, embeddings, metric='cosine')
 
-                # Apply threshold
-                cost_matrix[cost_matrix > self.max_cosine_distance] = 1e5
+                # Cosine threshold gate (any pair worse than this is
+                # implausible regardless of geometry).
+                cost_matrix[cost_matrix > self.max_cosine_distance] = INF
 
-                # Gate by pitch-space distance — reject matches where the
-                # detection's foot-point is more than ``pitch_gate_m`` metres
-                # from the track's last known pitch position. Aspect ratio
-                # and bbox height are NOT gated — in sports footage they
-                # vary too much per pose (e.g. a side-on player has
-                # aspect 0.32, the same player mid-run lunge has 0.72)
-                # and force-rejecting on those just orphans real
-                # detections (frame 12: tid=10 lost det_LO purely because
-                # det_LO's aspect spiked to 0.72).
-                #
-                # When calibration is unavailable (no pitch_pos on the
-                # detection or on the track), gating is skipped and
-                # matching falls back to ReID cosine alone — better an
-                # ungated match than a wrongly-rejected one.
-                pitch_gate_m_sq = (
-                    float(getattr(self, "pitch_gate_m", 3.0)) ** 2
+                # Pitch-space distance gate — reject matches where the
+                # detection's foot-point is more than ``pitch_gate_m``
+                # metres from the track's last known pitch position.
+                # Aspect ratio and bbox height are NOT gated; in sports
+                # footage they swing too much per pose (a side-on
+                # player has aspect 0.32, the same player mid-run lunge
+                # has 0.72), and force-rejecting on those just orphans
+                # real detections.
+                gate_tracks = [confirmed_tracks[i] for i in valid_track_idx]
+                apply_gates(
+                    cost_matrix,
+                    gates=[PitchGate(self.pitch_gate_m)],
+                    tracks=gate_tracks,
+                    detections=detections,
+                    embeddings=embeddings,
                 )
-                for ri in range(len(valid_track_idx)):
-                    t = confirmed_tracks[valid_track_idx[ri]]
-                    if t.pitch_pos is None:
-                        continue  # no track pitch anchor → can't gate
-                    tx, ty = t.pitch_pos
-                    for ci in range(len(detections)):
-                        if cost_matrix[ri, ci] >= 1e5:
-                            continue  # already rejected by cosine threshold
-                        det_pp = detections[ci].get("pitch_pos")
-                        if det_pp is None:
-                            continue  # detection lacks calibration → skip gate
-                        dx = tx - det_pp[0]
-                        dy = ty - det_pp[1]
-                        if dx * dx + dy * dy > pitch_gate_m_sq:
-                            cost_matrix[ri, ci] = 1e5
 
                 # Hungarian matching
                 if cost_matrix.size > 0:
@@ -210,7 +196,7 @@ class StrongSORTTracker:
 
             # Convert to cost (1 - IoU)
             cost_matrix = 1 - iou_matrix
-            cost_matrix[cost_matrix > self.max_iou_distance] = 1e5
+            cost_matrix[cost_matrix > self.max_iou_distance] = INF
 
             if cost_matrix.size > 0:
                 row_indices, col_indices = linear_sum_assignment(cost_matrix)
@@ -263,7 +249,7 @@ class StrongSORTTracker:
             remaining_dets = [detections[i] for i in unmatched_det_after_confirmed]
             iou_matrix = self._compute_iou_matrix(tentative_tracks, remaining_dets)
             cost_matrix = 1 - iou_matrix
-            cost_matrix[cost_matrix > self.max_iou_distance] = 1e5
+            cost_matrix[cost_matrix > self.max_iou_distance] = INF
 
             if cost_matrix.size > 0:
                 row_indices, col_indices = linear_sum_assignment(cost_matrix)
