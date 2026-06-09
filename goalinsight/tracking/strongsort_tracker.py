@@ -59,6 +59,14 @@ class Track:
     # background object.
     center_history: list = field(default_factory=list)
 
+    # Last successful projection of the bbox foot-point onto the pitch
+    # in world coordinates (metres). Refreshed whenever the orchestrator
+    # passes a calibration-derived ``pitch_pos`` on the matched
+    # detection. Used by the gating step to reject implausible matches
+    # in metric space rather than fragile pixel-space aspect/h gates.
+    # ``None`` when calibration was unavailable for the matched frame.
+    pitch_pos: tuple | None = None
+
     # Attributes
     team: str | None = None
     jersey_number: int | None = None
@@ -251,6 +259,11 @@ class StrongSORTTracker:
         self.max_iou_distance = config.get("max_iou_distance", 0.7)
         self.max_cosine_distance = config.get("max_cosine_distance", 0.3)
         self.feature_alpha = config.get("feature_alpha", 0.9)
+        # Pitch-space gating threshold (metres). At process_fps=10 a
+        # full-sprint 8 m/s player travels ~0.8m/sample; 3m leaves
+        # comfortable headroom for projection jitter on distant
+        # players. Calibration failures skip the gate entirely.
+        self.pitch_gate_m = float(config.get("pitch_gate_m", 3.0))
         # Stationary-track killer: delete a track if its bbox centre has
         # not moved more than ``stationary_max_pixels`` over the last
         # ``stationary_window`` updates (regardless of how many "matches"
@@ -345,41 +358,38 @@ class StrongSORTTracker:
                 # Apply threshold
                 cost_matrix[cost_matrix > self.max_cosine_distance] = 1e5
 
-                # Gate by Mahalanobis distance: reject matches where detection
-                # falls outside 95% confidence region of Kalman prediction.
-                # For tracks with large time_since_update, also enforce a hard
-                # pixel distance cap — their inflated covariance makes
-                # Mahalanobis gating alone ineffective.
-                gating_threshold = chi2inv95[4]  # 4-dim observation space
-                stale_age = 10  # frames without update before applying pixel cap
-                max_pixel_dist_sq = 400.0 ** 2  # hard cap for stale tracks
+                # Gate by pitch-space distance — reject matches where the
+                # detection's foot-point is more than ``pitch_gate_m`` metres
+                # from the track's last known pitch position. Aspect ratio
+                # and bbox height are NOT gated — in sports footage they
+                # vary too much per pose (e.g. a side-on player has
+                # aspect 0.32, the same player mid-run lunge has 0.72)
+                # and force-rejecting on those just orphans real
+                # detections (frame 12: tid=10 lost det_LO purely because
+                # det_LO's aspect spiked to 0.72).
+                #
+                # When calibration is unavailable (no pitch_pos on the
+                # detection or on the track), gating is skipped and
+                # matching falls back to ReID cosine alone — better an
+                # ungated match than a wrongly-rejected one.
+                pitch_gate_m_sq = (
+                    float(getattr(self, "pitch_gate_m", 3.0)) ** 2
+                )
                 for ri in range(len(valid_track_idx)):
                     t = confirmed_tracks[valid_track_idx[ri]]
-                    if t.kalman_state is None:
-                        continue
-                    is_stale = t.time_since_update > stale_age
-                    pred_cx, pred_cy = t.kalman_state.mean[0], t.kalman_state.mean[1]
+                    if t.pitch_pos is None:
+                        continue  # no track pitch anchor → can't gate
+                    tx, ty = t.pitch_pos
                     for ci in range(len(detections)):
                         if cost_matrix[ri, ci] >= 1e5:
-                            continue  # Already rejected by cosine threshold
-                        d = detections[ci]
-                        x1, y1, x2, y2 = d["bbox"]
-                        dcx = (x1 + x2) / 2
-                        dcy = (y1 + y2) / 2
-                        # Hard pixel cap for stale tracks (inflated covariance)
-                        if is_stale:
-                            pixel_dist_sq = (dcx - pred_cx) ** 2 + (dcy - pred_cy) ** 2
-                            if pixel_dist_sq > max_pixel_dist_sq:
-                                cost_matrix[ri, ci] = 1e5
-                                continue
-                        dw = x2 - x1
-                        dh = y2 - y1
-                        meas = np.array([dcx, dcy, dw / dh if dh > 0 else 1.0, dh])
-                        if self.kalman.gating_distance(t.kalman_state, meas) > gating_threshold:
+                            continue  # already rejected by cosine threshold
+                        det_pp = detections[ci].get("pitch_pos")
+                        if det_pp is None:
+                            continue  # detection lacks calibration → skip gate
+                        dx = tx - det_pp[0]
+                        dy = ty - det_pp[1]
+                        if dx * dx + dy * dy > pitch_gate_m_sq:
                             cost_matrix[ri, ci] = 1e5
-                # Debug stats (uncomment to monitor gating behavior)
-                # if gated_count and total_pairs:
-                #     self._gating_stats = (gated_count, total_pairs)
 
                 # Hungarian matching
                 if cost_matrix.size > 0:
@@ -437,6 +447,8 @@ class StrongSORTTracker:
             track.hits += 1
             track.time_since_update = 0
             self._record_center(track)
+            if det.get("pitch_pos") is not None:
+                track.pitch_pos = tuple(det["pitch_pos"])
 
             # Update appearance feature
             if embeddings is not None and det_idx < len(embeddings):
@@ -472,6 +484,8 @@ class StrongSORTTracker:
                         track.hits += 1
                         track.time_since_update = 0
                         self._record_center(track)
+                        if det.get("pitch_pos") is not None:
+                            track.pitch_pos = tuple(det["pitch_pos"])
 
                         if embeddings is not None and det_idx < len(embeddings):
                             track.update_feature(embeddings[det_idx], self.feature_alpha)
@@ -504,6 +518,8 @@ class StrongSORTTracker:
             )
             track.kalman_state = self.kalman.initiate(det["bbox"])
             self._record_center(track)
+            if det.get("pitch_pos") is not None:
+                track.pitch_pos = tuple(det["pitch_pos"])
 
             if embeddings is not None and i < len(embeddings):
                 track.update_feature(embeddings[i], self.feature_alpha)
