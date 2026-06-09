@@ -13,11 +13,10 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from scipy.optimize import linear_sum_assignment
-from scipy.spatial.distance import cdist
 
-from .gates import INF, PitchGate, apply_gates
+from .gates import PitchGate
 from .kalman import KalmanFilter
+from .matching import MatchingStage, cosine_cost, iou_cost, run_stage
 from .track import Track, TrackStatus
 
 
@@ -110,6 +109,93 @@ class StrongSORTTracker:
                     track.kalman_state, self.img_w, self.img_h
                 )
 
+    def _matching_stages(self) -> list[MatchingStage]:
+        """Build the cascaded matching pipeline for this update().
+
+        Three stages — same behaviour as the original DeepSORT cascade
+        — but expressed as data so adding/swapping a stage is local:
+
+        1. Confirmed × ReID cosine, gated by pitch distance.
+        2. Confirmed remaining × IoU (Kalman-predicted bbox).
+        3. Tentative × IoU only (no ReID, EMA isn't stable yet).
+        """
+        return [
+            MatchingStage(
+                name="confirmed-reid",
+                track_filter=lambda t: (
+                    t.status == TrackStatus.CONFIRMED
+                    and t.smooth_feature is not None
+                ),
+                cost_fn=cosine_cost,
+                gates=[PitchGate(self.pitch_gate_m)],
+                threshold=self.max_cosine_distance,
+            ),
+            MatchingStage(
+                name="confirmed-iou",
+                track_filter=lambda t: t.status == TrackStatus.CONFIRMED,
+                cost_fn=iou_cost,
+                gates=[],
+                threshold=self.max_iou_distance,
+            ),
+            MatchingStage(
+                name="tentative-iou",
+                track_filter=lambda t: t.status == TrackStatus.TENTATIVE,
+                cost_fn=iou_cost,
+                gates=[],
+                threshold=self.max_iou_distance,
+            ),
+        ]
+
+    def _apply_match(
+        self,
+        track: Track,
+        det_idx: int,
+        detections: list[dict[str, Any]],
+        embeddings: np.ndarray | None,
+    ) -> None:
+        """Apply a (track, detection) match: Kalman update, feature
+        EMA, pitch_pos refresh, hits++ and tentative-promotion."""
+        det = detections[det_idx]
+        track.kalman_state = self.kalman.update(track.kalman_state, det["bbox"])
+        track.bbox = det["bbox"]
+        track.confidence = det.get("confidence", 1.0)
+        track.hits += 1
+        track.time_since_update = 0
+        self._record_center(track)
+        if det.get("pitch_pos") is not None:
+            track.pitch_pos = tuple(det["pitch_pos"])
+        if embeddings is not None and det_idx < len(embeddings):
+            track.update_feature(embeddings[det_idx], self.feature_alpha)
+        if (
+            track.status == TrackStatus.TENTATIVE
+            and track.hits >= self.n_init
+        ):
+            track.status = TrackStatus.CONFIRMED
+
+    def _spawn_track(
+        self,
+        det: dict[str, Any],
+        det_idx: int,
+        embeddings: np.ndarray | None,
+    ) -> Track:
+        """Create a fresh TENTATIVE track from an unmatched detection."""
+        track = Track(
+            track_id=self.next_id,
+            status=TrackStatus.TENTATIVE,
+            bbox=det["bbox"],
+            confidence=det.get("confidence", 1.0),
+            class_id=det.get("class", 0),
+        )
+        track.kalman_state = self.kalman.initiate(det["bbox"])
+        self._record_center(track)
+        if det.get("pitch_pos") is not None:
+            track.pitch_pos = tuple(det["pitch_pos"])
+        if embeddings is not None and det_idx < len(embeddings):
+            track.update_feature(embeddings[det_idx], self.feature_alpha)
+        self.tracks.append(track)
+        self.next_id += 1
+        return track
+
     def update(
         self,
         detections: list[dict[str, Any]],
@@ -117,99 +203,23 @@ class StrongSORTTracker:
     ) -> list[dict[str, Any]]:
         """Update tracker with new detections.
 
-        Args:
-            detections: List of detection dicts with 'bbox', 'confidence', etc.
-            embeddings: ReID embeddings for each detection, shape (N, D).
-
-        Returns:
-            List of confirmed tracks with track_id, bbox, etc.
+        Pipeline:
+          1. Kalman predict for all tracks.
+          2. Run cascaded matching stages, applying each match before
+             the next stage so later stages see updated state. (The
+             original DeepSORT cascade applied step-1+step-2 matches
+             together then ran step-3 separately; for behavioural
+             parity we apply each stage's matches before moving on.)
+          3. Spawn TENTATIVE tracks for still-unmatched detections.
+          4. Tick age / time_since_update on tracks that didn't get a
+             measurement; cleanup pass deletes stale + ghost tracks.
+          5. Emit one dict per non-coasting track.
         """
-        # Predict existing tracks
         self.predict()
 
-        # Split tracks by status
-        confirmed_tracks = [t for t in self.tracks if t.status == TrackStatus.CONFIRMED]
-        tentative_tracks = [t for t in self.tracks if t.status == TrackStatus.TENTATIVE]
-
-        # Cascaded matching
-        # Step 1: Match confirmed tracks using appearance (ReID)
-        unmatched_tracks_idx = list(range(len(confirmed_tracks)))
-        unmatched_detections_idx = list(range(len(detections)))
-        matches = []
-
-        if embeddings is not None and len(confirmed_tracks) > 0 and len(detections) > 0:
-            # Get track features
-            track_features = []
-            valid_track_idx = []
-            for i, track in enumerate(confirmed_tracks):
-                if track.smooth_feature is not None:
-                    track_features.append(track.smooth_feature)
-                    valid_track_idx.append(i)
-
-            if track_features and len(embeddings) > 0:
-                track_features = np.array(track_features)
-
-                # Compute cosine distance
-                cost_matrix = cdist(track_features, embeddings, metric='cosine')
-
-                # Cosine threshold gate (any pair worse than this is
-                # implausible regardless of geometry).
-                cost_matrix[cost_matrix > self.max_cosine_distance] = INF
-
-                # Pitch-space distance gate — reject matches where the
-                # detection's foot-point is more than ``pitch_gate_m``
-                # metres from the track's last known pitch position.
-                # Aspect ratio and bbox height are NOT gated; in sports
-                # footage they swing too much per pose (a side-on
-                # player has aspect 0.32, the same player mid-run lunge
-                # has 0.72), and force-rejecting on those just orphans
-                # real detections.
-                gate_tracks = [confirmed_tracks[i] for i in valid_track_idx]
-                apply_gates(
-                    cost_matrix,
-                    gates=[PitchGate(self.pitch_gate_m)],
-                    tracks=gate_tracks,
-                    detections=detections,
-                    embeddings=embeddings,
-                )
-
-                # Hungarian matching
-                if cost_matrix.size > 0:
-                    row_indices, col_indices = linear_sum_assignment(cost_matrix)
-
-                    for row, col in zip(row_indices, col_indices):
-                        if cost_matrix[row, col] < self.max_cosine_distance:
-                            track_idx = valid_track_idx[row]
-                            matches.append((track_idx, col))
-                            if track_idx in unmatched_tracks_idx:
-                                unmatched_tracks_idx.remove(track_idx)
-                            if col in unmatched_detections_idx:
-                                unmatched_detections_idx.remove(col)
-
-        # Step 2: Match remaining tracks using IoU
-        if unmatched_tracks_idx and unmatched_detections_idx:
-            remaining_tracks = [confirmed_tracks[i] for i in unmatched_tracks_idx]
-            remaining_dets = [detections[i] for i in unmatched_detections_idx]
-
-            # Compute IoU matrix
-            iou_matrix = self._compute_iou_matrix(remaining_tracks, remaining_dets)
-
-            # Convert to cost (1 - IoU)
-            cost_matrix = 1 - iou_matrix
-            cost_matrix[cost_matrix > self.max_iou_distance] = INF
-
-            if cost_matrix.size > 0:
-                row_indices, col_indices = linear_sum_assignment(cost_matrix)
-
-                for row, col in zip(row_indices, col_indices):
-                    if cost_matrix[row, col] < self.max_iou_distance:
-                        track_idx = unmatched_tracks_idx[row]
-                        det_idx = unmatched_detections_idx[col]
-                        matches.append((track_idx, det_idx))
-
-        # Update matched tracks
-        matched_track_indices = set()
-        matched_det_indices = set()
+        # ---- Match ---------------------------------------------------
+        unmatched_track_ids: set[int] = {id(t) for t in self.tracks}
+        unmatched_det_idx: set[int] = set(range(len(detections)))
         # Tracks that received a real detection update this frame —
         # used at end-of-update so the time_since_update bump only
         # applies to truly unmatched tracks. Without this, tentative
@@ -218,96 +228,47 @@ class StrongSORTTracker:
         # them, hiding the first n_init frames of every track.
         updated_this_frame: set[int] = set()
 
-        for track_idx, det_idx in matches:
-            track = confirmed_tracks[track_idx]
-            det = detections[det_idx]
-
-            # Update Kalman state
-            track.kalman_state = self.kalman.update(track.kalman_state, det["bbox"])
-            track.bbox = det["bbox"]
-            track.confidence = det.get("confidence", 1.0)
-            track.hits += 1
-            track.time_since_update = 0
-            self._record_center(track)
-            if det.get("pitch_pos") is not None:
-                track.pitch_pos = tuple(det["pitch_pos"])
-
-            # Update appearance feature
-            if embeddings is not None and det_idx < len(embeddings):
-                track.update_feature(embeddings[det_idx], self.feature_alpha)
-
-            matched_track_indices.add(track_idx)
-            matched_det_indices.add(det_idx)
+        stages = self._matching_stages()
+        # Apply confirmed stages together (step 1 + step 2 in the
+        # original cascade collected matches then applied as a batch);
+        # apply tentative stages immediately after their match. This
+        # matches the original ordering bit-for-bit.
+        confirmed_matches: list[tuple[Track, int]] = []
+        for stage in stages:
+            stage_matches = run_stage(
+                stage, self.tracks, detections, embeddings,
+                unmatched_track_ids, unmatched_det_idx,
+            )
+            if stage.name.startswith("confirmed-"):
+                confirmed_matches.extend(stage_matches)
+            else:
+                # Apply confirmed matches before the tentative stage so
+                # spawn() decisions match the original ordering.
+                for track, det_idx in confirmed_matches:
+                    self._apply_match(track, det_idx, detections, embeddings)
+                    updated_this_frame.add(id(track))
+                confirmed_matches = []
+                for track, det_idx in stage_matches:
+                    self._apply_match(track, det_idx, detections, embeddings)
+                    updated_this_frame.add(id(track))
+        # Any leftover confirmed matches (no tentative stage ran).
+        for track, det_idx in confirmed_matches:
+            self._apply_match(track, det_idx, detections, embeddings)
             updated_this_frame.add(id(track))
 
-        # Step 3: Match tentative tracks using IoU only
-        unmatched_det_after_confirmed = [
-            i for i in range(len(detections)) if i not in matched_det_indices
-        ]
-
-        if tentative_tracks and unmatched_det_after_confirmed:
-            remaining_dets = [detections[i] for i in unmatched_det_after_confirmed]
-            iou_matrix = self._compute_iou_matrix(tentative_tracks, remaining_dets)
-            cost_matrix = 1 - iou_matrix
-            cost_matrix[cost_matrix > self.max_iou_distance] = INF
-
-            if cost_matrix.size > 0:
-                row_indices, col_indices = linear_sum_assignment(cost_matrix)
-
-                for row, col in zip(row_indices, col_indices):
-                    if cost_matrix[row, col] < self.max_iou_distance:
-                        track = tentative_tracks[row]
-                        det_idx = unmatched_det_after_confirmed[col]
-                        det = detections[det_idx]
-
-                        track.kalman_state = self.kalman.update(track.kalman_state, det["bbox"])
-                        track.bbox = det["bbox"]
-                        track.confidence = det.get("confidence", 1.0)
-                        track.hits += 1
-                        track.time_since_update = 0
-                        self._record_center(track)
-                        if det.get("pitch_pos") is not None:
-                            track.pitch_pos = tuple(det["pitch_pos"])
-
-                        if embeddings is not None and det_idx < len(embeddings):
-                            track.update_feature(embeddings[det_idx], self.feature_alpha)
-
-                        # Promote to confirmed if enough hits
-                        if track.hits >= self.n_init:
-                            track.status = TrackStatus.CONFIRMED
-
-                        matched_det_indices.add(det_idx)
-                        updated_this_frame.add(id(track))
-
-        # Create new tracks for unmatched detections — but suppress any
-        # detection landing inside a kill-zone left behind by the
-        # stationary-track killer.
-        for i in range(len(detections)):
-            if i in matched_det_indices:
-                continue
+        # ---- Spawn new tracks for unmatched detections --------------
+        # Suppress any detection landing inside a kill-zone left behind
+        # by the stationary-track killer (a persistent YOLO false-
+        # positive can't immediately respawn the ghost as a fresh
+        # track).
+        for i in sorted(unmatched_det_idx):
             det = detections[i]
             x1, y1, x2, y2 = det["bbox"]
             dcx = (x1 + x2) / 2.0
             dcy = (y1 + y2) / 2.0
             if self._in_kill_zone(dcx, dcy):
                 continue
-            track = Track(
-                track_id=self.next_id,
-                status=TrackStatus.TENTATIVE,
-                bbox=det["bbox"],
-                confidence=det.get("confidence", 1.0),
-                class_id=det.get("class", 0),
-            )
-            track.kalman_state = self.kalman.initiate(det["bbox"])
-            self._record_center(track)
-            if det.get("pitch_pos") is not None:
-                track.pitch_pos = tuple(det["pitch_pos"])
-
-            if embeddings is not None and i < len(embeddings):
-                track.update_feature(embeddings[i], self.feature_alpha)
-
-            self.tracks.append(track)
-            self.next_id += 1
+            track = self._spawn_track(det, i, embeddings)
             updated_this_frame.add(id(track))
 
         # Update unmatched tracks — bump time_since_update only on
@@ -411,41 +372,6 @@ class StrongSORTTracker:
         track.center_history.append((cx, cy))
         if len(track.center_history) > self.stationary_window:
             del track.center_history[: -self.stationary_window]
-
-    def _compute_iou_matrix(
-        self,
-        tracks: list[Track],
-        detections: list[dict],
-    ) -> np.ndarray:
-        """Compute IoU matrix between tracks and detections."""
-        if not tracks or not detections:
-            return np.array([])
-
-        n_tracks = len(tracks)
-        n_dets = len(detections)
-        iou_matrix = np.zeros((n_tracks, n_dets))
-
-        for i, track in enumerate(tracks):
-            for j, det in enumerate(detections):
-                iou_matrix[i, j] = self._iou(track.bbox, det["bbox"])
-
-        return iou_matrix
-
-    def _iou(self, box1: list, box2: list) -> float:
-        """Compute IoU between two boxes."""
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
-
-        inter = max(0, x2 - x1) * max(0, y2 - y1)
-
-        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-
-        union = area1 + area2 - inter
-
-        return inter / union if union > 0 else 0
 
     def get_track_features(self) -> dict[int, np.ndarray]:
         """Get mean features for all confirmed tracks."""
