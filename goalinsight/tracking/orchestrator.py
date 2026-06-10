@@ -56,6 +56,11 @@ from .ball_pipeline import (
     _select_best_trajectory,
     _render_ball_detection_diag,
 )
+from .yolo_raw import (
+    YoloRawRecord,
+    dump_yolo_raw_json,
+    render_yolo_raw_diag,
+)
 from .tracking_visualization import (
     TEAM_COLORS,
     get_color_for_track,
@@ -263,7 +268,9 @@ def run_tracking(
         tracker = StrongSORTTracker({
             "max_age": tracking_cfg.get("max_age", 50),
             "n_init": tracking_cfg.get("min_hits", 3),
-            "max_iou_distance": 0.7,
+            "max_iou_distance": tracking_cfg.get("max_iou_distance", 0.7),
+            "max_iou_distance_tentative": tracking_cfg.get(
+                "max_iou_distance_tentative", 0.55),
             "max_cosine_distance": 0.3,  # Tighter cosine distance
             "feature_alpha": 0.9,
             "frame_interval": frame_interval,
@@ -359,6 +366,12 @@ def run_tracking(
     # === Detection: unified (fused) or legacy (separate) ===
     all_ball_detections: dict[int, list] = {}
     two_pass_enabled = ball_config.get("two_pass", False) and ball_detector is not None
+    # Per-frame raw YOLO snapshots (raw/post_conf/post_size/post_pitch + balls).
+    # Populated at two hook points: fused detection pass (raw + post_conf
+    # + balls) and the filter loop (post_size + post_pitch). Empty when
+    # the config flag is off so the dict stays cheap.
+    yolo_raw_dump_enabled = bool(tracking_cfg.get("dump_yolo_raw", True))
+    yolo_raw_records: dict[int, YoloRawRecord] = {}
     import queue as _queue
 
     # Helper for ball pass 2 crop+enlarge (used by both unified and legacy paths)
@@ -437,9 +450,23 @@ def run_tracking(
             for i, fidx in enumerate(batch_fidxs):
                 players, balls = UnifiedDetector.split_by_class(batch_all_dets[i])
 
+                # Snapshot raw YOLO output before any filter, plus the
+                # ball channel here (the only place we have the unified
+                # split). Frame size also recorded once so the visualiser
+                # has correct image dims even on frames we never tracked.
+                if yolo_raw_dump_enabled:
+                    rec = yolo_raw_records.setdefault(fidx, YoloRawRecord(frame_index=fidx))
+                    fr = batch_frames[i]
+                    rec.image_size = (fr.shape[1], fr.shape[0])
+                    rec.players_raw = list(players)
+                    rec.balls_raw = list(balls)
+
                 # Player pipeline: apply conf threshold post-hoc
                 players = [d for d in players if d["confidence"] >= player_conf_thresh]
                 _precomputed_dets[fidx] = players
+
+                if yolo_raw_dump_enabled:
+                    yolo_raw_records[fidx].players_post_conf = list(players)
 
                 # Ball pipeline: apply size filter
                 if ball_detector is not None:
@@ -661,10 +688,26 @@ def run_tracking(
                 raw_dets = _batch_dets_list[_i]
 
             # Filter detections by size and pitch
+            # Capture post_size + post_pitch into the raw-YOLO snapshot.
+            # The legacy path skips the fused-pass hook above, so seed
+            # the record here too with raw_dets + frame size if needed.
+            if yolo_raw_dump_enabled:
+                rec = yolo_raw_records.setdefault(
+                    _fidx, YoloRawRecord(frame_index=_fidx))
+                if not rec.players_raw:
+                    rec.players_raw = list(raw_dets)
+                if rec.image_size == (0, 0):
+                    rec.image_size = (_frame.shape[1], _frame.shape[0])
+                if not rec.players_post_conf:
+                    rec.players_post_conf = list(raw_dets)
+
             detections = detector.filter_by_size(
                 raw_dets, min_height=25, max_height=350,
                 min_aspect_ratio=0.25, max_aspect_ratio=1.0,
             )
+            if yolo_raw_dump_enabled:
+                yolo_raw_records[_fidx].players_post_size = list(detections)
+
             _H_world2img = homographies.get(_fidx)
             _H_inv = None
             if _H_world2img is not None:
@@ -678,8 +721,14 @@ def run_tracking(
                     pitch_half_length=pitch_half_length,
                     pitch_half_width=pitch_half_width,
                 )
+                if yolo_raw_dump_enabled:
+                    yolo_raw_records[_fidx].has_camera_pose = True
             elif _H_inv is not None:
                 detections = detector.filter_by_pitch(detections, _H_inv, margin=5.0)
+                if yolo_raw_dump_enabled:
+                    yolo_raw_records[_fidx].has_camera_pose = True
+            if yolo_raw_dump_enabled:
+                yolo_raw_records[_fidx].players_post_pitch = list(detections)
             _filtered_dets[_fidx] = detections
 
             # Extract ReID crops from each detection (color/jersey features
@@ -1135,6 +1184,52 @@ def run_tracking(
 
     # Free ball processing intermediates before rendering
     del ball_track_histories, all_ball_track_candidates, all_ball_dets_diag
+
+    # Dump raw YOLO snapshots + render diagnostic frames. Annotates each
+    # snapshot detection with its foot-projected pitch_position when a
+    # camera pose is available so the JSON viewer doesn't have to redo
+    # the projection. Skipped when the config flag is off — the records
+    # dict will be empty in that case.
+    if yolo_raw_dump_enabled and yolo_raw_records:
+        for fidx, rec in yolo_raw_records.items():
+            pose = camera_poses.get(fidx)
+            if pose is None:
+                continue
+            for stage_dets in (rec.players_raw, rec.players_post_conf,
+                               rec.players_post_size, rec.players_post_pitch,
+                               rec.balls_raw):
+                for d in stage_dets:
+                    if d.get("pitch_position") is not None:
+                        continue
+                    bb = d["bbox"]
+                    foot = np.array([[(bb[0] + bb[2]) / 2.0, bb[3]]])
+                    pp = _undistort_and_project_to_pitch(foot, pose)
+                    if pp is not None:
+                        d["pitch_position"] = pp
+        dump_yolo_raw_json(
+            yolo_raw_records, output_dir,
+            extra_summary={
+                "video": str(video_path),
+                "sample_stride": int(
+                    (config.get("sample") or {}).get("stride", 1)),
+                "player_confidence_threshold": float(
+                    (config.get("unified_detection") or {}).get(
+                        "player_confidence_threshold",
+                        config.get("detection", {}).get(
+                            "confidence_threshold", 0.5),
+                    )
+                ),
+                "pitch_half_length": float(pitch_half_length),
+                "pitch_half_width": float(pitch_half_width),
+            },
+        )
+        if config.get("output", {}).get("save_visualizations", True):
+            render_yolo_raw_diag(
+                video_path, yolo_raw_records, output_dir,
+            )
+        logger.info(
+            f"  Raw YOLO dump: {len(yolo_raw_records)} frames → "
+            f"{output_dir}/yolo_raw/")
 
     # Team / role / jersey classification and off-field filtering have
     # all moved to the track_consolidation stage.

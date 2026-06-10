@@ -45,7 +45,14 @@ class StrongSORTTracker:
             config: Tracker configuration with keys:
                 - max_age: Max frames to keep unmatched track (default: 30)
                 - n_init: Min hits to confirm track (default: 3)
-                - max_iou_distance: Max IoU distance for matching (default: 0.7)
+                - max_iou_distance: Max IoU distance for confirmed-stage matching (default: 0.7)
+                - max_iou_distance_tentative: Max IoU distance for tentative-stage matching
+                  (default: falls back to max_iou_distance). Tighter than the confirmed
+                  threshold so the tentative-iou stage doesn't lock a freshly-spawned
+                  track to a high-IoU-but-physically-distant detection (the perspective
+                  failure mode that produced the frame-375 67/69 swap). When IoU is
+                  rejected the next stage (tentative-pitch, gated at pitch_gate_m)
+                  picks up the slack.
                 - max_cosine_distance: Max cosine distance for ReID (default: 0.3)
                 - feature_alpha: EMA alpha for feature smoothing (default: 0.9)
                 - pitch_gate_m: Max pitch-space distance gate in metres (default: 3.0)
@@ -54,6 +61,9 @@ class StrongSORTTracker:
         config = config or {}
         self.n_init = config.get("n_init", 3)
         self.max_iou_distance = config.get("max_iou_distance", 0.7)
+        self.max_iou_distance_tentative = config.get(
+            "max_iou_distance_tentative", self.max_iou_distance,
+        )
         self.max_cosine_distance = config.get("max_cosine_distance", 0.3)
         self.feature_alpha = config.get("feature_alpha", 0.9)
         # Pitch-space gating threshold (metres). At process_fps=10 a
@@ -152,7 +162,7 @@ class StrongSORTTracker:
                 track_filter=lambda t: t.status == TrackStatus.TENTATIVE,
                 cost_fn=iou_cost,
                 gates=[],
-                threshold=self.max_iou_distance,
+                threshold=self.max_iou_distance_tentative,
             ),
             MatchingStage(
                 name="tentative-pitch",

@@ -162,6 +162,20 @@ tracking:
   max_age: 30             # Max frames to keep lost tracks
   min_hits: 3             # Min detections before track is confirmed
   iou_threshold: 0.3
+  # IoU thresholds for the cascaded matcher (1 - IoU; higher = more permissive).
+  # Confirmed-stage stays loose so a one-frame ReID hiccup falls back to bbox
+  # geometry. Tentative-stage is tighter: a freshly-spawned track has no
+  # appearance history, so a high-IoU-but-physically-distant detection (the
+  # perspective failure where ~70 px vertical drift on a far player has IoU
+  # ≈ 0.4 yet pitch distance ≈ 3 m) was stealing the wrong identity. Reject
+  # via IoU here and let tentative-pitch (4 m gate) re-attach.
+  max_iou_distance: 0.7
+  max_iou_distance_tentative: 0.55
+  # Dump raw YOLO detections (per-frame JSON + annotated diagnostic JPGs)
+  # under <output>/yolo_raw/ so dropouts at conf/size/pitch filters can be
+  # inspected offline. Set false to skip — JSON is cheap, the JPG render
+  # adds ~25s/200-frame clip and is gated by output.save_visualizations.
+  dump_yolo_raw: true
   # Ghost-track killer: delete a track whose bbox centre has not moved
   # more than `stationary_max_pixels` over the last `stationary_window`
   # tracking-frame updates.  Targets the "YOLO false-positive on a
