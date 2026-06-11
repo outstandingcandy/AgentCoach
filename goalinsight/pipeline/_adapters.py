@@ -225,7 +225,15 @@ class TrackConsolidationStage(Stage):
         from ..track_consolidation import run_track_consolidation
 
         out = ctx.stage_dir(self.name)
-        config = ctx.config.get("track_consolidation", {}) if ctx.config else {}
+        config = dict(ctx.config.get("track_consolidation", {}) if ctx.config else {})
+        # Surface the pipeline-wide processing rate so consolidation can
+        # scale its frame-count thresholds (min_track_frames etc.) the
+        # same way tracking/orchestrator.py does. None means "no scaling".
+        if ctx.config:
+            video_cfg = ctx.config.get("video", {}) or {}
+            pf = video_cfg.get("tracking_fps") or video_cfg.get("process_fps")
+            if pf:
+                config.setdefault("_process_fps", pf)
         result = run_track_consolidation(
             output_dir=out,
             pipeline_output_dir=ctx.output_dir,

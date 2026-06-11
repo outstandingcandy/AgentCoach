@@ -249,13 +249,21 @@ def run_tracking(
     # BoT-SORT, useful on panning amateur footage).
     effective_fps = process_fps if process_fps and process_fps < fps else fps
     frame_interval = fps / effective_fps if effective_fps > 0 else 1.0
+    # Scale fps-sensitive defaults to the actual sampling rate. The hand-tuned
+    # values were chosen at process_fps=10; at other rates a fixed sample
+    # count or fixed per-sample displacement silently changes meaning.
+    #   *_count_default ∝ effective_fps / 10  (durations in samples)
+    #   *_step_default  ∝ 10 / effective_fps  (per-sample motion budget)
+    _ref_fps = 10.0
+    _fps_scale = (effective_fps / _ref_fps) if effective_fps > 0 else 1.0
+    _inv_fps_scale = 1.0 / _fps_scale
     tracking_cfg = config.get("tracking", {}) if config else {}
     tracker_backend = str(tracking_cfg.get("backend", "strongsort")).lower()
     if tracker_backend == "botsort":
         logger.info("Stage 2: Initializing BoT-SORT tracker...")
         bot_cfg = tracking_cfg.get("botsort", {})
         tracker = BoTSORTTracker({
-            "max_age": tracking_cfg.get("max_age", 50),
+            "max_age": tracking_cfg.get("max_age", int(round(50 * _fps_scale))),
             "max_cosine_distance": 0.3,
             "feature_alpha": 0.9,
             "frame_rate": int(round(effective_fps or fps or 30)),
@@ -266,7 +274,7 @@ def run_tracking(
         # Frame interval: native_fps / process_fps (e.g., 30/10 = 3.0)
         # Scales Kalman noise so gating works correctly at lower fps
         tracker = StrongSORTTracker({
-            "max_age": tracking_cfg.get("max_age", 50),
+            "max_age": tracking_cfg.get("max_age", int(round(50 * _fps_scale))),
             "n_init": tracking_cfg.get("min_hits", 3),
             "max_iou_distance": tracking_cfg.get("max_iou_distance", 0.7),
             "max_iou_distance_tentative": tracking_cfg.get(
@@ -274,9 +282,14 @@ def run_tracking(
             "max_cosine_distance": 0.3,  # Tighter cosine distance
             "feature_alpha": 0.9,
             "frame_interval": frame_interval,
-            "stationary_window": tracking_cfg.get("stationary_window", 30),
+            "pitch_gate_m": tracking_cfg.get(
+                "pitch_gate_m", 4.0 * _inv_fps_scale),
+            "stationary_window": tracking_cfg.get(
+                "stationary_window", int(round(30 * _fps_scale))),
             "stationary_max_pixels": tracking_cfg.get(
                 "stationary_max_pixels", 5.0),
+            "stationary_zone_ttl": tracking_cfg.get(
+                "stationary_zone_ttl", int(round(300 * _fps_scale))),
         })
     tracker.img_w = width
     tracker.img_h = height
@@ -319,6 +332,12 @@ def run_tracking(
         traj3d_config = ball_tracking_config.get("trajectory_3d", {})
         traj3d_config["pitch_half_length"] = pitch_length / 2
         traj3d_config["pitch_half_width"] = pitch_width / 2
+        # Kick detection uses Δv between consecutive *processed* samples;
+        # a fixed pixel threshold tuned at process_fps=10 gets too eager
+        # at lower rates (each sample covers more physical motion). Scale
+        # the default by 10/effective_fps so it tracks per-second accel.
+        traj3d_config.setdefault(
+            "kick_accel_threshold", 50.0 * _inv_fps_scale)
         if traj3d_config.get("enabled", True):
             ball_trajectory_3d = BallTrajectory3D(traj3d_config)
 
