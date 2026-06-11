@@ -1,20 +1,16 @@
-"""FastAPI app: video playback + LLM chat over a single pipeline run.
+"""FastAPI app: unified GoalInsight workspace product.
 
-Two factories live here:
-
-- ``create_app(run_dir, video_path)`` — single-run viewer used by
-  ``scripts/run_web_viewer.py`` (kept intact for backwards compatibility).
-- ``create_workspace_app(workspace_dir)`` — unified product that hosts the
-  viewer, annotator, pipeline console, and library against a workspace
-  directory (see ``_workspace.Workspace``). The annotator routes, library
-  endpoints, jobs API, and analytics endpoints are attached by their own
-  modules so this file stays a thin assembler.
+Single factory: ``create_workspace_app(workspace_dir)`` hosts the
+viewer, annotator, pipeline console, library, and tracking diagnostics
+against a workspace directory (see ``_workspace.Workspace``). The
+annotator routes, library endpoints, jobs API, analytics endpoints,
+tracking-diag, and pipeline-results route packs are attached by their
+own modules so this file stays a thin assembler.
 """
 
 from __future__ import annotations
 
 import logging
-import shutil
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -26,21 +22,21 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from ..highlights._context import MatchContext
 from ._runs import CHAT_ARTIFACTS_URL as RUNS_ARTIFACTS_URL, RunRegistry
 from ._workspace import Workspace, resolve_workspace
 from .analytics import register_analytics_routes
-from .chat import ChatEngine
 from .jobs import JobManager, register_jobs_routes
 from .library import register_library_routes
+from .pipeline_results import register_pipeline_results_routes
+from .tracking_diag import register_tracking_diag_routes
 
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 # Plots / images that run_python emits are stored here and mounted at
-# /chat_artifacts/* so the chat UI can render them inline. Cleared on
-# app start so old artifacts from a previous viewer session don't
-# silently shadow new ones with the same name.
+# /chat_artifacts/<run>/* so the chat UI can render them inline. Each
+# RunHandle clears its own subdir on creation so old artifacts from a
+# previous run don't silently shadow new ones with the same name.
 CHAT_ARTIFACTS_URL = "/chat_artifacts"
 
 
@@ -52,115 +48,6 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
     current_time: float = 0.0
-
-
-def create_app(run_dir: Path, video_path: Path | None = None) -> FastAPI:
-    run_dir = Path(run_dir).resolve()
-    if video_path is not None:
-        video_path = Path(video_path).resolve()
-        if not video_path.exists():
-            raise FileNotFoundError(f"video not found: {video_path}")
-    else:
-        # Prefer the web-optimized re-encode (small GOP + faststart) when
-        # present so seeks/scrubbing are responsive over slow links.
-        video_dir = run_dir / "annotated_video"
-        web_path = video_dir / "annotated_web.mp4"
-        full_path = video_dir / "annotated.mp4"
-        if web_path.exists():
-            video_path = web_path
-        elif full_path.exists():
-            video_path = full_path
-        else:
-            raise FileNotFoundError(f"annotated video not found: {full_path}")
-
-    ctx = MatchContext.from_output_dir(run_dir)
-
-    artifact_dir = run_dir / "chat_artifacts"
-    if artifact_dir.exists():
-        shutil.rmtree(artifact_dir)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-
-    engine = ChatEngine(
-        ctx=ctx,
-        artifact_dir=artifact_dir,
-        artifact_url_prefix=CHAT_ARTIFACTS_URL,
-    )
-
-    app = FastAPI(title="GoalInsight Viewer")
-
-    @app.on_event("shutdown")
-    def _shutdown() -> None:
-        engine.close()
-
-    @app.get("/")
-    def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
-
-    @app.get("/video")
-    def video() -> FileResponse:
-        # FileResponse handles HTTP range requests automatically, so the
-        # <video> element can seek.
-        return FileResponse(video_path, media_type="video/mp4")
-
-    @app.get("/api/meta")
-    def meta() -> JSONResponse:
-        teams = Counter(ctx.team_assignments.values())
-        event_types = Counter(e.get("type", "unknown") for e in ctx.events)
-        return JSONResponse({
-            "video_name": ctx.video_path.name,
-            "fps": ctx.fps,
-            "frame_count": ctx.frame_count,
-            "duration_s": ctx.frame_count / ctx.fps if ctx.fps else 0.0,
-            "width": ctx.width,
-            "height": ctx.height,
-            "pitch_length": ctx.pitch_length,
-            "pitch_width": ctx.pitch_width,
-            "teams": dict(teams),
-            "event_counts": dict(event_types),
-        })
-
-    @app.post("/api/chat")
-    def chat(req: ChatRequest) -> dict[str, Any]:
-        try:
-            text = engine.respond(
-                [m.model_dump() for m in req.messages],
-                req.current_time,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("chat failed")
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        return {"text": text}
-
-    @app.post("/api/chat/stream")
-    def chat_stream(req: ChatRequest) -> StreamingResponse:
-        messages = [m.model_dump() for m in req.messages]
-        current_time = req.current_time
-
-        def event_source():
-            try:
-                for delta in engine.stream(messages, current_time):
-                    yield f"data: {json.dumps({'delta': delta})}\n\n"
-                yield "data: {\"done\": true}\n\n"
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("chat stream failed")
-                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
-
-        return StreamingResponse(
-            event_source(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-    app.mount(
-        CHAT_ARTIFACTS_URL,
-        StaticFiles(directory=artifact_dir),
-        name="chat_artifacts",
-    )
-    return app
 
 
 # ---------------------------------------------------------------------------
@@ -266,11 +153,25 @@ def create_workspace_app(
             path = STATIC_DIR / "index.html"
         return FileResponse(path, headers=no_cache)
 
+    @app.get("/tracking/{run_name}")
+    def tracking_diag_page(run_name: str) -> FileResponse:
+        # Tracking-diagnostics page: client reads run_name from URL and
+        # calls /api/runs/{run_name}/tracking/diag/* (registered below).
+        path = STATIC_DIR / "tracking.html"
+        if not path.exists():
+            raise HTTPException(503, "tracking.html not yet installed")
+        return FileResponse(path, headers=no_cache)
+
     # Per-run viewer state. ChatEngine boot is expensive (boto3 + Bedrock +
     # MatchContext load); the registry keeps a small LRU of warm runs.
     runs = RunRegistry(ws)
     app.state.runs = runs
     register_analytics_routes(app, runs)
+    # Read-only YOLO-raw + track_audit endpoints back the
+    # /tracking/{run_name} diagnostics page.
+    register_tracking_diag_routes(app, ws)
+    # Per-stage manifest endpoints used by the /pipeline page right pane.
+    register_pipeline_results_routes(app, ws)
 
     @app.on_event("shutdown")
     def _shutdown_runs() -> None:
@@ -354,6 +255,14 @@ def create_workspace_app(
         RUNS_ARTIFACTS_URL,
         StaticFiles(directory=runs.artifacts_root),
         name="chat_artifacts",
+    )
+    # Read-only direct access to every file inside a run dir, used by the
+    # /pipeline page to display per-stage vis JPGs / mp4s. Path layout
+    # mirrors the on-disk one: /runs_static/<run>/<stage>/...
+    app.mount(
+        "/runs_static",
+        StaticFiles(directory=ws.runs_dir),
+        name="runs_static",
     )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

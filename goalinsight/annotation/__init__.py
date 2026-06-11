@@ -35,12 +35,6 @@ def __getattr__(name: str):
     if name == "AnchorAnnotator":
         from .ui import AnchorAnnotator
         return AnchorAnnotator
-    if name == "create_app":
-        from .web import create_app
-        return create_app
-    if name == "run_server":
-        from .web import run_server
-        return run_server
     # PITCH_LINES is mutable (set_active_pitch); read at access time.
     if name == "PITCH_LINES":
         return pitch_constants.PITCH_LINES

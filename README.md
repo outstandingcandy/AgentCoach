@@ -249,9 +249,16 @@ A 10-minute clip costs ~$0.10 wall-clock-equivalent. Full notes in [`sagemaker/R
 ## Web viewer + chat
 
 ```bash
-python scripts/run_web_viewer.py --run-dir output/<your-run>
-# default: http://127.0.0.1:8765/
+python -m goalinsight.web --workspace ./workspace
+# default: http://127.0.0.1:8000/
 ```
+
+A unified workspace UI: pipeline launcher (`/pipeline`), per-stage results
+viewer, single-run video viewer + chat (`/insights/<run>`), tracking
+diagnostics (`/tracking/<run>`), pitch annotator (`/annotate`), and a
+library of videos / runs (`/library`). Runs live under
+`<workspace>/runs/<run-name>/`; videos under `<workspace>/videos/`. Use
+symlinks to point an existing `output/` tree at `<workspace>/runs`.
 
 The viewer streams the match video alongside a Bedrock-backed chat. The model has five tools:
 
@@ -284,7 +291,7 @@ goalinsight/
   utils/, interfaces/        # factories + ABCs
 configs/                     # default + per-clip + camera profiles
 sagemaker/                   # setup, build, weights upload, entrypoint
-scripts/                     # run_full_pipeline, run_web_viewer, pipeline.sh, ...
+scripts/                     # run_full_pipeline, pipeline.sh, audit/dump tools, ...
 tools/                       # make_comparison.py and other utilities
 docs/                        # architecture diagrams (draw.io)
 ```
@@ -301,7 +308,6 @@ docs/                        # architecture diagrams (draw.io)
 # Run individual diagnostic / experimentation scripts
 python scripts/run_full_pipeline.py [same flags as goalinsight]
 python scripts/run_highlights.py --run-dir output/<run>
-python scripts/run_annotator.py --frames-dir <frames>   # pitch keypoint annotator
 
 # Per-backend quick run scripts
 bash scripts/pipeline.sh             # PnLCalib finetuned
@@ -318,7 +324,7 @@ There is no formal test suite. Test/debug scripts at the repo root use the `test
 
 This is a single-user research tool. The defaults are safe; the configurable footguns are documented:
 
-- **`scripts/run_web_viewer.py` and `scripts/run_annotator.py` bind to `127.0.0.1` and ship without authentication.** They are intended for local single-user use. If you pass `--host 0.0.0.0` to expose them on a network, add your own authentication layer (nginx + basic auth, SSH port-forwarding, etc.).
+- **`python -m goalinsight.web` binds to `127.0.0.1` and ships without authentication.** Intended for local single-user use. If you pass `--host 0.0.0.0` to expose it on a network, add your own authentication layer (nginx + basic auth, SSH port-forwarding, etc.).
 - **The chat `run_python` tool executes arbitrary Python in an AWS Bedrock AgentCore Code Interpreter sandbox.** The sandbox is AWS-managed, but token usage and sandbox session minutes are billed against the AWS account whose credentials are picked up from the default credential chain.
 - **Pipeline calibration outputs (`homographies.pkl`, `camera_poses.pkl`) are pickle files.** Do not load pipeline output directories you didn't produce yourself — pickle deserialization is RCE-equivalent. A safer on-disk format is on the roadmap.
 - **`video_enhancement.mode: docker` runs `ghcr.io/k4yt3x/video2x` with `--gpus all` and a host-directory volume mount.** Filenames and config arguments are now `shlex.quote`'d before reaching `bash -c`, but the container itself runs as root.
