@@ -51,6 +51,14 @@ def run_track_consolidation(
             f"tracking/tracks.json not found under {pipeline_output_dir}; "
             "run the tracking stage first.")
 
+    # Per-track frame counts come from the *processed* sample stream — at
+    # process_fps=5 a track that lasts 4 s contributes 20 observations,
+    # not 40. The frame-count thresholds below were tuned at process_fps=10;
+    # rescale by effective_fps/10 so they keep their intended duration.
+    _ref_fps = 10.0
+    _process_fps = config.get("_process_fps")
+    _fps_scale = (float(_process_fps) / _ref_fps) if _process_fps else 1.0
+
     # --- Load inputs --------------------------------------------------
     tracks_by_frame = _load_json(tracking_dir / "tracks.json")
     track_features = _load_json(tracking_dir / "track_features.json") or {}
@@ -108,8 +116,9 @@ def run_track_consolidation(
         positions_by_track,
         pitch_length=pitch_length,
         pitch_width=pitch_width,
-        min_frames_for_pattern=int(
-            config.get("min_frames_for_movement_pattern", 40)),
+        min_frames_for_pattern=int(config.get(
+            "min_frames_for_movement_pattern",
+            max(1, round(40 * _fps_scale)))),
         frame_count_by_track=frame_count_by_track,
     )
 
@@ -143,7 +152,8 @@ def run_track_consolidation(
             pitch_width=pitch_width,
             margin=float(off_cfg.get("margin_m", 1.5)),
             min_outside_fraction=float(off_cfg.get("min_outside_fraction", 0.85)),
-            min_observations=int(off_cfg.get("min_observations", 10)),
+            min_observations=int(off_cfg.get(
+                "min_observations", max(1, round(10 * _fps_scale)))),
         )
         if off_field_tids:
             logger.info(
@@ -163,7 +173,8 @@ def run_track_consolidation(
                 movement_by_track.pop(tid, None)
                 role_by_track.pop(tid, None)
 
-    min_frames = int(config.get("min_track_frames", 30))
+    min_frames = int(config.get(
+        "min_track_frames", max(1, round(30 * _fps_scale))))
     # All tracks with enough observations go to Claude, regardless of
     # KMeans team label or pitch position — Claude decides the final
     # role (player / coach / referee / linesman / other).
