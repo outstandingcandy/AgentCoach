@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Recover physical pitch dimensions from manual annotation JSONs.
 
-Reads one or more annotation JSONs (produced by ``scripts/run_annotator.py``),
-all assumed to be on the same physical field, and jointly fits per-frame camera
-pose and global pitch dimensions via robust nonlinear least squares.
+Reads one or more annotation JSONs (produced by the workspace annotator at
+``/annotate`` — ``python -m goalinsight.web``), all assumed to be on the
+same physical field, and jointly fits per-frame camera pose and global
+pitch dimensions via robust nonlinear least squares.
 
 Output is printed to the console — the user reviews the recovered dims and
 manually updates ``configs/kids_soccer.yaml``. Nothing is written to disk.

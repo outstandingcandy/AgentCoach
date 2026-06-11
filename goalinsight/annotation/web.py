@@ -5,13 +5,9 @@ goalinsight/annotation/static/, and all interaction goes through JSON
 endpoints under ``{prefix}/...`` (default ``/api``) plus a few image
 endpoints that return JPEGs.
 
-Two surfaces are exposed:
-
-- ``create_app(...)`` — stand-alone server (used by ``run_server`` /
-  ``goalinsight/annotation/index.py`` for the legacy single-page launcher).
-- ``register_annotation_routes(app, annotator, *, prefix)`` — mounts the
-  same routes onto a FastAPI app that already exists. Used by the unified
-  workspace app so the annotator and the viewer share one process.
+Public API: ``register_annotation_routes(app, annotator, *, prefix)``
+mounts the routes onto an existing FastAPI app — the unified workspace
+app uses this so the annotator and the viewer share one process.
 """
 
 from __future__ import annotations
@@ -365,57 +361,3 @@ def register_annotation_routes(
     async def set_projection(request: Request) -> JSONResponse:
         payload = await request.json()
         return _ok(annotator.set_show_projection(bool(payload.get("show", True))))
-
-def create_app(
-    videos_root: str,
-    annotations_dir: str,
-    start_frame: int = 0,
-    pitch: SoccerPitch | None = None,
-) -> FastAPI:
-    """Stand-alone annotator server (legacy launcher)."""
-    videos_root_path = Path(videos_root)
-    annotator = AnchorAnnotator(annotations_dir=annotations_dir, pitch=pitch)
-
-    discovered = _discover_videos(videos_root_path)
-    if not discovered:
-        raise RuntimeError(
-            f"No videos found in --videos-root: {videos_root_path}",
-        )
-    annotator.open_video(str(discovered[0]), start_frame=start_frame)
-
-    app = FastAPI(title="Soccer Pitch Annotator")
-
-    _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
-
-    @app.get("/")
-    def index_page() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html", headers=_NO_CACHE)
-
-    @app.get("/static/{filename}")
-    def static_file(filename: str) -> FileResponse:
-        path = STATIC_DIR / filename
-        if not path.exists():
-            raise HTTPException(404, "Not found")
-        return FileResponse(path, headers=_NO_CACHE)
-
-    register_annotation_routes(app, annotator, videos_root_path, prefix="/api")
-    return app
-
-
-def run_server(
-    videos_root: str,
-    annotations_dir: str,
-    host: str = "127.0.0.1",
-    port: int = 7860,
-    start_frame: int = 0,
-    pitch: SoccerPitch | None = None,
-) -> None:
-    import uvicorn
-
-    app = create_app(
-        videos_root,
-        annotations_dir,
-        start_frame=start_frame,
-        pitch=pitch,
-    )
-    uvicorn.run(app, host=host, port=port, log_level="info")
