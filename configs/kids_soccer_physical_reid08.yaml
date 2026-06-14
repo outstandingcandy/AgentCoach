@@ -165,3 +165,8 @@ pipeline:
     - track_consolidation
     - player_profile
     - highlights
+
+# Override: stricter ReID threshold (cosine >= 0.8 instead of 0.7)
+tracking:
+  max_cosine_distance: 0.2   # was 0.3 → cosine threshold lifted from 0.7 to 0.8
+

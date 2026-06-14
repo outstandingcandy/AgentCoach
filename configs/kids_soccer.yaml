@@ -103,3 +103,5 @@ pipeline:
     - field_registration
     - tracking
     - event_detection
+    - track_consolidation
+    - player_profile
