@@ -93,9 +93,16 @@ def render_event_video(
     player_frame_keys = []
     ball_frame_keys = []
     if tracking_dir:
-        player_tracks = _load_json(tracking_dir / "tracks.json") or {}
+        # Prefer the consolidation stage's player-id-keyed tracks.json
+        # (sibling dir under the same run), fall back to the raw
+        # tracker output. Additive layout means tracking/tracks.json
+        # is always raw — events visuals want the consolidated copy
+        # so jersey numbers and player_ids show up on overlays.
+        run_dir = tracking_dir.parent
+        from ..track_consolidation import load_team_assignments, load_tracks
+        player_tracks = load_tracks(run_dir) or {}
+        team_assignments = load_team_assignments(run_dir) or {}
         ball_tracks = _load_json(tracking_dir / "ball_tracks.json") or {}
-        team_assignments = _load_json(tracking_dir / "team_assignments.json") or {}
         # Pre-sort frame keys for nearest-frame lookup (tracking may be subsampled)
         player_frame_keys = sorted(int(k) for k in player_tracks.keys())
         ball_frame_keys = sorted(int(k) for k in ball_tracks.keys())

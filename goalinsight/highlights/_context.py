@@ -125,10 +125,10 @@ class MatchContext:
     @property
     def player_tracks(self) -> dict[str, list[dict]]:
         if self._player_tracks is None:
+            from ..track_consolidation import load_tracks
+            # Highlights need the consolidated player-id-keyed tracks.
             self._player_tracks = (
-                self._load_json("tracking", "tracks.json")
-                or self._load_json("stage2", "tracks.json")
-                or {}
+                load_tracks(self.pipeline_output_dir) or {}
             )
         return self._player_tracks
 
@@ -155,10 +155,9 @@ class MatchContext:
     @property
     def team_assignments(self) -> dict[str, str]:
         if self._team_assignments is None:
+            from ..track_consolidation import load_team_assignments
             self._team_assignments = (
-                self._load_json("tracking", "team_assignments.json")
-                or self._load_json("stage2", "team_assignments.json")
-                or {}
+                load_team_assignments(self.pipeline_output_dir) or {}
             )
         return self._team_assignments
 

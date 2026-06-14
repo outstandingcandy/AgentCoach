@@ -55,6 +55,7 @@ class PhysicalCalibrator:
         camera_position: tuple[float, float, float] | None = None,
         position_weight: float = 50.0,
         lock_camera_position: bool = False,
+        position_bounds_m: tuple[float, float, float] | None = None,
         pitch_length: float = 105.0,
         pitch_width: float = 68.0,
         pitch_dims: dict | None = None,
@@ -113,6 +114,13 @@ class PhysicalCalibrator:
         self.camera_position = camera_position
         self.position_weight = position_weight
         self.lock_camera_position = lock_camera_position and camera_position is not None
+        # Per-axis hard bounds (in metres) around the prior camera position.
+        # When set, LM's tvec is constrained so the resulting camera centre
+        # stays within ``camera_position ± position_bounds_m``. Use for axes
+        # where the prior is well-known (e.g. fixed sideline rig where x is
+        # tightly known to ~3m). Skipped when no prior is set or the axis
+        # bound is None / non-positive.
+        self.position_bounds_m = position_bounds_m
 
         # Resolve pitch dims:
         # - pitch_dims given → full override (FIFA fills missing keys).
@@ -962,6 +970,29 @@ class PhysicalCalibrator:
                 w_per_copy = self.position_weight / np.sqrt(n_copies)
                 pos_single = (cam_center - pos_target) * w_per_copy
                 all_residuals.append(np.tile(pos_single, n_copies))
+
+                # Per-axis HARD bounds. tvec lives in cam coords; the
+                # bound is on the world-frame camera centre, so we can't
+                # express it in scipy's `bounds=` argument directly.
+                # Instead emit a barrier-style residual that's 0 inside
+                # the box and grows quadratically outside, weighted high
+                # enough that Cauchy loss can't damp it away.
+                if self.position_bounds_m is not None:
+                    excess = np.zeros(3)
+                    for axis in range(3):
+                        bnd = self.position_bounds_m[axis]
+                        if bnd is None or bnd <= 0:
+                            continue
+                        delta = cam_center[axis] - pos_target[axis]
+                        if delta > bnd:
+                            excess[axis] = delta - bnd
+                        elif delta < -bnd:
+                            excess[axis] = delta + bnd
+                    if np.any(excess):
+                        # Heavy weight (1000) — a 1m violation produces
+                        # 1000 px-equivalent residual, far above any
+                        # legitimate reprojection cost.
+                        all_residuals.append(excess * 1000.0)
 
             return np.concatenate(all_residuals)
 

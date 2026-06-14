@@ -3,7 +3,18 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event
 from typing import Any
+
+
+class PipelineCancelled(RuntimeError):
+    """Raised when a caller cancels the pipeline mid-run.
+
+    Stages can't always be interrupted mid-loop (cv2/torch loops we
+    don't own), so the cancel point is at stage boundaries. Anything
+    in-progress when ``cancel_event`` fires runs to completion; the
+    next stage doesn't start.
+    """
 
 
 @dataclass
@@ -16,12 +27,20 @@ class PipelineContext:
     stage_dirs: dict[str, Path] = field(default_factory=dict)
     stage_stats: dict[str, Any] = field(default_factory=dict)
     skip_existing: bool = False
+    # Optional cancel hook: a thread-safe Event the JobManager (or any
+    # caller) can set to stop the pipeline at the next stage boundary.
+    # ``None`` means "no cancel support wired in" — pure-CLI invocations
+    # leave it unset and run to completion.
+    cancel_event: Event | None = None
 
     def stage_dir(self, name: str) -> Path:
         """Get (and register) the output directory for a named stage."""
         if name not in self.stage_dirs:
             self.stage_dirs[name] = self.output_dir / name
         return self.stage_dirs[name]
+
+    def is_cancelled(self) -> bool:
+        return self.cancel_event is not None and self.cancel_event.is_set()
 
 
 class Stage(ABC):

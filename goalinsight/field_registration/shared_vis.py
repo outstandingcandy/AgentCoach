@@ -158,7 +158,10 @@ def draw_vis_calibration(frame, keypoints, lines, calibrator, result, pitch_temp
                 pt1_in = -margin < pt1[0] < w + margin and -margin < pt1[1] < h + margin
                 pt2_in = -margin < pt2[0] < w + margin and -margin < pt2[1] < h + margin
                 if pt1_in and pt2_in:
-                    cv2.line(vis, pt1, pt2, (0, 165, 255), 2)
+                    # Bright blue (BGR) — distinguishable from red player
+                    # kits / scoreboard graphics that the orange wireframe
+                    # used to blend into in JPEG-compressed previews.
+                    cv2.line(vis, pt1, pt2, (255, 0, 0), 2)
 
     # Build inlier set for keypoint coloring
     inlier_img_set = set()

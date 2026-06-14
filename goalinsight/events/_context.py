@@ -83,10 +83,13 @@ class EventDetectionContext:
         d = Path(pipeline_output_dir)
 
         ball_tracks = _load_json(d, "tracking", "ball_tracks.json") or {}
-        player_tracks = _load_json(d, "tracking", "tracks.json") or {}
-        team_assignments = (
-            _load_json(d, "tracking", "team_assignments.json") or {}
-        )
+        # Prefer the consolidation stage's player-id-keyed tracks.json
+        # when it exists (additive output — the raw tracker file in
+        # tracking/ is never mutated). Falls back to the raw tracker
+        # output for runs that haven't run consolidation.
+        from ..track_consolidation import load_team_assignments, load_tracks
+        player_tracks = load_tracks(d) or {}
+        team_assignments = load_team_assignments(d) or {}
         camera_poses = _load_json(
             d, "field_registration", "camera_poses.json"
         )
@@ -125,10 +128,14 @@ class EventDetectionContext:
         """
         tracking_dir = Path(tracking_dir)
         ball_tracks = _load_json_file(tracking_dir / "ball_tracks.json") or {}
-        player_tracks = _load_json_file(tracking_dir / "tracks.json") or {}
-        team_assignments = (
-            _load_json_file(tracking_dir / "team_assignments.json") or {}
-        )
+        # Prefer the consolidation stage's player-id-keyed copy under
+        # the same run dir (tracking_dir.parent / track_consolidation),
+        # fall back to the raw tracker output. Additive layout: the
+        # raw tracker file is never mutated.
+        from ..track_consolidation import load_team_assignments, load_tracks
+        run_dir = tracking_dir.parent
+        player_tracks = load_tracks(run_dir) or {}
+        team_assignments = load_team_assignments(run_dir) or {}
 
         camera_poses = None
         vi: dict = {}
