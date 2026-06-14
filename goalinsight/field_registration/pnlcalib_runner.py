@@ -671,7 +671,7 @@ def _draw_visualization_nbjw(
                 for i in range(len(valid_points) - 1):
                     pt1, pt2 = valid_points[i], valid_points[i + 1]
                     if all(-1000 < c < 3000 for c in pt1 + pt2):
-                        cv2.line(vis, pt1, pt2, (0, 165, 255), 2)
+                        cv2.line(vis, pt1, pt2, (255, 0, 0), 2)
         except np.linalg.LinAlgError:
             pass
 

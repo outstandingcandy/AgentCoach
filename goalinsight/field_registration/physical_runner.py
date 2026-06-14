@@ -304,6 +304,11 @@ def run_stage1_physical(
         camera_position=camera_position,
         position_weight=phys_config.get("position_weight", 50.0),
         lock_camera_position=lock_camera_position,
+        position_bounds_m=(
+            tuple(phys_config["position_bounds_m"])
+            if phys_config.get("position_bounds_m") is not None
+            else None
+        ),
         pitch_dims=pitch_dims,
     )
 
@@ -1838,7 +1843,7 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
                         clamp = w + h
                         c1 = (max(-clamp, min(clamp, px1[0])), max(-clamp, min(clamp, px1[1])))
                         c2 = (max(-clamp, min(clamp, px2[0])), max(-clamp, min(clamp, px2[1])))
-                        cv2.line(vis, c1, c2, (0, 165, 255), 1)
+                        cv2.line(vis, c1, c2, (255, 0, 0), 1)
 
         # Draw projected template keypoints (yellow, matching pitch lines)
         from .pnlcalib import KeypointMapper

@@ -3,9 +3,10 @@
 import json
 from datetime import datetime
 from pathlib import Path
+from threading import Event
 from typing import Any
 
-from ._base import PipelineContext, Stage
+from ._base import PipelineCancelled, PipelineContext, Stage
 from ._registry import STAGE_REGISTRY
 
 DEFAULT_STAGES = ["field_registration", "tracking"]
@@ -49,8 +50,17 @@ class Pipeline:
         video_path: Path,
         output_dir: Path,
         skip_existing: bool = False,
+        cancel_event: Event | None = None,
     ) -> dict[str, Any]:
-        """Run the full pipeline."""
+        """Run the full pipeline.
+
+        ``cancel_event`` lets a caller (typically the web JobManager)
+        request a graceful stop. The pipeline checks the flag at each
+        stage boundary; if set, it raises ``PipelineCancelled`` after
+        the in-flight stage finishes. The last completed stages are
+        already on disk, so re-running with ``skip_existing=True``
+        picks up where the cancelled run left off.
+        """
         output_dir.mkdir(parents=True, exist_ok=True)
 
         ctx = PipelineContext(
@@ -58,16 +68,27 @@ class Pipeline:
             output_dir=output_dir,
             config=self._config,
             skip_existing=skip_existing,
+            cancel_event=cancel_event,
         )
 
+        completed: list[str] = []
+        cancelled = False
         for stage in self._stages:
             # Always register the stage dir so later stages can find it
             ctx.stage_dir(stage.name)
+
+            if ctx.is_cancelled():
+                print("=" * 60)
+                print(f"PIPELINE CANCELLED — skipping remaining stages")
+                print("=" * 60)
+                cancelled = True
+                break
 
             if stage.should_skip(ctx):
                 print("=" * 60)
                 print(f"{stage.description} [SKIPPED - output exists]")
                 print("=" * 60)
+                completed.append(stage.name)
                 continue
 
             print("=" * 60)
@@ -76,16 +97,22 @@ class Pipeline:
 
             stats = stage.run(ctx)
             ctx.stage_stats[stage.name] = stats
+            completed.append(stage.name)
             print()
 
         run_metadata = {
             "timestamp": datetime.now().isoformat(),
             "video_path": str(video_path.absolute()),
             "video_name": video_path.name,
-            "stages_run": [s.name for s in self._stages],
+            "stages_run": completed,
+            "cancelled": cancelled,
             "stats": ctx.stage_stats,
         }
         with open(output_dir / "pipeline_stats.json", "w") as f:
             json.dump(run_metadata, f, indent=2)
 
+        if cancelled:
+            raise PipelineCancelled(
+                f"cancelled after {len(completed)} stage(s): {completed}"
+            )
         return run_metadata
