@@ -188,6 +188,28 @@ class EventDetectionStage(Stage):
 
 
 @register_stage
+class PlayerProfileStage(Stage):
+    name = "player_profile"
+    description = "Player Profile (front/back crops, heatmaps, distance)"
+
+    def run(self, ctx: PipelineContext) -> dict[str, Any]:
+        from ..player_profile import build_player_profiles
+
+        out = ctx.stage_dir(self.name)
+        cfg = ctx.config.get("player_profile", {}) if ctx.config else {}
+        return build_player_profiles(
+            pipeline_output_dir=ctx.output_dir,
+            out_dir=out,
+            heatmap_bins=int(cfg.get("heatmap_bins", 30)),
+        )
+
+    def should_skip(self, ctx: PipelineContext) -> bool:
+        return ctx.skip_existing and (
+            ctx.stage_dir(self.name) / "players_profile.json"
+        ).exists()
+
+
+@register_stage
 class HighlightsStage(Stage):
     name = "highlights"
     description = "Highlight Clipping"
