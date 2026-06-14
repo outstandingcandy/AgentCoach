@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 
 from ._consolidator import (
@@ -187,137 +187,96 @@ def run_track_consolidation(
         len(candidates), len(frame_count_by_track), min_frames,
     )
 
-    # --- Cached votes? Skip LLM passes if jersey_votes.json exists.
-    # Useful for iterating on cluster-merge / GK / rendering logic
-    # without re-paying for the LLM round-trip.
-    cached_votes_path = output_dir / "jersey_votes.json"
-    cached_scene_path = output_dir / "scene.json"
-    use_cached = (
-        bool(config.get("reuse_cached_votes"))
-        and cached_votes_path.exists()
-    )
-    if use_cached:
-        print(
-            f"  Reusing cached jersey_votes.json + scene.json from "
-            f"{output_dir} (skipping all LLM calls).",
-            flush=True,
-        )
-
-    # --- Identify candidates missing from cached votes --------------
-    # When use_cached=True but the caller has lowered min_track_frames
-    # (or otherwise widened the candidate pool), the cache won't cover
-    # the new tids. We sample + LLM-vote those missing tids only —
-    # everything already in the cache is reused as-is.
-    cached_vote_tids: set[int] = set()
-    if use_cached:
-        try:
-            cached_vote_tids = {
-                int(k) for k in json.loads(
-                    cached_votes_path.read_text()).keys()
-            }
-        except Exception:
-            cached_vote_tids = set()
-    missing_candidates = [
-        tid for tid in candidates if tid not in cached_vote_tids
-    ]
-    needs_incremental_llm = use_cached and bool(missing_candidates)
-    if needs_incremental_llm:
-        print(
-            f"  Cache covers {len(cached_vote_tids)} tids; "
-            f"{len(missing_candidates)} new candidates need fresh votes.",
-            flush=True,
-        )
-
-    # --- Sample crops (skip when reusing cached votes — sampler is the
-    # second-most expensive step after the LLM) ----------------------
+    # --- Sample crops -----------------------------------------------
+    # Always re-sample. The LLM cache used to live at
+    # ``<stage>/jersey_votes.json`` and was reused across re-runs to
+    # save Claude tokens, but it had no input fingerprint — when the
+    # tracker re-ran with the same integer tids meaning different
+    # physical people, the cache silently served stale answers.
+    # Better-cheap-than-stale: pay the LLM cost every time.
+    #
+    # ``frames_per_track``: positive int → top-K sampling (legacy);
+    # 0 or null → take EVERY frame in the track (LLM sees all
+    # available bboxes), capped at ``max_crops_per_track``. Per-crop
+    # OCR runs in parallel inside ``recognize_multi`` so 100s of crops
+    # is tractable.
     sampler_cfg = config.get("sampler", {})
-    k = int(config.get("frames_per_track", 15))
-    sampled: dict = {}
-    if not use_cached:
-        print(f"  Sampling {k} crops × {len(candidates)} tracks...", flush=True)
-        t0 = time.time()
-        sampled = sample_crops_for_tracks(
-            video_path=video_path,
-            tracks_by_frame=tracks_by_frame,
-            track_ids=candidates,
-            k=k,
-            min_bbox_height=int(sampler_cfg.get("min_bbox_height", 80)),
-            upper_ratio=float(sampler_cfg.get("upper_body_ratio", 0.65)),
+    k_raw = config.get("frames_per_track", 0)
+    k = int(k_raw) if k_raw not in (None, "", "all", "none") else None
+    if k is not None and k <= 0:
+        k = None
+    max_crops = int(config.get("max_crops_per_track", 200))
+    # Stride sampling: take every Nth frame in temporal order. Cheaper
+    # than all-frames with similar voting confidence — N=10 over a
+    # 600-frame track gives ~60 OCR calls instead of 600. Defaults to
+    # 10 when ocr_backend=rapidocr (no API rate limit, but each call
+    # still costs ~50 ms on CPU). Setting ``frame_stride`` explicitly
+    # overrides regardless of backend.
+    jersey_cfg_pre = config.get("jersey", {}) or {}
+    stride_raw = config.get("frame_stride")
+    if stride_raw in (None, "", 0):
+        if str(jersey_cfg_pre.get("ocr_backend", "llm")).lower() == "rapidocr":
+            stride: int | None = 10
+        else:
+            stride = None
+    else:
+        stride = int(stride_raw)
+        if stride <= 1:
+            stride = None
+    if stride:
+        label = f"every {stride}th frame"
+    else:
+        label = (
+            f"all crops (cap {max_crops})" if k is None else f"{k} crops"
         )
-        print(f"  Sampling done in {time.time() - t0:.1f}s", flush=True)
-    elif needs_incremental_llm:
-        # Sample missing candidates AND the cached scene.json's
-        # ref_tids — the latter feed team_exemplars so the LLM has
-        # team-kit anchors when judging the new tids. Without these,
-        # _pick_team_exemplars_from_refs returns empty and the LLM
-        # falls back to free-text colour reasoning, which on this clip
-        # mis-routes goal-side yellow players to A-GK / B-GK.
-        cached_scene_for_sample = json.loads(cached_scene_path.read_text()) \
-            if cached_scene_path.exists() else {}
-        ref_tids = list({
-            *cached_scene_for_sample.get("team_A_ref_ids", []),
-            *cached_scene_for_sample.get("team_B_ref_ids", []),
-        })
-        sample_targets = list({*missing_candidates, *ref_tids})
-        print(
-            f"  Sampling {k} crops × {len(sample_targets)} tracks "
-            f"({len(missing_candidates)} new + {len(ref_tids)} ref)...",
-            flush=True,
-        )
-        t0 = time.time()
-        sampled = sample_crops_for_tracks(
-            video_path=video_path,
-            tracks_by_frame=tracks_by_frame,
-            track_ids=sample_targets,
-            k=k,
-            min_bbox_height=int(sampler_cfg.get("min_bbox_height", 80)),
-            upper_ratio=float(sampler_cfg.get("upper_body_ratio", 0.65)),
-        )
-        print(f"  Sampling done in {time.time() - t0:.1f}s", flush=True)
+    print(f"  Sampling {label} × {len(candidates)} tracks...", flush=True)
+    t0 = time.time()
+    sampled = sample_crops_for_tracks(
+        video_path=video_path,
+        tracks_by_frame=tracks_by_frame,
+        track_ids=candidates,
+        k=k,
+        min_bbox_height=int(sampler_cfg.get("min_bbox_height", 80)),
+        upper_ratio=float(sampler_cfg.get("upper_body_ratio", 0.65)),
+        max_cap=max_crops,
+        stride=stride,
+    )
+    n_total_crops = sum(len(v) for v in sampled.values())
+    print(f"  Sampling done in {time.time() - t0:.1f}s "
+          f"({n_total_crops} total crops)", flush=True)
 
     # --- Jersey recognition via Claude -------------------------------
     jersey_cfg = config.get("jersey", {})
-    # Build the recognizer when we're going to call the LLM — either
-    # full pass or incremental top-up over the cache.
-    recognizer = _build_recognizer(jersey_cfg) \
-        if (not use_cached or needs_incremental_llm) else None
+    recognizer = _build_recognizer(jersey_cfg)
     votes: dict[int, dict[str, Any]] = {}
     concurrency = int(jersey_cfg.get("max_concurrency", 8))
 
-    # --- Step 1: Global scene understanding (skip when reusing cache) -
-    if use_cached:
-        scene = json.loads(cached_scene_path.read_text()) \
-            if cached_scene_path.exists() else {}
-        print("  Step 1 (cached): "
-              f"team_A={scene.get('team_A_kit', '-')} | "
-              f"team_B={scene.get('team_B_kit', '-')}",
+    # --- Step 1: Global scene understanding -------------------------
+    wide_frame, wide_fid = _pick_wide_frame(
+        video_path=video_path,
+        tracks_by_frame=tracks_by_frame,
+    )
+    n_scene_persons = int(jersey_cfg.get("scene_person_samples", 20))
+    scene_person_crops = _pick_scene_person_crops(
+        sampled=sampled,
+        positions_by_track=positions_by_track,
+        pitch_length=pitch_length,
+        pitch_width=pitch_width,
+        n_total=n_scene_persons,
+    )
+    print(f"  Step 1 (scene understanding): wide frame @ fid={wide_fid} "
+          f"+ {len(scene_person_crops)} person samples...", flush=True)
+    t0 = time.time()
+    scene = recognizer.describe_scene(wide_frame, scene_person_crops) \
+        if wide_frame is not None else {}
+    print(f"  Step 1 done in {time.time() - t0:.1f}s", flush=True)
+    if scene:
+        with open(output_dir / "scene.json", "w") as _f:
+            json.dump(scene, _f, indent=2)
+        print("    team_A_kit: " + (scene.get("team_A_kit") or "-"),
               flush=True)
-    else:
-        wide_frame, wide_fid = _pick_wide_frame(
-            video_path=video_path,
-            tracks_by_frame=tracks_by_frame,
-        )
-        n_scene_persons = int(jersey_cfg.get("scene_person_samples", 20))
-        scene_person_crops = _pick_scene_person_crops(
-            sampled=sampled,
-            positions_by_track=positions_by_track,
-            pitch_length=pitch_length,
-            pitch_width=pitch_width,
-            n_total=n_scene_persons,
-        )
-        print(f"  Step 1 (scene understanding): wide frame @ fid={wide_fid} "
-              f"+ {len(scene_person_crops)} person samples...", flush=True)
-        t0 = time.time()
-        scene = recognizer.describe_scene(wide_frame, scene_person_crops) \
-            if wide_frame is not None else {}
-        print(f"  Step 1 done in {time.time() - t0:.1f}s", flush=True)
-        if scene:
-            with open(output_dir / "scene.json", "w") as _f:
-                json.dump(scene, _f, indent=2)
-            print("    team_A_kit: " + (scene.get("team_A_kit") or "-"),
-                  flush=True)
-            print("    team_B_kit: " + (scene.get("team_B_kit") or "-"),
-                  flush=True)
+        print("    team_B_kit: " + (scene.get("team_B_kit") or "-"),
+              flush=True)
 
     # Step 1 only commits team_A / team_B exemplars — referees,
     # goalkeepers, linesmen are decided in Step 2 from movement.
@@ -326,23 +285,13 @@ def run_track_consolidation(
     for tid in scene.get("team_B_ref_ids", []):
         team_by_track[tid] = "team_B"
 
-    # Load cached votes up front so we can route around tids that
-    # already have a verdict.
-    if use_cached:
-        cached = json.loads(cached_votes_path.read_text())
-        for k_str, v in cached.items():
-            try:
-                votes[int(k_str)] = v
-            except (TypeError, ValueError):
-                continue
-            t_lab = v.get("team")
-            if t_lab in ("team_A", "team_B"):
-                team_by_track.setdefault(int(k_str), t_lab)
-
-    # Pick team exemplars + LLM call helper. Used by both the full
-    # (no-cache) pass and the incremental top-up over a partial cache.
-    def _do_jersey_recognition(target_tids: list[int]) -> None:
-        n_exemplars = int(jersey_cfg.get("team_exemplars_per_team", 5))
+    # Team exemplars feed the LLM as reference images alongside each
+    # target track. Picked once up front so the dump path below sees the
+    # same set the LLM saw — including when votes are fully cached and
+    # ``_do_jersey_recognition`` never runs.
+    n_exemplars = int(jersey_cfg.get("team_exemplars_per_team", 5))
+    team_exemplars: dict[str, list[np.ndarray]] = {}
+    if sampled:
         team_exemplars = _pick_team_exemplars_from_refs(
             sampled=sampled,
             ref_tids_by_team={
@@ -367,10 +316,12 @@ def run_track_consolidation(
             len(team_exemplars.get("team_B", [])),
         )
 
+    # LLM call helper.
+    def _do_jersey_recognition(target_tids: list[int]) -> None:
         def _call(tid: int) -> tuple[int, tuple]:
             frames = sampled.get(tid, [])
             if not frames:
-                return tid, (None, 0.0, "no crops", "unknown", "unknown")
+                return tid, (None, 0.0, "no crops", "unknown", "unknown", [])
             crops = [f.crop for f in frames]
             pos_lab = position_label_by_track.get(tid, "unknown")
             mov_desc = movement_by_track.get(tid, "")
@@ -391,10 +342,22 @@ def run_track_consolidation(
             futs = [pool.submit(_call, tid) for tid in target_tids]
             for i, fut in enumerate(as_completed(futs), 1):
                 try:
-                    tid, (num, conf, reason, role, team) = fut.result()
+                    tid, result = fut.result()
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("recognize_multi failed: %s", exc)
                     continue
+                # Shape: (num, conf, reason, role, team, breakdown,
+                #         per_crop_verdicts). Tolerate legacy shorter
+                #         tuples from older code paths.
+                if len(result) == 7:
+                    num, conf, reason, role, team, breakdown, per_crop = result
+                elif len(result) == 6:
+                    num, conf, reason, role, team, breakdown = result
+                    per_crop = []
+                else:
+                    num, conf, reason, role, team = result
+                    breakdown = [(num, 1.0)] if num is not None else []
+                    per_crop = []
                 votes[tid] = {
                     "jersey_number": num,
                     "confidence": conf,
@@ -403,6 +366,19 @@ def run_track_consolidation(
                     "team": team,
                     "position_label": position_label_by_track.get(tid, "unknown"),
                     "n_crops": len(sampled.get(tid, [])),
+                    # Per-crop voting breakdown (number, weighted_score).
+                    # The consolidator can inspect runner-up candidates
+                    # to detect tracks that mix multiple physical
+                    # players (e.g. a tracker ID switch that left two
+                    # competing jersey readings inside one tid).
+                    "jersey_candidates": [
+                        [int(n), round(float(s), 3)] for n, s in breakdown
+                    ],
+                    # Per-crop OCR verdicts in the same order as
+                    # sampled[tid]. Each entry: {reading, crop_confidence,
+                    # visible_digits}. Surfaced so the /pipeline UI can
+                    # show what every crop contributed (or didn't).
+                    "per_crop_verdicts": per_crop,
                 }
                 if team in ("team_A", "team_B") and tid not in team_by_track:
                     team_by_track[tid] = team
@@ -414,16 +390,26 @@ def run_track_consolidation(
         print(f"  Jersey recognition done in {time.time() - t0:.1f}s",
               flush=True)
 
-    if not use_cached:
-        _do_jersey_recognition(candidates)
-        with open(output_dir / "jersey_votes.json", "w") as f:
-            json.dump({str(tid): v for tid, v in votes.items()}, f, indent=2)
-    elif needs_incremental_llm:
-        _do_jersey_recognition(missing_candidates)
-        # Persist the merged cache so the next run sees a complete set.
-        with open(output_dir / "jersey_votes.json", "w") as f:
-            json.dump({str(tid): v for tid, v in votes.items()}, f, indent=2)
-        print(f"  Reused {len(votes)} cached votes.", flush=True)
+    _do_jersey_recognition(candidates)
+    # Persist for inspection / the /pipeline page — NOT used as input
+    # cache on re-runs.
+    with open(output_dir / "jersey_votes.json", "w") as f:
+        json.dump({str(tid): v for tid, v in votes.items()}, f, indent=2)
+
+    # --- Dump the exact crops + context that fed the LLM -------------
+    # The /pipeline page reads this to surface what the model actually
+    # saw. Cheap (sampled is already in memory).
+    if sampled:
+        _dump_llm_inputs(
+            out_dir=output_dir / "llm_inputs",
+            sampled=sampled,
+            team_exemplars=team_exemplars,
+            scene=scene,
+            votes=votes,
+            position_label_by_track=position_label_by_track,
+            movement_by_track=movement_by_track,
+            frame_count_by_track=frame_count_by_track,
+        )
 
     # --- Build metas + consolidate -----------------------------------
     # Route tracks by Step 2's role verdict:
@@ -439,17 +425,47 @@ def run_track_consolidation(
     linesman_tracks: list[int] = []
     gk_voted_tracks: set[int] = set()
     metas: list[TrackMeta] = []
+    # Sanity-check referees/linesmen after the LLM votes. The LLM's
+    # vision on small/distant crops can mis-read e.g. a coach in a
+    # white hoodie as a "white-uniform assistant referee" (orig 46
+    # case at sideline (10.7, 18.9), 75 frames, completely static).
+    # Real referees move across the pitch; a track that is short AND
+    # static AND on the sideline cannot be the main ref. Demote those
+    # to 'other' before they reach _build_officiating_clusters.
+    half_l_for_ref = pitch_length / 2
+    half_w_for_ref = pitch_width / 2
+    def _looks_like_real_ref(tid: int) -> bool:
+        poss = positions_by_track.get(tid) or []
+        if len(poss) < 30:
+            return False  # too short to demonstrate movement
+        arr = np.asarray(poss, dtype=np.float32)
+        x_lo, x_hi = np.percentile(arr[:, 0], [5, 95])
+        y_lo, y_hi = np.percentile(arr[:, 1], [5, 95])
+        x_range = x_hi - x_lo
+        y_range = y_hi - y_lo
+        y_med = np.median(arr[:, 1])
+        # Reject static sideline tracks: nearly motionless AND median y
+        # in the touchline band. Real refs may produce short fragments
+        # mid-pitch with limited per-fragment range, but they don't sit
+        # on the sideline for long stretches without moving.
+        if x_range < 3.0 and y_range < 3.0 and abs(y_med) > 0.7 * half_w_for_ref:
+            return False
+        return True
     for tid in candidates:
         v = votes.get(tid, {})
         claude_role = (v.get("role") or "unknown").lower()
         if claude_role in dropped_roles:
             dropped_tracks[tid] = claude_role
             continue
-        if claude_role == "referee":
-            referee_tracks.append(tid)
-            continue
-        if claude_role == "linesman":
-            linesman_tracks.append(tid)
+        if claude_role in ("referee", "linesman"):
+            if not _looks_like_real_ref(tid):
+                # Visual mistake — demote.
+                dropped_tracks[tid] = "other"
+                continue
+            if claude_role == "referee":
+                referee_tracks.append(tid)
+            else:
+                linesman_tracks.append(tid)
             continue
         # player / goalkeeper / unknown → enter the player consolidation.
         # Goalkeepers carry team='unknown' from Step 2 (per prompt rules);
@@ -472,6 +488,20 @@ def run_track_consolidation(
                 med_x = float(np.median(np.asarray(
                     poss, dtype=np.float32), axis=0)[0])
                 team_label = "gk_left" if med_x < 0 else "gk_right"
+        # Surface the per-crop voting breakdown so the consolidator
+        # can inspect runner-up readings (split-vote tracks indicate
+        # tracker ID switches).
+        cands_raw = v.get("jersey_candidates") or []
+        cands: list[tuple[int, float]] = []
+        for entry in cands_raw:
+            try:
+                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    n = int(entry[0])
+                    s = float(entry[1])
+                    if 1 <= n <= 99:
+                        cands.append((n, s))
+            except (TypeError, ValueError):
+                continue
         metas.append(TrackMeta(
             track_id=tid,
             team=team_label,
@@ -480,6 +510,7 @@ def run_track_consolidation(
             jersey_number=num if isinstance(num, int) else None,
             jersey_confidence=conf,
             reid_centroid=centroid,
+            jersey_candidates=cands,
         ))
 
     if dropped_tracks or referee_tracks or linesman_tracks:
@@ -498,8 +529,18 @@ def run_track_consolidation(
     reid_cfg = config.get("reid", {})
     track_to_player, clusters = consolidate(
         metas,
-        same_person_threshold=float(reid_cfg.get("same_person_threshold", 0.55)),
-        orphan_absorb_threshold=float(reid_cfg.get("orphan_absorb_threshold", 0.80)),
+        # ReID-first clustering: cosine ≥ same_person_threshold + no
+        # cooccur is the primary identity gate. 0.9 reflects the
+        # PRTReID same-person centroid distribution (≈0.93–0.96) on
+        # Veo kids footage with margin for noisier short tracks.
+        same_person_threshold=float(reid_cfg.get("same_person_threshold", 0.9)),
+        orphan_absorb_threshold=float(reid_cfg.get("orphan_absorb_threshold", 0.92)),
+        # Same-(team, jersey) clusters get a second-pass merge at this
+        # lower cosine — the jersey number is an independent identity
+        # signal, so ReID 0.85 + matching #20 is much stronger evidence
+        # of "same player" than ReID 0.85 alone.
+        jersey_aware_merge_threshold=float(
+            reid_cfg.get("jersey_aware_merge_threshold", 0.8)),
         min_jersey_confidence=float(jersey_cfg.get("min_confidence", 0.6)),
         cooccur_pairs=cooccur_pairs,
     )
@@ -561,6 +602,10 @@ def run_track_consolidation(
     gk_cfg = config.get("goalkeeper", {})
     if gk_cfg.get("enabled", True):
         pitch_length, pitch_width = _pitch_dims(pipeline_output_dir)
+        # Snapshot pre-rename pids so we can identify which cluster
+        # objects were chosen as GKs (rename targets) regardless of
+        # name collisions.
+        pre_rename_pids = {id(c): c.player_id for c in clusters}
         renames = assign_goalkeepers(
             clusters,
             track_positions=positions_by_track,
@@ -568,6 +613,11 @@ def run_track_consolidation(
             pitch_width=pitch_width,
             goal_area_depth=float(gk_cfg.get("goal_area_depth", 16.5)),
         )
+        chosen_gk_cluster_ids = {
+            id(c) for c in clusters
+            if pre_rename_pids.get(id(c)) != c.player_id
+            and c.role == "goalkeeper"
+        }
         # Drop the synthetic gk_left / gk_right team labels that
         # didn't get chosen as the canonical GK — they're not real
         # team affiliations and would pollute downstream consumers.
@@ -585,6 +635,52 @@ def run_track_consolidation(
                 flush=True,
             )
 
+        # Demote any remaining role=goalkeeper clusters that
+        # ``assign_goalkeepers`` did NOT pick — Claude false-positives
+        # the GK label on persistent off-field detections (goalpost,
+        # banner, sideline staff) whose ReID happens to look uniform-
+        # coloured. Without demotion they collide on a single
+        # ``<suffix>-GK`` id (no ordinal). Identity check is on the
+        # cluster object via ``id()`` so a cluster that *happened* to
+        # already be named ``B-GK`` from a prior step but wasn't
+        # selected by assign_goalkeepers also gets demoted.
+        unk_extra: dict[str, int] = {}
+        for c in clusters:
+            if c.role != "goalkeeper":
+                continue
+            if id(c) in chosen_gk_cluster_ids:
+                continue  # the real GK
+            old_pid = c.player_id
+            team_key = c.team if c.team in ("team_A", "team_B") else "unknown"
+            unk_extra[team_key] = unk_extra.get(team_key, 0) + 1
+            suffix = team_key[5:] if team_key.startswith("team_") else team_key
+            new_pid = f"{suffix}-unk-gk-{unk_extra[team_key]:02d}"
+            c.role = "player"  # demote: it's not really a goalkeeper
+            c.player_id = new_pid
+            for tid in c.source_tracks:
+                if track_to_player.get(tid) == old_pid:
+                    track_to_player[tid] = new_pid
+
+        # Final dedupe: assign_goalkeepers may rename two clusters to
+        # the same canonical id (e.g. both A-GK from a previous A-GK
+        # collision). Append -a/-b on those.
+        from collections import Counter as _Counter
+        pid_counts = _Counter(c.player_id for c in clusters)
+        dup_seen: dict[str, int] = {}
+        for c in clusters:
+            if pid_counts[c.player_id] <= 1:
+                continue
+            if c.role in ("referee", "linesman"):
+                continue
+            idx = dup_seen.get(c.player_id, 0)
+            dup_seen[c.player_id] = idx + 1
+            new_pid = f"{c.player_id}-{chr(ord('a') + idx)}"
+            old_pid = c.player_id
+            c.player_id = new_pid
+            for tid in c.source_tracks:
+                if track_to_player.get(tid) == old_pid:
+                    track_to_player[tid] = new_pid
+
     # --- Write player map + cluster details --------------------------
     with open(output_dir / "player_map.json", "w") as f:
         json.dump({str(tid): pid for tid, pid in track_to_player.items()},
@@ -592,15 +688,19 @@ def run_track_consolidation(
     with open(output_dir / "players.json", "w") as f:
         json.dump([c.to_dict() for c in clusters], f, indent=2)
 
-    # --- Rewrite tracking outputs ------------------------------------
-    out_cfg = config.get("output", {})
-    if out_cfg.get("overwrite_tracks_json", True):
-        _rewrite_tracking(
-            tracking_dir=tracking_dir,
-            track_to_player=track_to_player,
-            clusters=clusters,
-            backup=bool(out_cfg.get("backup_original", True)),
-        )
+    # --- Write consolidated tracks.json + team_assignments.json -----
+    # Additive output: we write to ``track_consolidation/`` and leave
+    # ``tracking/`` untouched. Downstream stages should read via
+    # :func:`goalinsight.track_consolidation.load_tracks` which serves
+    # the consolidated file when it exists and falls back to the raw
+    # tracker output otherwise. Re-running consolidation no longer
+    # destroys the source-of-truth.
+    _write_consolidated_tracks(
+        tracking_dir=tracking_dir,
+        out_dir=output_dir,
+        track_to_player=track_to_player,
+        clusters=clusters,
+    )
 
     stats = {
         "candidate_tracks": len(candidates),
@@ -636,6 +736,99 @@ def _load_json(path: Path) -> Any | None:
         return None
     with open(path) as f:
         return json.load(f)
+
+
+def _dump_llm_inputs(
+    out_dir: Path,
+    sampled: dict[int, list[Any]],
+    team_exemplars: dict[str, list[np.ndarray]],
+    scene: dict[str, Any],
+    votes: dict[int, dict[str, Any]],
+    position_label_by_track: dict[int, str],
+    movement_by_track: dict[int, str],
+    frame_count_by_track: dict[int, int],
+) -> None:
+    """Persist the exact set of crops + context that fed the jersey LLM.
+
+    Emits under ``<stage>/llm_inputs/``:
+      - ``team_exemplars/team_{A,B}_<i>.jpg`` — same crops shown to the
+        LLM as team-kit reference (orig sampler crop, no resize).
+      - ``tracks/track_<NNNN>_f<NNNNN>.jpg`` — per source-track crops in
+        the same upper-body / order the LLM consumed.
+      - ``per_track.json`` — for each tid: vote (jersey/role/team/conf/
+        reasoning), position_label, movement_description, n_frames seen
+        in tracking, and the ordered crop filenames.
+      - ``scene.json`` — copy of the scene-understanding output (kept
+        here so the page has everything in one place).
+
+    All paths are relative to ``out_dir``; consumers prepend their own
+    URL prefix (``/runs_static/<run>/track_consolidation/llm_inputs/``).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tracks_dir = out_dir / "tracks"
+    tracks_dir.mkdir(exist_ok=True)
+    exemplars_dir = out_dir / "team_exemplars"
+    exemplars_dir.mkdir(exist_ok=True)
+
+    # Wipe stale artefacts so the dump always reflects the current run.
+    for old in tracks_dir.glob("*.jpg"):
+        old.unlink()
+    for old in exemplars_dir.glob("*.jpg"):
+        old.unlink()
+
+    for team_label in ("team_A", "team_B"):
+        for i, crop in enumerate(team_exemplars.get(team_label, []) or []):
+            cv2.imwrite(
+                str(exemplars_dir / f"{team_label}_{i:02d}.jpg"), crop)
+
+    per_track: dict[str, Any] = {}
+    for tid, frames in sampled.items():
+        crop_files: list[dict[str, Any]] = []
+        # Pull the per-crop OCR verdicts (same order as ``frames``) so
+        # we can stamp the OCR reading + reasoning onto each thumb.
+        verdicts = (votes.get(tid) or {}).get("per_crop_verdicts") or []
+        for idx, sf in enumerate(frames):
+            fname = f"track_{tid:04d}_f{sf.frame_id:05d}.jpg"
+            cv2.imwrite(str(tracks_dir / fname), sf.crop)
+            verdict = verdicts[idx] if idx < len(verdicts) else None
+            crop_entry: dict[str, Any] = {
+                "frame_id": int(sf.frame_id),
+                "name": fname,
+                "score": float(sf.score),
+            }
+            if verdict:
+                crop_entry["ocr_reading"] = verdict.get("reading")
+                crop_entry["ocr_confidence"] = round(
+                    float(verdict.get("crop_confidence", 0.0) or 0.0), 3,
+                )
+                crop_entry["ocr_visible"] = verdict.get("visible_digits") or ""
+            crop_files.append(crop_entry)
+        vote = votes.get(tid) or {}
+        per_track[str(tid)] = {
+            "tid": int(tid),
+            "vote": {
+                "jersey_number": vote.get("jersey_number"),
+                "confidence": vote.get("confidence"),
+                "reasoning": vote.get("reasoning"),
+                "role": vote.get("role"),
+                "team": vote.get("team"),
+            },
+            "position_label": position_label_by_track.get(tid, "unknown"),
+            "movement_description": movement_by_track.get(tid, ""),
+            "n_frames": int(frame_count_by_track.get(tid, 0)),
+            "n_crops_to_llm": len(crop_files),
+            "crops": crop_files,
+        }
+
+    payload = {
+        "n_tracks": len(per_track),
+        "n_team_A_exemplars": len(team_exemplars.get("team_A", []) or []),
+        "n_team_B_exemplars": len(team_exemplars.get("team_B", []) or []),
+        "scene": scene or {},
+        "tracks": per_track,
+    }
+    with open(out_dir / "per_track.json", "w") as f:
+        json.dump(payload, f, indent=2)
 
 
 def _pick_wide_frame(
@@ -1032,14 +1225,23 @@ def _compute_movement_descriptions(
                     and abs(y_med) <= half_w + 0.5)
 
         # ----- Classify -----
-        # Goalkeeper: very tight to one goal line, length range small.
+        # Goalkeeper: very tight to one goal line, small length range,
+        # AND positioned roughly in front of the goal mouth (|y| small).
+        # Without the y check, a stationary coach / spectator standing
+        # just behind a goal corner — e.g. orig 95 in the kids clip at
+        # (-33.5, 10.2), well past the corner flag — passes the depth
+        # checks (d_goal=0.4m, len_frac≈0) and gets falsely tagged as a
+        # GK. Real GKs sit within ~6m of the goal centreline; outside
+        # that band you're in corner / coach / spectator territory.
+        GK_MAX_Y_OFFSET = 6.0
         if (on_pitch and d_goal <= 18.0
-                and len_frac <= GK_LEN_FRAC):
+                and len_frac <= GK_LEN_FRAC
+                and abs(y_med) <= GK_MAX_Y_OFFSET):
             pattern = "tight_near_goal"
             descr = (
                 f"tight_near_goal: stays within ~{x_range:.1f}m of the "
-                f"{nearest_side} goal line ({d_goal:.1f}m from goal). "
-                "This is the goalkeeper pattern."
+                f"{nearest_side} goal line ({d_goal:.1f}m from goal), "
+                f"y_med={y_med:.1f}m. This is the goalkeeper pattern."
             )
         # Main referee: covers most of length AND most of width.
         elif (on_pitch and len_frac >= REF_LEN_FRAC
@@ -1221,37 +1423,42 @@ def _build_recognizer(jersey_cfg: dict[str, Any]):
         f"{{claude, gemini, qwen}}, got {backend!r}")
 
 
-def _rewrite_tracking(
+def _write_consolidated_tracks(
     tracking_dir: Path,
+    out_dir: Path,
     track_to_player: dict[int, str],
     clusters: list[PlayerCluster],
-    backup: bool,
 ) -> None:
-    """Rewrite tracks.json and team_assignments.json with player_ids.
+    """Write consolidated tracks.json + team_assignments.json into the
+    consolidation stage's own dir.
 
-    The rewrite is *additive*: each track dict keeps ``bbox`` / ``pitch_position`` /
-    ``team`` / ``role`` / ``confidence`` and gains a new ``track_id`` equal to
-    the player_id string, plus updated ``jersey_number`` / ``jersey_confidence``.
-    The original integer track_id is preserved under ``orig_track_id``.
+    Reads the raw tracker output from ``tracking/tracks.json`` and
+    writes the consolidated copy to ``out_dir/tracks.json``. The raw
+    tracker file is *never* mutated — re-running consolidation can't
+    destroy the source-of-truth, and downstream stages can switch
+    between raw / consolidated views via
+    :func:`goalinsight.track_consolidation.load_tracks`.
+
+    Each track dict in the output keeps ``bbox`` / ``pitch_position`` /
+    ``confidence`` from the raw tracker and gains:
+
+      - ``track_id``        = the player_id string from consolidation
+      - ``player_id``       = same string, exposed under the canonical
+                              field name so downstream consumers
+                              (events, chat run_python sandbox) don't
+                              need to know the historical key
+      - ``orig_track_id``   = the raw integer tid from the tracker
+      - ``team`` / ``role`` / ``jersey_number`` / ``jersey_confidence``
+                            = cluster attributes
     """
-    tracks_path = tracking_dir / "tracks.json"
-    team_path = tracking_dir / "team_assignments.json"
-
-    if backup:
-        bak = tracking_dir / "tracks.pre_consolidation.json"
-        if not bak.exists():
-            shutil.copy2(tracks_path, bak)
-        bak2 = tracking_dir / "team_assignments.pre_consolidation.json"
-        if team_path.exists() and not bak2.exists():
-            shutil.copy2(team_path, bak2)
-
+    raw_tracks = _load_json(tracking_dir / "tracks.json") or {}
     by_player: dict[str, PlayerCluster] = {c.player_id: c for c in clusters}
 
-    # tracks.json
-    tracks_by_frame = _load_json(tracks_path) or {}
-    for fk, tracks in tracks_by_frame.items():
+    consolidated: dict[str, list[dict[str, Any]]] = {}
+    for fk, tracks in raw_tracks.items():
         kept: list[dict[str, Any]] = []
-        for t in tracks:
+        for raw in tracks:
+            t = dict(raw)
             tid = int(t["track_id"])
             pid = track_to_player.get(tid)
             if pid is None:
@@ -1261,6 +1468,7 @@ def _rewrite_tracking(
                 # still requires a real cluster.
                 t["orig_track_id"] = tid
                 t["track_id"] = f"unmapped-{tid}"
+                t["player_id"] = t["track_id"]
                 t["role"] = "other"
                 t["team"] = "unknown"
                 kept.append(t)
@@ -1268,6 +1476,7 @@ def _rewrite_tracking(
             cluster = by_player.get(pid)
             t["orig_track_id"] = tid
             t["track_id"] = pid
+            t["player_id"] = pid
             if cluster and cluster.jersey_number is not None:
                 t["jersey_number"] = cluster.jersey_number
                 t["jersey_confidence"] = round(cluster.jersey_confidence, 3)
@@ -1275,11 +1484,13 @@ def _rewrite_tracking(
                 t["role"] = cluster.role
                 t["team"] = cluster.team
             kept.append(t)
-        tracks_by_frame[fk] = kept
-    with open(tracks_path, "w") as f:
-        json.dump(tracks_by_frame, f)
+        consolidated[fk] = kept
 
-    # team_assignments.json — key by player_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "tracks.json", "w") as f:
+        json.dump(consolidated, f)
+
+    # team_assignments.json keyed by player_id (not raw int tid).
     player_teams = {c.player_id: c.team for c in clusters}
-    with open(team_path, "w") as f:
+    with open(out_dir / "team_assignments.json", "w") as f:
         json.dump(player_teams, f, indent=2)

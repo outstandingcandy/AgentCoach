@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from typing import Any
 
@@ -74,6 +75,31 @@ def burn_id_banner(
 SINGLE_PROMPT = (
     "What jersey number is visible on this soccer player? "
     "Reply with ONLY a number 1-99, or 'none' if no number is visible."
+)
+
+# Per-crop OCR — strict reading rules + structured output. Used when
+# ``recognize_multi`` fans out one LLM request per crop in parallel.
+# The prompt forbids guessing the tens place from a single visible
+# digit (e.g. seeing only "0" must NOT be reported as "10" / "20").
+SINGLE_OCR_PROMPT = (
+    "Read the jersey number on this soccer player's back/chest.\n\n"
+    "RULES:\n"
+    "  - If you can FULLY see the number's digits, sharp and unobstructed,\n"
+    "    return that number (1-99).\n"
+    "  - If you can only see ONE digit clearly (e.g. a '0' but the tens\n"
+    "    place is occluded by an arm / by another player / by a sock),\n"
+    "    return reading=null. DO NOT guess that it's 10 / 20 / 30 / etc.\n"
+    "    Instead set visible_digits='partial: <digit>' so the caller knows.\n"
+    "  - Ignore numbers on shorts, socks, or in the background.\n"
+    "  - If the back is not visible at all (player facing camera /\n"
+    "    occluded), return reading=null with visible_digits='back not\n"
+    "    visible'.\n\n"
+    "Output a single JSON object on one line, no prose:\n"
+    '{"reading": <int 1-99 or null>, '
+    '"visible_digits": "<short factual>", '
+    '"crop_confidence": <float 0.0-1.0>}\n\n'
+    "crop_confidence: 0 if reading=null; 0.85+ when digits are sharp,\n"
+    "contiguous, and unobstructed; lower for partial / blurry."
 )
 
 MULTI_SYSTEM = (
@@ -154,27 +180,58 @@ _MULTI_USER_TEMPLATE = (
     "  3e) on_pitch AND target colour matches NEITHER team kit AND "
     "movement_pattern == 'touchline_runner' → role='linesman', "
     "team='referee'.\n"
-    "  3f) on_pitch AND target colour matches NEITHER team kit "
-    "(fallback) → role='referee', team='referee'. "
-    "BUT: if the crops are too blurry / dark / occluded to read "
-    "the kit at all, do NOT default to referee — return "
-    "role='unknown', team='unknown' so the track is treated as "
-    "an unidentifiable player rather than polluting the referee "
-    "cluster.\n"
-    "  3g) off_pitch → role='coach' if dressed in suit/jacket, else "
+    "  3f) on_pitch AND target colour matches NEITHER team kit AND "
+    "the kit looks like a referee uniform (typically all black, dark "
+    "navy, dark grey, or with a high-vis green/yellow trim — distinct "
+    "from coach jackets / parka tracksuits / casual wear) → "
+    "role='referee', team='referee'. Use this ONLY when the kit is "
+    "visually convincing as a referee uniform; track length is not "
+    "required (the same referee may have been split across many short "
+    "tracks).\n"
+    "  3g) on_pitch AND target colour matches NEITHER team kit AND "
+    "the kit does NOT look like a referee uniform (casual jacket, "
+    "tracksuit, hoodie, parka, etc.) → role='other'. These are "
+    "coaches, substitutes, ball boys, parents, spectators standing "
+    "on or near the playing area. Do NOT default to referee for "
+    "non-kit people in casual clothing.\n"
+    "  3h) off_pitch → role='coach' if dressed in suit/jacket, else "
     "'other'. Use 'linesman' only if movement was 'touchline_runner'.\n\n"
-    "STEP 4 — Jersey number:\n"
-    "  If role != 'player', jersey_number = null.\n"
-    "  Otherwise read the 1-99 number on the chest/back of the "
-    "jersey. Ignore numbers on shorts/socks. Return null if not "
-    "readable. NEVER invent a number.\n\n"
+    "REFEREE GUIDANCE — be visually honest. The main referee wears a "
+    "purpose-made referee uniform: typically black or dark navy "
+    "shorts + matching jersey, often with high-vis (yellow/green/"
+    "fluorescent) accents on shoulders or chest. Coaches and parents "
+    "standing on the sideline wear casual clothing — parkas, "
+    "tracksuit pants, jeans, hoodies, polo shirts — which looks "
+    "different from a referee kit even if both are dark-coloured. "
+    "If you see casual / non-uniform dark clothing, return "
+    "'other' not 'referee'.\n\n"
+    "STEP 4 — Jersey number (CRITICAL: per-crop voting):\n"
+    "  If role != 'player', skip this step (set jersey verdict null).\n"
+    "  Otherwise, examine EACH of the {N} crops INDIVIDUALLY and emit\n"
+    "  a per-crop verdict. RULES YOU MUST FOLLOW:\n"
+    "    - 'reading' = the digits you can FULLY see, as a string '0'..'99'\n"
+    "      Read what is actually on the back. If you can only see ONE\n"
+    "      digit clearly (e.g. a '0' but its tens place is occluded by\n"
+    "      an arm / by another player) you MUST set reading=null and\n"
+    "      visible_digits to the partial you saw — DO NOT guess that\n"
+    "      it is 10 / 20 / 30 / etc. NEVER invent a number.\n"
+    "    - 'visible_digits' = a short factual description of what you\n"
+    "      actually see on the back, e.g. '20', 'partial: 0', 'blurry',\n"
+    "      'back not visible', 'occluded by teammate'.\n"
+    "    - 'crop_confidence' ∈ [0,1] = confidence in this single crop's\n"
+    "      reading. 0 if you set reading=null. Use 0.9+ only when the\n"
+    "      digits are sharp, contiguous, and unobstructed.\n"
+    "  This is a JURY VOTE: a single hard-to-read crop must NOT\n"
+    "  collapse the whole track to a guessed number. Python code will\n"
+    "  aggregate the per-crop readings to pick the winning number.\n\n"
     "STEP 5 — Team for goalkeeper:\n"
     "  If role='goalkeeper', set team='unknown' (the post-processor "
     "decides from goal side). Do NOT force team_A/team_B by colour.\n\n"
     "STEP 6 — Confidence:\n"
-    "  confidence ∈ [0, 1] reflects YOUR CERTAINTY. When the movement "
-    "pattern matches a role rule (3a/3b/3c) you can use high "
-    "confidence (≥0.8). When colour and movement disagree, lower it.\n\n"
+    "  confidence ∈ [0, 1] reflects YOUR overall track-level certainty\n"
+    "  for the role/team decision (NOT the jersey number — that is\n"
+    "  derived from per-crop votes). Use ≥0.8 when movement/kit are\n"
+    "  decisive, lower it when colour and movement disagree.\n\n"
     "=== Output format ===\n"
     "Respond with ONLY a single JSON object on one line, no prose, no "
     "markdown:\n"
@@ -183,7 +240,9 @@ _MULTI_USER_TEMPLATE = (
     '"pitch_membership": "on_pitch"|"off_pitch", '
     '"role": "player"|"goalkeeper"|"coach"|"referee"|"linesman"|"other"|"unknown", '
     '"team": "team_A"|"team_B"|"referee"|"none"|"unknown", '
-    '"jersey_number": <int 1-99 or null>, '
+    '"crop_verdicts": [{{"image": 1, "visible_digits": "<short>", '
+    '"reading": <int 1-99 or null>, "crop_confidence": <float 0.0-1.0>}}, '
+    '... {N} entries in image-order ...], '
     '"confidence": <float 0.0-1.0>, '
     '"reasoning": "<one short sentence>"}}\n\n'
     "team rules:\n"
@@ -191,7 +250,9 @@ _MULTI_USER_TEMPLATE = (
     "kit matches).\n"
     "  - role=goalkeeper          → team='unknown'.\n"
     "  - role=referee or linesman → team='referee'.\n"
-    "  - role=coach / other       → team='none'."
+    "  - role=coach / other       → team='none'.\n\n"
+    "When role != 'player', emit crop_verdicts as an empty list [] — "
+    "the field is only meaningful for players."
 )
 
 
@@ -320,6 +381,50 @@ def parse_single_response(response: str) -> int | None:
     return None
 
 
+def parse_single_ocr_response(
+    raw: str,
+) -> tuple[int | None, float, str]:
+    """Parse SINGLE_OCR_PROMPT's JSON reply into
+    ``(reading, crop_confidence, visible_digits)``.
+
+    Robust to truncation and to the model emitting a plain integer or
+    free text instead of JSON — when the JSON parse fails we fall back
+    to ``parse_single_response`` (number-extraction) with cc=0.5.
+    """
+    text = raw.strip()
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            obj = _try_parse_truncated(m.group(0))
+            if obj is None:
+                obj = {}
+    else:
+        obj = {}
+    if obj:
+        reading_raw = obj.get("reading")
+        try:
+            reading = int(reading_raw) if reading_raw not in (
+                None, "", "null", "none") else None
+        except (TypeError, ValueError):
+            reading = None
+        if reading is not None and not (1 <= reading <= 99):
+            reading = None
+        try:
+            cc = float(obj.get("crop_confidence", 0.0))
+        except (TypeError, ValueError):
+            cc = 0.0
+        cc = max(0.0, min(1.0, cc))
+        if reading is None:
+            cc = 0.0
+        visible = str(obj.get("visible_digits", "") or "")[:80]
+        return reading, cc, visible
+    # Fallback: free-text reply.
+    n = parse_single_response(text)
+    return n, (0.5 if n is not None else 0.0), text[:80]
+
+
 _VALID_TEAMS = {"team_A", "team_B", "referee", "none", "unknown"}
 
 
@@ -362,14 +467,94 @@ def _try_parse_truncated(json_text: str) -> dict[str, Any] | None:
         return None
 
 
+def aggregate_crop_verdicts(
+    verdicts: list[dict[str, Any]],
+) -> tuple[int | None, float, list[tuple[int, float]]]:
+    """Aggregate per-crop ``crop_verdicts`` into a track-level verdict.
+
+    Voting: each crop with a clean ``reading`` casts a vote weighted by
+    its ``crop_confidence``. Crops where ``reading`` is null contribute
+    nothing (their ``visible_digits`` description is informative for
+    debugging but does NOT spawn a guess like '0' → 10/20/30).
+
+    Confidence formula combines two factors so that a single weak vote
+    (e.g. 1 crop reads "21" at cc=0.5 while 14 are blank) does NOT
+    masquerade as 100% certain:
+
+        evidence_strength = winner_score / N_crops_total   (turnout)
+        purity            = winner_score / total_voted     (consensus)
+        conf              = sqrt(evidence_strength × purity)
+
+    The geometric mean punishes either factor going to zero. Reference
+    points on a 15-crop track:
+
+      | scenario                          | winner | total | N  | conf |
+      |-----------------------------------|-------:|------:|---:|-----:|
+      | 1 vote, cc=0.5, 14 blanks         |   0.50 |  0.50 | 15 | 0.18 |
+      | 6 unanimous votes at cc=0.9       |   5.40 |  5.40 | 15 | 0.60 |
+      | 4 votes #18 + 2 votes #13 at 0.9  |   3.60 |  5.40 | 15 | 0.40 |
+      | 15 unanimous strong               |  13.50 | 13.50 | 15 | 0.95 |
+
+    Returns ``(winner_number, conf, breakdown)``. ``breakdown`` is a
+    list of ``(number, weighted_score)`` sorted desc — runner-up
+    readings are surfaced so downstream code can detect tracker ID
+    switches (a real same-person track would have a clear winner;
+    a mixed-identity track has competing numbers).
+    """
+    score: dict[int, float] = {}
+    total_voted = 0.0
+    n_crops_total = 0
+    for v in verdicts or []:
+        if not isinstance(v, dict):
+            continue
+        n_crops_total += 1
+        reading = v.get("reading")
+        if reading in (None, "", "null", "none"):
+            continue
+        try:
+            n = int(reading)
+        except (TypeError, ValueError):
+            continue
+        if not (1 <= n <= 99):
+            continue
+        try:
+            cc = float(v.get("crop_confidence", 0.0))
+        except (TypeError, ValueError):
+            cc = 0.0
+        cc = max(0.0, min(1.0, cc))
+        if cc <= 0.0:
+            continue
+        score[n] = score.get(n, 0.0) + cc
+        total_voted += cc
+    if not score or n_crops_total == 0 or total_voted <= 0:
+        return None, 0.0, []
+    breakdown = sorted(score.items(), key=lambda kv: -kv[1])
+    winner_n, winner_score = breakdown[0]
+    evidence = winner_score / float(n_crops_total)
+    purity = winner_score / total_voted
+    conf = math.sqrt(max(0.0, evidence * purity))
+    conf = max(0.0, min(1.0, conf))
+    return winner_n, conf, breakdown
+
+
 def parse_multi_response(
     raw: str,
-) -> tuple[int | None, float, str, str, str]:
+) -> tuple[int | None, float, str, str, str, list[tuple[int, float]]]:
     """Parse ``recognize_multi``'s JSON reply into ``(num, conf,
-    reasoning, role, team)``.
+    reasoning, role, team, jersey_breakdown)``.
 
     The ``target_kit_description`` field (when emitted) is folded into
     ``reasoning`` so it survives downstream auditing.
+
+    ``num`` and the jersey portion of ``conf`` are derived from the
+    per-crop ``crop_verdicts`` array via :func:`aggregate_crop_verdicts`.
+    Falls back to the legacy top-level ``jersey_number`` field when
+    the model didn't emit per-crop verdicts (back-compat with caches
+    produced before the prompt changed).
+
+    ``jersey_breakdown`` is a list of ``(number, weighted_score)`` so
+    the consolidator can see runner-up candidates and inspect cases
+    where ReID and the winning number disagree.
     """
     text = raw.strip()
     # First try to find a complete {…} block. If max_tokens cut the
@@ -382,29 +567,47 @@ def parse_multi_response(
     else:
         i = text.find("{")
         if i < 0:
-            return (None, 0.0, f"no json: {text[:80]}", "unknown", "unknown")
+            return (None, 0.0, f"no json: {text[:80]}", "unknown", "unknown", [])
         json_text = text[i:]
     try:
         obj = json.loads(json_text)
     except json.JSONDecodeError:
         obj = _try_parse_truncated(json_text)
         if obj is None:
-            return (None, 0.0, f"bad json: {text[:80]}", "unknown", "unknown")
-    num_raw = obj.get("jersey_number")
-    num: int | None
-    if num_raw in (None, "none", "null"):
-        num = None
+            return (None, 0.0, f"bad json: {text[:80]}", "unknown", "unknown", [])
+
+    # New path: aggregate per-crop verdicts.
+    crop_verdicts = obj.get("crop_verdicts")
+    if isinstance(crop_verdicts, list) and crop_verdicts:
+        num, jersey_score, breakdown = aggregate_crop_verdicts(crop_verdicts)
     else:
-        try:
-            n = int(num_raw)
-            num = n if 1 <= n <= 99 else None
-        except (TypeError, ValueError):
+        # Legacy fallback: read the old top-level fields.
+        num_raw = obj.get("jersey_number")
+        if num_raw in (None, "none", "null"):
             num = None
+        else:
+            try:
+                n = int(num_raw)
+                num = n if 1 <= n <= 99 else None
+            except (TypeError, ValueError):
+                num = None
+        breakdown = [(num, 1.0)] if num is not None else []
+        jersey_score = 1.0 if num is not None else 0.0
+
     try:
-        conf = float(obj.get("confidence", 0.0))
+        track_conf = float(obj.get("confidence", 0.0))
     except (TypeError, ValueError):
+        track_conf = 0.0
+    track_conf = max(0.0, min(1.0, track_conf))
+    # Effective confidence reported up: when a number was decided,
+    # combine the LLM's track-level confidence (role/team certainty)
+    # with the jersey vote ratio (how dominant the winner is). Take
+    # the min so a low-confidence role decision can't masquerade
+    # behind a 100% unanimous but tiny set of jersey votes.
+    if num is None:
         conf = 0.0
-    conf = max(0.0, min(1.0, conf))
+    else:
+        conf = min(track_conf, jersey_score)
     reasoning = str(obj.get("reasoning", "") or "")[:200]
     target_desc = str(obj.get("target_kit_description", "") or "")[:120]
     if target_desc:
@@ -431,7 +634,7 @@ def parse_multi_response(
         role = "unknown"
         team = "unknown"
         conf = min(conf, 0.2)
-        return (None, conf, reasoning, role, team)
+        return (None, conf, reasoning, role, team, [])
     team = str(obj.get("team", "unknown") or "unknown").strip()
     if team.lower() in {"team_a", "teama", "a"}:
         team = "team_A"
@@ -445,7 +648,7 @@ def parse_multi_response(
         team = "unknown"
     if num is None and role == "player":
         conf = min(conf, 0.0)
-    return (num, conf, reasoning, role, team)
+    return (num, conf, reasoning, role, team, breakdown)
 
 
 def parse_scene_response(raw: str) -> dict[str, Any]:

@@ -29,14 +29,17 @@ from ..interfaces import BaseJerseyRecognizer
 from ._vlm_common import (
     MULTI_SYSTEM,
     SCENE_TASK_TEXT,
+    SINGLE_OCR_PROMPT,
     SINGLE_PROMPT,
     TEAM_SEEDS_INTRO,
     TEAM_SEEDS_TASK_TEXT,
+    aggregate_crop_verdicts,
     build_multi_user_text,
     build_scene_context_block,
     burn_id_banner,
     parse_multi_response,
     parse_scene_response,
+    parse_single_ocr_response,
     parse_single_response,
     parse_team_seeds_response,
 )
@@ -67,6 +70,19 @@ class BaseVLMRecognizer(BaseJerseyRecognizer):
         self.jpeg_quality = int(self.config.get("jpeg_quality", 85))
         self.max_crop_dim = int(self.config.get("max_crop_dim", 384))
         self.max_concurrency = int(self.config.get("max_concurrency", 4))
+        # OCR backend for Phase 2 (per-crop jersey-number reading).
+        #   - "llm" (default): one ``SINGLE_OCR_PROMPT`` LLM call per crop.
+        #     Accurate but expensive ($ + rate limit) so the consolidator
+        #     normally caps at ~30 crops/track.
+        #   - "rapidocr": local RapidOCR / PaddleOCR ONNX. Free + fast,
+        #     can OCR every frame without rate-limit concerns. Less
+        #     accurate (Chinese model confuses some Latin digits with
+        #     Han characters; a small lookalike mapping recovers the
+        #     common cases). Phase 1 (role / team / scene) still goes
+        #     through the LLM regardless.
+        self.ocr_backend = str(
+            self.config.get("ocr_backend", "llm")).lower()
+        self._rapid_reader = None  # lazy on first call
 
     # ------------------------------------------------------------------
     # BaseJerseyRecognizer surface
@@ -160,18 +176,47 @@ class BaseVLMRecognizer(BaseJerseyRecognizer):
         team_exemplars: dict[str, list[np.ndarray]] | None = None,
         scene_description: dict[str, str] | None = None,
         movement_description: str = "",
-    ) -> tuple[int | None, float, str, str, str]:
+    ) -> tuple[
+        int | None, float, str, str, str,
+        list[tuple[int, float]], list[dict[str, Any]],
+    ]:
+        """Two-phase recognition.
+
+        Phase 1 (1 LLM call): role/team decision over a representative
+        subset of crops + scene + team exemplars. The LLM returns
+        ``role / team / target_kit_description / reasoning`` plus a
+        legacy ``crop_verdicts`` field that we ignore here.
+
+        Phase 2 (N LLM calls in parallel, only if role=='player'):
+        per-crop OCR. Each call sees ONE crop and returns
+        ``(reading, crop_confidence, visible_digits)``. Python
+        aggregates via :func:`aggregate_crop_verdicts`.
+
+        Splitting the work means a 200-crop track (long lifespan) gets
+        200 small parallel OCR calls instead of one huge prompt that
+        the model can't reason carefully over.
+        """
         if not crops:
-            return (None, 0.0, "no crops", "unknown", "unknown")
+            return (None, 0.0, "no crops", "unknown", "unknown", [], [])
+
+        # ---- Phase 1: role/team decision -----------------------------
+        # Use a representative subset (large bbox + sharp) to keep the
+        # decision call cheap. The full crop list still feeds the per-
+        # crop OCR phase.
+        decision_n = min(len(crops), int(self.config.get(
+            "decision_subset_size", 8)))
+        # Crops are already ordered by the sampler (frame_id); take an
+        # evenly-spaced subset to cover the track's duration.
+        if decision_n >= len(crops):
+            decision_crops = crops
+        else:
+            step = len(crops) / decision_n
+            decision_crops = [crops[int(i * step)] for i in range(decision_n)]
 
         blocks: list[Block] = []
-
-        # Optional scene context (from describe_scene) as a leading text block.
         ctx = build_scene_context_block(scene_description)
         if ctx:
             blocks.append(("text", ctx))
-
-        # Optional team-exemplar reference block.
         if team_exemplars:
             for team_label in ("team_A", "team_B"):
                 exemplars = team_exemplars.get(team_label, []) or []
@@ -188,25 +233,105 @@ class BaseVLMRecognizer(BaseJerseyRecognizer):
                     blocks.append(("image", ex))
             blocks.append((
                 "text",
-                "=== Target person — decide role / jersey below "
+                "=== Target person — decide role / team below "
                 "based on the reference images above ===",
             ))
-
-        # Target crops (same person, multiple frames).
-        for i, crop in enumerate(crops):
+        for i, crop in enumerate(decision_crops):
             blocks.append(("text", f"Image {i + 1}:"))
             blocks.append(("image", crop))
-
-        # Per-track decision prompt always at the end.
         blocks.append((
             "text",
-            build_multi_user_text(len(crops), position_label, movement_description),
+            build_multi_user_text(
+                len(decision_crops), position_label, movement_description),
         ))
 
-        raw = self._call(blocks, system=MULTI_SYSTEM)
+        decision_budget = max(self.max_tokens, 80 + 60 * len(decision_crops))
+        raw = self._call(
+            blocks, system=MULTI_SYSTEM, max_tokens=decision_budget,
+        )
         if raw is None:
-            return (None, 0.0, "api error", "unknown", "unknown")
-        return parse_multi_response(raw)
+            return (None, 0.0, "api error", "unknown", "unknown", [], [])
+        # ``parse_multi_response`` returns the LLM's own crop_verdicts;
+        # we ignore those (the decision-call subset is too small for
+        # robust voting) and let Phase 2 redo the OCR over ALL crops.
+        _legacy_num, _legacy_conf, reasoning, role, team, _legacy_breakdown = (
+            parse_multi_response(raw)
+        )
+
+        # ---- Phase 2: per-crop OCR (only for players) ---------------
+        if role != "player":
+            return (None, 0.0, reasoning, role, team, [], [])
+
+        verdicts = self._ocr_crops_parallel(crops)
+        num, conf, breakdown = aggregate_crop_verdicts(verdicts)
+        return num, conf, reasoning, role, team, breakdown, verdicts
+
+    def _ocr_crops_parallel(
+        self,
+        crops: list[np.ndarray],
+    ) -> list[dict[str, Any]]:
+        """Fan out one OCR call per crop, in parallel up to
+        ``ocr_per_track_concurrency`` (defaults to ``max_concurrency``).
+        Returns a list of verdict dicts in per-crop input order:
+        ``{reading, crop_confidence, visible_digits}``.
+
+        Routes to either the LLM ``SINGLE_OCR_PROMPT`` path (default)
+        or local RapidOCR depending on ``ocr_backend``.
+        """
+        n = len(crops)
+        verdicts: list[dict[str, Any]] = [{}] * n
+        per_track_workers = int(self.config.get(
+            "ocr_per_track_concurrency", self.max_concurrency))
+
+        if self.ocr_backend == "rapidocr":
+            ocr_fn = self._ocr_one_rapidocr
+        else:
+            ocr_fn = self._ocr_one_llm
+
+        with ThreadPoolExecutor(max_workers=per_track_workers) as pool:
+            futs = [pool.submit(ocr_fn, crops[i]) for i in range(n)]
+            for i, fut in enumerate(futs):
+                try:
+                    verdicts[i] = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("OCR failed for crop %d: %s", i, exc)
+                    verdicts[i] = {
+                        "reading": None,
+                        "crop_confidence": 0.0,
+                        "visible_digits": f"error: {exc}",
+                    }
+        return verdicts
+
+    def _ocr_one_llm(self, crop: np.ndarray) -> dict[str, Any]:
+        raw = self._call(
+            [("text", SINGLE_OCR_PROMPT), ("image", crop)],
+            system=None,
+            max_tokens=80,
+        )
+        if raw is None:
+            return {
+                "reading": None,
+                "crop_confidence": 0.0,
+                "visible_digits": "api error",
+            }
+        reading, cc, visible = parse_single_ocr_response(raw)
+        return {
+            "reading": reading,
+            "crop_confidence": cc,
+            "visible_digits": visible,
+        }
+
+    def _ocr_one_rapidocr(self, crop: np.ndarray) -> dict[str, Any]:
+        if self._rapid_reader is None:
+            from .rapidocr import RapidOCRJerseyReader  # noqa: PLC0415
+            self._rapid_reader = RapidOCRJerseyReader(
+                config=self.config.get("rapidocr", {}))
+        reading, cc, visible = self._rapid_reader.ocr_crop(crop)
+        return {
+            "reading": reading,
+            "crop_confidence": cc,
+            "visible_digits": visible,
+        }
 
     # ------------------------------------------------------------------
     # Subclass hooks
