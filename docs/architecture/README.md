@@ -1,6 +1,6 @@
 # Architecture diagrams
 
-Three views of how the system fits together. Generated from
+Four views of how the system fits together. Generated from
 [`render.py`](render.py) using the [`diagrams`](https://diagrams.mingrammer.com/)
 library + graphviz, so you get real AWS icons and the source-of-truth
 is code rather than a draw.io file someone has to find.
@@ -25,6 +25,19 @@ in-memory `MatchContext` (events / tracks / ball) and `run_python`
 delegates to AgentCore Code Interpreter for ad-hoc analysis. The only
 things that leave the box are LLM tokens and Python snippets — match
 data stays local.
+
+### Online — chat on AgentCore Runtime (opt-in)
+
+![chat-runtime](chat_architecture_runtime.png)
+
+Optional alternative where the chat agent (`ChatEngine` + tool
+dispatch) runs in an AWS-managed AgentCore Runtime container instead of
+the local FastAPI process. The browser path is unchanged — FastAPI
+proxies to the runtime via `bedrock-agentcore.InvokeAgentRuntime` and
+forwards the same SSE frames back. Each session pulls the run's JSON
+output from S3 once, then stays warm for the MicroVM's lifetime. Toggle
+via `GOALINSIGHT_AGENTCORE_RUNTIME_ARN`; setup lives under
+[`deploy/agentcore_runtime/`](../../deploy/agentcore_runtime/).
 
 ### Offline — pipeline default (all local)
 

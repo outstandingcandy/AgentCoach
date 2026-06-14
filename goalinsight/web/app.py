@@ -27,6 +27,7 @@ from ._workspace import Workspace, resolve_workspace
 from .analytics import register_analytics_routes
 from .jobs import JobManager, register_jobs_routes
 from .library import register_library_routes
+from .match_detail import register_match_detail_routes
 from .pipeline_results import register_pipeline_results_routes
 from .tracking_diag import register_tracking_diag_routes
 
@@ -162,6 +163,21 @@ def create_workspace_app(
             raise HTTPException(503, "tracking.html not yet installed")
         return FileResponse(path, headers=no_cache)
 
+    @app.get("/match")
+    @app.get("/match/")
+    def match_index_page() -> FileResponse:
+        path = STATIC_DIR / "match_index.html"
+        if not path.exists():
+            raise HTTPException(503, "match_index.html not yet installed")
+        return FileResponse(path, headers=no_cache)
+
+    @app.get("/match/{run_name}")
+    def match_detail_page(run_name: str) -> FileResponse:
+        path = STATIC_DIR / "match.html"
+        if not path.exists():
+            raise HTTPException(503, "match.html not yet installed")
+        return FileResponse(path, headers=no_cache)
+
     # Per-run viewer state. ChatEngine boot is expensive (boto3 + Bedrock +
     # MatchContext load); the registry keeps a small LRU of warm runs.
     runs = RunRegistry(ws)
@@ -172,6 +188,8 @@ def create_workspace_app(
     register_tracking_diag_routes(app, ws)
     # Per-stage manifest endpoints used by the /pipeline page right pane.
     register_pipeline_results_routes(app, ws)
+    # Match-detail page payload (roster + events with seek windows).
+    register_match_detail_routes(app, runs)
 
     @app.on_event("shutdown")
     def _shutdown_runs() -> None:
@@ -186,6 +204,14 @@ def create_workspace_app(
         ctx = handle.ctx
         teams = Counter(ctx.team_assignments.values())
         event_types = Counter(e.get("type", "unknown") for e in ctx.events)
+        # In Runtime mode, run_python returns presigned S3 URLs from
+        # this bucket; the viewer needs to know it to widen its
+        # IMG_RE so the image renders inline. Empty in local mode.
+        import os as _os
+        chat_artifact_bucket = (
+            _os.environ.get("GOALINSIGHT_CHAT_ARTIFACT_BUCKET")
+            or _os.environ.get("GOALINSIGHT_S3_BUCKET", "")
+        ) if _os.environ.get("GOALINSIGHT_AGENTCORE_RUNTIME_ARN") else ""
         return JSONResponse({
             "run_name": run_name,
             "video_name": ctx.video_path.name,
@@ -198,6 +224,7 @@ def create_workspace_app(
             "pitch_width": ctx.pitch_width,
             "teams": dict(teams),
             "event_counts": dict(event_types),
+            "chat_artifact_bucket": chat_artifact_bucket,
         })
 
     @app.get("/api/runs/{run_name}/video")
@@ -223,6 +250,36 @@ def create_workspace_app(
             logger.exception("chat failed (run=%s)", run_name)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         return {"text": text}
+
+    @app.post("/api/runs/{run_name}/chat/prepare")
+    def run_chat_prepare(run_name: str) -> StreamingResponse:
+        """Stream session-preparation progress as SSE.
+
+        When the chat agent is hosted on AgentCore Runtime this uploads
+        the run's JSON to S3 and warms up the runtime; in local mode it
+        immediately emits ``ready``. Front-end uses this to gate the
+        chat input until preparation finishes.
+        """
+        try:
+            handle = runs.get(run_name)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc))
+
+        from .chat_prepare import stream_prepare
+
+        def event_source():
+            try:
+                for evt in stream_prepare(run_name, handle.run_dir):
+                    yield f"data: {json.dumps(evt)}\n\n"
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("chat prepare failed (run=%s)", run_name)
+                yield f"data: {json.dumps({'stage':'error','percent':0,'detail':str(exc)})}\n\n"
+
+        return StreamingResponse(
+            event_source(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.post("/api/runs/{run_name}/chat/stream")
     def run_chat_stream(run_name: str, req: ChatRequest) -> StreamingResponse:

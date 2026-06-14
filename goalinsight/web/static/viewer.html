@@ -44,6 +44,19 @@
                         border: 1px solid #2a323c; margin: 6px 0; display: block; }
     .msg .caption { font-size: 11px; color: #9aa3ad; margin-bottom: 6px; }
 
+    /* Chat session preparation banner */
+    #prepare-banner { padding: 10px 14px; background: #1e242b;
+      border-bottom: 1px solid #2a323c; font-size: 12px; color: #cfe3ff; }
+    #prepare-banner.error { background: #3b1f24; color: #ffb4b4;
+      border-bottom-color: #5a2a32; }
+    #prepare-banner .label { display: flex; justify-content: space-between;
+      margin-bottom: 6px; }
+    #prepare-bar { height: 4px; background: #2a323c; border-radius: 2px;
+      overflow: hidden; }
+    #prepare-bar > div { height: 100%; background: #3b82f6; width: 0%;
+      transition: width 0.2s ease-out; }
+    #prepare-banner.ready { display: none; }
+
     /* Insights drawer */
     #insights-toggle { position: fixed; bottom: 16px; right: 436px;
       z-index: 20; background: #3b82f6; color: white; border: 0;
@@ -73,6 +86,7 @@
     #insights-output pre { background: #0d1116; padding: 10px; border-radius: 6px;
       font-size: 11px; color: #cfe3ff; overflow-x: auto; margin-top: 6px; }
   </style>
+  <script defer src="/static/nav.js"></script>
 </head>
 <body>
   <header>
@@ -101,14 +115,21 @@
   </div>
 
   <div id="chat-pane">
+    <div id="prepare-banner">
+      <div class="label">
+        <span id="prepare-text">Preparing chat session…</span>
+        <span id="prepare-pct">0%</span>
+      </div>
+      <div id="prepare-bar"><div></div></div>
+    </div>
     <div id="messages">
       <div class="msg system-hint">
         Ask about the match. Your current video timestamp is sent with each question so you can ask things like "who has the ball right now?" or "was that last pass successful?"
       </div>
     </div>
     <div id="composer">
-      <textarea id="input" rows="2" placeholder="Ask a question about the match..."></textarea>
-      <button id="send">Send</button>
+      <textarea id="input" rows="2" placeholder="Ask a question about the match..." disabled></textarea>
+      <button id="send" disabled>Send</button>
     </div>
   </div>
 
@@ -144,10 +165,30 @@
     // Match [MM:SS] or [MM:SS.ff] / [M:SS]; up to 999 minutes.
     const SEEK_RE = /\[(\d{1,3}):([0-5]\d)(?:\.(\d{1,2}))?\]/g;
 
-    // Match a markdown image: ![alt text](url). URL must look like a
-    // relative or absolute path (we restrict the scheme to '/' or
-    // /chat_artifacts/ so the model can't smuggle remote images).
-    const IMG_RE = /!\[([^\]]*)\]\((\/chat_artifacts\/[^\s)]+)\)/g;
+    // Match a markdown image: ![alt text](url). Two URL shapes are
+    // allowed; everything else is dropped to keep the model from
+    // smuggling images from arbitrary origins:
+    //   1. /chat_artifacts/...               (local-mode static mount)
+    //   2. https://<chat-artifact-bucket>.s3[.<region>].amazonaws.com/chat_artifacts/...
+    //      (Runtime mode — presigned S3 GET URLs returned by run_python)
+    // The bucket name is fetched from /api/runs/<run>/meta at startup
+    // and the regex is rebuilt once we have it. Until then only the
+    // local-mount form is accepted.
+    let IMG_RE = /!\[([^\]]*)\]\((\/chat_artifacts\/[^\s)]+)\)/g;
+    function buildImgRe(bucket) {
+      if (!bucket) return IMG_RE;
+      const esc = bucket.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return new RegExp(
+        '!\\[([^\\]]*)\\]\\(' +
+        '(' +
+          '\\/chat_artifacts\\/[^\\s)]+' +
+          '|' +
+          'https:\\/\\/' + esc +
+            '\\.s3(?:\\.[a-z0-9-]+)?\\.amazonaws\\.com\\/chat_artifacts\\/[^\\s)]+' +
+        ')\\)',
+        'g',
+      );
+    }
 
     // Start a few seconds before the cited moment so the user has time
     // to follow the buildup before the action.
@@ -335,6 +376,68 @@
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
     });
 
+    // ----- Chat session preparation -----
+    // In remote mode (GOALINSIGHT_AGENTCORE_RUNTIME_ARN set), the
+    // backend uploads this run's JSON to S3 and warms up the runtime
+    // before chat is usable. Show progress and only enable inputs
+    // when ready. In local mode the backend emits {ready,100} immediately.
+    const banner = document.getElementById('prepare-banner');
+    const prepText = document.getElementById('prepare-text');
+    const prepPct = document.getElementById('prepare-pct');
+    const prepFill = document.querySelector('#prepare-bar > div');
+
+    function setProgress(pct, text, errored) {
+      if (errored) banner.classList.add('error');
+      prepFill.style.width = `${pct}%`;
+      prepPct.textContent = `${pct}%`;
+      if (text) prepText.textContent = text;
+    }
+
+    async function prepareSession() {
+      try {
+        const resp = await fetch(`${API_BASE}/chat/prepare`, { method: 'POST' });
+        if (!resp.ok || !resp.body) {
+          setProgress(0, `prepare failed: HTTP ${resp.status}`, true);
+          return;
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf('\n\n')) !== -1) {
+            const frame = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            for (const line of frame.split('\n')) {
+              if (!line.startsWith('data:')) continue;
+              const payload = line.slice(5).trim();
+              if (!payload) continue;
+              let evt;
+              try { evt = JSON.parse(payload); } catch { continue; }
+              if (evt.stage === 'error') {
+                setProgress(0, evt.detail || 'preparation failed', true);
+                return;
+              }
+              setProgress(evt.percent ?? 0, evt.detail || evt.stage);
+              if (evt.stage === 'ready') {
+                banner.classList.add('ready');
+                inputEl.disabled = false;
+                sendBtn.disabled = false;
+                inputEl.focus();
+                return;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        setProgress(0, `prepare error: ${e}`, true);
+      }
+    }
+    prepareSession();
+
     (async () => {
       try {
         const r = await fetch(`${API_BASE}/meta`);
@@ -348,6 +451,12 @@
         const eventTags = Object.entries(m.event_counts)
           .map(([t, n]) => `<span class="tag">${t}: ${n}</span>`).join('');
         document.getElementById('meta-events').innerHTML = eventTags || 'none';
+        // Once we know the chat artifact bucket, widen the markdown
+        // image regex to also accept presigned S3 URLs from that
+        // bucket (Runtime mode). Safe: only this bucket is allowed.
+        if (m.chat_artifact_bucket) {
+          IMG_RE = buildImgRe(m.chat_artifact_bucket);
+        }
       } catch (e) {
         document.getElementById('meta-video').textContent = `(meta load failed: ${e})`;
       }
