@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from ..annotation import per_video_settings
-from ..pipeline import Pipeline
+from ..pipeline import Pipeline, PipelineCancelled
 from ..utils.config import get_default_config, load_config, merge_configs
 from ._workspace import Workspace
 
@@ -77,6 +77,12 @@ class JobManager:
         self.jobs: dict[str, JobRecord] = {}
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self._lock = threading.Lock()
+        # Per-job cancel hooks. Pipeline jobs run in-process so we use
+        # threading.Event; subprocess jobs (train / render) get a
+        # subprocess.Popen handle instead. Both are kept here so the
+        # /cancel endpoint has one lookup table to consult.
+        self._cancel_events: dict[str, threading.Event] = {}
+        self._procs: dict[str, subprocess.Popen] = {}
         self._restore()
 
     # ------------------------------------------------------------------
@@ -209,13 +215,28 @@ class JobManager:
     # ------------------------------------------------------------------
 
     def _run_pipeline(self, rec: JobRecord) -> dict[str, Any]:
+        """Run the pipeline as a subprocess so cancel can SIGTERM it.
+
+        The previous implementation ran ``Pipeline.run`` in a worker
+        thread of the web server's process. ThreadPoolExecutor has no
+        thread-kill primitive, so cancel could only fire between
+        stages — useless when the bottleneck is mid-stage (e.g.
+        ``field_registration`` Pass 1 takes 10+ minutes). Spawning a
+        subprocess gives us a real OS process to terminate within
+        seconds, at the cost of having to materialize the merged
+        config into a YAML file first.
+        """
         p = rec.payload
+        run_dir = self.workspace.run_dir(rec.run_name)  # type: ignore[arg-type]
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        # Apply per-video annotator overrides to the chosen YAML so the
+        # subprocess inherits them. Same merge order the old in-process
+        # path used; we just write the result to disk instead of
+        # passing a Python dict.
         config = get_default_config()
         if p.get("config_path"):
             config = merge_configs(config, load_config(p["config_path"]))
-        # Per-video annotator overrides win over the YAML config so a user
-        # who tweaks pitch/camera in the Annotate panel sees the same
-        # numbers in the Pipeline run without editing the YAML.
         config = _merge_per_video_overrides(
             config,
             annotations_dir=self.workspace.annotations_dir,
@@ -227,22 +248,60 @@ class JobManager:
         if p.get("no_viz"):
             config.setdefault("output", {})["save_visualizations"] = False
 
+        # If a stages list is supplied, encode it on disk too so a user
+        # inspecting effective.yaml later sees the exact run shape.
         stages = p.get("stages") or None
-        pipeline = (
-            Pipeline.from_stage_names(stages, config)
-            if stages else Pipeline(config)
+        if stages:
+            config.setdefault("pipeline", {})["stages"] = list(stages)
+
+        try:
+            import yaml  # local import: avoids the import on cold starts
+        except ImportError as exc:  # pragma: no cover — yaml ships with the project
+            raise RuntimeError(f"yaml module unavailable: {exc}") from exc
+        effective_path = run_dir / "logs" / f"effective-{rec.id}.yaml"
+        effective_path.parent.mkdir(parents=True, exist_ok=True)
+        effective_path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+        argv: list[str] = [
+            sys.executable, "-u", "-m", "goalinsight.cli",
+            "--video", p["video_path"],
+            "--output", str(run_dir),
+            "--config", str(effective_path),
+            "--no-timestamp",
+        ]
+        if stages:
+            argv += ["--stages", ",".join(stages)]
+        if p.get("skip_existing", True):
+            argv.append("--skip-existing")
+        if p.get("no_viz"):
+            argv.append("--no-viz")
+        if p.get("keypoint_model"):
+            argv += ["--keypoint-model", p["keypoint_model"]]
+
+        rc = self._run_subprocess(
+            argv, log_path=rec.log_path, cwd=REPO_ROOT, job_id=rec.id,
         )
-        run_dir = self.workspace.run_dir(rec.run_name)  # type: ignore[arg-type]
-        # Pipeline.run resolves stage_dirs as <output_dir>/<stage_name>/, so
-        # we hand it the run dir directly (no extra timestamping).
-        log_path = Path(rec.log_path) if rec.log_path else None
-        with _LogCapture(log_path):
-            metadata = pipeline.run(
-                video_path=Path(p["video_path"]),
-                output_dir=run_dir,
-                skip_existing=bool(p.get("skip_existing", True)),
+        # Distinguish "cancelled by user" from "real failure". SIGTERM
+        # produces -signal exit codes on Linux (negative when accessed
+        # via subprocess.returncode); also accept the standard
+        # 128 + SIGTERM (143) form some runtimes report.
+        if rc in (-15, 143):
+            raise PipelineCancelled(
+                f"pipeline cancelled by user (signal SIGTERM, rc={rc})"
             )
-        return {"stages_run": metadata.get("stages_run", [])}
+        if rc != 0:
+            raise RuntimeError(f"pipeline subprocess exited with code {rc}")
+
+        # Mirror the old return shape so callers + jobs.json keep
+        # the same schema.
+        stats_path = run_dir / "pipeline_stats.json"
+        if stats_path.exists():
+            try:
+                meta = json.loads(stats_path.read_text())
+                return {"stages_run": meta.get("stages_run", [])}
+            except (OSError, json.JSONDecodeError):
+                pass
+        return {"stages_run": stages or []}
 
     def _run_train(self, rec: JobRecord) -> dict[str, Any]:
         p = rec.payload
@@ -256,7 +315,7 @@ class JobManager:
         if p.get("remote"):
             argv.append("--remote")
         argv.extend(p.get("extra_argv") or [])
-        rc = self._run_subprocess(argv, log_path=rec.log_path, cwd=REPO_ROOT)
+        rc = self._run_subprocess(argv, log_path=rec.log_path, cwd=REPO_ROOT, job_id=rec.id)
         if rc != 0:
             raise RuntimeError(f"train_finetune.py exited with code {rc}")
         # Trainer writes best_model.pt under <output_dir>/run_<ts>/models/;
@@ -281,7 +340,7 @@ class JobManager:
         ]
         if p.get("max_frames"):
             argv += ["--max-frames", str(int(p["max_frames"]))]
-        rc = self._run_subprocess(argv, log_path=rec.log_path, cwd=REPO_ROOT)
+        rc = self._run_subprocess(argv, log_path=rec.log_path, cwd=REPO_ROOT, job_id=rec.id)
         if rc != 0:
             raise RuntimeError(f"render_consolidated_tracking exited with code {rc}")
         return {"output": p["output"]}
@@ -315,6 +374,16 @@ class JobManager:
             try:
                 rec.result = fn(rec)
                 rec.status = "done"
+            except PipelineCancelled as exc:
+                # User-initiated stop — record but don't log a stack
+                # trace (it's not a fault). Status distinguishes
+                # cancel-by-user from a real failure.
+                rec.status = "cancelled"
+                rec.error = str(exc)
+                if rec.log_path:
+                    with suppress(OSError):
+                        with open(rec.log_path, "a") as fh:
+                            fh.write(f"\n--- cancelled ---\n{exc}\n")
             except BaseException as exc:  # noqa: BLE001 — log everything
                 logger.exception("job %s failed", rec.id)
                 rec.status = "failed"
@@ -331,8 +400,42 @@ class JobManager:
                 self._persist()
         self.executor.submit(runner)
 
+    # ------------------------------------------------------------------
+    # Cancel
+    # ------------------------------------------------------------------
+
+    def cancel(self, job_id: str) -> bool:
+        """Request a graceful stop for ``job_id``.
+
+        Pipeline jobs honour this at the next stage boundary (the
+        currently-running stage finishes; later stages are skipped).
+        Subprocess jobs (train / render) get a SIGTERM.
+
+        Returns False if the job is unknown, not running, or has no
+        cancel hook attached. Returns True when the request was
+        delivered — actual termination is asynchronous.
+        """
+        with self._lock:
+            rec = self.jobs.get(job_id)
+            if rec is None or rec.status != "running":
+                return False
+            ev = self._cancel_events.get(job_id)
+            proc = self._procs.get(job_id)
+        if ev is not None:
+            ev.set()
+            return True
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                logger.exception("terminate failed for job %s", job_id)
+                return False
+            return True
+        return False
+
     def _run_subprocess(
         self, argv: list[str], *, log_path: str | None, cwd: Path,
+        job_id: str | None = None,
     ) -> int:
         log_fh = open(log_path, "a") if log_path else subprocess.DEVNULL
         try:
@@ -349,7 +452,16 @@ class JobManager:
                 stderr=subprocess.STDOUT,
                 env={**os.environ, "PYTHONUNBUFFERED": "1"},
             )
-            return proc.wait()
+            # Register so /cancel can SIGTERM in-flight subprocess jobs.
+            if job_id is not None:
+                with self._lock:
+                    self._procs[job_id] = proc
+            try:
+                return proc.wait()
+            finally:
+                if job_id is not None:
+                    with self._lock:
+                        self._procs.pop(job_id, None)
         finally:
             if not isinstance(log_fh, int):
                 log_fh.close()
@@ -460,6 +572,25 @@ def register_jobs_routes(app: FastAPI, manager: JobManager) -> None:
         except KeyError:
             raise HTTPException(404, f"job not found: {job_id}")
         return JSONResponse(rec.to_public())
+
+    @app.post("/api/jobs/{job_id}/cancel")
+    def cancel_job(job_id: str) -> JSONResponse:
+        try:
+            rec = manager.get(job_id)
+        except KeyError:
+            raise HTTPException(404, f"job not found: {job_id}")
+        if rec.status != "running":
+            raise HTTPException(
+                409,
+                f"job {job_id} is {rec.status!r}, only running jobs can be cancelled",
+            )
+        ok = manager.cancel(job_id)
+        if not ok:
+            raise HTTPException(
+                500,
+                f"cancel hook missing for job {job_id} — running but not interruptible",
+            )
+        return JSONResponse({"id": job_id, "cancel_requested": True})
 
     @app.get("/api/jobs/{job_id}/log")
     def get_log(job_id: str, tail_kb: int = 64) -> PlainTextResponse:

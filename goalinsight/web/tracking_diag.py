@@ -148,15 +148,12 @@ def register_tracking_diag_routes(app: FastAPI, workspace: Workspace) -> None:
         """
         idx = _frame_index_from_str(frame_index)
         run_dir = workspace.run_dir(_safe_filename(run_name))
+        # Tracking diag UI shows raw integer tids; tracking/tracks.json
+        # is always the raw tracker output (consolidation writes its
+        # own file under track_consolidation/).
         tracks_path = run_dir / "tracking" / "tracks.json"
         if not tracks_path.exists():
-            # Fall back to pre-consolidation if track_consolidation hasn't
-            # run yet (so the page still works on tracking-only runs).
-            alt = run_dir / "tracking" / "tracks.pre_consolidation.json"
-            if alt.exists():
-                tracks_path = alt
-            else:
-                raise HTTPException(404, "tracks.json missing for run")
+            raise HTTPException(404, "tracks.json missing for run")
         data = _load_json(tracks_path)
         # tracks.json keys are stringified frame indices.
         return JSONResponse({

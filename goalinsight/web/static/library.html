@@ -23,49 +23,157 @@
       background: #0d1116; color: #e6e9ee; border: 1px solid #2a323c;
       border-radius: 6px; padding: 8px; font-size: 13px; min-width: 140px;
     }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-            gap: 12px; }
-    .card { background: #161b21; border: 1px solid #262b33; border-radius: 8px;
-            padding: 14px; display: flex; flex-direction: column; gap: 6px; }
-    .card .name { color: #fff; font-weight: 600; word-break: break-all; }
-    .card .meta { color: #9aa3ad; font-size: 12px; }
-    .card .actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+
+    /* Video card grid */
+    .video-grid { display: grid; gap: 16px;
+                  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); }
+    .vcard { background: #161b21; border: 1px solid #262b33; border-radius: 10px;
+             overflow: hidden; display: flex; flex-direction: column; }
+    .vcard .cover { position: relative; aspect-ratio: 16 / 9; background: #0d1116;
+                    overflow: hidden; }
+    .vcard .cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .vcard .cover .pill { position: absolute; bottom: 8px; right: 8px;
+                          background: rgba(13,17,22,0.85); color: #cfe3ff;
+                          font-size: 11px; padding: 3px 8px; border-radius: 999px;
+                          font-variant-numeric: tabular-nums; }
+    .vcard .body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; flex: 1; }
+    .vcard .title { color: #fff; font-weight: 700; word-break: break-all; font-size: 14px; }
+    .vcard .vmeta { color: #9aa3ad; font-size: 12px; }
+    .vcard h4 { margin: 4px 0 4px; font-size: 11px; color: #cfe3ff;
+                text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; }
+
+    .section { background: #1a2027; border: 1px solid #232a32; border-radius: 6px;
+               padding: 8px 10px; }
+    .section .empty { color: #6b7380; font-size: 12px; padding: 4px 0; }
+    .section .line { display: flex; gap: 8px; align-items: center; font-size: 12px;
+                     color: #cfe3ff; flex-wrap: wrap; }
+
     .badge { display: inline-block; padding: 2px 6px; border-radius: 3px;
-             font-size: 11px; font-weight: 600; margin-right: 4px; }
+             font-size: 11px; font-weight: 600; margin: 1px 2px 1px 0; }
     .badge.done { background: #14532d; color: #86efac; }
     .badge.pending { background: #1e242b; color: #6b7380; border: 1px solid #2a323c; }
-    .empty { color: #6b7380; padding: 12px; font-style: italic; }
+
+    .vcard .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .vcard .actions a, .vcard .actions button {
+      font-size: 12px; padding: 5px 10px; border-radius: 5px;
+      text-decoration: none; cursor: pointer; border: 0; font-weight: 600;
+    }
+    .vcard .actions a.primary { background: #3b82f6; color: #fff; }
+    .vcard .actions a.primary:hover { background: #2563eb; }
+    .vcard .actions a.secondary, .vcard .actions button.secondary {
+      background: #2a323c; color: #cfe3ff;
+    }
+    .vcard .actions a.secondary:hover, .vcard .actions button.secondary:hover {
+      background: #364250;
+    }
+    .vcard .actions button.danger { background: #b91c1c; color: #fff; }
+
     #drop { border: 2px dashed #2a4661; border-radius: 8px; padding: 30px;
-            text-align: center; cursor: pointer; transition: border-color 0.2s; }
+            text-align: center; cursor: pointer; transition: border-color 0.2s;
+            margin-bottom: 16px; }
     #drop.dragover { border-color: #3b82f6; background: rgba(59,130,246,0.05); }
+
     #toast { position: fixed; bottom: 16px; right: 16px;
              background: #161b21; border: 1px solid #2a323c;
              padding: 10px 14px; border-radius: 6px; font-size: 13px;
              color: #cfe3ff; opacity: 0; transition: opacity 0.2s;
-             pointer-events: none; max-width: 360px; }
+             pointer-events: none; max-width: 360px; z-index: 100; }
     #toast.show { opacity: 1; pointer-events: auto; }
+
+    /* Upload progress card pinned bottom-right above the toast. */
+    #upload-card { position: fixed; bottom: 16px; right: 16px;
+                    width: 360px; background: #161b21; border: 1px solid #2a323c;
+                    border-radius: 8px; padding: 12px 14px;
+                    font-size: 13px; color: #cfe3ff; z-index: 99;
+                    display: none; box-shadow: 0 4px 16px rgba(0,0,0,0.4); }
+    #upload-card.show { display: block; }
+
+    /* Pipeline job progress card. Pins to the right side, wider than
+       the upload card so the log lines are readable. */
+    #job-card { position: fixed; bottom: 16px; right: 16px;
+                width: 520px; max-width: calc(100vw - 32px);
+                background: #161b21; border: 1px solid #2a323c;
+                border-radius: 8px; padding: 12px 14px;
+                font-size: 12px; color: #cfe3ff; z-index: 98;
+                display: none; box-shadow: 0 4px 16px rgba(0,0,0,0.4); }
+    #job-card.show { display: block; }
+    #job-card .head { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+    #job-card .head .title { font-weight: 700; color: #fff; flex: 1;
+                              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #job-card .status { font-size: 11px; padding: 2px 8px; border-radius: 999px;
+                         background: #2a323c; color: #cfe3ff; }
+    #job-card .status.running { background: #1e3a5f; color: #93c5fd; }
+    #job-card .status.success { background: #14532d; color: #86efac; }
+    #job-card .status.failed { background: #4c1d1d; color: #fca5a5; }
+    #job-card .close { background: transparent; color: #9aa3ad; border: 0;
+                       cursor: pointer; padding: 0 4px; font-size: 16px; }
+    #job-card .close:hover { color: #fff; }
+    #job-card .log { background: #0d1116; border: 1px solid #232a32; border-radius: 5px;
+                     padding: 8px 10px; max-height: 200px; overflow-y: auto;
+                     font-family: ui-monospace, "SF Mono", Menlo, monospace;
+                     font-size: 11px; line-height: 1.4; white-space: pre-wrap;
+                     color: #cfe3ff; }
+    #job-card .links { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+    #job-card .links a { font-size: 11px; padding: 4px 8px; border-radius: 4px;
+                          background: #2a323c; color: #cfe3ff; text-decoration: none;
+                          font-weight: 600; }
+    #job-card .links a:hover { background: #3b82f6; color: #fff; }
+    #upload-card .head { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+    #upload-card .name { font-weight: 700; color: #fff; flex: 1;
+                         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #upload-card .pct { color: #cfe3ff; font-variant-numeric: tabular-nums; min-width: 42px; text-align: right; }
+    #upload-card .bar { width: 100%; height: 6px; background: #0d1116;
+                         border-radius: 3px; overflow: hidden; }
+    #upload-card .bar > div { height: 100%; background: #3b82f6; width: 0%;
+                              transition: width 0.15s linear; }
+    #upload-card .meta { color: #9aa3ad; font-size: 11px; margin-top: 6px;
+                          font-variant-numeric: tabular-nums; }
+    #upload-card.error .bar > div { background: #b91c1c; }
+    #upload-card.done .bar > div { background: #14532d; }
+    #upload-card .close { background: transparent; color: #9aa3ad; border: 0;
+                          cursor: pointer; padding: 0 4px; font-size: 16px;
+                          margin-left: 4px; }
+    #upload-card .close:hover { color: #fff; }
   </style>
+  <script defer src="/static/nav.js"></script>
 </head>
 <body>
   <h1>Library</h1>
 
-  <h2>Upload video</h2>
   <div id="drop" onclick="document.getElementById('file').click()">
     Click or drop an .mp4 / .mov / .mkv / .avi file here
     <input id="file" type="file" accept=".mp4,.mov,.mkv,.avi" style="display:none">
   </div>
 
-  <h2>Videos</h2>
-  <div id="videos" class="grid"></div>
-
-  <h2>Runs</h2>
   <div class="row">
-    <input type="text" id="new-run-name" placeholder="new run name (e.g. demo_1)">
+    <input type="text" id="new-run-name" placeholder="new run name (optional)">
     <select id="new-run-video"></select>
     <select id="new-run-config"></select>
-    <button onclick="createRun()">Create run</button>
+    <button onclick="createRun()">Create new run</button>
   </div>
-  <div id="runs" class="grid"></div>
+
+  <h2>Videos</h2>
+  <div id="videos" class="video-grid"></div>
+
+  <div id="job-card">
+    <div class="head">
+      <span class="title" id="job-title">pipeline · run</span>
+      <span class="status" id="job-status">pending</span>
+      <button class="close" id="job-close" title="Hide">&times;</button>
+    </div>
+    <div class="log" id="job-log"></div>
+    <div class="links" id="job-links"></div>
+  </div>
+
+  <div id="upload-card">
+    <div class="head">
+      <span class="name" id="upload-name">file.mp4</span>
+      <span class="pct" id="upload-pct">0%</span>
+      <button class="close" id="upload-close" title="Dismiss">&times;</button>
+    </div>
+    <div class="bar"><div id="upload-bar"></div></div>
+    <div class="meta" id="upload-meta"></div>
+  </div>
 
   <div id="toast"></div>
 
@@ -77,10 +185,6 @@
       toast.classList.add('show');
       clearTimeout(flash._t);
       flash._t = setTimeout(() => toast.classList.remove('show'), ms);
-    }
-
-    function badge(state, label) {
-      return `<span class="badge ${state ? 'done' : 'pending'}">${label}</span>`;
     }
 
     async function api(method, path, body) {
@@ -96,26 +200,129 @@
       return data;
     }
 
+    // Stage labels shown for the latest run. Order roughly matches the
+    // pipeline DAG so a quick glance tells you how far along it is.
+    const STAGE_LABELS = [
+      ['field_registration', 'field_reg'],
+      ['tracking', 'track'],
+      ['track_consolidation', 'consol'],
+      ['event_detection', 'events'],
+      ['highlights', 'highlights'],
+      ['annotated_video', 'video'],
+    ];
+
+    function fmtDuration(s) {
+      if (!s || !isFinite(s)) return '?';
+      const m = Math.floor(s / 60);
+      const r = (s - m * 60).toFixed(0);
+      return `${m}:${String(r).padStart(2, '0')}`;
+    }
+
+    function fmtTimestamp(ts) {
+      if (!ts) return '';
+      // ISO from python datetime — drop fractional seconds for display.
+      return ts.replace('T', ' ').slice(0, 19);
+    }
+
+    function badge(state, label) {
+      return `<span class="badge ${state ? 'done' : 'pending'}">${label}</span>`;
+    }
+
+    function annotationBlock(v) {
+      const a = v.annotation;
+      const annotateHref = `/annotate?video=${encodeURIComponent(v.name)}`;
+      if (!a) {
+        return `<div class="section">
+          <h4>Annotations</h4>
+          <div class="empty">no annotations yet</div>
+          <div class="line"><a class="secondary" href="${annotateHref}"
+              style="padding:4px 10px;border-radius:5px;background:#2a323c;color:#cfe3ff;text-decoration:none;font-size:12px;font-weight:600">Open annotator →</a></div>
+        </div>`;
+      }
+      return `<div class="section">
+        <h4>Annotations</h4>
+        <div class="line">
+          <span><strong style="color:#fff">${a.frame_count}</strong> frame${a.frame_count === 1 ? '' : 's'} annotated</span>
+          ${a.last_modified
+            ? `<span style="color:#6b7380">· last edit ${fmtTimestamp(a.last_modified)}</span>`
+            : ''}
+        </div>
+        <div class="line" style="margin-top:6px">
+          <a class="secondary" href="${annotateHref}"
+             style="padding:4px 10px;border-radius:5px;background:#2a323c;color:#cfe3ff;text-decoration:none;font-size:12px;font-weight:600">Open annotator →</a>
+        </div>
+      </div>`;
+    }
+
+    function latestRunBlock(v) {
+      const lr = v.latest_run;
+      if (!lr) {
+        return `<div class="section">
+          <h4>Latest run</h4>
+          <div class="empty">no runs for this video yet</div>
+        </div>`;
+      }
+      const stages = lr.stages || {};
+      const stageBadges = STAGE_LABELS
+        .map(([k, lbl]) => badge(!!stages[k], lbl)).join('');
+      const lastStages = (lr.stages_run || []).slice().reverse().slice(0, 3).join(', ');
+      const ts = fmtTimestamp(lr.timestamp);
+      return `<div class="section">
+        <h4>Latest run</h4>
+        <div class="line">
+          <strong style="color:#fff">${lr.run_name}</strong>
+          ${ts ? `<span style="color:#6b7380">· ${ts}</span>` : ''}
+        </div>
+        ${lastStages
+          ? `<div class="line" style="color:#9aa3ad;font-size:11px;margin-top:2px">last: ${lastStages}</div>`
+          : ''}
+        <div style="margin-top:6px">${stageBadges}</div>
+        <div class="actions" style="margin-top:8px">
+          <a class="primary" href="/match/${encodeURIComponent(lr.run_name)}">Match</a>
+          <a class="secondary" href="/insights/${encodeURIComponent(lr.run_name)}">Insights</a>
+          <a class="secondary" href="/pipeline?run=${encodeURIComponent(lr.run_name)}">Pipeline</a>
+          <a class="secondary" href="/tracking/${encodeURIComponent(lr.run_name)}">Tracking</a>
+        </div>
+        ${(v.runs || []).length > 1
+          ? `<div class="line" style="color:#6b7380;font-size:11px;margin-top:6px">
+               (${v.runs.length - 1} earlier run${v.runs.length - 1 === 1 ? '' : 's'} for this video)
+             </div>`
+          : ''}
+      </div>`;
+    }
+
+    function videoCardHtml(v) {
+      const dur = fmtDuration(v.duration_s);
+      const wh = v.width ? `${v.width}×${v.height}` : '';
+      const fps = v.fps ? `@${v.fps.toFixed(1)} fps` : '';
+      const sizeMB = (v.size_bytes / 1024 / 1024).toFixed(1);
+      return `<div class="vcard">
+        <div class="cover">
+          <img src="${v.cover_url}" alt="${v.name}" loading="lazy"
+               onerror="this.style.display='none'"/>
+          <div class="pill">${dur}</div>
+        </div>
+        <div class="body">
+          <div class="title">${v.name}</div>
+          <div class="vmeta">${wh} ${fps} · ${sizeMB} MB</div>
+          ${annotationBlock(v)}
+          ${latestRunBlock(v)}
+          <div class="actions" style="margin-top:auto">
+            <button onclick="seedNewRun('${v.name}')">New run with this video</button>
+          </div>
+        </div>
+      </div>`;
+    }
+
+    let lastVideos = [];
+
     async function refreshVideos() {
       const videos = await api('GET', '/api/library/videos');
+      lastVideos = videos;
       const grid = $("#videos");
       grid.innerHTML = videos.length
-        ? videos.map(v => {
-            const dur = v.duration_s ? `${v.duration_s.toFixed(1)}s` : '?';
-            const wh = v.width ? `${v.width}×${v.height}` : '';
-            const fps = v.fps ? `@${v.fps.toFixed(1)} fps` : '';
-            return `<div class="card">
-              <div class="name">${v.name}</div>
-              <div class="meta">${dur} ${wh} ${fps}</div>
-              <div class="meta">${(v.size_bytes / 1024 / 1024).toFixed(1)} MB</div>
-              <div class="actions">
-                <button class="secondary" onclick="annotate('${v.name}')">Annotate</button>
-                <button onclick="seedNewRun('${v.name}')">Use in new run</button>
-              </div>
-            </div>`;
-          }).join('')
-        : '<div class="empty">No videos uploaded yet.</div>';
-
+        ? videos.map(videoCardHtml).join('')
+        : '<div style="color:#6b7380">No videos uploaded yet — drop one above.</div>';
       const sel = $("#new-run-video");
       sel.innerHTML = '<option value="">(no video)</option>' +
         videos.map(v => `<option value="${v.name}">${v.name}</option>`).join('');
@@ -123,111 +330,253 @@
 
     async function refreshConfigs() {
       const cfgs = await api('GET', '/api/library/configs');
+      configsCache = cfgs;
       const sel = $("#new-run-config");
       sel.innerHTML = cfgs.map(c => {
-        const sel = c.name === 'default.yaml' ? ' selected' : '';
-        return `<option value="${c.name}"${sel}>${c.name}</option>`;
+        const selAttr = c.name === 'default.yaml' ? ' selected' : '';
+        const stageHint = (c.stages && c.stages.length)
+          ? ` (${c.stages.length} stages)` : ' (no stages)';
+        return `<option value="${c.name}"${selAttr}>${c.name}${stageHint}</option>`;
       }).join('');
-    }
-
-    async function refreshRuns() {
-      const runs = await api('GET', '/api/library/runs');
-      const grid = $("#runs");
-      grid.innerHTML = runs.length
-        ? runs.map(r => {
-            const s = r.stages || {};
-            const stageBadges = [
-              ['field_registration', 'field_reg'],
-              ['tracking', 'track'],
-              ['track_consolidation', 'consol'],
-              ['event_detection', 'events'],
-              ['highlights', 'highlights'],
-              ['annotated_video', 'video'],
-              ['consolidated_overlay', 'overlay'],
-            ].map(([k, lbl]) => badge(!!s[k], lbl)).join(' ');
-            return `<div class="card">
-              <div class="name">${r.run_name}</div>
-              <div>${stageBadges}</div>
-              <div class="actions">
-                <button onclick="goPipeline('${r.run_name}')">Pipeline</button>
-                <button class="secondary" onclick="goInsights('${r.run_name}')">Insights</button>
-                <button class="danger" onclick="deleteRun('${r.run_name}')">Delete</button>
-              </div>
-            </div>`;
-          }).join('')
-        : '<div class="empty">No runs yet. Create one below.</div>';
-    }
-
-    function annotate(name) {
-      // Annotator opens by stem; jump there directly.
-      window.top.location = '/annotate';
-    }
-    function goPipeline(run) {
-      window.top.location = `/pipeline?run=${encodeURIComponent(run)}`;
-    }
-    function goInsights(run) {
-      window.top.location = `/insights/${encodeURIComponent(run)}`;
     }
 
     function seedNewRun(videoName) {
       $("#new-run-video").value = videoName;
       $("#new-run-name").focus();
+      $("#new-run-name").scrollIntoView({behavior: 'smooth', block: 'center'});
     }
+
+    let configsCache = [];
 
     async function createRun() {
       const run_name = $("#new-run-name").value.trim();
       const video_name = $("#new-run-video").value || null;
       const config_name = $("#new-run-config").value || 'default.yaml';
-      if (!run_name) { flash('Run name required'); return; }
+
+      // Validate up front so users see the failure inline instead of
+      // wondering why the button "didn't do anything".
+      if (!run_name) {
+        flash('Run name is required');
+        $("#new-run-name").focus();
+        return;
+      }
+      if (!video_name) {
+        flash('Pick a video for the new run');
+        $("#new-run-video").focus();
+        return;
+      }
+      const cfg = configsCache.find(c => c.name === config_name);
+      const stages = (cfg && cfg.stages) || [];
+      if (!stages.length) {
+        flash(`Config ${config_name} has no pipeline.stages — pick another`);
+        return;
+      }
+      const video = lastVideos.find(v => v.name === video_name);
+      if (!video) {
+        flash(`Video ${video_name} not found`);
+        return;
+      }
+
+      const btn = document.querySelector('button[onclick="createRun()"]');
+      btn.disabled = true;
+      btn.textContent = 'Creating…';
       try {
+        // Step 1: create the run dir.
         await api('POST', '/api/library/runs', { run_name, video_name, config_name });
+        // Step 2: launch the pipeline as a background job.
+        const job = await api('POST', '/api/jobs/pipeline', {
+          run_name,
+          stages,
+          config_path: cfg.path,
+          video_path: video.path,
+          skip_existing: true,
+        });
         $("#new-run-name").value = '';
-        flash('Run created');
-        refreshRuns();
-      } catch (e) { flash('Create failed: ' + e.message); }
+        flash(`Run ${run_name} created — pipeline running`);
+        refreshVideos();
+        watchJob(job, run_name);
+      } catch (e) {
+        flash('Create failed: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Create new run';
+      }
     }
 
-    async function deleteRun(name) {
-      if (!confirm(`Delete run ${name}? This removes its outputs from disk.`)) return;
-      try {
-        await api('DELETE', '/api/library/runs/' + encodeURIComponent(name));
-        flash('Deleted');
-        refreshRuns();
-      } catch (e) { flash('Delete failed: ' + e.message); }
-    }
-
-    // Upload (click + drag-and-drop)
-    const drop = $("#drop");
-    const fileInput = $("#file");
-    fileInput.addEventListener('change', () => uploadFiles(fileInput.files));
-    drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('dragover'); });
-    drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
-    drop.addEventListener('drop', e => {
-      e.preventDefault();
-      drop.classList.remove('dragover');
-      uploadFiles(e.dataTransfer.files);
+    // --- Pipeline job progress card (shared with /api/jobs/<id>/stream) ---
+    const jobCard = $("#job-card");
+    const jobTitle = $("#job-title");
+    const jobStatus = $("#job-status");
+    const jobLog = $("#job-log");
+    const jobLinks = $("#job-links");
+    const jobClose = $("#job-close");
+    let jobES = null;
+    jobClose.addEventListener('click', () => {
+      jobCard.classList.remove('show');
+      if (jobES) { jobES.close(); jobES = null; }
     });
 
-    async function uploadFiles(files) {
-      for (const f of files) {
-        const form = new FormData();
-        form.append('file', f);
-        flash(`Uploading ${f.name}…`, 60_000);
+    function watchJob(job, runName) {
+      if (jobES) { jobES.close(); jobES = null; }
+      jobCard.classList.add('show');
+      jobCard.classList.remove('error');
+      jobTitle.textContent = `pipeline · ${runName}`;
+      jobStatus.textContent = job.status || 'queued';
+      jobStatus.className = `status ${job.status || ''}`;
+      jobLog.textContent = '';
+      jobLinks.innerHTML = `
+        <a href="/pipeline?run=${encodeURIComponent(runName)}">Open Pipeline page</a>
+        <a href="/match/${encodeURIComponent(runName)}">Match (after stages finish)</a>
+      `;
+
+      const es = new EventSource(`/api/jobs/${job.id}/stream`);
+      jobES = es;
+      es.onmessage = (e) => {
         try {
-          const r = await fetch('/api/library/upload', { method: 'POST', body: form });
-          if (!r.ok) {
-            const d = await r.json().catch(() => ({}));
-            throw new Error(d.detail || r.statusText);
+          const obj = JSON.parse(e.data);
+          if (obj.log) {
+            jobLog.textContent += obj.log;
+            jobLog.scrollTop = jobLog.scrollHeight;
           }
-          flash(`Uploaded ${f.name}`);
-        } catch (e) { flash('Upload failed: ' + e.message); }
-      }
-      refreshVideos();
+          if (obj.status) {
+            jobStatus.textContent = obj.status;
+            jobStatus.className = `status ${obj.status}`;
+            if (obj.status === 'success' || obj.status === 'failed') {
+              es.close();
+              jobES = null;
+              refreshVideos();
+              if (obj.error) {
+                jobLog.textContent += '\n--- error ---\n' + obj.error;
+                jobLog.scrollTop = jobLog.scrollHeight;
+              }
+            }
+          }
+        } catch {}
+      };
+      es.onerror = () => {
+        // The server closes the SSE stream once the job exits, which
+        // surfaces here as an error event. Drop the connection
+        // silently — final status was already pushed via onmessage.
+        if (jobES) { jobES.close(); jobES = null; }
+      };
     }
 
-    refreshConfigs();
+    // Drop / upload
+    const drop = $("#drop");
+    const fileInput = $("#file");
+    ['dragenter', 'dragover'].forEach(ev =>
+      drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('dragover'); }));
+    ['dragleave', 'drop'].forEach(ev =>
+      drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('dragover'); }));
+    drop.addEventListener('drop', e => {
+      const f = e.dataTransfer.files[0];
+      if (f) upload(f);
+    });
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files[0];
+      if (f) upload(f);
+    });
+
+    // Upload via XHR so we can show real progress; fetch() can't.
+    const uploadCard = $("#upload-card");
+    const uploadName = $("#upload-name");
+    const uploadPct = $("#upload-pct");
+    const uploadBar = $("#upload-bar");
+    const uploadMeta = $("#upload-meta");
+    const uploadClose = $("#upload-close");
+    uploadClose.addEventListener('click', () => {
+      uploadCard.classList.remove('show', 'error', 'done');
+    });
+
+    function fmtBytes(n) {
+      if (!n) return '0 B';
+      const u = ['B','KB','MB','GB'];
+      let i = 0;
+      while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+      return `${n.toFixed(n >= 100 || i === 0 ? 0 : 1)} ${u[i]}`;
+    }
+    function fmtRate(bps) {
+      return `${fmtBytes(bps)}/s`;
+    }
+    function fmtEta(s) {
+      if (!isFinite(s) || s < 0) return '?';
+      if (s < 60) return `${Math.round(s)}s`;
+      const m = Math.floor(s / 60);
+      const r = Math.round(s - m * 60);
+      return `${m}m${String(r).padStart(2,'0')}s`;
+    }
+
+    function upload(file) {
+      uploadCard.classList.remove('error', 'done');
+      uploadCard.classList.add('show');
+      uploadName.textContent = file.name;
+      uploadPct.textContent = '0%';
+      uploadBar.style.width = '0%';
+      uploadMeta.textContent = `0 / ${fmtBytes(file.size)}`;
+
+      const fd = new FormData();
+      fd.append('file', file);
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/library/upload');
+
+      const t0 = performance.now();
+      let lastT = t0, lastLoaded = 0, smoothedRate = 0;
+
+      xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        const pct = (e.loaded / e.total) * 100;
+        uploadBar.style.width = `${pct.toFixed(1)}%`;
+        uploadPct.textContent = `${pct.toFixed(0)}%`;
+        const now = performance.now();
+        const dt = (now - lastT) / 1000;
+        if (dt > 0.2) {
+          const inst = (e.loaded - lastLoaded) / dt;
+          // Exponential smoothing keeps the rate display from
+          // jittering when chunks land at irregular intervals.
+          smoothedRate = smoothedRate ? 0.7 * smoothedRate + 0.3 * inst : inst;
+          lastT = now; lastLoaded = e.loaded;
+        }
+        const remaining = e.total - e.loaded;
+        const eta = smoothedRate > 0 ? remaining / smoothedRate : Infinity;
+        uploadMeta.textContent =
+          `${fmtBytes(e.loaded)} / ${fmtBytes(e.total)}` +
+          (smoothedRate ? ` · ${fmtRate(smoothedRate)} · ETA ${fmtEta(eta)}` : '');
+      };
+
+      xhr.onload = () => {
+        const ok = xhr.status >= 200 && xhr.status < 300;
+        let data = null;
+        try { data = JSON.parse(xhr.responseText); } catch {}
+        if (ok) {
+          uploadCard.classList.add('done');
+          uploadBar.style.width = '100%';
+          uploadPct.textContent = 'done';
+          uploadMeta.textContent =
+            `${fmtBytes(file.size)} uploaded in ${fmtEta((performance.now() - t0) / 1000)}`;
+          flash(`Uploaded ${data?.name || file.name}`);
+          refreshVideos();
+          // Auto-dismiss the success card after a few seconds; errors
+          // stay until the user closes them.
+          setTimeout(() => uploadCard.classList.remove('show', 'done'), 4000);
+        } else {
+          const detail = (data && data.detail) || xhr.statusText || `HTTP ${xhr.status}`;
+          uploadCard.classList.add('error');
+          uploadPct.textContent = 'failed';
+          uploadMeta.textContent = detail;
+          flash(`Upload failed: ${detail}`);
+        }
+      };
+      xhr.onerror = () => {
+        uploadCard.classList.add('error');
+        uploadPct.textContent = 'failed';
+        uploadMeta.textContent = 'network error';
+        flash('Upload failed: network error');
+      };
+      xhr.send(fd);
+    }
+
     refreshVideos();
-    refreshRuns();
+    refreshConfigs();
   </script>
 </body>
 </html>
