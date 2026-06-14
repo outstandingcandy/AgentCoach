@@ -181,17 +181,58 @@ def _build_tracking(run_dir: Path, pipeline_stats: dict) -> StageManifest:
         ))
 
     files: list[dict[str, Any]] = []
-    for fname in ("tracking.mp4", "tracks.json", "tracks.pre_consolidation.json",
+    for fname in ("tracking.mp4", "tracks.json",
                   "ball_tracks.json", "team_assignments.json",
                   "track_features.json", "ball_debug_log.json", "statistics.json"):
         p = stage_dir / fname
         if p.exists():
             files.append(_file_entry(p, run_dir))
 
+    # Per-orig-track lifetimes: list of frames where each tid appears.
+    # tracking/tracks.json is the raw tracker output (additive
+    # consolidation writes its rewritten copy under track_consolidation/).
+    lifetimes: dict[str, dict[str, Any]] = {}
+    src_path = stage_dir / "tracks.json"
+    src_data = _read_json(src_path)
+    if isinstance(src_data, dict):
+        # Map orig_tid → sorted list of frames it appears in.
+        per_tid_frames: dict[int, list[int]] = {}
+        for frame_key, dets in src_data.items():
+            try:
+                fidx = int(frame_key)
+            except (TypeError, ValueError):
+                continue
+            for det in dets or []:
+                # tracking/tracks.json is always raw — track_id is the
+                # integer tid from the tracker.
+                tid = det.get("track_id")
+                if not isinstance(tid, int):
+                    continue
+                per_tid_frames.setdefault(tid, []).append(fidx)
+        for tid, frames in per_tid_frames.items():
+            frames.sort()
+            lifetimes[str(tid)] = {
+                "tid": tid,
+                "first_frame": frames[0],
+                "last_frame": frames[-1],
+                "n_frames": len(frames),
+                "frames": frames,
+            }
+
+    manifest_stats = dict(pipeline_stats.get("tracking", {}))
+    if lifetimes:
+        manifest_stats["_track_lifetimes"] = lifetimes
+        # Also expose the consolidation player_map.json if present so
+        # the front-end can label each orig tid with its eventual
+        # consolidated player_id.
+        pmap = _read_json(run_dir / "track_consolidation" / "player_map.json")
+        if isinstance(pmap, dict):
+            manifest_stats["_player_map"] = pmap
+
     return StageManifest(
         stage="tracking",
         exists=True,
-        stats=pipeline_stats.get("tracking", {}),
+        stats=manifest_stats,
         vis_dirs=vis,
         files=files,
     )
@@ -211,24 +252,66 @@ def _build_track_consolidation(run_dir: Path, pipeline_stats: dict) -> StageMani
             frames=_frame_indices(frames_dir),
             digits=_digits_of(frames_dir),
         ))
-    # track_thumbs/<track_NNNN_fNNNNN.jpg> — display as a flat list.
-    thumbs_dir = stage_dir / "track_thumbs"
+
+    # Build the per-track thumb grid from llm_inputs/ — these are the
+    # *exact* crops the jersey LLM saw. Falls back to the legacy
+    # track_thumbs/ dir for runs that pre-date the llm_inputs dump.
     thumbs: list[dict[str, str]] = []
-    if thumbs_dir.is_dir():
-        for p in sorted(thumbs_dir.iterdir()):
+    llm_dir = stage_dir / "llm_inputs"
+    llm_tracks_dir = llm_dir / "tracks"
+    if llm_tracks_dir.is_dir():
+        for p in sorted(llm_tracks_dir.iterdir()):
             if p.suffix == ".jpg":
                 thumbs.append({
                     "name": p.name,
                     "url": p.relative_to(run_dir).as_posix(),
                 })
+    else:
+        legacy_dir = stage_dir / "track_thumbs"
+        if legacy_dir.is_dir():
+            for p in sorted(legacy_dir.iterdir()):
+                if p.suffix == ".jpg":
+                    thumbs.append({
+                        "name": p.name,
+                        "url": p.relative_to(run_dir).as_posix(),
+                    })
+
+    # The full LLM-input bundle (per-track vote + reasoning + position +
+    # movement + scene + team-exemplar URLs) so the front-end can show
+    # everything Claude saw alongside the verdict.
+    llm_inputs: dict[str, Any] = {}
+    per_track = _read_json(llm_dir / "per_track.json")
+    if isinstance(per_track, dict):
+        exemplar_urls: dict[str, list[str]] = {"team_A": [], "team_B": []}
+        ex_dir = llm_dir / "team_exemplars"
+        if ex_dir.is_dir():
+            for p in sorted(ex_dir.iterdir()):
+                if p.suffix != ".jpg":
+                    continue
+                rel = p.relative_to(run_dir).as_posix()
+                if p.name.startswith("team_A_"):
+                    exemplar_urls["team_A"].append(rel)
+                elif p.name.startswith("team_B_"):
+                    exemplar_urls["team_B"].append(rel)
+        llm_inputs = {
+            "n_tracks": per_track.get("n_tracks"),
+            "n_team_A_exemplars": per_track.get("n_team_A_exemplars"),
+            "n_team_B_exemplars": per_track.get("n_team_B_exemplars"),
+            "scene": per_track.get("scene") or {},
+            "tracks": per_track.get("tracks") or {},
+            "team_exemplar_urls": exemplar_urls,
+        }
 
     files: list[dict[str, Any]] = []
-    for fname in ("consolidated.mp4", "players.json", "player_map.json",
+    for fname in ("consolidated.mp4", "tracks.json", "team_assignments.json",
+                  "players.json", "player_map.json",
                   "consolidated.stats.json", "stats.json", "scene.json",
                   "jersey_votes.json"):
         p = stage_dir / fname
         if p.exists():
             files.append(_file_entry(p, run_dir))
+    if (llm_dir / "per_track.json").exists():
+        files.append(_file_entry(llm_dir / "per_track.json", run_dir))
 
     text_files = {}
     md = stage_dir / "consolidated_tracks.md"
@@ -246,6 +329,8 @@ def _build_track_consolidation(run_dir: Path, pipeline_stats: dict) -> StageMani
     # Stash thumbs in stats blob so the front-end can render a grid.
     if thumbs:
         manifest.stats = {**manifest.stats, "_track_thumbs": thumbs}
+    if llm_inputs:
+        manifest.stats = {**manifest.stats, "_llm_inputs": llm_inputs}
     # Original-tid → consolidated-player mapping so the front-end can
     # group thumbs first by consolidated player, then by orig track.
     pmap = _read_json(stage_dir / "player_map.json")

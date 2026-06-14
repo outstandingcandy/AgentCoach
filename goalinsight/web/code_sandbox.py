@@ -95,11 +95,17 @@ class CodeSandbox:
     # Data upload
     # ------------------------------------------------------------------
 
+    # ``tracks.json`` and ``team_assignments.json`` are listed under
+    # ``track_consolidation/`` first (the consolidated player-id-keyed
+    # copies) and the raw tracker copies are the fallback. The first
+    # available source wins per file. Other files are unique-source.
     DATA_FILES = [
-        ("event_detection/events.json", "events.json"),
-        ("tracking/tracks.json", "tracks.json"),
-        ("tracking/ball_tracks.json", "ball_tracks.json"),
-        ("tracking/team_assignments.json", "team_assignments.json"),
+        ("event_detection/events.json", "events.json", None),
+        ("track_consolidation/tracks.json", "tracks.json",
+         "tracking/tracks.json"),
+        ("tracking/ball_tracks.json", "ball_tracks.json", None),
+        ("track_consolidation/team_assignments.json", "team_assignments.json",
+         "tracking/team_assignments.json"),
     ]
 
     def _ensure_data_uploaded(self) -> None:
@@ -110,8 +116,11 @@ class CodeSandbox:
         sid = self._ensure_session()
         # Build content list. writeFiles supports either text or blob.
         content = []
-        for src_rel, sandbox_name in self.DATA_FILES:
+        for entry in self.DATA_FILES:
+            src_rel, sandbox_name, fallback_rel = entry
             src = self.pipeline_output_dir / src_rel
+            if not src.exists() and fallback_rel:
+                src = self.pipeline_output_dir / fallback_rel
             if not src.exists():
                 logger.warning("data file missing, skipping upload: %s", src)
                 continue

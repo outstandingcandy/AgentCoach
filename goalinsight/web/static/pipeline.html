@@ -126,7 +126,28 @@
                       border: 1px solid #262b33; }
     .thumb-grid .thumb-label { font-size: 10px; color: #9aa3ad; text-align: center;
                                margin-top: 2px; word-break: break-all; }
+    .thumb-grid img.thumb-jump:hover { border-color: #3b82f6; box-shadow: 0 0 0 1px #3b82f6; }
+    /* Per-crop OCR result rendered under each thumb. ``.ocr-hit`` for
+       crops that produced a clean digit reading (highlighted), .ocr-miss
+       for crops where OCR ran but didn't return a parseable number. */
+    .thumb-grid .thumb-ocr { font-size: 10px; text-align: center;
+                             margin-top: 1px; padding: 1px 4px;
+                             border-radius: 3px; line-height: 1.2;
+                             font-family: ui-monospace, 'SF Mono', monospace; }
+    .thumb-grid .thumb-ocr.ocr-hit { color: #cfe3ff; background: #14304b;
+                                     font-weight: 600; }
+    .thumb-grid .thumb-ocr.ocr-miss { color: #6b7380; background: #1a1f25;
+                                      font-style: italic; }
+
+    /* Per-orig collapsible block. Default closed. */
+    details.orig-block { background: #0d1116; border: 1px solid #2a323c;
+                         border-radius: 5px; padding: 4px 6px; }
+    details.orig-block > summary { user-select: none; }
+    details.orig-block > summary::-webkit-details-marker { display: none; }
+    details.orig-block > summary:hover { background: #1e242b; }
+    details.orig-block[open] > summary .caret { transform: rotate(90deg); }
   </style>
+  <script defer src="/static/nav.js"></script>
 </head>
 <body>
   <div id="left">
@@ -155,6 +176,8 @@
       </div>
       <div class="row">
         <button onclick="runPipeline()">Run selected</button>
+        <button id="stop-pipeline" class="secondary" onclick="stopPipeline()" disabled>Stop</button>
+        <span class="hint" id="stop-hint" style="font-size:11px;color:#9aa3ad"></span>
       </div>
     </div>
 
@@ -289,11 +312,11 @@
         : '<option value="">(no runs — create one in Library)</option>';
       activeRun = runSelect.value || '';
 
+      // Render the config list now; selectConfigForRun overrides the
+      // selection once the run's recorded config_path is fetched.
       const cfgSelect = $("#config-select");
-      cfgSelect.innerHTML = configs.map(c => {
-        const sel = c.name === 'default.yaml' ? ' selected' : '';
-        return `<option value="${c.path}"${sel}>${c.name}</option>`;
-      }).join('');
+      cfgSelect.innerHTML = configs.map(c =>
+        `<option value="${c.path}">${c.name}</option>`).join('');
 
       $("#train-kp-video").innerHTML = videos.map(v =>
         `<option value="${v.name}">${v.name}</option>`).join('');
@@ -304,6 +327,35 @@
       renderStages(r);
       $("#run-hint").textContent = activeRun ? `Run dir: workspace/runs/${activeRun}` : '';
       if (activeStage) loadStagePane();
+      await selectConfigForRun(activeRun);
+    }
+
+    // Pre-select the dropdown to whatever config_path the active run
+    // was created with, so re-running uses the same config the
+    // initial run did. Falls back to default.yaml when run.json is
+    // missing or doesn't list a config.
+    async function selectConfigForRun(runName) {
+      const cfgSelect = $("#config-select");
+      let target = null;
+      if (runName) {
+        try {
+          const meta = await api('GET', `/api/library/runs/${encodeURIComponent(runName)}`);
+          if (meta && meta.config_path) target = meta.config_path;
+        } catch {}
+      }
+      if (target) {
+        // Match by full path; fall back to basename if the run was
+        // recorded with a path the current configs list doesn't expose.
+        let opt = [...cfgSelect.options].find(o => o.value === target);
+        if (!opt) {
+          const base = target.split('/').pop();
+          opt = [...cfgSelect.options].find(o => o.textContent === base);
+        }
+        if (opt) { cfgSelect.value = opt.value; return; }
+      }
+      // No recorded config — keep the historical default.
+      const def = [...cfgSelect.options].find(o => o.textContent === 'default.yaml');
+      if (def) cfgSelect.value = def.value;
     }
 
     $("#run-select")?.addEventListener('change', e => {
@@ -315,6 +367,7 @@
       u.searchParams.set('run', activeRun);
       history.replaceState({}, '', u);
       if (activeStage) loadStagePane();
+      selectConfigForRun(activeRun);
     });
 
     // ---- Stage results pane ----
@@ -349,11 +402,27 @@
       parts.push(renderStats(mf));
       parts.push(renderVis(mf));
       parts.push(renderEventList(mf));
+      parts.push(renderLLMScene(mf));
       parts.push(renderThumbsGrid(mf));
+      parts.push(renderTrackLifetimes(mf));
       parts.push(renderFiles(mf));
       parts.push(renderTextFiles(mf));
       pane.innerHTML = parts.filter(Boolean).join('');
       wireVisHandlers();
+      // Honor `#expand=<tid>` hash for deep-linking into a specific
+      // orig-tid's frame list (also useful for screenshot tests).
+      const m = /#expand=(\d+)/.exec(location.hash || '');
+      if (m) {
+        const target = m[1];
+        const trs = document.querySelectorAll('tr[data-detail]');
+        for (const tr of trs) {
+          if (tr.querySelector('td')?.textContent.trim() === target) {
+            tr.click();
+            tr.scrollIntoView({behavior: 'smooth', block: 'center'});
+            break;
+          }
+        }
+      }
     }
 
     function renderStageHeader(mf) {
@@ -497,9 +566,49 @@
       </div>`;
     }
 
+    // Scene description + team exemplars — what the LLM saw before
+    // looking at each track. Only renders for track_consolidation when
+    // llm_inputs/per_track.json was dumped.
+    function renderLLMScene(mf) {
+      const li = mf.stats?._llm_inputs;
+      if (!li) return '';
+      const scene = li.scene || {};
+      const sceneRows = Object.entries(scene)
+        .filter(([k]) => !k.endsWith('_ref_ids'))
+        .map(([k, v]) => `
+          <div class="kv">
+            <div class="k">${escapeHTML(k)}</div>
+            <div class="v">${escapeHTML(typeof v === 'string' ? v : JSON.stringify(v))}</div>
+          </div>`).join('');
+      const exA = li.team_exemplar_urls?.team_A || [];
+      const exB = li.team_exemplar_urls?.team_B || [];
+      const exemplarRow = (label, urls) => urls.length ? `
+        <div style="margin-top:10px">
+          <div style="font-size:11px;color:#cfe3ff;margin-bottom:4px;
+                      font-family:ui-monospace,'SF Mono',monospace">
+            ${escapeHTML(label)} <span style="color:#6b7380">(${urls.length})</span>
+          </div>
+          <div class="thumb-grid">
+            ${urls.map(u => `
+              <div>
+                <img src="/runs_static/${encodeURIComponent(activeRun)}/${u}"
+                     alt="${escapeHTML(label)}" loading="lazy">
+              </div>`).join('')}
+          </div>
+        </div>` : '';
+      return `<div class="stats-card">
+        <h3>LLM scene context (${li.n_tracks ?? '?'} tracks scored)</h3>
+        ${sceneRows ? `<div class="stats-grid">${sceneRows}</div>` : ''}
+        ${exemplarRow('team_A exemplars', exA)}
+        ${exemplarRow('team_B exemplars', exB)}
+      </div>`;
+    }
+
     function renderThumbsGrid(mf) {
       const thumbs = mf.stats?._track_thumbs;
       if (!Array.isArray(thumbs) || !thumbs.length) return '';
+      const llm = mf.stats?._llm_inputs?.tracks || {};
+
       // First-pass: bucket thumbs by orig tid (parsed from filename).
       const byOrig = new Map();   // origTid (str, no leading zeros) → [thumbs]
       for (const t of thumbs) {
@@ -528,6 +637,9 @@
       const numPlayers = byPlayer.size;
       return `<div class="stats-card">
         <h3>Track thumbs (${thumbs.length} thumbs · ${numTracks} orig tracks · ${numPlayers} players)</h3>
+        <div style="font-size:11px;color:#9aa3ad;margin-bottom:8px">
+          These are the exact crops the jersey LLM saw — sampled from each track and shown alongside the per-track verdict.
+        </div>
         <div style="display:flex;flex-direction:column;gap:18px">
           ${playerList.map(([player, origMap]) => {
             const origs = [...origMap.entries()].sort(
@@ -542,24 +654,111 @@
                 </span>
               </div>
               ${origs.map(([orig, items]) => `
-                <div style="margin:6px 0 6px 4px">
-                  <div style="font-size:11px;color:#cfe3ff;margin-bottom:3px;
-                              font-family:ui-monospace,'SF Mono',monospace">
+                <details class="orig-block" style="margin:4px 0 4px 4px">
+                  <summary style="font-size:11px;color:#cfe3ff;cursor:pointer;
+                                  padding:4px 6px;border-radius:4px;
+                                  font-family:ui-monospace,'SF Mono',monospace;
+                                  list-style:none;display:flex;align-items:center;gap:6px"
+                           data-orig="${escapeHTML(orig)}">
+                    <span class="caret" style="display:inline-block;width:10px;
+                                                color:#6b7380;transition:transform 0.1s">▶</span>
                     orig ${escapeHTML(orig)}
-                    <span style="color:#6b7380">(${items.length})</span>
+                    <span style="color:#6b7380">(${items.length} crops)</span>
+                    ${renderLLMVerdictInline(llm[orig])}
+                  </summary>
+                  <div style="padding:6px 0 0 14px">
+                    ${renderLLMVerdict(llm[orig])}
+                    <div class="thumb-grid">
+                      ${items.map(t => {
+                        const m = /_f0*(\d+)\.[a-z]+$/i.exec(t.name);
+                        const frame = m ? parseInt(m[1], 10) : null;
+                        const dataAttr = frame !== null ? ` data-frame="${frame}"` : '';
+                        const cls = frame !== null ? ' thumb-jump' : '';
+                        const title = frame !== null ? ` title="jump to frame ${frame}"` : '';
+                        // Look up the OCR verdict for this crop: per_track.json
+                        // stores the same crops (keyed by .name) with
+                        // ocr_reading / ocr_confidence / ocr_visible fields.
+                        const llmCrops = llm[orig]?.crops || [];
+                        const crop = llmCrops.find(c => c.name === t.name);
+                        let ocrLabel = '';
+                        if (crop) {
+                          const reading = crop.ocr_reading;
+                          const cc = crop.ocr_confidence;
+                          const visible = crop.ocr_visible || '';
+                          if (reading != null) {
+                            ocrLabel = `<div class="thumb-ocr ocr-hit"
+                              title="${escapeHTML(visible)}">
+                              #${reading}<span style="color:#9aa3ad">·${cc?.toFixed(2)}</span>
+                            </div>`;
+                          } else if (visible) {
+                            ocrLabel = `<div class="thumb-ocr ocr-miss"
+                              title="${escapeHTML(visible)}">
+                              ${escapeHTML(visible.length > 14
+                                ? visible.slice(0,14) + '…' : visible)}
+                            </div>`;
+                          }
+                        }
+                        return `<div>
+                          <img src="/runs_static/${encodeURIComponent(activeRun)}/${t.url}"
+                               alt="${escapeHTML(t.name)}" loading="lazy"
+                               class="thumb-img${cls}"${dataAttr}${title}
+                               style="cursor:${frame !== null ? 'pointer' : 'default'}">
+                          <div class="thumb-label">${escapeHTML(t.name.replace(/^track_\d+_/, ''))}</div>
+                          ${ocrLabel}
+                        </div>`;
+                      }).join('')}
+                    </div>
                   </div>
-                  <div class="thumb-grid">
-                    ${items.map(t => `
-                      <div>
-                        <img src="/runs_static/${encodeURIComponent(activeRun)}/${t.url}"
-                             alt="${escapeHTML(t.name)}" loading="lazy">
-                        <div class="thumb-label">${escapeHTML(t.name.replace(/^track_\d+_/, ''))}</div>
-                      </div>`).join('')}
-                  </div>
-                </div>`).join('')}
+                </details>`).join('')}
             </div>`;
           }).join('')}
         </div>
+      </div>`;
+    }
+
+    // Single-line condensed verdict shown inside the collapsed
+    // <summary> so the user can see jersey/team/conf without
+    // expanding. Returns '' when the record is missing.
+    function renderLLMVerdictInline(rec) {
+      if (!rec) return '';
+      const v = rec.vote || {};
+      const jersey = v.jersey_number != null ? `#${v.jersey_number}` : '#?';
+      const conf = typeof v.confidence === 'number' ? v.confidence.toFixed(2) : '—';
+      const team = v.team || '—';
+      const role = v.role || '—';
+      return `<span style="margin-left:auto;color:#9aa3ad;font-weight:400">
+        ${escapeHTML(jersey)}  ·  ${escapeHTML(team)}  ·  ${escapeHTML(role)}  ·  conf ${conf}
+      </span>`;
+    }
+
+    function renderLLMVerdict(rec) {
+      if (!rec) return '';
+      const v = rec.vote || {};
+      const jersey = v.jersey_number != null ? `#${v.jersey_number}` : '—';
+      const conf = typeof v.confidence === 'number' ? v.confidence.toFixed(2) : '—';
+      const team = v.team || '—';
+      const role = v.role || '—';
+      const reason = v.reasoning || '';
+      const pos = rec.position_label || '—';
+      const mov = rec.movement_description || '';
+      return `<div style="background:#0d1116;border:1px solid #2a323c;
+                          border-radius:5px;padding:6px 8px;margin-bottom:6px;
+                          font-size:11px;line-height:1.4">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;color:#cfe3ff;font-weight:600">
+          <span>jersey ${jersey}</span>
+          <span style="color:#9aa3ad">·</span>
+          <span>conf ${conf}</span>
+          <span style="color:#9aa3ad">·</span>
+          <span>team ${escapeHTML(team)}</span>
+          <span style="color:#9aa3ad">·</span>
+          <span>role ${escapeHTML(role)}</span>
+          <span style="color:#9aa3ad">·</span>
+          <span>pos ${escapeHTML(pos)}</span>
+          <span style="color:#9aa3ad">·</span>
+          <span>${rec.n_crops_to_llm ?? 0} crops</span>
+        </div>
+        ${reason ? `<div style="color:#9aa3ad;margin-top:3px">↳ ${escapeHTML(reason)}</div>` : ''}
+        ${mov ? `<div style="color:#6b7380;margin-top:2px;font-style:italic">${escapeHTML(mov)}</div>` : ''}
       </div>`;
     }
 
@@ -570,6 +769,192 @@
       if (n < 1024*1024*1024) return (n/1024/1024).toFixed(1) + ' MB';
       return (n/1024/1024/1024).toFixed(2) + ' GB';
     }
+
+    // Per-orig-track lifetime listing for the tracking stage. For each
+    // raw tracker tid: first / last / n_frames + (collapsible) full
+    // frame list, plus the consolidated player_id when player_map is
+    // present.
+    function renderTrackLifetimes(mf) {
+      const lt = mf.stats?._track_lifetimes;
+      if (!lt) return '';
+      const playerMap = mf.stats?._player_map || {};
+      const rows = Object.values(lt);
+      rows.sort((a, b) => a.first_frame - b.first_frame || a.tid - b.tid);
+      const minFrame = rows.length ? Math.min(...rows.map(r => r.first_frame)) : 0;
+      const maxFrame = rows.length ? Math.max(...rows.map(r => r.last_frame)) : 1;
+      const span = Math.max(1, maxFrame - minFrame);
+      // Build a one-line sparkline DOM piece per tid: tiny SVG rect
+      // showing where this tid's frames fall on the global timeline.
+      function sparkline(tid, frames) {
+        const w = 160, h = 12;
+        const lifeStart = frames[0], lifeEnd = frames[frames.length - 1];
+        const sx = (f) => Math.round(((f - minFrame) / span) * (w - 2)) + 1;
+        const lx = sx(lifeStart);
+        const lw = Math.max(2, sx(lifeEnd) - lx);
+        const ticks = frames
+          .map(f => `<line x1="${sx(f)}" y1="2" x2="${sx(f)}" y2="${h-2}" stroke="#3b82f6" stroke-width="1"/>`)
+          .join('');
+        return `<svg width="${w}" height="${h}"
+                     style="background:#0d1116;border-radius:2px;display:block;cursor:pointer"
+                     data-tid-frames='${JSON.stringify(frames)}'
+                     data-min-frame="${minFrame}"
+                     data-max-frame="${maxFrame}"
+                     title="click to jump to nearest frame">
+          <rect x="${lx}" y="${h/2-1}" width="${lw}" height="2" fill="#1e3a5f"/>
+          ${ticks}
+        </svg>`;
+      }
+      function fmtFrameChips(frames) {
+        // Render every frame as a clickable chip. Lifetime frames are
+        // already in order; we don't collapse uniform runs because the
+        // user wants to *click* individual frames to scrub.
+        return frames.map(f => `
+          <span class="frame-chip" data-frame="${f}"
+                style="display:inline-block;padding:2px 7px;margin:2px;
+                       background:#1e242b;border:1px solid #2a323c;
+                       border-radius:3px;color:#cfe3ff;cursor:pointer;
+                       font-family:ui-monospace,'SF Mono',monospace;
+                       font-size:11px"
+                onmouseover="this.style.background='#2a4661'"
+                onmouseout="this.style.background='#1e242b'">${f}</span>`).join('');
+      }
+      return `<div class="stats-card">
+        <h3>Orig track lifetimes (${rows.length} tracks)</h3>
+        <div style="font-size:11px;color:#9aa3ad;margin-bottom:8px">
+          For each raw tracker ID: when it first/last appears and which sampled frames it shows up in. Sparkline is its presence across the whole clip; click a row to expand the full frame list.
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums">
+          <thead>
+            <tr style="text-align:left;color:#9aa3ad;border-bottom:1px solid #2a323c">
+              <th style="padding:4px 8px">orig tid</th>
+              <th style="padding:4px 8px">first</th>
+              <th style="padding:4px 8px">last</th>
+              <th style="padding:4px 8px">n</th>
+              <th style="padding:4px 8px">consolidated</th>
+              <th style="padding:4px 8px">timeline</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((r, i) => {
+              const pid = playerMap[String(r.tid)] ?? '';
+              const rowId = `lifetime-row-${i}`;
+              const detailId = `lifetime-detail-${i}`;
+              return `
+                <tr id="${rowId}" data-detail="${detailId}"
+                    style="cursor:pointer;border-bottom:1px solid #1e242b">
+                  <td style="padding:4px 8px;color:#cfe3ff;font-weight:600">${r.tid}</td>
+                  <td style="padding:4px 8px">${r.first_frame}</td>
+                  <td style="padding:4px 8px">${r.last_frame}</td>
+                  <td style="padding:4px 8px">${r.n_frames}</td>
+                  <td style="padding:4px 8px;color:${pid ? '#cfe3ff' : '#6b7380'}">${escapeHTML(pid || '(unmapped)')}</td>
+                  <td style="padding:4px 8px">${sparkline(r.tid, r.frames)}</td>
+                </tr>
+                <tr id="${detailId}" style="display:none;background:#0d1116">
+                  <td colspan="6" style="padding:6px 14px;line-height:1.6">
+                    <span style="font-size:11px;color:#9aa3ad;margin-right:6px">click a frame to scrub the vis above:</span>
+                    ${fmtFrameChips(r.frames)}
+                  </td>
+                </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>`;
+    }
+
+    // Bind row click handler once at DOM-mutation level (delegated):
+    document.addEventListener('click', (e) => {
+      // Frame chip → scrub the vis above to that frame.
+      const chip = e.target.closest('.frame-chip');
+      if (chip) {
+        e.stopPropagation();  // don't toggle the parent row
+        const f = parseInt(chip.dataset.frame, 10);
+        if (!Number.isNaN(f)) gotoFrame(f);
+        return;
+      }
+      // Track-thumb image → jump to the frame embedded in its filename.
+      const thumb = e.target.closest('.thumb-jump');
+      if (thumb) {
+        e.preventDefault();
+        e.stopPropagation();
+        const f = parseInt(thumb.dataset.frame, 10);
+        if (!Number.isNaN(f)) gotoFrame(f);
+        return;
+      }
+      // Row click → toggle frame-list expansion.
+      const tr = e.target.closest('tr[data-detail]');
+      if (!tr) return;
+      const det = document.getElementById(tr.dataset.detail);
+      if (det) det.style.display = det.style.display === 'none' ? '' : 'none';
+    });
+
+    // Switch to the first vis tab (tracking frames) and snap its
+    // slider to the closest frame, then dispatch input so the existing
+    // slider handler refreshes the JPG + label.
+    function gotoFrame(targetFrame) {
+      const vis = currentManifest?.vis_dirs;
+      if (!Array.isArray(vis) || !vis.length) return;
+      // Pick the vis dir whose frames best contain the target. Prefer
+      // index 0 (tracking) if it has the frame, else any dir that
+      // contains it, else fall back to nearest neighbour in dir 0.
+      let chosenIdx = 0;
+      let chosenVd = vis[0];
+      if (!chosenVd.frames.includes(targetFrame)) {
+        for (let i = 0; i < vis.length; i++) {
+          if (vis[i].frames.includes(targetFrame)) {
+            chosenIdx = i; chosenVd = vis[i]; break;
+          }
+        }
+      }
+      // Activate that tab.
+      document.querySelectorAll('[data-vis-tab]').forEach(b =>
+        b.classList.toggle('active', b.dataset.visTab === String(chosenIdx)));
+      document.querySelectorAll('[data-vis-body]').forEach(b =>
+        b.style.display = b.dataset.visBody === String(chosenIdx) ? '' : 'none');
+      // Find the slider position (frame index in this dir's array).
+      const frames = chosenVd.frames;
+      let i = frames.indexOf(targetFrame);
+      if (i < 0) {
+        // Nearest neighbour
+        let bestD = Infinity;
+        for (let k = 0; k < frames.length; k++) {
+          const d = Math.abs(frames[k] - targetFrame);
+          if (d < bestD) { bestD = d; i = k; }
+        }
+      }
+      const slider = document.querySelector(`[data-vis-slider="${chosenIdx}"]`);
+      if (slider) {
+        slider.value = String(i);
+        slider.dispatchEvent(new Event('input', {bubbles: true}));
+      }
+      // Scroll the vis card into view so user sees the change.
+      const visCard = document.querySelector('.vis-card');
+      if (visCard) visCard.scrollIntoView({behavior: 'smooth', block: 'start'});
+    }
+
+    // Sparkline ticks are SVG <line> elements; make them clickable too.
+    // Capture-phase listener so it runs before the row-toggle handler
+    // and can stop propagation to it.
+    document.addEventListener('click', (e) => {
+      const svg = e.target.closest('svg');
+      if (!svg || !svg.dataset.tidFrames) return;
+      e.stopImmediatePropagation();   // don't toggle the row
+      // Compute click x → nearest frame.
+      const rect = svg.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const w = rect.width;
+      const frames = JSON.parse(svg.dataset.tidFrames);
+      const minF = parseInt(svg.dataset.minFrame, 10);
+      const maxF = parseInt(svg.dataset.maxFrame, 10);
+      const span = Math.max(1, maxF - minF);
+      const targetF = minF + Math.round((x / w) * span);
+      // Snap to nearest frame in this tid's frame list.
+      let best = frames[0], bestD = Infinity;
+      for (const f of frames) {
+        const d = Math.abs(f - targetF);
+        if (d < bestD) { bestD = d; best = f; }
+      }
+      gotoFrame(best);
+    }, true);  // capture phase
 
     function renderFiles(mf) {
       const files = mf.files || [];
@@ -672,12 +1057,53 @@
     }
 
     let activeJobES = null;
+    let activeJobId = null;
+
+    function setStopButton(running) {
+      const btn = $("#stop-pipeline");
+      const hint = $("#stop-hint");
+      if (running) {
+        btn.disabled = false;
+        btn.textContent = 'Stop';
+        hint.textContent = '';
+      } else {
+        btn.disabled = true;
+        btn.textContent = 'Stop';
+        hint.textContent = '';
+      }
+    }
+
+    async function stopPipeline() {
+      if (!activeJobId) return;
+      const btn = $("#stop-pipeline");
+      const hint = $("#stop-hint");
+      if (!confirm(
+        'Stop the pipeline?\n\n' +
+        'The current stage will run to completion (loops inside ' +
+        'tracking/calibration can\'t be interrupted), then later stages ' +
+        'are skipped. Stages already done remain on disk; rerunning ' +
+        'with --skip-existing picks up where this stopped.'
+      )) return;
+      btn.disabled = true;
+      btn.textContent = 'Stopping…';
+      hint.textContent = 'request sent — waiting for current stage to finish';
+      try {
+        await api('POST', `/api/jobs/${activeJobId}/cancel`);
+      } catch (e) {
+        hint.textContent = `cancel failed: ${e.message}`;
+        btn.disabled = false;
+        btn.textContent = 'Stop';
+      }
+    }
+
     function watchJob(job) {
       if (activeJobES) { activeJobES.close(); activeJobES = null; }
+      activeJobId = job.id;
       $("#job-title").textContent = `${job.kind}${job.run_name ? ' · ' + job.run_name : ''}`;
       $("#job-id-hint").textContent = `id ${job.id}`;
       $("#job-status").textContent = job.status;
       $("#log-pane").textContent = '';
+      setStopButton(true);
 
       const es = new EventSource(`/api/jobs/${job.id}/stream`);
       activeJobES = es;
@@ -691,21 +1117,58 @@
           }
           if (obj.status) {
             $("#job-status").textContent = obj.status;
-            es.close();
-            refreshAll();
-            if (obj.result) {
-              $("#log-pane").textContent += '\n--- result ---\n' + JSON.stringify(obj.result, null, 2);
-            }
-            if (obj.error) {
-              $("#log-pane").textContent += '\n--- error ---\n' + obj.error;
+            // Terminal states close the stream and the Stop button.
+            const terminal = ['done', 'failed', 'cancelled'];
+            if (terminal.includes(obj.status)) {
+              es.close();
+              activeJobId = null;
+              setStopButton(false);
+              refreshAll();
+              if (obj.result) {
+                $("#log-pane").textContent += '\n--- result ---\n' + JSON.stringify(obj.result, null, 2);
+              }
+              if (obj.error) {
+                $("#log-pane").textContent += '\n--- error ---\n' + obj.error;
+              }
             }
           }
         } catch (err) { /* ignore frame */ }
       };
-      es.onerror = () => { es.close(); activeJobES = null; };
+      es.onerror = () => {
+        es.close();
+        activeJobES = null;
+        // SSE errors don't necessarily mean the job died — keep the
+        // Stop button live; a subsequent /api/jobs/<id> poll on
+        // refreshAll() will resync the status.
+      };
     }
 
-    refreshAll();
+    // Re-attach to a running job that was launched in another tab /
+    // session. Without this the Stop button stays disabled on a fresh
+    // pipeline page load even though a pipeline is actively running.
+    async function attachActiveJob() {
+      if (!activeRun) return;
+      let jobs;
+      try { jobs = await api('GET', '/api/jobs'); }
+      catch { return; }
+      const running = (jobs || [])
+        .filter(j => j.status === 'running'
+                     && j.kind === 'pipeline'
+                     && j.run_name === activeRun)
+        .sort((a, b) => (b.started_at || 0) - (a.started_at || 0))[0];
+      if (!running) return;
+      // Attach silently — don't replay the entire log (the SSE stream
+      // only delivers new lines; full log is /api/jobs/<id>/log).
+      try {
+        const txt = await fetch(`/api/jobs/${running.id}/log`).then(r => r.text());
+        watchJob(running);
+        if (txt) $("#log-pane").textContent = txt;
+      } catch {
+        watchJob(running);
+      }
+    }
+
+    refreshAll().then(attachActiveJob);
   </script>
 </body>
 </html>

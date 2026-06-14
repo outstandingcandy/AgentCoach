@@ -1,0 +1,1074 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>GoalInsight — Match Detail</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; background: #101418; color: #e6e9ee;
+                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; overflow: hidden; }
+
+    header { padding: 8px 16px; border-bottom: 1px solid #262b33;
+             display: flex; gap: 24px; align-items: center; font-size: 13px; color: #9aa3ad; }
+    header strong { color: #e6e9ee; margin-right: 4px; }
+    header a { color: #cfe3ff; text-decoration: none; font-size: 12px; }
+    header a:hover { text-decoration: underline; }
+
+    /* Two-panel stage: video on the left, top-down pitch on the right.
+       Mirrors the calibration visualization layout where the broadcast
+       camera view sits next to the corresponding 2D pitch. */
+    #stage { display: grid; grid-template-columns: minmax(0, 1.78fr) minmax(0, 1fr);
+             gap: 1px; background: #262b33; min-height: 0; overflow: hidden; }
+    #video-panel { position: relative; background: #000; min-width: 0; min-height: 0;
+                   overflow: hidden; display: flex; align-items: center; justify-content: center; }
+    #pitch-panel { position: relative; background: #0d1f0d; min-width: 0; min-height: 0;
+                   overflow: hidden; display: flex; align-items: center; justify-content: center; }
+    #player { max-width: 100%; max-height: 100%; display: block; }
+    #overlay { position: absolute; pointer-events: none; }
+    #mini { display: block; max-width: 100%; max-height: 100%; }
+
+    /* Clip-queue HUD overlaid on the video stage. */
+    #queue-hud { position: absolute; top: 8px; left: 8px; z-index: 5;
+                 background: rgba(20,28,38,0.92); border: 1px solid #2a323c;
+                 border-radius: 6px; padding: 8px 10px; font-size: 12px;
+                 color: #cfe3ff; display: none; gap: 8px; align-items: center; }
+    #queue-hud button { background: #3b82f6; color: white; border: 0;
+                        border-radius: 5px; padding: 5px 10px; font-weight: 600;
+                        cursor: pointer; font-size: 12px; }
+    #queue-hud button.secondary { background: #2a323c; color: #cfe3ff; }
+    #queue-hud .label { color: #9aa3ad; }
+
+    #controls { background: #161b21; border-top: 1px solid #262b33;
+                padding: 12px 16px; display: grid;
+                grid-template-columns: 1fr 1fr 1fr; gap: 16px;
+                max-height: 48vh; overflow-y: auto; }
+    .panel h3 { margin: 0 0 8px; font-size: 12px; color: #cfe3ff;
+                text-transform: uppercase; letter-spacing: 0.06em; }
+    .panel { background: #1a2027; border: 1px solid #232a32; border-radius: 8px;
+             padding: 10px 12px; min-width: 0; }
+
+    .toggle-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .toggle { display: inline-flex; align-items: center; gap: 4px;
+              background: #2a323c; color: #cfe3ff; border: 1px solid #2a323c;
+              border-radius: 5px; padding: 5px 9px; font-size: 12px; font-weight: 500;
+              cursor: pointer; user-select: none; }
+    .toggle.on { background: #3b82f6; border-color: #3b82f6; color: white; }
+    .toggle:hover { border-color: #3b82f6; }
+
+    .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+    .chip { background: #2a323c; color: #cfe3ff; border: 0; border-radius: 5px;
+            padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer; }
+    .chip.on { background: #3b82f6; color: white; }
+    .chip:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .event-list, .player-grid { max-height: 28vh; overflow-y: auto;
+                                background: #0d1116; border: 1px solid #232a32;
+                                border-radius: 6px; padding: 4px; }
+    .event-list .row { display: flex; justify-content: space-between; align-items: center;
+                       padding: 4px 6px; border-radius: 4px; cursor: pointer;
+                       font-size: 12px; }
+    .event-list .row:hover { background: #1e242b; }
+    .event-list .row.active { background: #2a4661; }
+    .event-list .meta { color: #9aa3ad; font-size: 11px; }
+    .event-list .empty { padding: 8px; color: #6b7380; font-size: 12px; text-align: center; }
+
+    .player-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+                   gap: 4px; }
+    .player-card { background: #2a323c; border: 1px solid #2a323c; border-radius: 5px;
+                   padding: 6px 8px; font-size: 12px; cursor: pointer; min-width: 0;
+                   position: relative; }
+    .player-card:hover { border-color: #3b82f6; }
+    .player-card.active { background: #3b82f6; border-color: #3b82f6; color: white; }
+    .player-card .pid { font-weight: 700; }
+    .player-card .meta { color: #9aa3ad; font-size: 11px; }
+    .player-card.active .meta { color: #cfe3ff; }
+    .player-card .info-btn { position: absolute; top: 2px; right: 4px;
+                              width: 18px; height: 18px; line-height: 16px;
+                              text-align: center; font-size: 11px; font-weight: 700;
+                              border-radius: 50%; background: rgba(0,0,0,0.25);
+                              color: #cfe3ff; cursor: pointer; user-select: none;
+                              border: 1px solid transparent; }
+    .player-card .info-btn:hover { background: #3b82f6; color: #fff;
+                                    border-color: #cfe3ff; }
+    .player-card.active .info-btn { background: rgba(255,255,255,0.18);
+                                     color: #fff; }
+
+    /* Per-player profile modal */
+    #profile-modal { position: fixed; inset: 0; z-index: 50;
+                     display: none; align-items: center; justify-content: center;
+                     background: rgba(0,0,0,0.55); }
+    #profile-modal.show { display: flex; }
+    #profile-card { background: #161b21; border: 1px solid #2a323c;
+                    border-radius: 10px; padding: 18px 20px;
+                    width: min(640px, 92vw); max-height: 90vh; overflow-y: auto;
+                    box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+    #profile-card .head { display: flex; align-items: center; gap: 10px;
+                          margin-bottom: 10px; }
+    #profile-card .head .pid { font-size: 18px; font-weight: 700; color: #fff; }
+    #profile-card .head .badge { font-size: 11px; padding: 2px 8px;
+                                  border-radius: 4px; color: #fff; font-weight: 600; }
+    #profile-card .head .close { margin-left: auto; cursor: pointer;
+                                  color: #9aa3ad; font-size: 20px; }
+    #profile-card .head .close:hover { color: #fff; }
+    #profile-card .stats { display: grid; grid-template-columns: repeat(3, 1fr);
+                           gap: 8px; margin: 8px 0 12px; }
+    #profile-card .stat { background: #1a2027; border: 1px solid #232a32;
+                          border-radius: 6px; padding: 8px 10px; }
+    #profile-card .stat .k { font-size: 11px; color: #9aa3ad;
+                              text-transform: uppercase; letter-spacing: 0.04em; }
+    #profile-card .stat .v { font-size: 18px; font-weight: 700; color: #cfe3ff;
+                              margin-top: 2px; }
+    #profile-card .crops { display: grid; grid-template-columns: 1fr 1fr;
+                            gap: 8px; margin-bottom: 12px; }
+    #profile-card .crop { background: #0d1116; border: 1px solid #232a32;
+                          border-radius: 6px; padding: 6px;
+                          display: flex; flex-direction: column; align-items: center; }
+    #profile-card .crop .label { font-size: 11px; color: #9aa3ad;
+                                  text-transform: uppercase; letter-spacing: 0.04em;
+                                  margin-bottom: 4px; }
+    #profile-card .crop img { max-width: 100%; max-height: 220px; border-radius: 4px;
+                              image-rendering: -webkit-optimize-contrast; }
+    #profile-card .crop .missing { color: #6b7380; font-size: 12px;
+                                    padding: 30px 10px; text-align: center; }
+    #profile-card .heatmap { background: #0d1116; border: 1px solid #232a32;
+                              border-radius: 6px; padding: 6px; text-align: center; }
+    #profile-card .heatmap img { max-width: 100%; max-height: 320px; }
+    #profile-card .heatmap .missing { color: #6b7380; font-size: 12px;
+                                       padding: 18px 10px; }
+    #profile-card .actions { display: flex; gap: 6px; margin-top: 12px; }
+    #profile-card .actions button { background: #3b82f6; color: white; border: 0;
+                                     border-radius: 5px; padding: 6px 12px;
+                                     font-size: 12px; font-weight: 600; cursor: pointer; }
+    #profile-card .actions button.secondary { background: #2a323c; color: #cfe3ff; }
+    #profile-card .actions button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #profile-card .nostage { color: #fda4af; font-size: 12px;
+                              background: #2a1a20; border: 1px solid #4a2a32;
+                              border-radius: 6px; padding: 8px 10px; }
+    .team-tag { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+                margin-right: 4px; vertical-align: middle; }
+
+    .play-bar { display: flex; gap: 6px; margin-top: 6px; align-items: center; }
+    .play-bar button { background: #3b82f6; color: white; border: 0; border-radius: 5px;
+                       padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer; }
+    .play-bar button.secondary { background: #2a323c; color: #cfe3ff; }
+    .play-bar button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .play-bar .count { color: #9aa3ad; font-size: 11px; margin-left: auto; }
+  </style>
+  <script defer src="/static/nav.js"></script>
+</head>
+<body>
+  <header>
+    <div><strong>Match:</strong><span id="meta-name">loading...</span></div>
+    <div><strong>Duration:</strong><span id="meta-duration">-</span></div>
+    <div><strong>Players:</strong><span id="meta-players">-</span></div>
+    <div><strong>Events:</strong><span id="meta-events">-</span></div>
+    <div style="margin-left:auto"><a id="link-insights" href="#">Insights →</a></div>
+  </header>
+
+  <div id="stage">
+    <div id="video-panel">
+      <video id="player" controls preload="metadata"></video>
+      <canvas id="overlay"></canvas>
+      <div id="queue-hud">
+        <span class="label" id="queue-label">Clip 1/1</span>
+        <button id="queue-next">Next ▶</button>
+        <button id="queue-stop" class="secondary">Stop</button>
+      </div>
+    </div>
+    <div id="pitch-panel">
+      <canvas id="mini"></canvas>
+    </div>
+  </div>
+
+  <div id="controls">
+    <div class="panel">
+      <h3>Overlays</h3>
+      <div class="toggle-row" id="toggles"></div>
+    </div>
+    <div class="panel">
+      <h3>Filter by event</h3>
+      <div class="chip-row" id="event-chips"></div>
+      <div class="event-list" id="event-list"></div>
+      <div class="play-bar">
+        <button id="event-playall" disabled>Play all</button>
+        <span class="count" id="event-count"></span>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Filter by player</h3>
+      <div class="player-grid" id="player-grid"></div>
+      <div class="play-bar">
+        <button id="player-playall" disabled>Play all clips</button>
+        <button id="player-clear" class="secondary" disabled>Clear</button>
+        <span class="count" id="player-count"></span>
+      </div>
+    </div>
+  </div>
+
+  <div id="profile-modal">
+    <div id="profile-card"></div>
+  </div>
+
+  <script>
+    // ---------- Boot ----------
+    const RUN_MATCH = window.location.pathname.match(/^\/match\/([^/]+)/);
+    const RUN_NAME = RUN_MATCH ? decodeURIComponent(RUN_MATCH[1]) : null;
+    if (!RUN_NAME) {
+      document.body.innerHTML = '<div style="padding:24px">match page must be opened at /match/&lt;run_name&gt;</div>';
+      throw new Error('no run name');
+    }
+    const API = `/api/runs/${encodeURIComponent(RUN_NAME)}`;
+    document.getElementById('link-insights').href = `/insights/${encodeURIComponent(RUN_NAME)}`;
+
+    const player = document.getElementById('player');
+    const overlay = document.getElementById('overlay');
+    const overlayCtx = overlay.getContext('2d');
+    const mini = document.getElementById('mini');
+    const miniCtx = mini.getContext('2d');
+    const queueHud = document.getElementById('queue-hud');
+    const queueLabel = document.getElementById('queue-label');
+
+    player.src = `${API}/video`;
+
+    // ---------- Colors ----------
+    // Mirror events/visualization.py:TEAM_COLORS but in CSS-friendly form.
+    // The Python code stores BGR, here we use the equivalent RGB.
+    const TEAM_COLORS = {
+      team_A: '#ff3b30',   // red
+      team_B: '#3b82ff',   // blue
+      referee: '#f7c948',  // yellow-ish
+      unknown: '#9aa3ad',
+    };
+    function teamColor(team) { return TEAM_COLORS[team] || TEAM_COLORS.unknown; }
+
+    // A track is "identified" when the consolidator gave it a real
+    // jersey number, OR a role we want to surface even without a
+    // number (referee / goalkeeper). Anything else is the
+    // ``unknown-unk-NN`` long-tail that pollutes the roster and the
+    // overlays — we hide those by default.
+    function isIdentifiedTrack(t) {
+      if (!t) return false;
+      const tid = String(t.track_id || '');
+      const meta = (payload && payload.players || []).find(p => p.player_id === tid) || {};
+      const jersey = (t.jersey_number != null) ? t.jersey_number : meta.jersey_number;
+      if (jersey != null) return true;
+      const role = t.role || meta.role || 'player';
+      return role === 'referee' || role === 'goalkeeper' || role === 'linesman';
+    }
+    function isIdentifiedPlayer(p) {
+      if (!p) return false;
+      if (p.jersey_number != null) return true;
+      const role = p.role || 'player';
+      return role === 'referee' || role === 'goalkeeper' || role === 'linesman';
+    }
+
+    // ---------- State ----------
+    let meta = null;          // /api/runs/{run}/meta
+    let payload = null;       // /api/runs/{run}/match/data
+    let tracksByFrame = {};   // frame_str -> [track,...]
+    let ballByFrame = {};     // frame_str -> ball
+
+    // Defaults: keep the broadcast clean — only an ellipse under each
+    // player's feet plus their jersey number. Everything else is opt-in
+    // via the toggles below.
+    const overlays = {
+      ellipse: true,
+      jersey: true,
+      bbox: false,
+      ball: false,
+      ball_trail: false,
+      pass_arrows: false,
+      possession: false,
+    };
+
+    let selectedPlayer = null;
+    let activeEvent = null;
+    let activeEventType = null;
+
+    // Clip queue: {windows:[{start_s,end_s,label}], idx, label}
+    let queue = null;
+
+    // ---------- Header / overlay toggle UI ----------
+    function buildToggles() {
+      const row = document.getElementById('toggles');
+      const items = [
+        ['ellipse', 'Ellipse under feet'],
+        ['jersey', 'Jersey #'],
+        ['bbox', 'Bbox + team color'],
+        ['ball', 'Ball marker'],
+        ['ball_trail', 'Ball trail'],
+        ['pass_arrows', 'Pass arrows'],
+        ['possession', 'Possession'],
+      ];
+      row.innerHTML = items.map(([k, lbl]) =>
+        `<span class="toggle ${overlays[k] ? 'on' : ''}" data-k="${k}">${lbl}</span>`
+      ).join('');
+      row.querySelectorAll('.toggle').forEach(el => {
+        el.addEventListener('click', () => {
+          const k = el.dataset.k;
+          overlays[k] = !overlays[k];
+          el.classList.toggle('on', overlays[k]);
+        });
+      });
+    }
+
+    // ---------- Layout: keep overlay aligned with video display rect ----------
+    function syncOverlayLayout() {
+      // Video element sizes itself with letterboxing inside the video
+      // panel. Compute the actual rendered rect of the video frame and
+      // place the overlay canvas exactly on top of it.
+      const videoPanel = document.getElementById('video-panel');
+      const panelRect = videoPanel.getBoundingClientRect();
+      const vw = player.videoWidth || 0;
+      const vh = player.videoHeight || 0;
+      if (!vw || !vh || !panelRect.width || !panelRect.height) {
+        overlay.style.display = 'none';
+      } else {
+        overlay.style.display = 'block';
+        // Object-fit: contain math.
+        const scale = Math.min(panelRect.width / vw, panelRect.height / vh);
+        const dw = vw * scale;
+        const dh = vh * scale;
+        const left = (panelRect.width - dw) / 2;
+        const top = (panelRect.height - dh) / 2;
+        overlay.style.left = `${left}px`;
+        overlay.style.top = `${top}px`;
+        overlay.style.width = `${dw}px`;
+        overlay.style.height = `${dh}px`;
+        overlay.width = Math.round(dw);
+        overlay.height = Math.round(dh);
+        overlay._scale = scale;
+      }
+      syncPitchLayout();
+    }
+
+    function syncPitchLayout() {
+      // Pitch panel hosts a 2D top-down view sized to fit its container
+      // while preserving the pitch aspect ratio.
+      const pitchPanel = document.getElementById('pitch-panel');
+      const rect = pitchPanel.getBoundingClientRect();
+      const PL = (payload && (payload.pitch && payload.pitch.length || payload.pitch_length)) || 105;
+      const PW = (payload && (payload.pitch && payload.pitch.width  || payload.pitch_width))  || 68;
+      const margin = 16;
+      const aspect = PL / PW;
+      let dw = rect.width - margin * 2;
+      let dh = dw / aspect;
+      if (dh > rect.height - margin * 2) {
+        dh = rect.height - margin * 2;
+        dw = dh * aspect;
+      }
+      mini.width = Math.max(100, Math.round(dw));
+      mini.height = Math.max(80, Math.round(dh));
+    }
+
+    player.addEventListener('loadedmetadata', syncOverlayLayout);
+    window.addEventListener('resize', syncOverlayLayout);
+
+    // ---------- Frame lookup ----------
+    function nearestFrameKey(map, frame, maxDist) {
+      // Tracks are sampled at process_fps so the exact frame may not be
+      // present — fall back to the closest within ±maxDist.
+      if (map[frame] !== undefined) return frame;
+      for (let d = 1; d <= maxDist; d++) {
+        if (map[frame - d] !== undefined) return frame - d;
+        if (map[frame + d] !== undefined) return frame + d;
+      }
+      return null;
+    }
+
+    function frameAtPlayhead() {
+      const fps = (payload && payload.fps) || (meta && meta.fps) || 30;
+      return Math.round(player.currentTime * fps);
+    }
+
+    // ---------- Possession lookup ----------
+    // Track which player currently has the ball based on possession events.
+    let possessionSpans = []; // [{start_frame, end_frame, player_id, team_id}]
+    function buildPossessionSpans() {
+      possessionSpans = [];
+      // Possession events were stripped from payload.events; pull them
+      // from a lightweight scan via /runs_static. For simplicity we
+      // rely on the 'possession' events surfaced through meta.events_count
+      // — actually we re-fetch events.json for this purpose.
+    }
+
+    let rawEvents = []; // full events.json (for possession spans)
+    function activePossessionAt(frame) {
+      // possessionSpans is sorted by start_frame; linear scan is fine
+      // (typically dozens to hundreds of spans).
+      for (const s of possessionSpans) {
+        if (s.start_frame <= frame && frame <= s.end_frame) return s;
+      }
+      return null;
+    }
+
+    // ---------- rAF render loop ----------
+    function draw() {
+      requestAnimationFrame(draw);
+      if (!overlay._scale) return;
+      const w = overlay.width, h = overlay.height;
+      overlayCtx.clearRect(0, 0, w, h);
+      miniCtx.clearRect(0, 0, mini.width, mini.height);
+      const scale = overlay._scale;
+
+      const frame = frameAtPlayhead();
+      const trackKey = nearestFrameKey(tracksByFrame, frame, 6);
+      const tracks = trackKey != null ? tracksByFrame[trackKey] : [];
+      const ballKey = nearestFrameKey(ballByFrame, frame, 6);
+      const ball = ballKey != null ? ballByFrame[ballKey] : null;
+
+      const possHolder = overlays.possession ? activePossessionAt(frame) : null;
+      const possId = possHolder ? String(possHolder.player_id) : null;
+
+      // Player overlays. Default: every *identified* player (jersey
+      // number or referee/goalkeeper role) gets an ellipse under their
+      // feet and their jersey number, mirroring the FIFA-game style.
+      // Bbox / possession outline / etc. are opt-in via toggles.
+      for (const t of tracks || []) {
+        const bbox = t.bbox;
+        if (!bbox) continue;
+        if (!isIdentifiedTrack(t)) continue;
+        const [x1, y1, x2, y2] = bbox;
+        const tid = String(t.track_id);
+        const team = t.team || (payload.players.find(p => p.player_id === tid) || {}).team_id || 'unknown';
+        const color = teamColor(team);
+        const sx1 = x1 * scale, sy1 = y1 * scale;
+        const sx2 = x2 * scale, sy2 = y2 * scale;
+        const isSelected = selectedPlayer === tid;
+        const isPossessor = overlays.possession && possId === tid;
+
+        if (overlays.bbox || isPossessor) {
+          overlayCtx.strokeStyle = color;
+          overlayCtx.lineWidth = isPossessor ? 3 : 1.5;
+          overlayCtx.strokeRect(sx1, sy1, sx2 - sx1, sy2 - sy1);
+        }
+        if (overlays.ellipse || isSelected) {
+          const cx = (sx1 + sx2) / 2;
+          const cy = sy2;
+          const ew = (sx2 - sx1) * 1.2 / 2;
+          const eh = Math.max(6, (sx2 - sx1) * 0.35 / 2);
+          overlayCtx.save();
+          if (isSelected) {
+            overlayCtx.shadowColor = color;
+            overlayCtx.shadowBlur = 14;
+            overlayCtx.lineWidth = 3.5;
+          } else {
+            overlayCtx.lineWidth = 2;
+          }
+          overlayCtx.strokeStyle = color;
+          overlayCtx.beginPath();
+          overlayCtx.ellipse(cx, cy, ew, eh, 0, 0, Math.PI * 2);
+          overlayCtx.stroke();
+          overlayCtx.restore();
+        }
+        if (overlays.jersey) {
+          const jersey = (t.jersey_number != null) ? t.jersey_number : tid;
+          overlayCtx.font = 'bold 13px sans-serif';
+          // Place above the ellipse so it doesn't fight with the ring.
+          const cx = (sx1 + sx2) / 2;
+          const text = String(jersey);
+          const textW = overlayCtx.measureText(text).width;
+          const tx = cx - textW / 2;
+          const ty = Math.max(12, sy1 - 4);
+          // Outline for legibility against busy backgrounds.
+          overlayCtx.lineWidth = 3;
+          overlayCtx.strokeStyle = 'rgba(0,0,0,0.85)';
+          overlayCtx.strokeText(text, tx, ty);
+          overlayCtx.fillStyle = color;
+          overlayCtx.fillText(text, tx, ty);
+        }
+      }
+
+      // Ball overlay.
+      if (overlays.ball && ball && ball.center) {
+        const [cx, cy] = ball.center;
+        overlayCtx.beginPath();
+        overlayCtx.arc(cx * scale, cy * scale, 7, 0, Math.PI * 2);
+        overlayCtx.fillStyle = '#ffa500';
+        overlayCtx.fill();
+        overlayCtx.lineWidth = 2;
+        overlayCtx.strokeStyle = '#fff';
+        overlayCtx.stroke();
+      }
+      if (overlays.ball_trail) drawBallTrail(frame, scale);
+
+      // Pass arrow during pass windows.
+      if (overlays.pass_arrows && activeEvent && activeEvent.type === 'pass') {
+        drawPassArrow(activeEvent, tracks, scale);
+      }
+
+      // Mini pitch is now a peer panel and is always rendered.
+      drawMiniPitch(tracks, ball);
+    }
+
+    function drawBallTrail(frame, scale) {
+      const fps = (payload && payload.fps) || 30;
+      const window = Math.round(2.0 * fps);
+      const pts = [];
+      for (let f = frame - window; f <= frame; f += 1) {
+        const b = ballByFrame[f];
+        if (b && b.center) pts.push([b.center[0] * scale, b.center[1] * scale, f - frame]);
+      }
+      if (pts.length < 2) return;
+      overlayCtx.lineWidth = 3;
+      for (let i = 1; i < pts.length; i++) {
+        const a = (window + pts[i][2]) / window; // 0..1, newer = higher
+        overlayCtx.strokeStyle = `rgba(255, 165, 0, ${a.toFixed(2)})`;
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(pts[i - 1][0], pts[i - 1][1]);
+        overlayCtx.lineTo(pts[i][0], pts[i][1]);
+        overlayCtx.stroke();
+      }
+    }
+
+    function drawPassArrow(ev, tracks, scale) {
+      const passerId = String(ev.player_id || '');
+      const recvId = String((ev.metadata || {}).receiver_id || '');
+      if (!passerId) return;
+      const find = (pid) => (tracks || []).find(t => String(t.track_id) === pid);
+      const passerT = find(passerId);
+      const recvT = recvId ? find(recvId) : null;
+      const bottomCenter = (t) => [(t.bbox[0] + t.bbox[2]) / 2, t.bbox[3]];
+      let p1, p2;
+      if (passerT) p1 = bottomCenter(passerT);
+      if (recvT) p2 = bottomCenter(recvT);
+      // Fall back to event start/end pitch positions are world coords; the
+      // canvas overlay is image-space, so we can't reproject without the
+      // camera. Skip if we don't have current bboxes.
+      if (!p1 || !p2) return;
+      drawArrow(p1[0] * scale, p1[1] * scale, p2[0] * scale, p2[1] * scale, '#ffd166');
+    }
+
+    function drawArrow(x1, y1, x2, y2, color) {
+      const ctx = overlayCtx;
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+      const ang = Math.atan2(y2 - y1, x2 - x1);
+      const head = 12;
+      ctx.beginPath();
+      ctx.moveTo(x2, y2);
+      ctx.lineTo(x2 - head * Math.cos(ang - Math.PI / 6), y2 - head * Math.sin(ang - Math.PI / 6));
+      ctx.lineTo(x2 - head * Math.cos(ang + Math.PI / 6), y2 - head * Math.sin(ang + Math.PI / 6));
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // ---------- Camera FOV polygons (precomputed server-side) ----------
+    // Sorted-by-frame array; we binary-search the nearest entry per
+    // playhead so the polygon tracks pan/zoom in real time.
+    let fovFrames = [];
+    function setFovFrames(frames) {
+      fovFrames = (frames || []).slice().sort((a, b) => a.frame - b.frame);
+    }
+    function nearestFov(frame) {
+      if (!fovFrames.length) return null;
+      // Binary search for the closest frame.
+      let lo = 0, hi = fovFrames.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (fovFrames[mid].frame < frame) lo = mid + 1; else hi = mid;
+      }
+      const a = fovFrames[lo];
+      const b = fovFrames[Math.max(0, lo - 1)];
+      return Math.abs(a.frame - frame) <= Math.abs(b.frame - frame) ? a : b;
+    }
+
+    function drawMiniPitch(tracks, ball) {
+      const W = mini.width, H = mini.height;
+      const geom = (payload && payload.pitch) || {
+        length: (payload && payload.pitch_length) || 105,
+        width: (payload && payload.pitch_width) || 68,
+        penalty_area_length: 16.5,
+        penalty_area_width: 40.32,
+        goal_area_length: 5.5,
+        goal_area_width: 18.32,
+        center_circle_radius: 9.15,
+      };
+      const PL = geom.length, PW = geom.width;
+      const pad = 12;
+      const sx = (W - 2 * pad) / PL;
+      const sy = (H - 2 * pad) / PW;
+
+      // Grass background.
+      miniCtx.fillStyle = '#0d1f0d';
+      miniCtx.fillRect(0, 0, W, H);
+
+      const w2p = (wx, wy) => [
+        pad + (wx + PL / 2) * sx,
+        pad + (PW / 2 - wy) * sy,
+      ];
+
+      const lineColor = '#cfe3ff';
+      miniCtx.strokeStyle = lineColor;
+      miniCtx.lineWidth = 1.5;
+
+      // Touchlines + goal lines (outline).
+      const tl = w2p(-PL / 2,  PW / 2);
+      const br = w2p( PL / 2, -PW / 2);
+      miniCtx.strokeRect(tl[0], tl[1], br[0] - tl[0], br[1] - tl[1]);
+
+      // Halfway line.
+      miniCtx.beginPath();
+      const ht = w2p(0,  PW / 2);
+      const hb = w2p(0, -PW / 2);
+      miniCtx.moveTo(ht[0], ht[1]); miniCtx.lineTo(hb[0], hb[1]);
+      miniCtx.stroke();
+
+      // Center circle + spot.
+      const ccr = geom.center_circle_radius * Math.min(sx, sy);
+      const c0 = w2p(0, 0);
+      miniCtx.beginPath();
+      miniCtx.arc(c0[0], c0[1], ccr, 0, Math.PI * 2);
+      miniCtx.stroke();
+      miniCtx.beginPath();
+      miniCtx.arc(c0[0], c0[1], 2, 0, Math.PI * 2);
+      miniCtx.fillStyle = lineColor;
+      miniCtx.fill();
+
+      // Penalty + goal areas, both ends.
+      const paW = geom.penalty_area_width / 2;
+      const paL = geom.penalty_area_length;
+      const gaW = geom.goal_area_width / 2;
+      const gaL = geom.goal_area_length;
+      const drawBox = (x1w, y1w, x2w, y2w) => {
+        const [a, b] = w2p(x1w, y1w);
+        const [c, d] = w2p(x2w, y2w);
+        miniCtx.strokeRect(a, b, c - a, d - b);
+      };
+      // Left side
+      drawBox(-PL / 2,  paW, -PL / 2 + paL, -paW);
+      drawBox(-PL / 2,  gaW, -PL / 2 + gaL, -gaW);
+      // Right side
+      drawBox( PL / 2,  paW,  PL / 2 - paL, -paW);
+      drawBox( PL / 2,  gaW,  PL / 2 - gaL, -gaW);
+
+      // Camera FOV polygon (where the broadcast camera is currently
+      // looking) — drawn before the players so the dots stay on top.
+      const fov = nearestFov(frameAtPlayhead());
+      if (fov && fov.polygon && fov.polygon.length >= 3) {
+        miniCtx.beginPath();
+        for (let i = 0; i < fov.polygon.length; i++) {
+          const [px, py] = w2p(fov.polygon[i][0], fov.polygon[i][1]);
+          if (i === 0) miniCtx.moveTo(px, py); else miniCtx.lineTo(px, py);
+        }
+        miniCtx.closePath();
+        miniCtx.fillStyle = 'rgba(255, 215, 102, 0.18)';
+        miniCtx.fill();
+        miniCtx.lineWidth = 1.5;
+        miniCtx.strokeStyle = 'rgba(255, 215, 102, 0.95)';
+        miniCtx.stroke();
+      }
+
+      // On-field identified players + referees only. ``tracks`` already
+      // comes from the current frame; we just need to drop tracks that
+      // have no pitch_position (i.e. couldn't be projected onto the
+      // field) or no jersey/role.
+      const PLAYER_R = Math.max(5, Math.min(W, H) / 50);
+      for (const t of tracks || []) {
+        const pp = t.pitch_position;
+        if (!pp || pp[0] == null) continue;
+        if (!isIdentifiedTrack(t)) continue;
+        // Skip detections that landed outside the field rectangle by
+        // more than a margin — these are invariably calibration
+        // misprojections (sideline staff, photographers, etc.) and
+        // muddy the top-down view.
+        const margin = 3.0;
+        if (Math.abs(pp[0]) > PL / 2 + margin) continue;
+        if (Math.abs(pp[1]) > PW / 2 + margin) continue;
+
+        const tid = String(t.track_id);
+        const playerInfo = payload.players.find(p => p.player_id === tid) || {};
+        const team = t.team || playerInfo.team_id || 'unknown';
+        const role = t.role || playerInfo.role || 'player';
+        const [px, py] = w2p(pp[0], pp[1]);
+        const isSelected = selectedPlayer === tid;
+        const r = isSelected ? PLAYER_R + 2 : PLAYER_R;
+
+        miniCtx.fillStyle = teamColor(team);
+        miniCtx.beginPath();
+        miniCtx.arc(px, py, r, 0, Math.PI * 2);
+        miniCtx.fill();
+        miniCtx.lineWidth = isSelected ? 2.5 : 1.2;
+        miniCtx.strokeStyle = isSelected ? '#ffffff' : 'rgba(0,0,0,0.55)';
+        miniCtx.stroke();
+
+        // Jersey / id label inside the dot.
+        const jersey = t.jersey_number != null ? String(t.jersey_number)
+                     : (role === 'referee' ? 'R'
+                       : (role === 'goalkeeper' ? 'GK'
+                         : (tid.split('-').pop() || tid).slice(0, 3)));
+        miniCtx.font = `bold ${Math.round(r * 1.1)}px sans-serif`;
+        miniCtx.fillStyle = '#ffffff';
+        miniCtx.textAlign = 'center';
+        miniCtx.textBaseline = 'middle';
+        miniCtx.fillText(jersey, px, py);
+        miniCtx.textAlign = 'left';
+        miniCtx.textBaseline = 'alphabetic';
+      }
+
+      // Ball.
+      if (ball && ball.pitch_position && ball.pitch_position[0] != null) {
+        const [px, py] = w2p(ball.pitch_position[0], ball.pitch_position[1]);
+        miniCtx.fillStyle = '#ffa500';
+        miniCtx.beginPath();
+        miniCtx.arc(px, py, Math.max(3, PLAYER_R * 0.55), 0, Math.PI * 2);
+        miniCtx.fill();
+        miniCtx.lineWidth = 1.5;
+        miniCtx.strokeStyle = '#000';
+        miniCtx.stroke();
+      }
+    }
+
+    requestAnimationFrame(draw);
+
+    // ---------- Clip queue ----------
+    function startQueue(windows, label) {
+      if (!windows || !windows.length) return;
+      queue = { windows, idx: 0, label };
+      seekToCurrentClip();
+      updateQueueHud();
+      queueHud.style.display = 'flex';
+    }
+
+    function seekToCurrentClip() {
+      if (!queue) return;
+      const w = queue.windows[queue.idx];
+      try { player.currentTime = Math.max(0, w.start_s); } catch {}
+      player.play().catch(() => {});
+      queue._endS = w.end_s;
+      queue._paused = false;
+    }
+
+    function updateQueueHud() {
+      if (!queue) {
+        queueHud.style.display = 'none';
+        return;
+      }
+      const total = queue.windows.length;
+      const i = queue.idx + 1;
+      queueLabel.textContent = `${queue.label} ${i}/${total}`;
+    }
+
+    function nextClip() {
+      if (!queue) return;
+      if (queue.idx + 1 >= queue.windows.length) {
+        queue = null;
+        updateQueueHud();
+        return;
+      }
+      queue.idx += 1;
+      seekToCurrentClip();
+      updateQueueHud();
+    }
+
+    function stopQueue() {
+      queue = null;
+      updateQueueHud();
+      player.pause();
+    }
+
+    document.getElementById('queue-next').addEventListener('click', nextClip);
+    document.getElementById('queue-stop').addEventListener('click', stopQueue);
+
+    // Boundary watchdog: when the playhead crosses end_s of the active
+    // clip, pause and wait for the user to hit Next.
+    player.addEventListener('timeupdate', () => {
+      if (!queue || queue._paused) return;
+      if (player.currentTime >= queue._endS) {
+        player.pause();
+        queue._paused = true;
+      }
+    });
+
+    // ---------- Event filter ----------
+    function buildEventChips() {
+      const types = Array.from(new Set(payload.events.map(e => e.type)));
+      types.sort();
+      const chipRow = document.getElementById('event-chips');
+      if (!types.length) {
+        chipRow.innerHTML = '<span style="color:#6b7380;font-size:12px">no events detected</span>';
+        return;
+      }
+      chipRow.innerHTML = types.map(t =>
+        `<button class="chip" data-t="${t}">${t}</button>`
+      ).join('');
+      chipRow.querySelectorAll('.chip').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const t = btn.dataset.t;
+          activeEventType = (activeEventType === t) ? null : t;
+          chipRow.querySelectorAll('.chip').forEach(b =>
+            b.classList.toggle('on', b.dataset.t === activeEventType));
+          renderEventList();
+        });
+      });
+    }
+
+    function renderEventList() {
+      const list = document.getElementById('event-list');
+      const playall = document.getElementById('event-playall');
+      const count = document.getElementById('event-count');
+      if (!activeEventType) {
+        list.innerHTML = '<div class="empty">Pick an event type above.</div>';
+        playall.disabled = true;
+        count.textContent = '';
+        return;
+      }
+      const events = payload.events.filter(e => e.type === activeEventType);
+      if (!events.length) {
+        list.innerHTML = '<div class="empty">no events of this type</div>';
+        playall.disabled = true;
+        count.textContent = '';
+        return;
+      }
+      list.innerHTML = events.map((e, i) => {
+        const team = e.team_id && e.team_id !== 'unknown'
+          ? `<span class="team-tag" style="background:${teamColor(e.team_id)}"></span>${e.team_id}` : '';
+        const player = e.player_id ? ` · ${e.player_id}` : '';
+        const outcome = (e.metadata || {}).outcome ? ` · ${(e.metadata).outcome}` : '';
+        return `<div class="row" data-i="${i}">
+          <span>${fmtTime(e.start_s)} → ${fmtTime(e.end_s)}${player}</span>
+          <span class="meta">${team}${outcome}</span>
+        </div>`;
+      }).join('');
+      list.querySelectorAll('.row').forEach(row => {
+        row.addEventListener('click', () => {
+          list.querySelectorAll('.row').forEach(r => r.classList.remove('active'));
+          row.classList.add('active');
+          const e = events[parseInt(row.dataset.i, 10)];
+          activeEvent = e;
+          startQueue([{ start_s: e.start_s, end_s: e.end_s }], `${e.type}`);
+        });
+      });
+      playall.disabled = false;
+      count.textContent = `${events.length} clips`;
+      playall.onclick = () => {
+        startQueue(events.map(e => ({ start_s: e.start_s, end_s: e.end_s })),
+                   `all ${activeEventType}`);
+      };
+    }
+
+    // ---------- Player filter ----------
+    function buildPlayerGrid() {
+      const grid = document.getElementById('player-grid');
+      // Hide tracks the consolidator never resolved into a numbered
+      // player (jersey OCR + role both unknown). They're the long tail
+      // of fragmented detections; surfacing them just clutters the
+      // roster.
+      const players = (payload.players || []).filter(isIdentifiedPlayer);
+      players.sort((a, b) => (a.team_id || '').localeCompare(b.team_id || '')
+        || -(a.frames_observed - b.frames_observed));
+      grid.innerHTML = players.map(p => {
+        const jersey = p.jersey_number != null ? `#${p.jersey_number}` : '';
+        const role = p.role && p.role !== 'player' ? ` · ${p.role}` : '';
+        const distNote = p.distance_m != null ? ` · ${p.distance_m.toFixed(1)}m` : '';
+        return `<div class="player-card" data-pid="${p.player_id}">
+          <span class="info-btn" data-pid="${p.player_id}" title="Profile">i</span>
+          <div class="pid"><span class="team-tag" style="background:${teamColor(p.team_id)}"></span>${p.player_id} ${jersey}</div>
+          <div class="meta">${p.team_id}${role} · ${p.frames_observed}f${distNote}</div>
+        </div>`;
+      }).join('');
+      grid.querySelectorAll('.player-card').forEach(card => {
+        card.addEventListener('click', (ev) => {
+          // Info button is a child of the card; intercept its clicks so
+          // they open the profile pane instead of toggling the spotlight.
+          if (ev.target && ev.target.classList.contains('info-btn')) return;
+          const pid = card.dataset.pid;
+          if (selectedPlayer === pid) {
+            selectedPlayer = null;
+          } else {
+            selectedPlayer = pid;
+          }
+          grid.querySelectorAll('.player-card').forEach(c =>
+            c.classList.toggle('active', c.dataset.pid === selectedPlayer));
+          updatePlayerControls();
+        });
+      });
+      grid.querySelectorAll('.info-btn').forEach(btn => {
+        btn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          openProfile(btn.dataset.pid);
+        });
+      });
+    }
+
+    // ---------- Player profile modal ----------
+    const profileModal = document.getElementById('profile-modal');
+    const profileCard = document.getElementById('profile-card');
+
+    profileModal.addEventListener('click', (ev) => {
+      if (ev.target === profileModal) closeProfile();
+    });
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && profileModal.classList.contains('show')) closeProfile();
+    });
+
+    function closeProfile() {
+      profileModal.classList.remove('show');
+      profileCard.innerHTML = '';
+    }
+
+    function openProfile(pid) {
+      const p = (payload.players || []).find(x => x.player_id === pid);
+      if (!p) return;
+
+      const hasProfile = p.front_crop_url || p.back_crop_url || p.heatmap_url
+                        || p.distance_m != null;
+      const jersey = p.jersey_number != null ? `#${p.jersey_number}` : '';
+      const role = p.role && p.role !== 'player' ? ` · ${p.role}` : '';
+
+      const cropCell = (label, url) => `
+        <div class="crop">
+          <div class="label">${label}</div>
+          ${url
+            ? `<img src="${url}" alt="${pid} ${label}"/>`
+            : `<div class="missing">no ${label} crop</div>`}
+        </div>`;
+
+      const stat = (k, v) => `
+        <div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+      const fmt = (v, unit) => v == null ? '—' : `${v.toFixed(2)}${unit}`;
+
+      profileCard.innerHTML = `
+        <div class="head">
+          <span class="badge" style="background:${teamColor(p.team_id)}">${p.team_id || 'unknown'}</span>
+          <span class="pid">${p.player_id} ${jersey}</span>
+          <span style="color:#9aa3ad;font-size:12px">${role.replace(/^ · /, '')}</span>
+          <span class="close" id="profile-close">&times;</span>
+        </div>
+        ${hasProfile ? '' : `<div class="nostage">player_profile stage hasn't run for this match yet.</div>`}
+        <div class="stats">
+          ${stat('Distance', fmt(p.distance_m, ' m'))}
+          ${stat('Avg speed', fmt(p.avg_speed_mps, ' m/s'))}
+          ${stat('Max speed', fmt(p.max_speed_mps, ' m/s'))}
+        </div>
+        <div class="crops">
+          ${cropCell('front', p.front_crop_url)}
+          ${cropCell('back', p.back_crop_url)}
+        </div>
+        <div class="heatmap">
+          ${p.heatmap_url
+            ? `<img src="${p.heatmap_url}" alt="${pid} heatmap"/>`
+            : `<div class="missing">no heatmap available</div>`}
+        </div>
+        <div class="actions">
+          <button id="profile-spotlight">${selectedPlayer === pid ? 'Spotlight on' : 'Spotlight'}</button>
+          <button id="profile-playall" class="secondary">Play all clips (${((payload.player_clips||{})[pid]||[]).length})</button>
+        </div>
+      `;
+      profileCard.querySelector('#profile-close').addEventListener('click', closeProfile);
+      profileCard.querySelector('#profile-spotlight').addEventListener('click', () => {
+        selectedPlayer = (selectedPlayer === pid) ? null : pid;
+        document.querySelectorAll('.player-card').forEach(c =>
+          c.classList.toggle('active', c.dataset.pid === selectedPlayer));
+        updatePlayerControls();
+        closeProfile();
+      });
+      profileCard.querySelector('#profile-playall').addEventListener('click', () => {
+        const clips = (payload.player_clips || {})[pid] || [];
+        if (!clips.length) return;
+        startQueue(clips.map(c => ({ start_s: c.start_s, end_s: c.end_s })),
+                   `player ${pid}`);
+        closeProfile();
+      });
+      profileModal.classList.add('show');
+    }
+
+    function updatePlayerControls() {
+      const playall = document.getElementById('player-playall');
+      const clear = document.getElementById('player-clear');
+      const count = document.getElementById('player-count');
+      if (!selectedPlayer) {
+        playall.disabled = true;
+        clear.disabled = true;
+        count.textContent = '';
+        return;
+      }
+      const clips = (payload.player_clips || {})[selectedPlayer] || [];
+      playall.disabled = clips.length === 0;
+      clear.disabled = false;
+      count.textContent = `${clips.length} clip${clips.length === 1 ? '' : 's'}`;
+      playall.onclick = () => {
+        startQueue(clips.map(c => ({ start_s: c.start_s, end_s: c.end_s })),
+                   `player ${selectedPlayer}`);
+      };
+      clear.onclick = () => {
+        selectedPlayer = null;
+        document.querySelectorAll('.player-card').forEach(c => c.classList.remove('active'));
+        updatePlayerControls();
+      };
+    }
+
+    // ---------- Possession spans (load once from raw events) ----------
+    async function loadPossessionSpans() {
+      try {
+        const r = await fetch(`/runs_static/${encodeURIComponent(RUN_NAME)}/event_detection/events.json`);
+        if (!r.ok) return;
+        const events = await r.json();
+        possessionSpans = events
+          .filter(e => e.type === 'possession')
+          .map(e => ({
+            start_frame: e.start_frame ?? e.frame ?? 0,
+            end_frame: e.end_frame ?? e.frame ?? 0,
+            player_id: e.player_id,
+            team_id: e.team_id,
+          }))
+          .sort((a, b) => a.start_frame - b.start_frame);
+      } catch {}
+    }
+
+    // ---------- Format helpers ----------
+    function fmtTime(s) {
+      if (s == null) return '-';
+      const m = Math.floor(s / 60);
+      const r = (s - m * 60).toFixed(1);
+      return `${String(m).padStart(2,'0')}:${String(r).padStart(4,'0')}`;
+    }
+
+    // ---------- Boot sequence ----------
+    (async () => {
+      buildToggles();
+      try {
+        const [m, p, tj, bj] = await Promise.all([
+          fetch(`${API}/meta`).then(r => r.json()),
+          fetch(`${API}/match/data`).then(r => r.json()),
+          fetch(`/runs_static/${encodeURIComponent(RUN_NAME)}/track_consolidation/tracks.json`).then(r => r.ok ? r.json() : {}),
+          fetch(`/runs_static/${encodeURIComponent(RUN_NAME)}/tracking/ball_tracks.json`).then(r => r.ok ? r.json() : {}),
+        ]);
+        meta = m;
+        payload = p;
+        // tracks.json is keyed by str(frame); convert to plain object lookup
+        // with integer keys so the rAF loop can index by current frame.
+        tracksByFrame = {};
+        for (const k of Object.keys(tj || {})) tracksByFrame[parseInt(k, 10)] = tj[k];
+        ballByFrame = {};
+        for (const k of Object.keys(bj || {})) ballByFrame[parseInt(k, 10)] = bj[k];
+
+        document.getElementById('meta-name').textContent = meta.video_name;
+        document.getElementById('meta-duration').textContent =
+          `${fmtTime(meta.duration_s)} (${meta.frame_count} frames @ ${(meta.fps || 0).toFixed(1)} fps)`;
+        const idCount = (payload.players || []).filter(isIdentifiedPlayer).length;
+        const totalCount = (payload.players || []).length;
+        document.getElementById('meta-players').textContent =
+          idCount === totalCount ? `${totalCount}` : `${idCount} (of ${totalCount})`;
+        document.getElementById('meta-events').textContent = `${(payload.events || []).length}`;
+
+        buildEventChips();
+        renderEventList();
+        buildPlayerGrid();
+        updatePlayerControls();
+        setFovFrames((payload.camera_fov || {}).frames || []);
+        await loadPossessionSpans();
+        syncOverlayLayout();
+      } catch (e) {
+        document.getElementById('meta-name').textContent = `(load failed: ${e})`;
+      }
+    })();
+  </script>
+</body>
+</html>
