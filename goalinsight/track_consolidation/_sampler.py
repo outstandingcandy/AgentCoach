@@ -46,16 +46,37 @@ def _bbox_area(bbox: list[float]) -> float:
 
 def pick_top_frames(
     track_frames: list[tuple[int, list[float]]],
-    k: int,
+    k: int | None,
+    max_cap: int = 200,
+    stride: int | None = None,
 ) -> list[tuple[int, list[float]]]:
-    """Pick *k* frames with largest bboxes (pre-seek, no crop yet).
+    """Pick frames for a track.
 
-    Sharpness is cheap-ish but requires reading the frame; we use bbox
-    area as a fast coarse pre-filter to narrow candidates, then rely on
-    a second pass for sharpness within those candidates.
+    - ``stride > 1``: take every Nth frame from the track's appearance
+      list in temporal order. Cheaper than the all-frames mode with
+      similar voting confidence — N=10 over a 600-frame track gives
+      ~60 OCR calls instead of 600.
+    - ``k=None`` or ``k<=0``: return EVERY frame in the track, capped
+      at ``max_cap`` (largest bboxes win when the cap bites).
+    - ``k>0``: legacy top-K sampling — bbox-area top-3K then
+      time-spread down to K. Used by the LLM scene/role decision call.
+
+    ``stride`` takes precedence over ``k`` when both are set, so the
+    caller can opt into stride-sampling without rewriting the existing
+    "all frames" config knob.
     """
     if not track_frames:
         return []
+    ordered = sorted(track_frames, key=lambda fr: fr[0])
+    if stride and stride > 1:
+        return ordered[::int(stride)]
+    if k is None or k <= 0:
+        if len(ordered) <= max_cap:
+            return ordered
+        # Over the cap: keep the largest-bbox max_cap, then sort by frame.
+        pool = sorted(ordered, key=lambda fr: -_bbox_area(fr[1]))[:max_cap]
+        pool.sort(key=lambda fr: fr[0])
+        return pool
     # Take 3× candidates by area, then sharpness re-ranks inside seek loop
     pool = sorted(track_frames, key=lambda fr: -_bbox_area(fr[1]))[: k * 3]
     # Spread candidates across the track's time range so crops aren't
@@ -71,13 +92,18 @@ def sample_crops_for_tracks(
     video_path: str | Path,
     tracks_by_frame: dict[str, list[dict[str, Any]]],
     track_ids: list[int],
-    k: int,
+    k: int | None,
     min_bbox_height: int,
     upper_ratio: float,
+    max_cap: int = 200,
+    stride: int | None = None,
 ) -> dict[int, list[SampledFrame]]:
     """Return ``{track_id: [SampledFrame, ...]}`` for every candidate track.
 
-    Opens the source video once and seeks to each selected frame.  For
+    ``k`` semantics: ``None``/``<=0`` = take all frames (capped at
+    ``max_cap``); positive int = top-K by bbox area + time-spread.
+
+    Opens the source video once and seeks to each selected frame. For
     efficiency, collects all (frame_id, track_id, bbox) tuples first,
     sorts by frame_id, and does a single forward pass through the video.
     """
@@ -100,7 +126,9 @@ def sample_crops_for_tracks(
     # Rank and select candidates per track
     wanted: list[tuple[int, int, list[float]]] = []  # (frame_id, track_id, bbox)
     for tid in track_ids:
-        picks = pick_top_frames(by_track.get(tid, []), k)
+        picks = pick_top_frames(
+            by_track.get(tid, []), k, max_cap=max_cap, stride=stride,
+        )
         for fid, bbox in picks:
             wanted.append((fid, tid, bbox))
     wanted.sort(key=lambda x: x[0])
@@ -159,10 +187,15 @@ def sample_crops_for_tracks(
     finally:
         cap.release()
 
-    # Per-track: keep top-k by sharpness-weighted score; preserve temporal order
+    # Per-track post-processing:
+    #   - stride mode keeps every Nth frame as picked above (no
+    #     re-ranking — temporal evenness IS the point).
+    #   - k>0 keeps top-k by sharpness-weighted score.
+    #   - k=None/0 leaves all picked frames (already capped).
     for tid in list(result.keys()):
         frames = result[tid]
-        if len(frames) > k:
+        if not (stride and stride > 1) and k is not None and k > 0 \
+                and len(frames) > k:
             frames = sorted(frames, key=lambda f: -f.score)[:k]
         frames.sort(key=lambda f: f.frame_id)
         result[tid] = frames

@@ -65,15 +65,28 @@ def _player_color(
     return TEAM_COLOR.get(team, DEFAULT_COLOR)
 
 
-def _player_label(track_id: str, player: dict | None) -> str:
-    """Build a compact label: 'B-21 #21' or 'REF-01' or fallback to track_id."""
+def _player_label(
+    track_id: str,
+    player: dict | None,
+    orig_tid: int | None = None,
+) -> str:
+    """Build a compact bbox label.
+
+    Format: ``"<player_id> #<jersey> [orig <tid>]"`` — the orig tid
+    suffix lets you trace back to the raw tracker fragment in
+    tracking/tracks.json (consolidation merges multiple raw tids into
+    one player_id; useful when auditing whether a fragmentation got
+    fixed). Falls back to just the track_id when there's no cluster
+    info.
+    """
+    orig_suffix = f" [orig {orig_tid}]" if orig_tid is not None else ""
     if not player:
-        return str(track_id)
+        return f"{track_id}{orig_suffix}"
     pid = player.get("player_id", track_id)
     jersey = player.get("jersey_number")
     if jersey is not None:
-        return f"{pid} #{jersey}"
-    return str(pid)
+        return f"{pid} #{jersey}{orig_suffix}"
+    return f"{pid}{orig_suffix}"
 
 
 def _draw_side_panel(
@@ -141,7 +154,10 @@ def render_consolidated_video(
     ``vis_frame_stride`` > 0 saves ``output_path.parent / 'frames' /
     frame_NNN.jpg`` every Nth video frame for offline auditing.
     """
-    with open(tracking_dir / "tracks.json") as f:
+    # The consolidation stage writes its tracks.json (player_id strings,
+    # jersey numbers populated) into its own dir; the raw tracker file
+    # under tracking/ is never mutated.
+    with open(consolidation_dir / "tracks.json") as f:
         all_tracks: dict = json.load(f)
     with open(consolidation_dir / "players.json") as f:
         players: list[dict] = json.load(f)
@@ -189,7 +205,8 @@ def render_consolidated_video(
             visible_ids.add(tid)
             player = player_by_id.get(tid)
             color = _player_color(player, t)
-            label = _player_label(tid, player)
+            orig_tid = t.get("orig_track_id")
+            label = _player_label(tid, player, orig_tid=orig_tid)
             x1, y1, x2, y2 = (int(v) for v in t["bbox"])
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
