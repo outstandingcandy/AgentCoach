@@ -279,11 +279,15 @@ def run_tracking(
             "max_iou_distance": tracking_cfg.get("max_iou_distance", 0.7),
             "max_iou_distance_tentative": tracking_cfg.get(
                 "max_iou_distance_tentative", 0.55),
-            "max_cosine_distance": 0.3,  # Tighter cosine distance
+            "max_cosine_distance": tracking_cfg.get(
+                "max_cosine_distance", 0.3),  # cosine distance threshold
             "feature_alpha": 0.9,
             "frame_interval": frame_interval,
             "pitch_gate_m": tracking_cfg.get(
                 "pitch_gate_m", 4.0 * _inv_fps_scale),
+            "reid_iou_min": tracking_cfg.get("reid_iou_min", 0.1),
+            "reid_pitch_max_m": tracking_cfg.get(
+                "reid_pitch_max_m", 1.5 * _inv_fps_scale),
             "stationary_window": tracking_cfg.get(
                 "stationary_window", int(round(30 * _fps_scale))),
             "stationary_max_pixels": tracking_cfg.get(

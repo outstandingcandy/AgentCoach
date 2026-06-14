@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from .gates import PitchGate
+from .gates import MotionPitchGate, PitchGate
 from .kalman import KalmanFilter
 from .lifecycle import TrackLifecycle
 from .matching import (
@@ -75,6 +75,23 @@ class StrongSORTTracker:
         # real detection enough slack to re-attach without spawning a
         # fresh tid). Calibration failures skip the gate entirely.
         self.pitch_gate_m = float(config.get("pitch_gate_m", 4.0))
+        # Confirmed-ReID stage uses a hybrid IoU-or-pitch gate. ReID by
+        # itself gives cross-team / same-team kits ambiguous cosines on
+        # Veo footage; the bare 4 m pitch gate often admits an
+        # adjacent same-team player as a candidate, and Hungarian
+        # picks whichever ReID cosine is marginally smaller — that's
+        # how orig 1 in the kids clip teleported 60 px between frames
+        # 303 and 306 (same-team yellow player 2 m away). Hybrid gate
+        # passes pairs only if EITHER:
+        #   - bbox IoU(pred, det) ≥ reid_iou_min (the "stayed put"
+        #     case — fast wingers can fail this), OR
+        #   - pitch_dist ≤ reid_pitch_max_m (the "moved fast on the
+        #     ground" case — accepts displacement up to a typical
+        #     1-sample sprint + projection jitter).
+        # Tentative-pitch stage's PitchGate keeps the original 4 m so
+        # newly-spawned tracks still re-attach across IoU dropouts.
+        self.reid_iou_min = float(config.get("reid_iou_min", 0.1))
+        self.reid_pitch_max_m = float(config.get("reid_pitch_max_m", 1.5))
 
         self.lifecycle = TrackLifecycle(
             max_age=config.get("max_age", 30),
@@ -123,9 +140,12 @@ class StrongSORTTracker:
 
         Stages, in order:
 
-        1. ``confirmed-reid``: confirmed × ReID cosine, gated by
-           pitch distance. Fine-grained appearance matching for tracks
-           with stable EMA features.
+        1. ``confirmed-reid``: confirmed × ReID cosine, gated by a
+           hybrid IoU-or-pitch gate (MotionPitchGate). Fine-grained
+           appearance matching for tracks with stable EMA features.
+           The gate prevents Hungarian from teleporting a confirmed
+           track to a same-team player a few metres away purely on
+           noisy ReID cosines.
         2. ``confirmed-iou``: confirmed leftovers × IoU. Bridges short
            ReID drops where the track and detection are clearly the
            same bbox geometry.
@@ -147,14 +167,24 @@ class StrongSORTTracker:
                     and t.smooth_feature is not None
                 ),
                 cost_fn=cosine_cost,
-                gates=[PitchGate(self.pitch_gate_m)],
+                gates=[MotionPitchGate(
+                    iou_min=self.reid_iou_min,
+                    pitch_max_m=self.reid_pitch_max_m,
+                )],
                 threshold=self.max_cosine_distance,
             ),
             MatchingStage(
                 name="confirmed-iou",
                 track_filter=lambda t: t.status == TrackStatus.CONFIRMED,
                 cost_fn=iou_cost,
-                gates=[],
+                # Pitch sanity-check: a multi-metre jump in pitch space
+                # is physically impossible at process_fps even when the
+                # 2D bboxes happen to overlap on screen (perspective
+                # collapse — a player and a goalkeeper several metres
+                # apart in depth can share the same image-rectangle).
+                # Use pitch_gate_m as the ceiling so newly-confirmed
+                # tracks still re-attach across short occlusions.
+                gates=[PitchGate(self.pitch_gate_m)],
                 threshold=self.max_iou_distance,
             ),
             MatchingStage(
