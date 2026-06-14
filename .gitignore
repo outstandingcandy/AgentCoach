@@ -81,3 +81,7 @@ chat_artifacts/
 credentials.json
 secrets.yaml
 secrets.yml
+
+# AgentCore deploy outputs (per-env state)
+.agentcore_runtime_arn
+.agentcore_session_salt

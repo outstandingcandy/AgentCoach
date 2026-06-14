@@ -274,6 +274,17 @@ Example questions that work today:
 > "Compare B-10's first-half and second-half pass success rate."
 > "Plot a heatmap of where team A's possessions ended."
 
+### Optional: chat on AgentCore Runtime
+
+The chat agent can also run as an AWS-managed AgentCore Runtime
+container instead of inside the FastAPI process — same prompts, same
+tools, same SSE shape on the wire. The local app proxies turns to the
+runtime via `bedrock-agentcore.InvokeAgentRuntime` and streams the
+response back to the browser unchanged. Setup, deploy, and per-run S3
+sync are documented in [`deploy/agentcore_runtime/README.md`](deploy/agentcore_runtime/README.md);
+toggle by setting `GOALINSIGHT_AGENTCORE_RUNTIME_ARN` (and unset to
+revert to local chat).
+
 ## Repository layout
 
 ```
@@ -291,6 +302,7 @@ goalinsight/
   utils/, interfaces/        # factories + ABCs
 configs/                     # default + per-clip + camera profiles
 sagemaker/                   # setup, build, weights upload, entrypoint
+deploy/agentcore_runtime/    # optional AgentCore Runtime image for chat
 scripts/                     # run_full_pipeline, pipeline.sh, audit/dump tools, ...
 tools/                       # make_comparison.py and other utilities
 docs/                        # architecture diagrams (draw.io)

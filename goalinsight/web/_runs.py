@@ -5,6 +5,11 @@ ChatEngine. Building these is expensive (loads JSON, opens a Bedrock
 client, eagerly parses tracks), so we build on first request and keep at
 most ``RUN_CACHE_SIZE`` warm in memory. The least-recently-used run is
 closed when capacity is exceeded.
+
+When ``GOALINSIGHT_AGENTCORE_RUNTIME_ARN`` is set, chat is delegated to
+an AgentCore Runtime container (see ``chat_remote.RemoteChatEngine``)
+instead of running locally. Other endpoints (analytics, viewer, etc.)
+are unaffected.
 """
 
 from __future__ import annotations
@@ -14,10 +19,23 @@ import shutil
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Protocol
 
 from ..highlights._context import MatchContext
 from ._workspace import VIDEO_EXTS, Workspace
 from .chat import ChatEngine
+from .chat_remote import (
+    RemoteChatEngine,
+    runtime_arn_from_env,
+    s3_bucket_from_env,
+    s3_prefix_for,
+)
+
+
+class ChatEngineLike(Protocol):
+    def respond(self, messages: list[dict[str, str]], current_time: float) -> str: ...
+    def stream(self, messages: list[dict[str, str]], current_time: float): ...
+    def close(self) -> None: ...
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +51,11 @@ class RunHandle:
     ctx: MatchContext
     # Built lazily on first chat call so analytics-only requests (heatmap,
     # stats) don't pay the boto3 / Bedrock startup cost.
-    _engine: ChatEngine | None = None
+    _engine: ChatEngineLike | None = None
     _engine_factory: Any = None
 
     @property
-    def engine(self) -> ChatEngine:
+    def engine(self) -> ChatEngineLike:
         if self._engine is None:
             if self._engine_factory is None:
                 raise RuntimeError("engine factory missing for run handle")
@@ -121,8 +139,28 @@ class RunRegistry:
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
         prefix = self.url_prefix_for(run_name)
+        runtime_arn = runtime_arn_from_env()
+        s3_bucket = s3_bucket_from_env() if runtime_arn else None
 
-        def _build_engine() -> ChatEngine:
+        def _build_engine() -> ChatEngineLike:
+            if runtime_arn:
+                if not s3_bucket:
+                    raise RuntimeError(
+                        "GOALINSIGHT_AGENTCORE_RUNTIME_ARN is set but "
+                        "GOALINSIGHT_S3_BUCKET is not — can't tell the "
+                        "runtime where to read this run's outputs from."
+                    )
+                logger.info(
+                    "run %s: chat via AgentCore Runtime %s",
+                    run_name, runtime_arn,
+                )
+                return RemoteChatEngine(
+                    ctx=ctx,
+                    run_name=run_name,
+                    agent_runtime_arn=runtime_arn,
+                    s3_bucket=s3_bucket,
+                    s3_prefix=s3_prefix_for(run_name),
+                )
             return ChatEngine(
                 ctx=ctx,
                 artifact_dir=artifact_dir,

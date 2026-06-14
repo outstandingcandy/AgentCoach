@@ -1,9 +1,10 @@
 """Render the GoalInsight architecture diagrams.
 
-Outputs three PNGs into the same directory as this script:
-  - chat_architecture.png       — online viewer (Bedrock + AgentCore)
-  - pipeline_local.png          — offline pipeline default (local stages)
-  - pipeline_remote.png         — offline pipeline with --remote-stages
+Outputs four PNGs into the same directory as this script:
+  - chat_architecture.png         — online viewer (Bedrock + AgentCore)
+  - chat_architecture_runtime.png — chat hosted on AgentCore Runtime
+  - pipeline_local.png            — offline pipeline default (local stages)
+  - pipeline_remote.png           — offline pipeline with --remote-stages
 
 Run:  python docs/architecture/render.py
 Deps: pip install diagrams ; apt install graphviz
@@ -184,8 +185,58 @@ def render_pipeline_remote() -> None:
         s3_outputs >> Edge(label="download") >> remote
 
 
+def render_chat_runtime() -> None:
+    """Chat with AgentCore Runtime hosting the agent loop (opt-in).
+
+    Same Bedrock + Code Interpreter under the hood; the difference is
+    that ChatEngine runs in an AWS-managed MicroVM container instead of
+    in-process. The local FastAPI app proxies turns over
+    InvokeAgentRuntime and forwards the SSE stream back to the browser.
+    """
+    attrs = dict(GRAPH_ATTR)
+    attrs["rankdir"] = "TB"
+    attrs["ranksep"] = "1.0"
+    with Diagram(
+        "GoalInsight chat — AgentCore Runtime (opt-in)",
+        filename=str(OUT_DIR / "chat_architecture_runtime"),
+        outformat="png",
+        show=False,
+        graph_attr=attrs,
+    ):
+        user = Users("Browser")
+
+        with Cluster("Local viewer process"):
+            api = Fastapi("FastAPI\n/api/chat/stream")
+            remote = Python("RemoteChatEngine\n(boto3 invoke_agent_runtime)")
+
+        with Cluster("AWS"):
+            with Cluster("S3"):
+                run_s3 = S3("runs/<run>/\nevents.json,\ntracks.json,\nball_tracks.json,\n...")
+
+            with Cluster("AgentCore Runtime (MicroVM)"):
+                rt_api = Fastapi("/invocations\n/ping")
+                rt_engine = Python("ChatEngine\n+ TOOL_DISPATCH")
+
+            bedrock = Bedrock("Bedrock Runtime\nClaude Opus 4.7")
+            sandbox = Bedrock("AgentCore\nCode Interpreter\n(aws.codeinterpreter.v1)")
+
+        user >> Edge(label="HTML / SSE") >> api
+        api >> Edge(
+            label="invoke_agent_runtime\n(SSE passthrough)",
+        ) >> rt_api
+        rt_api >> rt_engine
+        rt_engine >> Edge(
+            label="download (1x per session)", style="dashed",
+        ) << run_s3
+        rt_engine >> Edge(label="invoke_model_with_response_stream") >> bedrock
+        rt_engine >> Edge(
+            label="run_python (optional)\nstart/invoke session",
+        ) >> sandbox
+
+
 def main() -> None:
     render_chat()
+    render_chat_runtime()
     render_pipeline_local()
     render_pipeline_remote()
     print(f"wrote PNGs into {OUT_DIR}")
