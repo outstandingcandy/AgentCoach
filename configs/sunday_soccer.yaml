@@ -1,0 +1,136 @@
+video:
+  process_fps: 30            # 30 fps source = process every video frame (dense
+                             # tracking). Smaller per-frame displacements make
+                             # IoU/pitch gates much tighter, killing the
+                             # "two-same-team-players-close-together" ID
+                             # switches. fps-sensitive tracker defaults
+                             # (max_age, pitch_gate_m, reid_pitch_max_m) auto-
+                             # scale by effective_fps/10, so physical meaning
+                             # is preserved.
+
+# Single source of truth for "compute every Nth video frame" used both
+# for the per-stage compute path and for the per-frame jpg/json vis
+# sink. Keeping these in sync means the vis sample lines up exactly
+# with what each stage actually processed — no missing-detection holes.
+sample:
+  stride: 1                  # process every video frame (matches process_fps=30 on 30fps source)
+
+# Standard FIFA-spec adult pitch (105 × 68 m). Used by the
+# physical backend's PnP + the rest of the pipeline (events, highlights,
+# pitch labels, etc.). All measurements in metres.
+pitch:
+  pitch_length: 105.0
+  pitch_width: 68.0
+  penalty_area_width: 40.32
+  penalty_area_length: 16.5
+  goal_area_width: 18.32
+  goal_area_length: 5.5
+  goal_line_to_penalty_mark: 11.0
+  center_circle_radius: 9.15
+  goal_height: 2.44
+  goal_length: 7.32
+
+field_registration:
+  backend: "physical"
+
+  physical:
+    # Generic 4K profile (3500 fx, no distortion) — matches the
+    # 3840x2160 Sunday-cup footage which is from a non-Veo camera
+    # (phone / GoPro). Wide focal_bounds let LM refine the rough
+    # initial fx; camera_position is a soft prior, not locked.
+    camera_profile: "generic_4k"
+    ransac_reproj_error: 50.0
+    line_weight: 1.0
+    line_sample_points: 20
+    max_reproj_error: 25.0
+    use_line_model: true
+    focal_bounds: [2500.0, 5000.0]   # 4K focal range
+    world_residual_weight: 0.0
+    joint_optimize: false
+    world_error_threshold: 8.0
+
+    # Approximate camera prior. Inferred from KP image-y order: keypoints
+    # at world y=+34 land on TOP of the image (small image y) and KPs
+    # at world y=+9 land lower — meaning the camera is on the -y side
+    # looking towards +y. half_w = 34, so y=-34 is the bottom sideline
+    # and the camera sits ~1m behind it (y=-35). Clip is zoomed in on
+    # the right half so x prior is positive (~7m, the LM-converged
+    # value from the first frame; rounded down from 10m initial guess).
+    camera_position: [7.0, -35.0, 5.0]
+    lock_camera_position: false
+    # 25.0 — stronger pull than the default 5.0 so LM doesn't drift
+    # x by 3m+ between frames when KP coverage is sparse. Each
+    # 1m of pose deviation now costs ~25 px of reproj-equivalent
+    # residual, comparable to a single noisy KP.
+    position_weight: 25.0
+    # Per-axis HARD bounds in metres around the prior. LM cannot
+    # produce a camera centre outside camera_position ± these. Set
+    # tight on x because the rig is fixed and we know x to ~3m;
+    # leave y/z slightly looser to absorb sideline-distance and
+    # tripod-height uncertainty.
+    position_bounds_m: [3.0, 5.0, 3.0]
+
+    pitch_length: 105.0
+    pitch_width: 68.0
+
+    calibration_skip: 1
+    vis_interval: 1
+
+    gap_fill_chain:
+      enabled: true
+      anchor_max_reproj_px: 30.0
+      overwrite_above_reproj_px: 30.0
+      method: improved
+      smoothing_window: 5
+      use_masking: false
+      max_gap_frames: 60
+      max_anchor_distance_frames: 120
+      sift_top_skip_frac: 0.25
+
+  # KP model fine-tuned on 2 sunday_cup annotations
+  # (workspace/models/keypoint_20260612_103059). Line model still
+  # uses pretrained SV_lines (no fine-tune for lines yet).
+  pnlcalib:
+    keypoint_model_path: "workspace/models/keypoint_20260612_143742/run_20260612_143747/models/best_model.pt"
+    keypoint_weights: "SV_kp"
+    keypoint_threshold: 0.15
+    use_lines: true
+    line_model_path: "workspace/models/SV_lines.pt"
+    line_weights: "SV_lines"
+    line_threshold: 0.10
+
+device: "cuda"
+
+# PRTReID is fine-tuned on SoccerNet (player-level), 256-dim with HRNet32.
+# Same choice as the kids config — better same-team discrimination than OSNet.
+reid:
+  backend: "prtreid"
+
+# 30fps tracking — scale per-sample motion budgets by 10/effective_fps.
+# At 30fps a sprinting 8 m/s player covers 0.27 m/sample; the looser
+# 10fps defaults (4 m gate, 1.5 m reid pitch) silently admitted multi-
+# metre teleports through the pitch sanity check.
+tracking:
+  pitch_gate_m: 1.33                # was 4.0 @10fps → 1.33 @30fps
+  reid_pitch_max_m: 0.5             # was 1.5 @10fps → 0.5 @30fps
+
+track_consolidation:
+  # 30 frames at process_fps=30 ≈ 1 second of observations — filters
+  # genuine 1-2-frame YOLO false positives but keeps fragmented player
+  # tids.
+  min_track_frames: 30
+
+  # Phase-2 jersey OCR runs through the LLM (Bedrock Claude Opus).
+  jersey:
+    ocr_backend: llm
+  # stride=10 keeps OCR cost bounded at ~60 LLM calls per long track.
+  frame_stride: 10
+
+pipeline:
+  stages:
+    - field_registration
+    - tracking
+    - event_detection
+    - track_consolidation
+    - player_profile
+    - highlights

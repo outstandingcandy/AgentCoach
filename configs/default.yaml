@@ -171,6 +171,17 @@ tracking:
   # via IoU here and let tentative-pitch (4 m gate) re-attach.
   max_iou_distance: 0.7
   max_iou_distance_tentative: 0.55
+  # Confirmed-ReID stage hybrid gate: a (track, det) pair passes if
+  # EITHER the predicted bbox IoU ≥ reid_iou_min OR pitch distance
+  # ≤ reid_pitch_max_m. Without the IoU half, ReID alone can teleport
+  # a confirmed track to a 2 m-away same-team player whose ReID
+  # cosine is marginally smaller (the orig 1 frame 303→306 case in
+  # the kids clip). Without the pitch half, fast wingers whose bbox
+  # crosses its own width in one sample fail. tentative-pitch keeps
+  # the looser pitch_gate_m (4 m default) so newly-spawned tracks
+  # can still re-attach after IoU dropouts.
+  reid_iou_min: 0.1
+  reid_pitch_max_m: 1.5
   # Dump raw YOLO detections (per-frame JSON + annotated diagnostic JPGs)
   # under <output>/yolo_raw/ so dropouts at conf/size/pitch filters can be
   # inspected offline. Set false to skip — JSON is cheap, the JPG render
@@ -257,7 +268,24 @@ highlights:
 track_consolidation:
   enabled: false
   min_track_frames: 30          # filter tracks with fewer observations
-  frames_per_track: 15          # crops sent to Claude per track
+  # frames_per_track:
+  #   - 0 (default): take EVERY frame the track appears in (jersey OCR
+  #     fans out one parallel LLM call per crop; aggregation in Python).
+  #     A 100-frame track = 100 small parallel calls.
+  #   - >0: top-K sampling like the old behaviour — picks bbox-area
+  #     largest then time-spreads. Cheaper but noisier.
+  frames_per_track: 0
+  # Hard ceiling on how many crops one track can spend on the LLM. A
+  # rare 1000-frame track is bounded so cost stays predictable. Crops
+  # beyond the cap are dropped lowest-bbox-area first.
+  max_crops_per_track: 200
+  # Optional temporal stride: take every Nth frame in the track's
+  # appearance list instead of top-K or all-frames. When unset, the
+  # consolidator defaults to stride=10 if jersey.ocr_backend=rapidocr
+  # (cheap OCR per call, no API rate limit but still 50 ms each), or
+  # falls back to frames_per_track / max_crops_per_track for the LLM
+  # backend.
+  # frame_stride: 10
   sampler:
     min_bbox_height: 80         # upscale crops smaller than this
     upper_body_ratio: 0.65      # focus on torso (jersey number region)
@@ -265,6 +293,23 @@ track_consolidation:
     # Backend selector. Only one of {claude, gemini, qwen} is used per run.
     # Each sub-section is read only when its name matches backend.
     backend: claude
+
+    # Phase-2 (per-crop number reading) backend. Phase 1 (role / team
+    # decision) always uses the LLM ``backend`` above — only the per-
+    # crop OCR can be swapped.
+    #   - llm (default): ``SINGLE_OCR_PROMPT`` LLM call per crop. Best
+    #     accuracy. Capped at ~30 crops/track to control cost / rate
+    #     limits.
+    #   - rapidocr: local PaddleOCR ONNX runtime via rapidocr-onnxruntime.
+    #     Free and fast, so the consolidator OCRs every frame in each
+    #     track instead of sub-sampling. Less accurate on partial /
+    #     blurry digits; the per-crop voting aggregator washes the
+    #     noise out.
+    ocr_backend: llm
+    # rapidocr-specific tuning (only read when ocr_backend == rapidocr):
+    rapidocr:
+      upscale: 4.0           # bicubic upscale before OCR (kids jerseys are tiny)
+      min_confidence: 0.5    # drop OCR rec hits below this score
 
     # --- Claude Opus (AWS Bedrock) -----------------------------------
     model_id: "us.anthropic.claude-opus-4-7"
@@ -281,21 +326,64 @@ track_consolidation:
     # base_url: "http://localhost:8000/v1"
 
     # --- Shared tuning ------------------------------------------------
+    # Cross-track parallelism (how many tracks resolved concurrently).
     max_concurrency: 16
+    # Within-track parallelism for per-crop OCR (Phase 2 of
+    # recognize_multi). Each track fans out N OCR calls, one per crop;
+    # this caps that fan-out so a single 200-crop track doesn't
+    # monopolise the API quota. Total in-flight LLM calls roughly =
+    # max_concurrency × ocr_per_track_concurrency, so be conservative.
+    ocr_per_track_concurrency: 8
+    # Crop subset size sent to the role/team decision call (Phase 1).
+    # 8 sharpest evenly-spaced crops is enough for "is this a player /
+    # what team" without burning tokens.
+    decision_subset_size: 8
     max_retries: 2
     max_tokens: 128
     max_crop_dim: 384
     jpeg_quality: 85
-    min_confidence: 0.6         # below this, number is treated as unknown
+    # Per-track jersey confidence threshold; below this the LLM's
+    # winning number is treated as unknown. With per-crop OCR over
+    # ALL frames in the track (frames_per_track=0), conf ranges
+    # roughly:
+    #   - winner_score / N_crops × purity, sqrt'd. So a 132-crop
+    #     track with 50 strong votes for #20 and 5 spurious ≈
+    #     sqrt(50/132 * 50/55) ≈ 0.59 → keep.
+    #   - 42-crop track, 12 strong votes for #18 with no rivals ≈
+    #     sqrt(12/42 * 1.0) ≈ 0.53 → keep.
+    #   - mixed-identity track: top vote outscores rivals 4×, but
+    #     per-N is low: sqrt(20/95 * 20/35) ≈ 0.34 → drop ✅.
+    # 0.25 — lowered from 0.4 to recover long tracks where the
+    # player's back is visible on only ~1/3 of frames (e.g. orig 90,
+    # 10 strong #21 votes / 48 crops → conf 0.34). The geometric mean
+    # punishes long tracks for having lots of back-not-visible crops
+    # even when the readable subset is unanimous.
+    min_confidence: 0.25
   reid:
-    same_person_threshold: 0.0  # 0 = merge all same-(team,jersey) tracks unconditionally
-    orphan_absorb_threshold: 0.94  # high bar: OSNet can't discriminate same-team players
+    # ReID-first consolidation (see _consolidator.consolidate). Cosine
+    # gate for the primary clustering. 0.9 fits PRTReID's same-person
+    # centroid distribution on Veo kids footage; raise to 0.92+ for
+    # higher-fidelity broadcast where cross-team cosines are tighter.
+    same_person_threshold: 0.9
+    orphan_absorb_threshold: 0.92  # second-chance absorption above this
+    # Two clusters that ended up with the same (team, jersey_number)
+    # but didn't merge in Stage A get a second-pass merge if their
+    # ReID cosine is at least this much. Jersey number is a second
+    # independent identity signal — same kit + same number + ReID
+    # near-miss is still very likely the same player who reappeared
+    # after a long-interval gap. 0.8 is well above the cross-team
+    # noise floor (~0.65) but below the same-team-different-player
+    # ceiling (~0.87), so this catches reappearances without
+    # collapsing two real same-team-same-number players.
+    jersey_aware_merge_threshold: 0.8
   goalkeeper:
     enabled: true                # post-consolidation GK identification
     goal_area_depth: 16.5        # metres — cluster mean x must be within this of own goal line
-  output:
-    backup_original: true
-    overwrite_tracks_json: true
+  # The ``output`` block used to control in-place rewrites of
+  # tracking/tracks.json + tracking/team_assignments.json. With the
+  # additive layout (consolidated copies live under
+  # track_consolidation/) those flags no longer do anything; downstream
+  # readers select via goalinsight.track_consolidation.load_tracks.
 
 # Annotated Full-Video Render (HUD-style)
 annotated_video:
@@ -378,7 +466,7 @@ events:
     deflection_window_seconds: 0.5  # seconds — window for computing ball deflection angle
 
 # Pipeline orchestration
-# Available stages: field_registration, tracking, event_detection, track_consolidation, highlights, annotated_video
+# Available stages: field_registration, tracking, event_detection, track_consolidation, player_profile, highlights, annotated_video
 pipeline:
   stages:
     - field_registration

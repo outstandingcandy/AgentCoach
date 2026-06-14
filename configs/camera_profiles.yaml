@@ -24,6 +24,32 @@ profiles:
       - [0.0, 0.0, 1.0]
     dist_coeffs: [-0.376, 0.0572, 0.0, 0.0, 0.0]
 
+  # 4K (3840x2160) variant of veo_1080p. Veo's 4K stream is a 2x
+  # bilinear upsample of the same sensor crop, so fx/fy/cx/cy all
+  # double exactly. Distortion coefficients are unitless (operate in
+  # normalized image coordinates) so they're identical to the 1080p
+  # profile.
+  veo_4k:
+    image_size: [3840, 2160]
+    K:
+      - [3448.6, 0.0, 1920.8]
+      - [0.0, 3448.6, 1069.4]
+      - [0.0, 0.0, 1.0]
+    dist_coeffs: [-0.376, 0.0572, 0.0, 0.0, 0.0]
+
+  # Generic 4K sideline profile for non-Veo cameras (phones, GoPros,
+  # consumer cams) where we don't have a lab-calibrated K. Uses a
+  # mid-range focal estimate (≈ 35° hfov) and zero distortion (most
+  # phone footage is lens-corrected upstream). Pair with a wide
+  # focal_bounds and lock_camera_position=false so the LM can refine.
+  generic_4k:
+    image_size: [3840, 2160]
+    K:
+      - [3500.0, 0.0, 1920.0]
+      - [0.0, 3500.0, 1080.0]
+      - [0.0, 0.0, 1.0]
+    dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+
   broadcast_1080p:
     image_size: [1920, 1080]
     K:
