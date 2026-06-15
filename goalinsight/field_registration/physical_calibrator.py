@@ -56,6 +56,7 @@ class PhysicalCalibrator:
         position_weight: float = 50.0,
         lock_camera_position: bool = False,
         position_bounds_m: tuple[float, float, float] | None = None,
+        pitch_bounds_deg: tuple[float, float] | None = None,
         pitch_length: float = 105.0,
         pitch_width: float = 68.0,
         pitch_dims: dict | None = None,
@@ -86,6 +87,11 @@ class PhysicalCalibrator:
                 removed from optimization and recomputed every step as -R·C_target.
                 Reduces 7-DOF to 4-DOF (rvec, f). Use when position is known
                 to ≤cm accuracy. Otherwise keep False for soft constraint.
+            pitch_bounds_deg: Optional ``(min_deg, max_deg)`` hard bounds on
+                the camera tilt angle below the horizon. Skipped when None.
+                Use to keep LM from drifting to near-horizontal poses on
+                sparse KP sets (sideline rigs are typically 10–35° below
+                horizon).
             pitch_length: Pitch length in meters (default 105 = FIFA standard).
                 Only used when ``pitch_dims`` is None.
             pitch_width: Pitch width in meters (default 68 = FIFA standard).
@@ -121,6 +127,16 @@ class PhysicalCalibrator:
         # tightly known to ~3m). Skipped when no prior is set or the axis
         # bound is None / non-positive.
         self.position_bounds_m = position_bounds_m
+        # Hard bounds (degrees) on the camera tilt angle (pitch_deg = angle
+        # below horizon, computed as ``arcsin(-(R^T @ [0,0,1]).z)``). When
+        # set, LM gets a barrier residual that grows linearly outside the
+        # range. A typical sideline rig sits at 10–35° tilt; values outside
+        # that band almost always come from LM running away on a sparse,
+        # spatially-clustered keypoint set (e.g. the frame-779 case where
+        # 8 KPs all clustered in the right-half far corner let LM drift
+        # tilt down to 6° while compensating with a smaller fx).
+        # ``None`` skips the constraint entirely.
+        self.pitch_bounds_deg = pitch_bounds_deg
 
         # Resolve pitch dims:
         # - pitch_dims given → full override (FIFA fills missing keys).
@@ -148,6 +164,52 @@ class PhysicalCalibrator:
         """Update with detected keypoints and lines for current frame."""
         self._keypoints = keypoints
         self._lines = lines
+
+    def calibrate_correspondences(
+        self,
+        img_pts: np.ndarray,
+        world_pts: np.ndarray,
+        kp_ids: list | None = None,
+        line_constraints: list | None = None,
+        initial_rvec: np.ndarray | None = None,
+        initial_tvec: np.ndarray | None = None,
+    ) -> dict[str, Any] | None:
+        """Calibrate from caller-supplied (pixel, world) correspondences.
+
+        The annotator already knows the (pixel, world) match for each
+        keypoint by name and doesn't need to go through the KP detector
+        / KeypointMapper path. This method skips Step 1 / 2 of
+        :meth:`calibrate` (correspondence preparation, line-from-keypoint
+        derivation) and runs the same Step 3-6 cold-start + 7-DOF LM +
+        sanity-check pipeline as the pipeline backend.
+
+        Args:
+            img_pts: (N, 2) pixel coordinates.
+            world_pts: (N, 3) world coordinates (z=0 ground points,
+                z=-2.44 crossbar points). Must have len == len(img_pts).
+            kp_ids: Optional per-correspondence labels for diagnostics.
+                Defaults to range(N).
+            line_constraints: Optional pre-built line constraint dicts
+                (same shape :meth:`_derive_lines_from_keypoints` outputs).
+                Pass [] to skip the line residual term entirely.
+            initial_rvec / initial_tvec: Warm-start pose; skips the
+                cold-start RANSAC / P3P stage when both are given.
+
+        Returns:
+            Same result dict shape as :meth:`calibrate`, or None on
+            failure (see ``self._last_debug`` for the reason).
+        """
+        img_pts = np.asarray(img_pts, dtype=np.float64).reshape(-1, 2)
+        world_pts = np.asarray(world_pts, dtype=np.float64).reshape(-1, 3)
+        if kp_ids is None:
+            kp_ids = list(range(len(img_pts)))
+        if line_constraints is None:
+            line_constraints = []
+        return self._calibrate_core(
+            img_pts, world_pts, list(kp_ids), line_constraints,
+            initial_rvec=initial_rvec, initial_tvec=initial_tvec,
+            keypoint_mapper=None, line_mapper=None,
+        )
 
     def calibrate(
         self,
@@ -210,6 +272,38 @@ class PhysicalCalibrator:
             logger.debug("Added %d line intersection points pre-PnP (total=%d)",
                          n_intersections, len(kp_ids))
 
+        return self._calibrate_core(
+            img_pts, world_pts, kp_ids, line_constraints,
+            initial_rvec=initial_rvec, initial_tvec=initial_tvec,
+            keypoint_mapper=keypoint_mapper, line_mapper=line_mapper,
+        )
+
+    def _calibrate_core(
+        self,
+        img_pts: np.ndarray,
+        world_pts: np.ndarray,
+        kp_ids: list,
+        line_constraints: list,
+        *,
+        initial_rvec: np.ndarray | None = None,
+        initial_tvec: np.ndarray | None = None,
+        keypoint_mapper=None,
+        line_mapper=None,
+    ) -> dict[str, Any] | None:
+        """Step 3-6 of calibrate() — cold-start + 7-DOF LM + sanity check.
+
+        Shared by :meth:`calibrate` (pipeline path) and
+        :meth:`calibrate_correspondences` (annotator path). Anything
+        before Step 3 — building correspondences from the KP detector
+        and stitching line constraints — is the caller's job.
+
+        ``keypoint_mapper`` / ``line_mapper`` are only consulted when
+        the world-error outlier rejection loop wants to re-derive line
+        constraints after dropping a keypoint. The annotator passes
+        None and the loop simply preserves the supplied constraints.
+        """
+        min_pts = 3 if self.camera_position is not None else 6
+
         # Step 3: Get initial pose estimate
         ransac_info = None
         if initial_rvec is not None and initial_tvec is not None:
@@ -218,10 +312,21 @@ class PhysicalCalibrator:
             tvec_init = initial_tvec.copy().ravel()
             logger.debug("Using warm-start from previous frame")
         else:
-            # Cold start. Few-point P3P branch when total points are scarce
-            # AND we have a position prior to disambiguate the multiple
-            # P3P solutions. Otherwise the standard multi-focal RANSAC.
-            if self.camera_position is not None and len(world_pts) < 6:
+            # Cold start. Few-point P3P branch when (a) total points
+            # are scarce and we have a position prior, OR (b) the
+            # camera position is hard-locked — in that case the prior
+            # is fully trusted, so the dense focal sweep + position-
+            # based candidate scoring inside ``_pnp_few_points_init``
+            # is strictly stronger than the multi-focal RANSAC, even
+            # when there are ≥6 points. Otherwise fall back to the
+            # standard multi-focal RANSAC (which doesn't use the
+            # position prior).
+            use_few_pts = (
+                self.camera_position is not None and (
+                    len(world_pts) < 6 or self.lock_camera_position
+                )
+            )
+            if use_few_pts:
                 pnp_result = self._pnp_few_points_init(world_pts, img_pts)
             else:
                 pnp_result = self._pnp_ransac_init(world_pts, img_pts)
@@ -297,10 +402,13 @@ class PhysicalCalibrator:
                 cur_rvec = rvec_opt
                 cur_tvec = tvec_opt
 
-                # Re-derive line constraints from remaining keypoints
-                cur_lc = self._derive_lines_from_keypoints(
-                    cur_kp_ids, cur_img_pts, keypoint_mapper, line_mapper
-                )
+                # Re-derive line constraints from remaining keypoints.
+                # Skipped when the caller (e.g. annotator) didn't supply
+                # the mappers — the original line_constraints stay.
+                if keypoint_mapper is not None:
+                    cur_lc = self._derive_lines_from_keypoints(
+                        cur_kp_ids, cur_img_pts, keypoint_mapper, line_mapper
+                    )
         else:
             # No outlier rejection — use all keypoints, single optimization pass
             rvec_opt, tvec_opt, f_opt = self._refine_7dof(
@@ -364,9 +472,14 @@ class PhysicalCalibrator:
             "world_error_all": float(world_error_all),
             "per_point_world_errors": per_point_world_errors,
             "per_kp_world_errors": per_kp_world_errors,
+            # Caller-supplied paths (e.g. annotator) bypass the KP /
+            # line / intersection prep stages, so these counts only
+            # reflect what was passed into _calibrate_core.
             "num_keypoints": len(self._keypoints),
             "num_lines": len(self._lines),
-            "num_intersections": n_intersections,
+            "num_intersections": len([
+                k for k in kp_ids if isinstance(k, str) and k.startswith("isect_")
+            ]),
             "total_points": len(img_pts),
             "inliers": int(inlier_count),
             "intrinsics_init": {
@@ -618,16 +731,19 @@ class PhysicalCalibrator:
             (rvec, tvec, ransac_info) or None on failure.
             ransac_info contains inlier indices, per-point errors, and init pose.
         """
-        # Sample focal lengths spanning the allowed range
+        # Sample focal lengths spanning the allowed range. Densify the
+        # candidate set so a wide focal_bounds (e.g. [4000, 12000] for
+        # a zooming clip) gets covered with steps small enough that
+        # SQPNP/EPNP can produce ≥4-inlier solutions at one of them —
+        # the original 5-point sweep left 2-3k gaps and frames whose
+        # true focal landed in a gap saw all-trial-failed RANSAC.
         f_min, f_max = self.focal_bounds
-        f_profile = self.K[0, 0]
-        focal_candidates = sorted(set([
-            f_min,
-            (f_min + f_profile) / 2,
-            f_profile,
-            (f_profile + f_max) / 2,
-            f_max,
-        ]))
+        f_profile = float(self.K[0, 0])
+        n_steps = max(7, int((f_max - f_min) / 1000) + 1)
+        focal_candidates = sorted(set(
+            list(np.linspace(f_min, f_max, n_steps).tolist())
+            + [f_profile]
+        ))
         solvers = [cv2.SOLVEPNP_SQPNP, cv2.SOLVEPNP_EPNP]
         cx, cy = self.K[0, 2], self.K[1, 2]
         dist = self.dist_coeffs
@@ -975,8 +1091,12 @@ class PhysicalCalibrator:
                 # bound is on the world-frame camera centre, so we can't
                 # express it in scipy's `bounds=` argument directly.
                 # Instead emit a barrier-style residual that's 0 inside
-                # the box and grows quadratically outside, weighted high
+                # the box and grows linearly outside, weighted high
                 # enough that Cauchy loss can't damp it away.
+                # IMPORTANT: ``least_squares`` requires the residual
+                # vector to have a fixed length across calls, so we
+                # ALWAYS append the 3-element vector (zeros when the
+                # camera centre is inside the box).
                 if self.position_bounds_m is not None:
                     excess = np.zeros(3)
                     for axis in range(3):
@@ -988,11 +1108,32 @@ class PhysicalCalibrator:
                             excess[axis] = delta - bnd
                         elif delta < -bnd:
                             excess[axis] = delta + bnd
-                    if np.any(excess):
-                        # Heavy weight (1000) — a 1m violation produces
-                        # 1000 px-equivalent residual, far above any
-                        # legitimate reprojection cost.
-                        all_residuals.append(excess * 1000.0)
+                    # Heavy weight (1000) — a 1m violation produces a
+                    # 1000 px-equivalent residual, far above any
+                    # legitimate reprojection cost.
+                    all_residuals.append(excess * 1000.0)
+
+            # Camera tilt (pitch_deg) hard barrier — emit a 1-element
+            # residual that's 0 inside the bounds and grows linearly with
+            # the violation (in degrees). Same fixed-length pattern as
+            # position_bounds_m above.
+            if self.pitch_bounds_deg is not None:
+                R_tilt, _ = cv2.Rodrigues(rvec)
+                fwd_z = float((R_tilt.T @ np.array([0.0, 0.0, 1.0]))[2])
+                # Clamp domain for arcsin stability; sin range is [-1, 1].
+                pitch_rad = np.arcsin(-np.clip(fwd_z, -1.0, 1.0))
+                pitch_deg_cur = float(np.degrees(pitch_rad))
+                lo, hi = self.pitch_bounds_deg
+                if pitch_deg_cur < lo:
+                    excess_deg = pitch_deg_cur - lo  # negative
+                elif pitch_deg_cur > hi:
+                    excess_deg = pitch_deg_cur - hi  # positive
+                else:
+                    excess_deg = 0.0
+                # Weight 100 px per degree of violation — a 5° drift
+                # produces 500 px-equivalent residual, swamping the
+                # ~20 px reprojection cost the LM otherwise enjoys.
+                all_residuals.append(np.array([excess_deg * 100.0]))
 
             return np.concatenate(all_residuals)
 

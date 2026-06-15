@@ -55,6 +55,16 @@ def main() -> int:
             print(f"Pitch override: {pitch.PITCH_LENGTH}m × {pitch.PITCH_WIDTH}m")
 
     app = create_workspace_app(args.workspace, pitch=pitch)
+    # If a config was supplied, also bind it as the active solver
+    # config so the annotator's compute_homography uses the matching
+    # backend / camera_profile out of the box (without forcing the user
+    # to click the dropdown after every restart).
+    if args.pitch_config and getattr(app.state, "annotator", None) is not None:
+        try:
+            app.state.annotator.set_solver_config(str(args.pitch_config))
+            print(f"Active solver config: {args.pitch_config}")
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Warning: could not bind solver config: {exc}")
     print(f"Workspace: {args.workspace.resolve()}")
     print(f"Listening on http://{args.host}:{args.port}/")
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

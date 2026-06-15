@@ -211,6 +211,122 @@ def solve_camera(
     return cam, mean_err, diagnostics
 
 
+def solve_camera_physical(
+    pixel_pts: list[tuple[float, float]],
+    world_3d_pts: list[tuple[float, float, float]],
+    img_size: tuple[int, int],
+    physical_cfg: dict,
+    camera_profiles: dict,
+) -> tuple[Camera | None, float, dict]:
+    """Solve camera with the pipeline's physical-backend code.
+
+    Thin adapter that constructs a ``PhysicalCalibrator`` from the
+    config / profile and delegates to its
+    :meth:`calibrate_correspondences` method, then unpacks the
+    pipeline-shaped result dict back into the ``(Camera, mean_err,
+    diagnostics)`` shape expected by the annotator.
+    """
+    import cv2
+
+    from goalinsight.field_registration.physical_calibrator import (
+        PhysicalCalibrator,
+    )
+
+    if len(pixel_pts) < 4:
+        return None, float("inf"), {"unresolved": 0, "mode": "physical"}
+
+    profile_name = physical_cfg.get("camera_profile", "veo_1080p")
+    profile = camera_profiles.get(profile_name)
+    if profile is None:
+        return None, float("inf"), {
+            "unresolved": 0, "mode": "physical",
+            "error": f"camera_profile '{profile_name}' not found",
+        }
+
+    K_init = np.asarray(profile["K"], dtype=np.float64)
+    w, h = int(img_size[0]), int(img_size[1])
+    focal_bounds = tuple(physical_cfg.get(
+        "focal_bounds", [K_init[0, 0] * 0.5, K_init[0, 0] * 2.0],
+    ))
+    cam_pos = physical_cfg.get("camera_position")
+    if cam_pos is not None:
+        cam_pos = tuple(float(v) for v in cam_pos)
+
+    pos_bounds = physical_cfg.get("position_bounds_m")
+    if pos_bounds is not None:
+        pos_bounds = tuple(pos_bounds)
+
+    pl = float(physical_cfg.get("pitch_length", 105.0))
+    pw = float(physical_cfg.get("pitch_width", 68.0))
+
+    calibrator = PhysicalCalibrator(
+        K=K_init,
+        image_size=(w, h),
+        ransac_reproj_error=float(physical_cfg.get("ransac_reproj_error", 50.0)),
+        line_weight=float(physical_cfg.get("line_weight", 1.0)),
+        line_sample_points=int(physical_cfg.get("line_sample_points", 20)),
+        focal_bounds=focal_bounds,
+        world_residual_weight=float(physical_cfg.get("world_residual_weight", 0.0)),
+        world_error_threshold=float(physical_cfg.get("world_error_threshold", 5.0)),
+        camera_position=cam_pos,
+        position_weight=float(physical_cfg.get("position_weight", 50.0)),
+        lock_camera_position=bool(physical_cfg.get("lock_camera_position", False)),
+        position_bounds_m=pos_bounds,
+        pitch_length=pl,
+        pitch_width=pw,
+    )
+    img_arr = np.asarray(pixel_pts, dtype=np.float64).reshape(-1, 2)
+    world_arr = np.asarray(world_3d_pts, dtype=np.float64).reshape(-1, 3)
+
+    result = calibrator.calibrate_correspondences(
+        img_pts=img_arr,
+        world_pts=world_arr,
+    )
+    if result is None:
+        debug = getattr(calibrator, "_last_debug", None) or {}
+        return None, float("inf"), {
+            "unresolved": 0,
+            "mode": "physical",
+            "fail": debug.get("failure_reason", "calibrate_correspondences returned None"),
+            "profile": profile_name,
+        }
+
+    cam_params = result["camera_params"]
+    K_best = np.asarray(cam_params["K"], dtype=np.float64)
+    rvec = np.asarray(cam_params["rvec"], dtype=np.float64).reshape(3)
+    tvec = np.asarray(cam_params["tvec"], dtype=np.float64).reshape(3)
+    f_best = float(cam_params["focal_length"])
+
+    cam = Camera(iwidth=w, iheight=h)
+    cam.calibration = K_best
+    cam.xfocal_length = f_best
+    cam.yfocal_length = f_best
+    cam.principal_point = (float(K_best[0, 2]), float(K_best[1, 2]))
+    R, _ = cv2.Rodrigues(rvec)
+    cam.rotation = R
+    cam.position = (-R.T @ tvec).ravel()
+
+    diagnostics = {
+        "median_err": float(np.median(np.linalg.norm(
+            result["img_pts"] - cv2.projectPoints(
+                result["world_pts"].reshape(-1, 1, 3), rvec, tvec,
+                K_best, calibrator.dist_coeffs,
+            )[0].reshape(-1, 2),
+            axis=1,
+        ))),
+        "max_err": float(result.get("final_error", 0.0)) * 2.0,  # rough proxy
+        "back_facing": bool(tvec[2] <= 0),
+        "fx": f_best,
+        "mode": "physical",
+        "inliers": int(result.get("inliers", 0)),
+        "total": int(result.get("total_points", len(pixel_pts))),
+        "profile": profile_name,
+        "unresolved": 0,
+    }
+    mean_err = float(result["final_error"])
+    return cam, mean_err, diagnostics
+
+
 def camera_to_image_to_world(cam: Camera) -> np.ndarray | None:
     """Invert Camera.to_homography() into the image->world H the annotator stores."""
     H_w2i = cam.to_homography()

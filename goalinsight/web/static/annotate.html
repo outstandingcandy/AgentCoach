@@ -119,6 +119,14 @@
   <span class="badge" id="hdr-h0">no homography</span>
   <span class="badge" id="hdr-counts">0 pts</span>
   <label style="margin-left: auto; display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted);">
+    config:
+    <select id="cfg-select" style="background:#15171a; color:#cfe0ff;
+            border:1px solid #2a2c30; border-radius:4px; padding:2px 6px;
+            font-family:ui-monospace,monospace; font-size:11px;">
+      <option value="">(loading…)</option>
+    </select>
+  </label>
+  <label style="display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted);">
     <input type="checkbox" id="toggle-projection" checked /> Projection
   </label>
 </header>
@@ -317,6 +325,18 @@ function applyState(state) {
   $("#hdr-counts").textContent = `${accepted} accepted (${manualConfirmed} manual + ${derivedAccepted} derived + ${autoAccepted} auto), ${pending} pending`;
 
   if (state.status) $("#status").textContent = state.status;
+  // Pitch-mismatch banner: shown when the active pitch config disagrees
+  // with the saved annotations for this video. The user can clear it by
+  // restarting the server with a matching pitch config (or accept the
+  // mismatch and overwrite by saving with the new pitch).
+  if (state.pitch_mismatch_warning) {
+    $("#status").textContent = "⚠ " + state.pitch_mismatch_warning;
+    $("#status").style.background = "#3a2316";
+    $("#status").style.color = "#fbbf77";
+  } else {
+    $("#status").style.background = "";
+    $("#status").style.color = "";
+  }
 
   // Mode toggle
   $("#mode-point").classList.toggle("active", state.mode === "point");
@@ -400,6 +420,32 @@ function applyState(state) {
 
   refreshPitch();
   refreshVideosAndFrames();
+}
+
+async function refreshConfigs() {
+  try {
+    const cfgs = await api("GET", "/api/annotate/configs");
+    const sel = $("#cfg-select");
+    const prev = sel.value;
+    sel.innerHTML = "";
+    if (!cfgs.length) {
+      sel.innerHTML = "<option value=''>(no configs)</option>";
+      return;
+    }
+    for (const c of cfgs) {
+      const opt = document.createElement("option");
+      opt.value = c.path;
+      const dim = c.pitch_length && c.pitch_width
+        ? ` (${c.pitch_length}×${c.pitch_width})` : "";
+      opt.textContent = `${c.name} [${c.backend}]${dim}`;
+      if (c.active) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    // Preserve user choice across re-renders if no server-side active.
+    if (!sel.value && prev) sel.value = prev;
+  } catch (err) {
+    console.error("config refresh failed", err);
+  }
 }
 
 async function refreshVideosAndFrames() {
@@ -543,6 +589,18 @@ async function init() {
   keypoints = await api("GET", "/api/annotate/keypoints");
   lines = await api("GET", "/api/annotate/lines");
   pitchLayout = await api("GET", "/api/annotate/pitch_layout");
+
+  // Config selector — populated from /api/annotate/configs.
+  await refreshConfigs();
+  $("#cfg-select").addEventListener("change", async (e) => {
+    const path = e.target.value;
+    if (!path) return;
+    const state = await api("POST", "/api/annotate/set_config",
+                            { config_path: path });
+    applyState(state);
+    refreshFrame();
+    await refreshConfigs();
+  });
 
   const kpSel = $("#kp-select");
   for (const kp of keypoints) {

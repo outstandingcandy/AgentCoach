@@ -309,6 +309,11 @@ def run_stage1_physical(
             if phys_config.get("position_bounds_m") is not None
             else None
         ),
+        pitch_bounds_deg=(
+            tuple(phys_config["pitch_bounds_deg"])
+            if phys_config.get("pitch_bounds_deg") is not None
+            else None
+        ),
         pitch_dims=pitch_dims,
     )
 
@@ -869,6 +874,28 @@ def _physical_chain_gap_fill(
         _interpolate_camera_poses as _lin_interp_poses,
     )
 
+    # Optional GPU backend (LightGlue + SuperPoint) — ~20× faster on
+    # 4K, available when ``gap_fill_chain.matcher_backend: lightglue``
+    # is set in config.
+    matcher_backend = (
+        chain_cfg.get("matcher_backend", "sift") or "sift"
+    ).lower()
+    if matcher_backend == "lightglue":
+        try:
+            from .homography_chain.lightglue_matcher import (
+                LightGlueFeatureMatcher,
+            )
+            FeatureMatcherCls = LightGlueFeatureMatcher
+            logger.info("  Chain gap-fill: using LightGlue+SuperPoint backend")
+        except ImportError as exc:
+            logger.warning(
+                "  Chain gap-fill: lightglue not installed (%s), "
+                "falling back to SIFT", exc,
+            )
+            FeatureMatcherCls = FeatureMatcher
+    else:
+        FeatureMatcherCls = FeatureMatcher
+
     ff = calibration_results["frames"]
     anchor_max_err = float(chain_cfg.get("anchor_max_reproj_px", 30.0))
     overwrite_above = float(chain_cfg.get("overwrite_above_reproj_px", 30.0))
@@ -983,7 +1010,11 @@ def _physical_chain_gap_fill(
         anchor_imgs[af] = frame
         anchor_H_inv[af] = H_a_inv
 
-    matcher = FeatureMatcher(n_features=2000, ratio_threshold=0.75, min_matches=min_inliers)
+    matcher = FeatureMatcherCls(
+        n_features=2000,
+        ratio_threshold=0.75,
+        min_matches=min_inliers,
+    )
 
     # Cache extracted SIFT features per anchor so we don't re-extract on
     # every target. Only kp/desc are cached; raw image already in anchor_imgs.

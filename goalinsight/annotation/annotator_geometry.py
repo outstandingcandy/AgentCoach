@@ -17,6 +17,7 @@ from .homography import (
     line_intersection,
     project_camera_point,
     solve_camera,
+    solve_camera_physical,
 )
 from .keypoint_utils import find_nearest_keypoint
 from .pitch import keypoints as _pk
@@ -138,24 +139,36 @@ def compute_homography(state: "AnchorAnnotator") -> str:
     pixel_pts, world_3d_pts = collect_pnp_points(state)
 
     total_points = len(pixel_pts)
-    if total_points < MIN_POINTS_FOR_PNLCALIB:
+    backend = getattr(state, "_solver_backend", "pnlcalib")
+    # pnlcalib needs ≥6 (Zhang multi-plane); physical's EPNP RANSAC
+    # needs only 4. Don't force users to over-annotate when the
+    # solver they picked doesn't require it.
+    min_pts = 4 if backend == "physical" else MIN_POINTS_FOR_PNLCALIB
+    if total_points < min_pts:
         return (
-            f"Need at least {MIN_POINTS_FOR_PNLCALIB} points "
-            f"(pnlcalib RANSAC requirement). Current: {total_points} — "
+            f"Need at least {min_pts} points "
+            f"({backend} solver requirement). Current: {total_points} — "
             f"add more keypoints or annotate intersecting lines to "
             f"derive corner points."
         )
     unique_world = {
         (round(x, 3), round(y, 3), round(z, 3)) for x, y, z in world_3d_pts
     }
-    if len(unique_world) < MIN_POINTS_FOR_PNLCALIB:
+    if len(unique_world) < min_pts:
         return (
-            f"Need {MIN_POINTS_FOR_PNLCALIB} DIFFERENT world points. "
+            f"Need {min_pts} DIFFERENT world points. "
             f"Current unique: {len(unique_world)}"
         )
 
     h, w = state.current_frame.shape[:2]
-    cam, mean_error, diag = solve_camera(pixel_pts, world_3d_pts, (w, h))
+    if backend == "physical":
+        cam, mean_error, diag = solve_camera_physical(
+            pixel_pts, world_3d_pts, (w, h),
+            physical_cfg=state._physical_cfg or {},
+            camera_profiles=state._camera_profiles or {},
+        )
+    else:
+        cam, mean_error, diag = solve_camera(pixel_pts, world_3d_pts, (w, h))
     if cam is None:
         return (
             f"PnP RANSAC failed across all focal/distortion candidates "
