@@ -89,6 +89,20 @@ class AnchorAnnotator:
         self.H0: np.ndarray | None = None
         self.reprojection_error = 0.0
         self.show_projection = True
+        # Non-blocking warning surfaced via state_dict when the active
+        # pitch config disagrees with saved annotations. None when
+        # consistent or no prior annotations exist.
+        self._pending_pitch_mismatch: str | None = None
+        # Solver backend selector. ``pnlcalib`` (default) goes through
+        # the upstream FramebyFrameCalib + heuristic_voting path; the
+        # ``physical`` value uses solve_camera_physical with a fixed K
+        # from the active config's camera_profile and a focal-length
+        # sweep + EPNP/RANSAC. set_solver_config() picks one based on
+        # ``field_registration.backend`` in the loaded yaml.
+        self._solver_backend: str = "pnlcalib"
+        self._physical_cfg: dict | None = None
+        self._camera_profiles: dict | None = None
+        self._active_config_name: str | None = None
         self.selected_manual_idx: int | None = None
         self.selected_line_idx: int | None = None
 
@@ -289,11 +303,18 @@ class AnchorAnnotator:
     # ------------------------------------------------------------------
 
     def open_video(self, video_path: str, start_frame: int = 0) -> int:
-        """Load a video, auto-restore last annotation, return active frame idx."""
+        """Load a video, auto-restore last annotation, return active frame idx.
+
+        Pitch mismatches are surfaced as a non-blocking warning on the
+        ``status`` field of the next state response — the UI can show
+        it and prompt the user to switch pitch config. Previously this
+        raised RuntimeError and refused to switch, which prevented the
+        common workflow of "open the video first, then pick the right
+        pitch type for it".
+        """
         video_name = Path(video_path).stem
         mismatch = self._check_pitch_consistency(video_name)
-        if mismatch:
-            raise RuntimeError(mismatch)
+        self._pending_pitch_mismatch = mismatch  # surfaced via status
 
         self._load_video(video_path)
         self.video_name = video_name
@@ -407,6 +428,74 @@ class AnchorAnnotator:
 
     def reset(self) -> None:
         self._reset_state()
+
+    def set_solver_config(self, config_path: str | Path) -> str:
+        """Switch active solver / pitch from a yaml config file.
+
+        Reads ``field_registration.backend`` (selects the solver) and the
+        ``pitch:`` block (rebuilds the active SoccerPitch). Physical
+        backends additionally load ``physical`` block + camera_profiles.
+        Stale ``H0`` is invalidated since it was solved under the old K.
+
+        Returns a human-readable status string.
+        """
+        import yaml
+        from pathlib import Path as _Path
+
+        cp = _Path(config_path)
+        if not cp.exists():
+            return f"Config not found: {cp}"
+        cfg = yaml.safe_load(cp.read_text()) or {}
+        fr = cfg.get("field_registration", {}) or {}
+        backend = (fr.get("backend") or "pnlcalib").lower()
+
+        # Update active pitch (matching the per-video override loader).
+        pitch_cfg = cfg.get("pitch") or {}
+        if pitch_cfg:
+            try:
+                new_pitch = SoccerPitch(**pitch_cfg)
+                pitch_constants.set_active_pitch(new_pitch)
+            except (TypeError, ValueError) as exc:
+                return f"Bad pitch block in {cp.name}: {exc}"
+
+        if backend == "physical":
+            phys = fr.get("physical") or {}
+            profile_path = phys.get("camera_profiles_path") or \
+                "configs/camera_profiles.yaml"
+            try:
+                profiles_doc = yaml.safe_load(
+                    _Path(profile_path).read_text()
+                ) or {}
+            except FileNotFoundError:
+                return f"camera_profiles not found: {profile_path}"
+            self._camera_profiles = profiles_doc.get("profiles") or {}
+            self._physical_cfg = phys
+            self._solver_backend = "physical"
+        else:
+            self._physical_cfg = None
+            self._camera_profiles = None
+            self._solver_backend = "pnlcalib"
+
+        self._active_config_name = cp.name
+
+        # Invalidate H0 and re-derive against the new pitch / solver.
+        self.H0 = None
+        self.reprojection_error = 0.0
+        self.auto_projected_points = []
+        self.auto_accepted = []
+        return (
+            f"Active config: {cp.name} (backend={self._solver_backend}, "
+            f"pitch={int(pitch_constants.get_active_pitch().PITCH_LENGTH)}x"
+            f"{int(pitch_constants.get_active_pitch().PITCH_WIDTH)}m)"
+        )
+
+    @property
+    def active_config_info(self) -> dict:
+        """Snapshot for state_dict / API consumers."""
+        return {
+            "name": self._active_config_name,
+            "backend": self._solver_backend,
+        }
 
     def compute_homography(self) -> str:
         return _compute_homography(self)
@@ -755,4 +844,12 @@ class AnchorAnnotator:
                 if self.current_frame is not None
                 else None
             ),
+            # Non-blocking warning surfaced when the active pitch config
+            # disagrees with what was used to save existing annotations.
+            # The UI shows it as a banner; the user can switch pitch type
+            # via per-video overrides and reload.
+            "pitch_mismatch_warning": getattr(
+                self, "_pending_pitch_mismatch", None,
+            ),
+            "active_config": self.active_config_info,
         }

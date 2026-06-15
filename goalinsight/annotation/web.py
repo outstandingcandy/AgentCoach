@@ -308,6 +308,47 @@ def register_annotation_routes(
     async def auto_reject_all() -> JSONResponse:
         return _ok(annotator.reject_all_auto())
 
+    @app.get(f"{p}/configs")
+    async def list_configs() -> JSONResponse:
+        """List config yamls under ./configs that include a
+        ``field_registration`` block — these are the ones that make
+        sense to bind as the active solver/pitch source."""
+        from pathlib import Path as _P
+        import yaml as _yaml
+        out = []
+        for cp in sorted(_P("configs").glob("*.yaml")):
+            try:
+                doc = _yaml.safe_load(cp.read_text()) or {}
+            except (OSError, _yaml.YAMLError):
+                continue
+            fr = doc.get("field_registration") or {}
+            if not isinstance(fr, dict) or not fr.get("backend"):
+                # Skip non-pipeline configs (e.g. camera_profiles.yaml,
+                # standalone helper docs that don't drive a backend).
+                continue
+            backend = fr["backend"].lower()
+            pitch = doc.get("pitch") or {}
+            out.append({
+                "path": str(cp),
+                "name": cp.name,
+                "backend": backend,
+                "pitch_length": pitch.get("pitch_length"),
+                "pitch_width": pitch.get("pitch_width"),
+                "active": (
+                    cp.name == getattr(annotator, "_active_config_name", None)
+                ),
+            })
+        return JSONResponse(out)
+
+    @app.post(f"{p}/set_config")
+    async def set_config(request: Request) -> JSONResponse:
+        payload = await request.json()
+        cfg = payload.get("config_path") or payload.get("path")
+        if not cfg:
+            raise HTTPException(400, "config_path is required")
+        msg = annotator.set_solver_config(cfg)
+        return _ok(msg)
+
     @app.post(f"{p}/manual/select")
     async def manual_select(request: Request) -> JSONResponse:
         payload = await request.json()

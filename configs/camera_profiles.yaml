@@ -38,15 +38,17 @@ profiles:
     dist_coeffs: [-0.376, 0.0572, 0.0, 0.0, 0.0]
 
   # Generic 4K sideline profile for non-Veo cameras (phones, GoPros,
-  # consumer cams) where we don't have a lab-calibrated K. Uses a
-  # mid-range focal estimate (≈ 35° hfov) and zero distortion (most
-  # phone footage is lens-corrected upstream). Pair with a wide
-  # focal_bounds and lock_camera_position=false so the LM can refine.
+  # consumer cams) where we don't have a lab-calibrated K. fx=6000 is
+  # the LM-converged value on sunday_cup_0050-0110 (~ 31° hfov) and
+  # works as a starting point for similar long-focal sideline rigs.
+  # Distortion zeroed — most phone footage is lens-corrected upstream.
+  # Pair with a wide focal_bounds and lock_camera_position=false so
+  # the LM can refine across rigs.
   generic_4k:
     image_size: [3840, 2160]
     K:
-      - [3500.0, 0.0, 1920.0]
-      - [0.0, 3500.0, 1080.0]
+      - [6000.0, 0.0, 1920.0]
+      - [0.0, 6000.0, 1080.0]
       - [0.0, 0.0, 1.0]
     dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
 

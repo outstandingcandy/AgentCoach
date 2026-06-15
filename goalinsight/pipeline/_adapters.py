@@ -82,11 +82,19 @@ class FieldRegistrationStage(Stage):
         vis_dir.mkdir(exist_ok=True)
 
         config = ctx.config if ctx.config is not None else get_default_config()
-        process_fps = get_process_fps_from_config(config)
-
+        # Field registration may run at a coarser fps than the rest of
+        # the pipeline (calibration changes slowly; tracking needs every
+        # frame). ``field_registration.process_fps`` overrides the global
+        # ``video.process_fps`` for THIS stage only — tracking still uses
+        # the global value.
         fr_config = config.get("field_registration", {})
+        process_fps = (
+            fr_config.get("process_fps")
+            or get_process_fps_from_config(config)
+        )
+
         backend = fr_config.get("backend", "pnlcalib")
-        print(f"Field Registration: Using {backend} backend")
+        print(f"Field Registration: Using {backend} backend (process_fps={process_fps})")
 
         if backend == "nbjw":
             from ..field_registration.pnlcalib_runner import _run_stage1_nbjw

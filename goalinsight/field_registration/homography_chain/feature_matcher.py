@@ -23,6 +23,7 @@ class FeatureMatcher:
         ratio_threshold: float = 0.75,
         ransac_reproj_threshold: float = 5.0,
         min_matches: int = 10,
+        max_long_side: int | None = 1920,
     ):
         """Initialize feature matcher.
 
@@ -33,11 +34,20 @@ class FeatureMatcher:
             ratio_threshold: Lowe's ratio test threshold.
             ransac_reproj_threshold: RANSAC reprojection threshold.
             min_matches: Minimum number of matches for valid homography.
+            max_long_side: Cap the long side of the image fed to SIFT to
+                this many pixels (default 1920 = downsample 4K to 1080p).
+                SIFT cost scales ~linearly with pixel count and 4K is
+                roughly 4× slower than 1080p with no benefit on field
+                imagery — the same descriptors come out either way.
+                Keypoint coords are scaled BACK to the input frame's
+                resolution so callers see native-resolution coordinates.
+                Set to None to disable.
         """
         self.n_features = n_features
         self.ratio_threshold = ratio_threshold
         self.ransac_reproj_threshold = ransac_reproj_threshold
         self.min_matches = min_matches
+        self.max_long_side = max_long_side
 
         # Initialize SIFT detector
         self.sift = cv2.SIFT_create(
@@ -74,7 +84,29 @@ class FeatureMatcher:
         else:
             gray = frame
 
+        # Optional downscale before SIFT to cap CPU cost on 4K input.
+        # Each output keypoint's (x, y) is rescaled back to the input
+        # frame's resolution so callers can keep using native coords.
+        scale = 1.0
+        if self.max_long_side is not None:
+            long_side = max(gray.shape[:2])
+            if long_side > self.max_long_side:
+                scale = self.max_long_side / long_side
+                new_w = int(round(gray.shape[1] * scale))
+                new_h = int(round(gray.shape[0] * scale))
+                gray = cv2.resize(gray, (new_w, new_h),
+                                  interpolation=cv2.INTER_AREA)
+                if mask is not None:
+                    mask = cv2.resize(mask, (new_w, new_h),
+                                      interpolation=cv2.INTER_NEAREST)
+
         keypoints, descriptors = self.sift.detectAndCompute(gray, mask)
+
+        if scale != 1.0 and keypoints:
+            inv = 1.0 / scale
+            for kp in keypoints:
+                kp.pt = (kp.pt[0] * inv, kp.pt[1] * inv)
+                kp.size *= inv
 
         return keypoints, descriptors
 
