@@ -130,7 +130,7 @@ class CarryDetector(BaseEventDetector):
     @staticmethod
     def _get_player_position(
         ctx: EventDetectionContext,
-        track_id: int,
+        track_id: int | str,
         frame: int,
         search_radius: int = 5,
     ) -> list[float] | None:

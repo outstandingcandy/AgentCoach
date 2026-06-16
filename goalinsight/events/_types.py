@@ -37,7 +37,11 @@ class MatchEvent:
     event_type: EventType
     frame: int
     match_time: float  # seconds into match
-    player_id: int | None = None
+    # ``player_id`` is an int track_id when event_detection runs on raw
+    # tracker output, or a consolidated string (``"A-7"``) when it runs
+    # after track_consolidation. Equality comparison and dict-key use are
+    # the only operations on it, so both forms flow through unchanged.
+    player_id: int | str | None = None
     team_id: str | None = None
     start_frame: int | None = None
     end_frame: int | None = None
@@ -76,7 +80,7 @@ class MatchEvent:
 class PossessionSpan:
     """A continuous interval where a single player controls the ball."""
 
-    player_id: int
+    player_id: int | str
     team_id: str
     start_frame: int
     end_frame: int

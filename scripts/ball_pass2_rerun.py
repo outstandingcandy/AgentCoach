@@ -94,6 +94,7 @@ def main():
 
     # Process
     cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     new_dets = 0
     det_frames = []
 
@@ -137,7 +138,7 @@ def main():
     if det_frames:
         print(f"\nNew detections:")
         for fidx, cx, cy, conf in det_frames:
-            t = fidx / 30.0
+            t = fidx / fps
             m = int(t // 60)
             s = t % 60
             print(f"  frame={fidx} ({m}:{s:04.1f}) pixel=({cx:.0f},{cy:.0f}) conf={conf:.3f}")

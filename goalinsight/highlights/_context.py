@@ -189,7 +189,7 @@ class MatchContext:
         return self.ball_tracks.get(str(frame))
 
     def get_player_trajectory(
-        self, track_id: int, start_frame: int, end_frame: int
+        self, track_id: int | str, start_frame: int, end_frame: int
     ) -> list[dict[str, Any]]:
         """Return all observations of *track_id* between start and end frames.
 
@@ -203,7 +203,7 @@ class MatchContext:
                     break
         return result
 
-    def get_team_for_track(self, track_id: int) -> str:
+    def get_team_for_track(self, track_id: int | str) -> str:
         return self.team_assignments.get(str(track_id), "unknown")
 
     # ------------------------------------------------------------------

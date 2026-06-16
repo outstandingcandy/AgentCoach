@@ -104,7 +104,16 @@ ball_detection:
   min_size: 3                # Minimum bbox dimension in pixels
   max_size: 100              # Maximum bbox dimension in pixels
   min_aspect_ratio: 0.5      # Ball should be roughly circular
-  max_aspect_ratio: 2.0
+  max_aspect_ratio: 3.0      # Loosened from 2.0 → 3.0 — a hard kick blurs the
+                             # ball into a w/h≈2.7 ellipse for ~3 frames
+                             # before/after impact. Used to drop the actual
+                             # shot frame at goal time. The conf-skip below
+                             # is the wider safety net.
+  # High-confidence detections bypass the aspect filter entirely. A
+  # motion-blurred ball is non-circular by definition, but YOLO still
+  # locks on at conf ≥ 0.6 and the downstream pitch/speed filters guard
+  # against false positives anyway.
+  aspect_filter_conf_skip: 0.6
   # SAHI sliced inference for improved small ball detection
   use_sahi: false # SAHI is slower and produces more false positives; disable by default
   sahi_slice_size: 640                    # Slice dimensions (pixels)
@@ -137,7 +146,13 @@ ball_tracking:
   tracker_type: botsort       # "bytetrack" or "botsort"
   track_high_thresh: 0.15    # High-confidence threshold for first-stage matching
   track_low_thresh: 0.1      # Low-confidence threshold for second-stage IoU rescue
-  track_buffer: 15           # Frames to keep lost tracks (1.5s at 10fps)
+  track_buffer: 60           # Frames to keep lost tracks. Raised 15→60 so a
+                             # 1s ball-detection gap during a kick (motion
+                             # blur + small object) doesn't kill the track
+                             # and force a new-track promotion on the next
+                             # isolated detection — which BoT-SORT's
+                             # unconfirmed→confirmed state machine then
+                             # silently drops at typical 0.5-conf detections.
   match_thresh: 0.8          # Distance threshold for matching (normalized center distance)
   new_track_thresh: 0.4      # Min confidence for new track initialization (higher than track_high to avoid false positives)
   max_position_distance: 120  # Max pixel distance for center-distance matching
@@ -466,7 +481,9 @@ events:
     deflection_window_seconds: 0.5  # seconds — window for computing ball deflection angle
 
 # Pipeline orchestration
-# Available stages: field_registration, tracking, event_detection, track_consolidation, player_profile, highlights, annotated_video
+# Available stages: field_registration, tracking, track_consolidation, event_detection, player_profile, highlights, annotated_video
+# NOTE: track_consolidation must run BEFORE event_detection so events.json
+# carries stable player_id strings (e.g. "A-7") instead of raw int track_ids.
 pipeline:
   stages:
     - field_registration

@@ -135,7 +135,8 @@ def render_event_video(
 
         # Draw event timeline bar at bottom
         frame = _draw_timeline(
-            frame, frame_idx, total_frames, events, banner_frames
+            frame, frame_idx, total_frames, events, banner_frames,
+            fps=video_fps,
         )
 
         out.write(frame)
@@ -372,6 +373,7 @@ def _draw_timeline(
     total_frames: int,
     events: list[dict],
     banner_frames: int,
+    fps: float = 30.0,
 ) -> np.ndarray:
     """Draw a timeline bar at the bottom showing event positions."""
     h, w = frame.shape[:2]
@@ -401,7 +403,7 @@ def _draw_timeline(
     cv2.line(frame, (cx, bar_y), (cx, h), (255, 255, 255), 2)
 
     # Timestamp
-    secs = frame_idx / 30.0  # approximate
+    secs = frame_idx / max(fps, 1.0)
     cv2.putText(frame, f"{int(secs//60)}:{int(secs%60):02d}",
                  (cx + 4, h - 5), FONT, 0.35, (255, 255, 255), 1)
 

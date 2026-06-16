@@ -81,12 +81,26 @@ def _center_distance_matrix(
     tracks: list,
     detections: list,
     max_distance: float,
+    *,
+    current_frame_id: int | None = None,
+    gap_scale_cap: float = 8.0,
 ) -> np.ndarray:
     """Compute normalized center-distance matrix with hard gate.
 
+    Per-track gate scaling: a track that has been coasting on Kalman
+    predict for N frames (``current_frame_id - track.frame_id``) gets its
+    gate scaled by ``max(1, N)``, capped at ``gap_scale_cap``. Without
+    this scaling a track that loses its detection during a kick (16+
+    frames of motion blur) can never re-associate when the ball reappears
+    hundreds of pixels away — the base 120 px gate was sized for the
+    fresh-track case (≤2 frame gap, ≤95 px displacement) and rejects
+    every long-gap reacquisition. ultralytics's BYTETracker doesn't
+    maintain ``time_since_update``, so we derive the gap from the
+    tracker's ``frame_id`` counter instead.
+
     Returns:
-        (dists, hard_mask) — dists[i,j] in [0,1], hard_mask[i,j]=True means
-        the pair is gated out regardless of score fusion.
+        (dists, hard_mask) — dists[i,j] in [0,1], hard_mask[i,j]=True
+        means the pair is gated out regardless of score fusion.
     """
     if len(tracks) == 0 or len(detections) == 0:
         empty = np.zeros((len(tracks), len(detections)), dtype=np.float32)
@@ -98,24 +112,43 @@ def _center_distance_matrix(
     diff = track_centers[:, None, :] - det_centers[None, :, :]
     dists = np.sqrt((diff ** 2).sum(axis=2))
 
-    dists = np.minimum(dists / max_distance, 1.0)
+    if current_frame_id is None:
+        per_track_max = np.full(len(tracks), max_distance, dtype=np.float32)
+    else:
+        gaps = np.array(
+            [max(1.0, min(float(current_frame_id - int(t.frame_id)),
+                          gap_scale_cap))
+             for t in tracks],
+            dtype=np.float32,
+        )
+        per_track_max = max_distance * gaps
+
+    dists = np.minimum(dists / per_track_max[:, None], 1.0)
 
     hard_mask = dists >= 1.0
 
     return dists, hard_mask
 
 
-def _center_distance_as_iou(max_distance: float):
+def _center_distance_as_iou(max_distance: float, frame_id_getter):
     """Return a function with the same signature as matching.iou_distance
-    but using center-distance instead of IoU."""
+    but using center-distance instead of IoU.
+
+    ``frame_id_getter`` is a zero-arg callable returning the tracker's
+    current frame id; it's threaded through so the gap-aware gate inside
+    ``_center_distance_matrix`` works for the second-stage call too.
+    """
     def _iou_replacement(tracks, detections):
-        dists, _ = _center_distance_matrix(tracks, detections, max_distance)
+        dists, _ = _center_distance_matrix(
+            tracks, detections, max_distance,
+            current_frame_id=frame_id_getter(),
+        )
         return dists
     return _iou_replacement
 
 
 @contextmanager
-def _patch_second_stage(max_distance: float):
+def _patch_second_stage(max_distance: float, frame_id_getter):
     """Temporarily replace matching functions used by the second stage.
 
     BYTETracker.update() hardcodes ``matching.iou_distance`` and
@@ -130,7 +163,7 @@ def _patch_second_stage(max_distance: float):
     """
     orig_iou = matching.iou_distance
     orig_fuse = matching.fuse_score
-    matching.iou_distance = _center_distance_as_iou(max_distance)
+    matching.iou_distance = _center_distance_as_iou(max_distance, frame_id_getter)
     matching.fuse_score = lambda cost, dets: cost  # no-op
     try:
         yield
@@ -153,7 +186,10 @@ class _BallBYTETracker(BYTETracker):
 
     def get_dists(self, tracks: list[STrack], detections: list[STrack]) -> np.ndarray:
         """Center-distance matrix normalized to [0, 1] range with hard gate."""
-        dists, hard_mask = _center_distance_matrix(tracks, detections, self.max_distance)
+        dists, hard_mask = _center_distance_matrix(
+            tracks, detections, self.max_distance,
+            current_frame_id=self.frame_id,
+        )
 
         if self.args.fuse_score:
             det_scores = np.array([d.score for d in detections], dtype=np.float32)
@@ -164,7 +200,7 @@ class _BallBYTETracker(BYTETracker):
         return dists
 
     def update(self, results, img=None, feats=None):
-        with _patch_second_stage(self.max_distance):
+        with _patch_second_stage(self.max_distance, lambda: self.frame_id):
             return super().update(results, img=img, feats=feats)
 
 
@@ -185,7 +221,10 @@ class _BallBOTSORTTracker(BOTSORT):
 
     def get_dists(self, tracks: list[BOTrack], detections: list[BOTrack]) -> np.ndarray:
         """Center-distance matrix normalized to [0, 1] range with hard gate."""
-        dists, hard_mask = _center_distance_matrix(tracks, detections, self.max_distance)
+        dists, hard_mask = _center_distance_matrix(
+            tracks, detections, self.max_distance,
+            current_frame_id=self.frame_id,
+        )
 
         if self.args.fuse_score:
             det_scores = np.array([d.score for d in detections], dtype=np.float32)
@@ -196,7 +235,7 @@ class _BallBOTSORTTracker(BOTSORT):
         return dists
 
     def update(self, results, img=None, feats=None):
-        with _patch_second_stage(self.max_distance):
+        with _patch_second_stage(self.max_distance, lambda: self.frame_id):
             return super().update(results, img=img, feats=feats)
 
 
