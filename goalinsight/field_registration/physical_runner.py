@@ -470,8 +470,14 @@ def run_stage1_physical(
     # (rvec + focal). This forces a single shared C without coupling focal
     # across frames, so the field-zoom case still works. Set
     # `field_registration.physical.lock_position_pass2: false` to skip.
+    #
+    # Skip the pass entirely when Pass 1 was already lock_camera_position=
+    # true: Pass 1's tvec is already ``-R · C_target`` for every frame, so
+    # computing a median and re-running with that median lock is just a
+    # repeat of Pass 1 with negligible drift. Saves ~30s per run.
     if (
         phys_config.get("lock_position_pass2", True)
+        and not calibrator.lock_camera_position
         and len(joint_frame_data) >= 2
     ):
         # Filter to "trustworthy" Pass 1 frames before computing the median.

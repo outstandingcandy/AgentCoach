@@ -196,8 +196,19 @@ def draw_tracks(
         team = team_assignments.get(track_id, track.get("team", "unknown"))
         color = get_color_for_track(track_id, team)
 
+        # Font scaled by frame width — the /pipeline page resizes
+        # jpgs to long-edge=1080, so a 4K source ends up 1080×608 in
+        # the browser (~28% scale). To keep labels at a usable ~22 px
+        # post-resize, we render at ~2.6 in 4K (post-resize = 0.73).
+        # Use width (long edge) rather than height so panel-stretched
+        # frames also scale correctly.
+        long_edge = max(vis.shape[:2])
+        font_scale = max(0.7, long_edge / 1500.0)        # 4K → 2.56
+        text_thick = max(2, int(round(long_edge / 800.0)))   # 4K → 5
+        rect_thick = max(2, int(round(long_edge / 700.0)))   # 4K → 5
+
         # Draw bbox
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, rect_thick)
 
         # Draw label
         role = track.get("role", "player")
@@ -208,9 +219,15 @@ def draw_tracks(
         if jersey:
             label += f" #{jersey}"
 
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(vis, (x1, y1 - th - 4), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(vis, label, (x1 + 2, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        (tw, th), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_thick,
+        )
+        cv2.rectangle(vis, (x1, y1 - th - 8), (x1 + tw + 8, y1), color, -1)
+        cv2.putText(
+            vis, label, (x1 + 4, y1 - 4),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+            (255, 255, 255), text_thick, cv2.LINE_AA,
+        )
 
         # Track history (kept for potential future use, not drawn on camera view)
         center = ((x1 + x2) // 2, y2)

@@ -44,6 +44,40 @@
                         border: 1px solid #2a323c; margin: 6px 0; display: block; }
     .msg .caption { font-size: 11px; color: #9aa3ad; margin-bottom: 6px; }
 
+    /* Tool-call cards (run_python and the canned match tools) */
+    .tool-card { align-self: flex-start; max-width: 92%; width: 92%;
+      background: #141a21; border: 1px solid #2a323c; border-radius: 10px;
+      font-size: 12px; color: #cfe3ff; overflow: hidden; }
+    .tool-card.python { border-color: #3b6ea8; }
+    .tool-card summary { cursor: pointer; padding: 8px 12px;
+      display: flex; gap: 8px; align-items: center; list-style: none;
+      user-select: none; }
+    .tool-card summary::-webkit-details-marker { display: none; }
+    .tool-card .tool-icon { font-size: 14px; }
+    .tool-card .tool-name { font-weight: 600; color: #e6e9ee; }
+    .tool-card .tool-status { margin-left: auto; font-size: 11px;
+      color: #9aa3ad; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .tool-card.ok .tool-status { color: #7ed27e; }
+    .tool-card.err .tool-status { color: #ff8b8b; }
+    .tool-card .tool-body { padding: 0 12px 10px; }
+    .tool-card pre { background: #0d1116; border: 1px solid #2a323c;
+      border-radius: 6px; padding: 8px 10px; margin: 6px 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11.5px; line-height: 1.45; color: #cfe3ff;
+      max-height: 280px; overflow: auto; white-space: pre-wrap;
+      word-break: break-word; }
+    .tool-card .tool-label { font-size: 10.5px; color: #9aa3ad;
+      letter-spacing: 0.04em; text-transform: uppercase;
+      margin: 8px 0 2px; }
+    .tool-card .tool-art { max-width: 100%; margin-top: 6px; border-radius: 6px;
+      border: 1px solid #2a323c; display: block; }
+    .tool-card .tool-art-row { display: flex; gap: 8px; flex-wrap: wrap;
+      margin-top: 6px; }
+    .tool-card.compact summary { padding: 6px 12px; }
+    .tool-card.compact .tool-args { color: #9aa3ad;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px; }
+
     /* Chat session preparation banner */
     #prepare-banner { padding: 10px 14px; background: #1e242b;
       border-bottom: 1px solid #2a323c; font-size: 12px; color: #cfe3ff; }
@@ -85,6 +119,25 @@
       border: 1px solid #2a323c; margin-top: 6px; }
     #insights-output pre { background: #0d1116; padding: 10px; border-radius: 6px;
       font-size: 11px; color: #cfe3ff; overflow-x: auto; margin-top: 6px; }
+
+    /* Session bar (multi-conversation picker) */
+    #session-bar { display: flex; gap: 6px; align-items: center;
+      padding: 8px 12px; border-bottom: 1px solid #262b33;
+      background: #141a21; font-size: 12px; }
+    #session-bar select { flex: 1; min-width: 0;
+      background: #0d1116; color: #e6e9ee;
+      border: 1px solid #2a323c; border-radius: 6px;
+      padding: 6px 8px; font: inherit; }
+    #session-bar select:focus { outline: none; border-color: #3b82f6; }
+    #session-bar button { background: #2a323c; color: #cfe3ff; border: 0;
+      border-radius: 6px; padding: 6px 9px; font-size: 12px;
+      font-weight: 600; cursor: pointer; }
+    #session-bar button:hover { background: #3b4453; }
+    #session-bar button.primary { background: #3b82f6; color: #fff; }
+    #session-bar button.primary:hover { background: #2563eb; }
+    #session-bar button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #session-bar .session-state { font-size: 11px; color: #9aa3ad;
+      white-space: nowrap; }
   </style>
   <script defer src="/static/nav.js"></script>
 </head>
@@ -122,6 +175,12 @@
       </div>
       <div id="prepare-bar"><div></div></div>
     </div>
+    <div id="session-bar">
+      <select id="session-select" title="Switch chat session"></select>
+      <button id="session-new" type="button" title="Start a new chat">＋ New</button>
+      <button id="session-delete" type="button" title="Delete this chat">🗑</button>
+      <span id="session-state"></span>
+    </div>
     <div id="messages">
       <div class="msg system-hint">
         Ask about the match. Your current video timestamp is sent with each question so you can ask things like "who has the ball right now?" or "was that last pass successful?"
@@ -149,7 +208,34 @@
     const VIDEO_URL = RUN_NAME ? `${API_BASE}/video` : '/video';
     player.src = VIDEO_URL;
 
-    const history = []; // {role, content}
+    // History is server-side now (per chat session, on disk). The
+    // client only tracks which session is active and renders the
+    // messages it gets back from /sessions/<sid>.
+    let currentSessionId = null;
+    const SESSION_KEY = `chat:session:${RUN_NAME || ''}`;
+    // url -> [<img>...] inside tool cards. When the assistant
+    // markdown later embeds the same URL via `![](...)`, we hide the
+    // duplicate copies in the tool cards: chart belongs in the
+    // assistant message where the user is reading, not buried in a
+    // foldable Python card. Reset on session switch.
+    const toolArtifactImgs = new Map();
+    // Two ways to land on a specific session:
+    //   1. /insights/<run>?session=<sid>  — shareable / refresh-stable
+    //   2. localStorage[SESSION_KEY]      — last session this browser
+    //      was on (only kicks in when no ?session= is present)
+    function urlSessionId() {
+      const p = new URLSearchParams(window.location.search);
+      return p.get('session') || null;
+    }
+    function setUrlSession(sid) {
+      const url = new URL(window.location.href);
+      if (sid) url.searchParams.set('session', sid);
+      else url.searchParams.delete('session');
+      // replaceState (not pushState) so the browser back button still
+      // takes the user out of /insights, not through every session
+      // they clicked through.
+      window.history.replaceState(null, '', url.toString());
+    }
 
     function fmtTime(s) {
       if (!isFinite(s)) return '-';
@@ -239,6 +325,26 @@
             img.src = url;
             img.alt = alt;
             target.appendChild(img);
+            // Hide the same URL inside any tool card that already
+            // showed it: the chart now lives in the assistant
+            // message, where users naturally read. If the row /
+            // ARTIFACTS label end up with nothing else to show, hide
+            // them too so the card doesn't carry an empty section.
+            const dups = toolArtifactImgs.get(url);
+            if (dups) {
+              for (const e of dups) {
+                e.style.display = 'none';
+                const row = e._artRow;
+                if (row) {
+                  const stillVisible = Array.from(row.children).some(
+                    c => c.style.display !== 'none');
+                  if (!stillVisible) {
+                    row.style.display = 'none';
+                    if (e._artLabel) e._artLabel.style.display = 'none';
+                  }
+                }
+              }
+            }
           },
         });
       }
@@ -294,31 +400,208 @@
       return body;
     }
 
+    // ---- Tool-call cards ------------------------------------------
+    // run_python gets a full collapsible card (open by default) that
+    // shows the code, then folds in stdout / stderr / artifacts as
+    // they arrive. The canned match tools (list_events, etc.) get a
+    // one-line chip showing the args and a tiny success/error mark —
+    // they're cheap and show up several times per turn so a full
+    // card would crowd the chat.
+    const TOOL_ICON = {
+      run_python: '🐍',
+      list_events: '📋',
+      get_player_stats: '👤',
+      get_team_stats: '🏳',
+      get_frame_snapshot: '📸',
+    };
+    function shortJson(obj) {
+      try {
+        const s = JSON.stringify(obj);
+        return s.length > 140 ? s.slice(0, 140) + '…' : s;
+      } catch { return ''; }
+    }
+    function addToolCard(evt) {
+      const card = document.createElement('details');
+      const compact = evt.name !== 'run_python';
+      card.className = `tool-card${compact ? ' compact' : ''}`
+        + (evt.name === 'run_python' ? ' python' : '');
+      card.open = !compact;  // expand python by default, collapse the rest
+
+      const summary = document.createElement('summary');
+      const icon = document.createElement('span');
+      icon.className = 'tool-icon';
+      icon.textContent = TOOL_ICON[evt.name] || '🛠';
+      const name = document.createElement('span');
+      name.className = 'tool-name';
+      name.textContent = evt.name;
+      summary.appendChild(icon);
+      summary.appendChild(name);
+
+      if (compact) {
+        const args = document.createElement('span');
+        args.className = 'tool-args';
+        args.textContent = shortJson(evt.input);
+        summary.appendChild(args);
+      }
+
+      const status = document.createElement('span');
+      status.className = 'tool-status';
+      status.textContent = '· running…';
+      summary.appendChild(status);
+      card.appendChild(summary);
+
+      const body = document.createElement('div');
+      body.className = 'tool-body';
+      if (evt.name === 'run_python') {
+        const lbl = document.createElement('div');
+        lbl.className = 'tool-label';
+        lbl.textContent = 'code';
+        const pre = document.createElement('pre');
+        pre.textContent = evt.input?.code || '';
+        body.appendChild(lbl);
+        body.appendChild(pre);
+      }
+      card.appendChild(body);
+
+      messagesEl.appendChild(card);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return { card, body, status };
+    }
+    function fillToolResult(handle, result) {
+      const { card, body, status } = handle;
+      const errored = result?.exit_code && result.exit_code !== 0
+        || !!result?.error;
+      card.classList.add(errored ? 'err' : 'ok');
+      if (result?.execution_time_s != null) {
+        status.textContent = `· ${result.execution_time_s.toFixed(2)}s`;
+      } else {
+        status.textContent = errored ? '· error' : '· ok';
+      }
+
+      // run_python: show stdout/stderr/artifacts.
+      const stdout = (result?.stdout || '').trim();
+      const stderr = (result?.stderr || '').trim();
+      const artifacts = result?.artifacts || [];
+      const errMsg = result?.error;
+
+      if (stdout) {
+        const lbl = document.createElement('div');
+        lbl.className = 'tool-label';
+        lbl.textContent = 'stdout';
+        const pre = document.createElement('pre');
+        pre.textContent = stdout;
+        body.appendChild(lbl);
+        body.appendChild(pre);
+      }
+      if (stderr) {
+        const lbl = document.createElement('div');
+        lbl.className = 'tool-label';
+        lbl.textContent = 'stderr';
+        const pre = document.createElement('pre');
+        pre.textContent = stderr;
+        body.appendChild(lbl);
+        body.appendChild(pre);
+      }
+      if (errMsg) {
+        const lbl = document.createElement('div');
+        lbl.className = 'tool-label';
+        lbl.textContent = 'error';
+        const pre = document.createElement('pre');
+        pre.textContent = errMsg;
+        body.appendChild(lbl);
+        body.appendChild(pre);
+      }
+      if (artifacts.length) {
+        const lbl = document.createElement('div');
+        lbl.className = 'tool-label';
+        lbl.textContent = 'artifacts';
+        body.appendChild(lbl);
+        const row = document.createElement('div');
+        row.className = 'tool-art-row';
+        for (const a of artifacts) {
+          if ((a.mime_type || '').startsWith('image/')) {
+            const img = document.createElement('img');
+            img.className = 'tool-art';
+            img.src = a.url;
+            img.alt = a.name || 'artifact';
+            // Stash a back-pointer so the dedup hook can collapse the
+            // surrounding row + label once every image in this row
+            // ends up hidden.
+            img._artRow = row;
+            img._artLabel = lbl;
+            row.appendChild(img);
+            if (a.url) {
+              if (!toolArtifactImgs.has(a.url)) toolArtifactImgs.set(a.url, []);
+              toolArtifactImgs.get(a.url).push(img);
+            }
+          } else {
+            const link = document.createElement('a');
+            link.href = a.url;
+            link.target = '_blank';
+            link.rel = 'noopener';
+            link.textContent = a.name || a.url;
+            row.appendChild(link);
+          }
+        }
+        body.appendChild(row);
+      }
+      // For canned tools (compact), show a JSON preview on demand.
+      if (card.classList.contains('compact')) {
+        const lbl = document.createElement('div');
+        lbl.className = 'tool-label';
+        lbl.textContent = 'result';
+        const pre = document.createElement('pre');
+        try {
+          pre.textContent = JSON.stringify(result, null, 2);
+        } catch { pre.textContent = String(result); }
+        body.appendChild(lbl);
+        body.appendChild(pre);
+      }
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
     async function send() {
       const text = inputEl.value.trim();
       if (!text) return;
+      if (!currentSessionId) {
+        // Should not happen — the UI gates input on session readiness.
+        addMessage('assistant', 'no active session — click ＋ New');
+        return;
+      }
       inputEl.value = '';
       sendBtn.disabled = true;
       inputEl.disabled = true;
 
       addMessage('user', text);
-      history.push({ role: 'user', content: text });
 
-      const placeholder = addMessage('assistant', '');
+      // The assistant's final text gets its own bubble — but only once
+      // text actually starts arriving. If tool_use comes first, the
+      // tool cards land directly in the messages column and the text
+      // bubble is created *after* them, so the conversation reads
+      // top-to-bottom: question → tool calls → answer.
+      let placeholder = null;
+      const toolHandles = {};  // tool_use_id -> {card, body, status}
       let acc = '';
+
+      function ensurePlaceholder() {
+        if (placeholder == null) placeholder = addMessage('assistant', '');
+        return placeholder;
+      }
+
       try {
-        const resp = await fetch(`${API_BASE}/chat/stream`, {
+        const url =
+          `${API_BASE}/chat/sessions/${encodeURIComponent(currentSessionId)}/stream`;
+        const resp = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            messages: history,
+            message: text,
             current_time: player.currentTime || 0,
           }),
         });
         if (!resp.ok || !resp.body) {
           const err = resp.body ? await resp.text() : `HTTP ${resp.status}`;
-          placeholder.textContent = `error: ${err}`;
-          history.pop();
+          ensurePlaceholder().textContent = `error: ${err}`;
           return;
         }
         const reader = resp.body.getReader();
@@ -342,28 +625,51 @@
               try { obj = JSON.parse(payload); } catch { continue; }
               if (obj.delta) {
                 acc += obj.delta;
-                renderWithSeeks(placeholder, acc);
+                renderWithSeeks(ensurePlaceholder(), acc);
                 messagesEl.scrollTop = messagesEl.scrollHeight;
+              } else if (obj.event) {
+                const e = obj.event;
+                if (e.type === 'tool_use') {
+                  toolHandles[e.id] = addToolCard(e);
+                } else if (e.type === 'tool_result') {
+                  // If the tool_use card never made it (page loaded
+                  // mid-stream, or addToolCard threw), surface the
+                  // result anyway as a fallback card so the user
+                  // doesn't silently lose the proof-of-work.
+                  if (toolHandles[e.id]) {
+                    fillToolResult(toolHandles[e.id], e.result);
+                  } else {
+                    console.warn('tool_result without matching tool_use', e);
+                    toolHandles[e.id] = addToolCard({
+                      id: e.id,
+                      name: e.name,
+                      input: { code: '(code not captured by client)' },
+                    });
+                    fillToolResult(toolHandles[e.id], e.result);
+                  }
+                } else {
+                  console.warn('unknown event type from /chat/stream', e);
+                }
               } else if (obj.error) {
                 streamErr = obj.error;
+              } else if (!obj.done) {
+                console.warn('unknown SSE payload from /chat/stream', obj);
               }
             }
           }
         }
         if (streamErr) {
-          placeholder.textContent = `error: ${streamErr}`;
-          history.pop();
+          ensurePlaceholder().textContent = `error: ${streamErr}`;
         } else if (!acc) {
-          placeholder.textContent = '(no response)';
-          history.pop();
-        } else {
-          history.push({ role: 'assistant', content: acc });
+          ensurePlaceholder().textContent = '(no response)';
         }
+        // Refresh the session list so updated_at / autotitle reflect.
+        refreshSessionList({ keepCurrent: true }).catch(() => {});
       } catch (e) {
-        placeholder.textContent = acc
+        const target = ensurePlaceholder();
+        target.textContent = acc
           ? `${acc}\n\n[stream interrupted: ${e}]`
           : `error: ${e}`;
-        if (!acc) history.pop();
       } finally {
         sendBtn.disabled = false;
         inputEl.disabled = false;
@@ -393,9 +699,262 @@
       if (text) prepText.textContent = text;
     }
 
+    function showIncompleteRunBanner(detail) {
+      const required = (detail.missing_required || []).join(', ');
+      const recommended = (detail.missing_recommended || []).join(', ');
+      let msg = `Pipeline not finished for "${detail.run_name}". `;
+      if (required) {
+        msg += `Missing required stage(s): ${required}. `;
+      }
+      if (recommended) {
+        msg += `Recommended (for richer answers): ${recommended}. `;
+      }
+      msg += 'Run them via the pipeline page, then reload.';
+      setProgress(0, msg, true);
+      // Keep chat input disabled — there's no MatchContext to back it.
+      inputEl.disabled = true;
+      sendBtn.disabled = true;
+    }
+
+    // ----- Session picker -----
+    const sessionSelect = document.getElementById('session-select');
+    const sessionNewBtn = document.getElementById('session-new');
+    const sessionDeleteBtn = document.getElementById('session-delete');
+    const sessionStateEl = document.getElementById('session-state');
+
+    function setSessionState(text, kind) {
+      // kind: 'ok' | 'warn' | 'busy' | ''
+      sessionStateEl.textContent = text || '';
+      sessionStateEl.style.color =
+        kind === 'warn' ? '#ffb27a'
+        : kind === 'ok' ? '#7ed27e'
+        : kind === 'busy' ? '#cfe3ff'
+        : '#9aa3ad';
+    }
+
+    function setInputEnabled(enabled) {
+      inputEl.disabled = !enabled;
+      sendBtn.disabled = !enabled;
+      if (enabled) inputEl.focus();
+    }
+
+    function fmtRelTime(unix_s) {
+      if (!unix_s) return '';
+      const dt = (Date.now() / 1000) - unix_s;
+      if (dt < 60) return `${Math.floor(dt)}s ago`;
+      if (dt < 3600) return `${Math.floor(dt/60)}m ago`;
+      if (dt < 86400) return `${Math.floor(dt/3600)}h ago`;
+      return `${Math.floor(dt/86400)}d ago`;
+    }
+
+    function rerenderSessionDropdown(sessions) {
+      sessionSelect.innerHTML = '';
+      if (!sessions.length) {
+        const opt = document.createElement('option');
+        opt.textContent = '(no chats yet — click ＋ New)';
+        opt.value = '';
+        opt.disabled = true;
+        sessionSelect.appendChild(opt);
+        return;
+      }
+      // Clip very long titles in the dropdown so a single chatty
+      // session can't push the date suffix off the right edge.
+      // Browsers don't truncate <option> text with CSS, so we cut in
+      // JS and put the full string in the tooltip.
+      const MAX_TITLE = 28;
+      for (const s of sessions) {
+        const opt = document.createElement('option');
+        opt.value = s.session_id;
+        const when = fmtRelTime(s.updated_at);
+        const t = s.title || '';
+        const clipped = t.length > MAX_TITLE ? t.slice(0, MAX_TITLE - 1) + '…' : t;
+        opt.textContent = `${clipped}  ·  ${when}`;
+        opt.title = `${t}\n${new Date(s.updated_at * 1000).toLocaleString()}`;
+        sessionSelect.appendChild(opt);
+      }
+    }
+
+    async function refreshSessionList({keepCurrent = false} = {}) {
+      const r = await fetch(`${API_BASE}/chat/sessions`);
+      if (!r.ok) throw new Error(`list sessions: HTTP ${r.status}`);
+      const j = await r.json();
+      rerenderSessionDropdown(j.sessions || []);
+      if (keepCurrent && currentSessionId) {
+        sessionSelect.value = currentSessionId;
+      }
+      return j.sessions || [];
+    }
+
+    function clearMessages() {
+      // Keep the system hint at the top; drop everything else.
+      const hint = messagesEl.querySelector('.system-hint');
+      messagesEl.innerHTML = '';
+      if (hint) messagesEl.appendChild(hint);
+      toolArtifactImgs.clear();
+    }
+
+    function renderHistoryFromServer(messages) {
+      clearMessages();
+      // tool_use entries spawn a card; the matching tool_result fills
+      // it in. Pair them by id so out-of-order writes (shouldn't
+      // happen, but defensive) still land on the right card.
+      const toolHandles = {};
+      for (const m of messages || []) {
+        if (m.role === 'user' || m.role === 'assistant') {
+          addMessage(m.role, m.content || '');
+        } else if (m.role === 'tool_use') {
+          toolHandles[m.id] = addToolCard({
+            id: m.id, name: m.name, input: m.input || {},
+          });
+        } else if (m.role === 'tool_result') {
+          if (toolHandles[m.id]) {
+            fillToolResult(toolHandles[m.id], m.result || {});
+          } else {
+            // Defensive: tool_result before tool_use. Build a stub card.
+            const h = addToolCard({
+              id: m.id, name: m.name,
+              input: { code: '(code not in history)' },
+            });
+            fillToolResult(h, m.result || {});
+            toolHandles[m.id] = h;
+          }
+        }
+      }
+    }
+
+    async function loadSession(sid, {warm = true} = {}) {
+      currentSessionId = sid;
+      try { localStorage.setItem(SESSION_KEY, sid); } catch {}
+      setUrlSession(sid);
+      sessionSelect.value = sid;
+      setSessionState('loading…', 'busy');
+      setInputEnabled(false);
+      try {
+        const r = await fetch(
+          `${API_BASE}/chat/sessions/${encodeURIComponent(sid)}`);
+        if (!r.ok) {
+          setSessionState(`load failed (HTTP ${r.status})`, 'warn');
+          return;
+        }
+        const j = await r.json();
+        renderHistoryFromServer(j.messages);
+        const turnCount = (j.messages || []).filter(
+          m => m.role === 'user' || m.role === 'assistant').length;
+        if (warm) {
+          // Fire-and-forget: keepalive the AgentCore sandbox so the
+          // first user turn lands on a warm container instead of
+          // paying the cold-start tax mid-question.
+          fetch(
+            `${API_BASE}/chat/sessions/${encodeURIComponent(sid)}/resume`,
+            { method: 'POST' },
+          ).then(rr => rr.ok ? rr.json() : null)
+           .then(jj => {
+             if (jj && jj.agentcore_alive) {
+               setSessionState('sandbox ready', 'ok');
+             } else if (jj) {
+               setSessionState('sandbox cold (will warm on next turn)', '');
+             }
+           }).catch(() => {});
+        }
+        setInputEnabled(true);
+        setSessionState(turnCount
+          ? `${turnCount} messages` : 'empty', '');
+      } catch (e) {
+        setSessionState(`load error: ${e}`, 'warn');
+      }
+    }
+
+    async function newSession() {
+      sessionNewBtn.disabled = true;
+      try {
+        const r = await fetch(`${API_BASE}/chat/sessions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        if (!r.ok) {
+          setSessionState(`new failed (HTTP ${r.status})`, 'warn');
+          return;
+        }
+        const meta = await r.json();
+        await refreshSessionList();
+        await loadSession(meta.session_id, {warm: false});
+      } finally {
+        sessionNewBtn.disabled = false;
+      }
+    }
+
+    async function deleteCurrentSession() {
+      if (!currentSessionId) return;
+      const ok = confirm('Delete this chat session? This cannot be undone.');
+      if (!ok) return;
+      sessionDeleteBtn.disabled = true;
+      try {
+        const r = await fetch(
+          `${API_BASE}/chat/sessions/${encodeURIComponent(currentSessionId)}`,
+          { method: 'DELETE' });
+        if (!r.ok) {
+          setSessionState(`delete failed (HTTP ${r.status})`, 'warn');
+          return;
+        }
+        try { localStorage.removeItem(SESSION_KEY); } catch {}
+        currentSessionId = null;
+        setUrlSession(null);
+        const sessions = await refreshSessionList();
+        if (sessions.length) {
+          await loadSession(sessions[0].session_id);
+        } else {
+          // No sessions left — auto-create one.
+          await newSession();
+        }
+      } finally {
+        sessionDeleteBtn.disabled = false;
+      }
+    }
+
+    sessionSelect.addEventListener('change', () => {
+      const sid = sessionSelect.value;
+      if (sid && sid !== currentSessionId) loadSession(sid);
+    });
+    sessionNewBtn.addEventListener('click', newSession);
+    sessionDeleteBtn.addEventListener('click', deleteCurrentSession);
+
+    async function initSessions() {
+      const sessions = await refreshSessionList();
+      // Resolution order: ?session= wins (shareable / explicit),
+      // then localStorage (sticky per-browser), then most-recent,
+      // then auto-create.
+      let preferred = urlSessionId();
+      if (!preferred) {
+        try { preferred = localStorage.getItem(SESSION_KEY); } catch {}
+      }
+      const exists = sessions.find(s => s.session_id === preferred);
+      if (exists) {
+        await loadSession(preferred);
+      } else if (sessions.length) {
+        await loadSession(sessions[0].session_id);
+      } else {
+        await newSession();
+      }
+    }
+
+    // Reflect Back/Forward buttons too: if the user hits Back into a
+    // different ?session= we should switch to it.
+    window.addEventListener('popstate', () => {
+      const sid = urlSessionId();
+      if (sid && sid !== currentSessionId) loadSession(sid);
+    });
+
     async function prepareSession() {
       try {
         const resp = await fetch(`${API_BASE}/chat/prepare`, { method: 'POST' });
+        if (resp.status === 409) {
+          let body = null;
+          try { body = await resp.json(); } catch {}
+          const detail = body?.detail || body || {};
+          showIncompleteRunBanner(detail);
+          return;
+        }
         if (!resp.ok || !resp.body) {
           setProgress(0, `prepare failed: HTTP ${resp.status}`, true);
           return;
@@ -424,9 +983,11 @@
               setProgress(evt.percent ?? 0, evt.detail || evt.stage);
               if (evt.stage === 'ready') {
                 banner.classList.add('ready');
-                inputEl.disabled = false;
-                sendBtn.disabled = false;
-                inputEl.focus();
+                // Don't enable input here — the session bar does that
+                // once it has loaded (or created) a session.
+                initSessions().catch(err => {
+                  console.error('initSessions failed', err);
+                });
                 return;
               }
             }
@@ -441,6 +1002,15 @@
     (async () => {
       try {
         const r = await fetch(`${API_BASE}/meta`);
+        if (r.status === 409) {
+          // /chat/prepare will surface the same 409 detail; keep the
+          // header tidy and let the prepare banner explain why.
+          const body = await r.json().catch(() => ({}));
+          const detail = body?.detail || body || {};
+          document.getElementById('meta-video').textContent =
+            `(${detail.run_name || RUN_NAME} — pipeline incomplete)`;
+          return;
+        }
         const m = await r.json();
         document.getElementById('meta-video').textContent = m.video_name;
         document.getElementById('meta-duration').textContent =

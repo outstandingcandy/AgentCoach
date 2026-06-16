@@ -251,31 +251,33 @@ def render_yolo_raw_diag(
         post_size_ids = {_bbox_id(d) for d in rec.players_post_size}
         post_conf_ids = {_bbox_id(d) for d in rec.players_post_conf}
 
-        # Players: classify each raw det into a drop stage.
+        # Players: classify each raw det into a drop stage. All bboxes
+        # share the same line thickness (3 px on 4K; on a 1080p browser
+        # render that's ~1 px which is too faint to see) so dropped
+        # detections aren't lost in the JPG when the image is downscaled.
+        font_scale = max(0.6, frame.shape[1] / 3000.0)
+        thickness = max(2, int(round(frame.shape[1] / 1000.0)))
         for d in rec.players_raw:
             bid = _bbox_id(d)
             if bid in passed_ids:
                 color = _COLOR_PASS
                 label = "OK"
-                thickness = 2
             elif bid in post_size_ids:
                 color = _COLOR_DROP_PITCH
                 label = "drop:pitch"
-                thickness = 1
             elif bid in post_conf_ids:
                 color = _COLOR_DROP_SIZE
                 label = "drop:size"
-                thickness = 1
             else:
                 color = _COLOR_DROP_CONF
                 label = "drop:conf"
-                thickness = 1
             x1, y1, x2, y2 = map(int, d["bbox"])
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
             text = f"{label} {d['confidence']:.2f}"
             ty = max(y1 - 6, 12)
             cv2.putText(frame, text, (x1, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, color,
+                        max(1, thickness - 1), cv2.LINE_AA)
 
         # Balls
         for d in rec.balls_raw:

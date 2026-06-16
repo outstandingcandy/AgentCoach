@@ -39,10 +39,17 @@
     #queue-hud button.secondary { background: #2a323c; color: #cfe3ff; }
     #queue-hud .label { color: #9aa3ad; }
 
+    /* Controls now stack: Player status (primary) on top, More
+       drawer below. The collapsed drawer is just a one-line summary,
+       so the grid expands naturally. ``grid-column: 1/-1`` on each
+       panel keeps the column count irrelevant. */
     #controls { background: #161b21; border-top: 1px solid #262b33;
                 padding: 12px 16px; display: grid;
-                grid-template-columns: 1fr 1fr 1fr; gap: 16px;
+                grid-template-columns: 1fr; gap: 12px;
                 max-height: 48vh; overflow-y: auto; }
+    /* When the drawer expands, mark the caret rotated. */
+    #more-panel[open] > summary .caret { transform: rotate(90deg);
+                                          display: inline-block; }
     .panel h3 { margin: 0 0 8px; font-size: 12px; color: #cfe3ff;
                 text-transform: uppercase; letter-spacing: 0.06em; }
     .panel { background: #1a2027; border: 1px solid #232a32; border-radius: 8px;
@@ -75,14 +82,42 @@
 
     .player-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
                    gap: 4px; }
+    /* Player card: background = player's profile crop, dark gradient
+       overlay so the white text stays readable. ``.live`` flips the
+       border to amber and surfaces an action badge when the playhead
+       is inside an event involving this player (goal/shot/pass...). */
     .player-card { background: #2a323c; border: 1px solid #2a323c; border-radius: 5px;
                    padding: 6px 8px; font-size: 12px; cursor: pointer; min-width: 0;
-                   position: relative; }
+                   position: relative; min-height: 96px; overflow: hidden;
+                   background-size: cover; background-position: center top;
+                   background-repeat: no-repeat;
+                   color: #fff;
+                   text-shadow: 0 1px 3px rgba(0,0,0,0.7); }
+    /* Overlay so text on top of any crop stays legible. */
+    .player-card::before {
+      content: ""; position: absolute; inset: 0;
+      background: linear-gradient(to bottom, rgba(20,28,38,0.55) 0%,
+                                              rgba(20,28,38,0.20) 50%,
+                                              rgba(20,28,38,0.85) 100%);
+      pointer-events: none;
+    }
+    .player-card > * { position: relative; z-index: 1; }
     .player-card:hover { border-color: #3b82f6; }
-    .player-card.active { background: #3b82f6; border-color: #3b82f6; color: white; }
-    .player-card .pid { font-weight: 700; }
-    .player-card .meta { color: #9aa3ad; font-size: 11px; }
-    .player-card.active .meta { color: #cfe3ff; }
+    .player-card.active { border-color: #3b82f6; outline: 2px solid #3b82f6; }
+    .player-card.live { border-color: #f59e0b; outline: 2px solid #f59e0b;
+                        box-shadow: 0 0 0 4px rgba(245,158,11,0.25); }
+    .player-card .pid { font-weight: 700; font-size: 12px; }
+    .player-card .meta { color: #cfe3ff; font-size: 10px; opacity: 0.85; }
+    .player-card.active .meta { color: #fff; }
+    .player-card .action-badge {
+      position: absolute; bottom: 4px; left: 4px; right: 24px;
+      background: #f59e0b; color: #161b21;
+      font-weight: 700; font-size: 10px;
+      padding: 2px 6px; border-radius: 4px;
+      text-shadow: none;
+      display: none;   /* shown only when .live */
+    }
+    .player-card.live .action-badge { display: block; }
     .player-card .info-btn { position: absolute; top: 2px; right: 4px;
                               width: 18px; height: 18px; line-height: 16px;
                               text-align: center; font-size: 11px; font-weight: 700;
@@ -154,6 +189,31 @@
     .play-bar button.secondary { background: #2a323c; color: #cfe3ff; }
     .play-bar button:disabled { opacity: 0.4; cursor: not-allowed; }
     .play-bar .count { color: #9aa3ad; font-size: 11px; margin-left: auto; }
+
+    /* Portrait viewport (rotated 24" monitor, ~1080×1920). The default
+       landscape grid puts video + 2D pitch side-by-side and crams
+       the three control panels into one short bottom strip — that
+       layout overflows horizontally and clips most of the controls
+       on a portrait screen. Switch to a vertical stack: video on
+       top, pitch under it, controls (single column) below, page
+       scrolls naturally. Triggered by ``orientation: portrait``
+       (true on rotated desktop monitors and phones held vertically),
+       not by ``max-width``, so wide laptops never see this branch. */
+    @media (orientation: portrait) {
+      html, body { height: auto; min-height: 100%; overflow: visible; }
+      body { display: flex; flex-direction: column; min-height: 100vh; }
+
+      header { flex-wrap: wrap; gap: 12px; }
+
+      #stage { grid-template-columns: 1fr; grid-template-rows: auto auto;
+               overflow: visible; }
+      #video-panel { width: 100%; aspect-ratio: 16 / 9; }
+      #pitch-panel { width: 100%; aspect-ratio: 105 / 68; }
+      #player, #mini { width: 100%; height: 100%; object-fit: contain; }
+
+      #controls { grid-template-columns: 1fr; max-height: none; }
+      .event-list, .player-grid { max-height: none; }
+    }
   </style>
   <script defer src="/static/nav.js"></script>
 </head>
@@ -182,21 +242,13 @@
   </div>
 
   <div id="controls">
-    <div class="panel">
-      <h3>Overlays</h3>
-      <div class="toggle-row" id="toggles"></div>
-    </div>
-    <div class="panel">
-      <h3>Filter by event</h3>
-      <div class="chip-row" id="event-chips"></div>
-      <div class="event-list" id="event-list"></div>
-      <div class="play-bar">
-        <button id="event-playall" disabled>Play all</button>
-        <span class="count" id="event-count"></span>
-      </div>
-    </div>
-    <div class="panel">
-      <h3>Filter by player</h3>
+    <!-- Player roster — primary panel. Cards have the player's
+         profile crop as the background and surface an action badge
+         (GOAL / SHOT / PASS / …) when the playhead enters an event
+         that names this player_id. Click toggles the spotlight just
+         like before. -->
+    <div class="panel" style="grid-column: 1 / -1">
+      <h3>Player status</h3>
       <div class="player-grid" id="player-grid"></div>
       <div class="play-bar">
         <button id="player-playall" disabled>Play all clips</button>
@@ -204,6 +256,38 @@
         <span class="count" id="player-count"></span>
       </div>
     </div>
+
+    <!-- Less-used controls live in a single collapsible drawer so
+         they don't push the player grid down. Default closed. -->
+    <details class="panel" id="more-panel" style="grid-column: 1 / -1">
+      <summary style="cursor:pointer;font-size:12px;color:#cfe3ff;
+                      text-transform:uppercase;letter-spacing:0.06em;
+                      font-weight:600;padding:2px 0;list-style:none;
+                      display:flex;align-items:center;gap:8px">
+        <span class="caret" style="color:#6b7380;width:10px">▶</span>
+        More
+        <span style="color:#6b7380;font-weight:400;font-size:11px;
+                     text-transform:none;letter-spacing:0;margin-left:auto">
+          overlays · filter by event
+        </span>
+      </summary>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;
+                  margin-top:10px">
+        <div>
+          <div style="font-size:11px;color:#9aa3ad;margin-bottom:6px">Overlays</div>
+          <div class="toggle-row" id="toggles"></div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:#9aa3ad;margin-bottom:6px">Filter by event</div>
+          <div class="chip-row" id="event-chips"></div>
+          <div class="event-list" id="event-list"></div>
+          <div class="play-bar">
+            <button id="event-playall" disabled>Play all</button>
+            <span class="count" id="event-count"></span>
+          </div>
+        </div>
+      </div>
+    </details>
   </div>
 
   <div id="profile-modal">
@@ -786,6 +870,51 @@
       }
     });
 
+    // Live player-status: when the playhead is inside an event
+    // window that names a player_id, mark that player's card .live
+    // and surface the event type as a coloured badge ("GOAL",
+    // "SHOT", "PASS", …). Multiple players can be live at once
+    // (e.g. PASS has shooter + receiver). Throttled to 4 Hz so it
+    // doesn't repaint on every video frame.
+    let _lastLiveAt = 0;
+    function refreshLivePlayers(now_s) {
+      if (!payload || !Array.isArray(payload.events)) return;
+      const live = new Map();   // player_id → action label
+      for (const e of payload.events) {
+        if (e.player_id && e.start_s <= now_s && now_s < e.end_s) {
+          // Prefer goal/shot/save labels over generic ones when
+          // multiple events overlap (they shouldn't but defensive).
+          const label = (e.metadata?.outcome || e.type || '').toString().toUpperCase();
+          const prev = live.get(e.player_id);
+          if (!prev || label.length < prev.length) live.set(e.player_id, label);
+        }
+      }
+      document.querySelectorAll('.player-card').forEach(card => {
+        const pid = card.dataset.pid;
+        const lbl = live.get(pid);
+        const wasLive = card.classList.contains('live');
+        if (lbl) {
+          if (!wasLive) card.classList.add('live');
+          const badge = card.querySelector('.action-badge');
+          if (badge && badge.textContent !== lbl) badge.textContent = lbl;
+        } else if (wasLive) {
+          card.classList.remove('live');
+          const badge = card.querySelector('.action-badge');
+          if (badge) badge.textContent = '';
+        }
+      });
+    }
+    player.addEventListener('timeupdate', () => {
+      const now_ms = Date.now();
+      // Throttle to 4 Hz so we don't repaint every video frame.
+      if (now_ms - _lastLiveAt < 250) return;
+      _lastLiveAt = now_ms;
+      refreshLivePlayers(player.currentTime);
+    });
+    // Also refresh on seek, so the right card lights up the moment
+    // the user clicks a different point in the timeline.
+    player.addEventListener('seeked', () => refreshLivePlayers(player.currentTime));
+
     // ---------- Event filter ----------
     function buildEventChips() {
       const types = Array.from(new Set(payload.events.map(e => e.type)));
@@ -867,10 +996,17 @@
         const jersey = p.jersey_number != null ? `#${p.jersey_number}` : '';
         const role = p.role && p.role !== 'player' ? ` · ${p.role}` : '';
         const distNote = p.distance_m != null ? ` · ${p.distance_m.toFixed(1)}m` : '';
-        return `<div class="player-card" data-pid="${p.player_id}">
+        // Use the front body crop as the card background. Falls back
+        // to back-crop, then to flat colour when neither exists.
+        const bg = p.front_crop_url || p.back_crop_url;
+        const bgStyle = bg
+          ? `background-image:url('${bg}'); background-color:#1a2027`
+          : `background-color:${teamColor(p.team_id)}30`;
+        return `<div class="player-card" data-pid="${p.player_id}" style="${bgStyle}">
           <span class="info-btn" data-pid="${p.player_id}" title="Profile">i</span>
           <div class="pid"><span class="team-tag" style="background:${teamColor(p.team_id)}"></span>${p.player_id} ${jersey}</div>
           <div class="meta">${p.team_id}${role} · ${p.frames_observed}f${distNote}</div>
+          <div class="action-badge" data-pid-badge="${p.player_id}"></div>
         </div>`;
       }).join('');
       grid.querySelectorAll('.player-card').forEach(card => {

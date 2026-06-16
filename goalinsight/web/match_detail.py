@@ -45,10 +45,23 @@ _PLAYER_CLIP_GAP_S = 1.0
 def register_match_detail_routes(app: FastAPI, runs: RunRegistry) -> None:
     @app.get("/api/runs/{run_name}/match/data")
     def match_data(run_name: str) -> JSONResponse:
+        from ._runs import IncompleteRunError
         try:
             handle = runs.get(run_name)
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc))
+        except IncompleteRunError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "incomplete_run",
+                    "run_name": exc.run_name,
+                    "message": str(exc),
+                    "stages": exc.stages,
+                    "missing_required": exc.missing_required,
+                    "missing_recommended": exc.missing_recommended,
+                },
+            ) from exc
         return JSONResponse(_build_payload(handle))
 
 

@@ -210,12 +210,33 @@ def run_tracking(
     unified_det = None
     if unified_enabled:
         logger.info("Stage 2: Initializing unified detector (player + ball)...")
+        # Required keys under ``unified_detection``. Missing any of
+        # them is a config bug — fail loudly instead of silently
+        # falling back to a hard-coded default. default.yaml ships
+        # complete values; an override file that strips a key needs to
+        # add it back explicitly. ``model_path`` stays optional (None
+        # means "use the named model from torch hub").
+        _REQUIRED = ("model", "confidence_threshold", "iou_threshold", "imgsz")
+        missing = [k for k in _REQUIRED if k not in unified_config]
+        if missing:
+            raise ValueError(
+                f"unified_detection is missing required keys: {missing}. "
+                f"Set them in your config (or inherit default.yaml which "
+                f"ships defaults). To use the legacy two-pass path "
+                f"instead, set ``unified_detection.enabled: false``."
+            )
+        logger.info(
+            "  unified_detection: model=%s  imgsz=%d  iou=%.2f  conf=%.2f",
+            unified_config["model"], unified_config["imgsz"],
+            unified_config["iou_threshold"],
+            unified_config["confidence_threshold"],
+        )
         unified_det = UnifiedDetector({
-            "model": unified_config.get("model", det_config.get("model", "yolov8x")),
-            "model_path": unified_config.get("model_path", det_config.get("model_path")),
-            "confidence_threshold": unified_config.get("confidence_threshold", 0.3),
-            "iou_threshold": unified_config.get("iou_threshold", 0.45),
-            "imgsz": unified_config.get("imgsz", 1920),
+            "model": unified_config["model"],
+            "model_path": unified_config.get("model_path"),
+            "confidence_threshold": unified_config["confidence_threshold"],
+            "iou_threshold": unified_config["iou_threshold"],
+            "imgsz": unified_config["imgsz"],
         })
         unified_det.load_model()
         # PlayerDetector still needed for filter methods but does not load its own model
@@ -243,6 +264,26 @@ def run_tracking(
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Player bbox size gate. ``max_height`` was 350 — fine on 1080p
+    # (player height there caps around 300 px), but on 4K source the
+    # near-camera players are 400-500 px tall and were silently
+    # dropped (drop:size in yolo_raw). Default both height bounds to
+    # fractions of image height so the filter scales with resolution.
+    # Aspect ratio bounds are still hard-coded — they're resolution-
+    # invariant.
+    _size_cfg = (config.get("detection", {}) or {}).get("size_filter", {}) or {}
+    _size_filter_min_h = int(_size_cfg.get(
+        "min_height", max(15, round(height * 0.012))))     # ~25 on 1080p, ~26 on 4K
+    _size_filter_max_h = int(_size_cfg.get(
+        "max_height", round(height * 0.40)))               # ~432 on 1080p, ~864 on 4K
+    _size_filter_min_aspect = float(_size_cfg.get("min_aspect_ratio", 0.25))
+    _size_filter_max_aspect = float(_size_cfg.get("max_aspect_ratio", 1.0))
+    logger.info(
+        "  Size filter: height in [%d, %d] px, aspect in [%.2f, %.2f]",
+        _size_filter_min_h, _size_filter_max_h,
+        _size_filter_min_aspect, _size_filter_max_aspect,
+    )
 
     # Initialize tracker — backend selectable via tracking.backend
     # ("strongsort" default, or "botsort" for camera-motion-compensated
@@ -725,8 +766,11 @@ def run_tracking(
                     rec.players_post_conf = list(raw_dets)
 
             detections = detector.filter_by_size(
-                raw_dets, min_height=25, max_height=350,
-                min_aspect_ratio=0.25, max_aspect_ratio=1.0,
+                raw_dets,
+                min_height=_size_filter_min_h,
+                max_height=_size_filter_max_h,
+                min_aspect_ratio=_size_filter_min_aspect,
+                max_aspect_ratio=_size_filter_max_aspect,
             )
             if yolo_raw_dump_enabled:
                 yolo_raw_records[_fidx].players_post_size = list(detections)
