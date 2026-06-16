@@ -470,11 +470,28 @@ def create_workspace_app(
         engine = store.engine(sid)
 
         def event_source():
-            assistant_text_parts: list[str] = []
+            # Only persist the FINAL round's text (commentary from
+            # intermediate tool-using rounds is shown in real time but
+            # discarded from the saved transcript so history replay
+            # matches the original buffered behaviour).
+            current_round_text: list[str] = []
+            final_round_text: list[str] = []
             try:
                 for evt in engine.stream(history, current_time):
-                    if evt.get("type") == "text":
-                        assistant_text_parts.append(evt["delta"])
+                    et = evt.get("type")
+                    if et == "round_start":
+                        current_round_text = []
+                        yield f"data: {json.dumps({'event': evt}, ensure_ascii=False)}\n\n"
+                        continue
+                    if et == "round_end":
+                        # Last seen round is the most recent; if it
+                        # ended on end_turn it's the final answer.
+                        if evt.get("stop_reason") != "tool_use":
+                            final_round_text = current_round_text
+                        yield f"data: {json.dumps({'event': evt}, ensure_ascii=False)}\n\n"
+                        continue
+                    if et == "text":
+                        current_round_text.append(evt["delta"])
                         yield f"data: {json.dumps({'delta': evt['delta']})}\n\n"
                     elif evt.get("type") == "tool_use":
                         # Persist before yielding so a stream that dies
@@ -497,10 +514,10 @@ def create_workspace_app(
                         yield f"data: {json.dumps({'event': evt}, ensure_ascii=False)}\n\n"
                     else:
                         yield f"data: {json.dumps({'event': evt}, ensure_ascii=False)}\n\n"
-                # Persist the assistant's final text + the AgentCore
-                # session id so a server restart (or the user closing
-                # the tab and coming back tomorrow) can resume.
-                full = "".join(assistant_text_parts)
+                # Persist the assistant's final-round text + the
+                # AgentCore session id so a server restart (or the user
+                # closing the tab and coming back tomorrow) can resume.
+                full = "".join(final_round_text)
                 if full:
                     store.append_message(sid, {
                         "role": "assistant",

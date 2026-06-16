@@ -138,8 +138,12 @@ class ChatEngine:
     # Generous cap because run_python tool calls can carry hundreds
     # of lines of Python in a single ``code`` argument; truncating at
     # ~1k tokens left input_json incomplete and dispatch failed with
-    # "missing required argument: code".
-    max_tokens: int = 4096
+    # "missing required argument: code". Raised 4096 → 16384 so a single
+    # turn can hold ``run_python(72-line code) + full markdown
+    # explanation + follow-up`` without hitting stop_reason="max_tokens".
+    # Billing is per-actual-token, not per-cap, so the higher ceiling
+    # only matters when the model genuinely wants to write more.
+    max_tokens: int = 16384
     max_retries: int = 2
     # Where run_python plot artifacts land on disk; the FastAPI app
     # mounts this directory at ``artifact_url_prefix`` so the chat UI
@@ -405,10 +409,15 @@ class ChatEngine:
         Why streaming: middle-box idle timeouts (SSH/IDE port forwards,
         load balancers) silently drop connections that go quiet for
         more than a few seconds. We yield bytes within ~1s, keeping
-        the TCP connection lively. tool_use / tool_result events are
-        emitted live so the frontend can show what the model is doing
-        between text deltas; only the FINAL assistant message's text
-        deltas are streamed (intermediate rounds' text is suppressed).
+        the TCP connection lively.
+
+        Live text streaming: text_delta is yielded the moment Bedrock
+        emits it, including from intermediate (tool-using) rounds. The
+        client distinguishes rounds via the per-round
+        ``round_start`` / ``round_end`` markers so it can reset the
+        active bubble whenever a new round begins. The persisted
+        ``messages.jsonl`` only carries the final assistant content
+        block, so history replay is unaffected.
         """
         system_blocks = self._build_system_blocks(current_time)
         bedrock_messages = self._initial_messages(messages)
@@ -430,12 +439,19 @@ class ChatEngine:
                 contentType="application/json",
             )
 
-            # Accumulate the stream into structured content blocks. We
-            # don't know up front whether this round will end on
-            # tool_use or end_turn, so we buffer text deltas and
-            # release them only when we know this is the final round.
+            # Tell the client a new round is starting — it should reset
+            # any active assistant bubble before appending text from
+            # this round.
+            yield {"type": "round_start", "round": round_idx}
+
+            # Accumulate the stream into structured content blocks for
+            # history persistence. Text deltas are ALSO yielded live to
+            # the client (see the text_delta branch below) so users get
+            # a typewriter effect; the round_start / round_end markers
+            # let the client reset its active bubble between rounds so
+            # intermediate-round commentary doesn't merge with the
+            # final answer.
             current_blocks: dict[int, dict[str, Any]] = {}
-            text_deltas: list[tuple[int, str]] = []
             stop_reason: str | None = None
             usage: dict[str, Any] = {}
 
@@ -474,7 +490,9 @@ class ChatEngine:
                         text = delta.get("text", "")
                         current_blocks.setdefault(idx, {"type": "text", "text": ""})
                         current_blocks[idx]["text"] += text
-                        text_deltas.append((idx, text))
+                        # Live yield: stream this chunk to the client now.
+                        if text:
+                            yield {"type": "text", "delta": text}
                     elif dtype == "input_json_delta":
                         partial = delta.get("partial_json", "")
                         current_blocks.setdefault(
@@ -504,8 +522,10 @@ class ChatEngine:
                 # Run tools, surface them to the client as structured
                 # events, append assistant + tool_result back into the
                 # Bedrock conversation, and loop. Intermediate-round
-                # text deltas are dropped — they're usually empty, and
-                # surfacing them would interleave with the final answer.
+                # text was already streamed live; tell the client this
+                # round is done so it can detach the active bubble.
+                yield {"type": "round_end", "round": round_idx,
+                       "stop_reason": "tool_use"}
                 bedrock_messages.append({
                     "role": "assistant",
                     "content": ordered,
@@ -538,12 +558,10 @@ class ChatEngine:
                 bedrock_messages.append({"role": "user", "content": tool_results_msg})
                 continue
 
-            # Final round — stream out the buffered text deltas in order.
-            # We buffered them rather than yielding live because we
-            # didn't yet know whether this round would end on tool_use.
-            for _, text in text_deltas:
-                if text:
-                    yield {"type": "text", "delta": text}
+            # Final round — text already streamed live above. Just
+            # signal completion so the client can finalise the bubble.
+            yield {"type": "round_end", "round": round_idx,
+                   "stop_reason": stop_reason or "end_turn"}
             return
 
         logger.warning("Stream hit MAX_TOOL_ROUNDS=%d", MAX_TOOL_ROUNDS)

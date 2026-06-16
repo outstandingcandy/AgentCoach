@@ -3,6 +3,15 @@
 <head>
   <meta charset="UTF-8" />
   <title>GoalInsight Viewer</title>
+  <!-- Markdown + syntax highlighting for assistant code blocks. CDN
+       choices: jsdelivr is the only one that responds reliably from
+       both public internet and the EC2 here. Pinned to known-good
+       majors so a CDN-side update doesn't surprise the page. -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/highlight.min.js"></script>
   <style>
     * { box-sizing: border-box; }
     html, body { height: 100%; margin: 0; background: #101418; color: #e6e9ee;
@@ -24,6 +33,53 @@
            max-width: 92%; font-size: 14px; }
     .msg.user { background: #2a4661; align-self: flex-end; }
     .msg.assistant { background: #1e242b; align-self: flex-start; border: 1px solid #2a323c; }
+    /* Markdown body inside an assistant bubble. Reset pre-wrap so the
+       block layout (paragraphs / lists / code blocks) controls
+       spacing instead of inheriting plain-text whitespace. */
+    .msg.assistant .md-body { white-space: normal; }
+    .msg.assistant .md-body > *:first-child { margin-top: 0; }
+    .msg.assistant .md-body > *:last-child { margin-bottom: 0; }
+    .msg.assistant .md-body p { margin: 6px 0; }
+    .msg.assistant .md-body ul,
+    .msg.assistant .md-body ol { margin: 6px 0; padding-left: 22px; }
+    .msg.assistant .md-body li { margin: 2px 0; }
+    .msg.assistant .md-body h1,
+    .msg.assistant .md-body h2,
+    .msg.assistant .md-body h3,
+    .msg.assistant .md-body h4 { margin: 10px 0 4px; line-height: 1.2; }
+    .msg.assistant .md-body h1 { font-size: 18px; }
+    .msg.assistant .md-body h2 { font-size: 16px; }
+    .msg.assistant .md-body h3 { font-size: 14px; font-weight: 700; }
+    .msg.assistant .md-body h4 { font-size: 13px; font-weight: 700; color: #b8c0c8; }
+    .msg.assistant .md-body code {
+      background: #0d1116; padding: 1px 5px; border-radius: 4px;
+      border: 1px solid #2a323c;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12.5px;
+    }
+    .msg.assistant .md-body pre {
+      background: #0d1116; border: 1px solid #2a323c; border-radius: 6px;
+      padding: 10px 12px; margin: 8px 0; overflow-x: auto;
+      max-width: 100%;
+    }
+    .msg.assistant .md-body pre code {
+      background: transparent; border: 0; padding: 0;
+      display: block; white-space: pre;
+      font-size: 12px; line-height: 1.5;
+    }
+    .msg.assistant .md-body blockquote {
+      border-left: 3px solid #3b82f6; margin: 6px 0; padding: 2px 10px;
+      color: #b8c0c8; background: rgba(59, 130, 246, 0.06);
+    }
+    .msg.assistant .md-body a { color: #6fa8ff; }
+    .msg.assistant .md-body table {
+      border-collapse: collapse; margin: 8px 0; font-size: 13px;
+    }
+    .msg.assistant .md-body th,
+    .msg.assistant .md-body td {
+      border: 1px solid #2a323c; padding: 4px 8px;
+    }
+    .msg.assistant .md-body th { background: #1e242b; }
     .msg.system-hint { background: transparent; color: #6b7380; font-style: italic; font-size: 12px; align-self: center; }
     .msg .meta { font-size: 11px; color: #9aa3ad; margin-bottom: 4px; }
     #composer { padding: 12px; border-top: 1px solid #262b33; display: flex; gap: 8px; }
@@ -47,12 +103,36 @@
     /* Tool-call cards (run_python and the canned match tools) */
     .tool-card { align-self: flex-start; max-width: 92%; width: 92%;
       background: #141a21; border: 1px solid #2a323c; border-radius: 10px;
-      font-size: 12px; color: #cfe3ff; overflow: hidden; }
+      font-size: 12px; color: #cfe3ff; }
+    /* Note: ``overflow: hidden`` was here to clip the rounded corners,
+       but it interacted with <details> in a way that, when collapsed,
+       computed the card's height as ~3 px even though the summary
+       inside flexed to 28 px. Visually the summary text leaked out
+       and looked like it was being covered by the next card. The
+       summary already lives inside the rounded card via padding, so
+       no clipping is needed. */
     .tool-card.python { border-color: #3b6ea8; }
     .tool-card summary { cursor: pointer; padding: 8px 12px;
       display: flex; gap: 8px; align-items: center; list-style: none;
       user-select: none; }
     .tool-card summary::-webkit-details-marker { display: none; }
+    /* Disclosure caret (▶ / ▼). The native marker is hidden above so
+       chips look uniform across browsers; this is a manual pseudo-
+       element that points right when collapsed and rotates 90° down
+       when the <details> is open. */
+    .tool-card summary::before {
+      content: '';
+      display: inline-block;
+      width: 0; height: 0;
+      margin-right: 2px;
+      border-top: 4px solid transparent;
+      border-bottom: 4px solid transparent;
+      border-left: 6px solid #9aa3ad;
+      transition: transform 0.15s ease-out;
+      flex-shrink: 0;
+    }
+    .tool-card[open] summary::before { transform: rotate(90deg); }
+    .tool-card summary:hover::before { border-left-color: #cfe3ff; }
     .tool-card .tool-icon { font-size: 14px; }
     .tool-card .tool-name { font-weight: 600; color: #e6e9ee; }
     .tool-card .tool-status { margin-left: auto; font-size: 11px;
@@ -64,7 +144,14 @@
       border-radius: 6px; padding: 8px 10px; margin: 6px 0;
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 11.5px; line-height: 1.45; color: #cfe3ff;
-      max-height: 280px; overflow: auto; white-space: pre-wrap;
+      /* No height cap — let the code/stdout/stderr block grow with its
+         content. Earlier we capped at 280 px (then 640 px) to keep the
+         tool card "tidy", but capping triggers an inner scrollbar the
+         instant the snippet exceeds the cap, which reads as the code
+         block shrinking the moment streaming finishes. The chat pane
+         already has its own outer scroll (#messages overflow-y:auto),
+         so users scroll the chat naturally and see the full block. */
+      overflow-x: auto; white-space: pre-wrap;
       word-break: break-word; }
     .tool-card .tool-label { font-size: 10.5px; color: #9aa3ad;
       letter-spacing: 0.04em; text-transform: uppercase;
@@ -365,6 +452,21 @@
 
     function renderWithSeeks(target, text) {
       target.textContent = '';
+      // Render assistant content as markdown when the libs are loaded
+      // — otherwise (e.g. CDN unreachable) fall back to the legacy
+      // text + seek/img inline path so the chat is still readable.
+      const hasMarked = typeof window.marked !== 'undefined';
+      const hasPurify = typeof window.DOMPurify !== 'undefined';
+      if (hasMarked && hasPurify) {
+        renderMarkdownWithSeeks(target, text);
+      } else {
+        renderInlineMatchesOnly(target, text);
+      }
+    }
+
+    // Legacy: text + inline [seek] / ![](url) — kept as a fallback
+    // for when the CDN-hosted markdown libraries fail to load.
+    function renderInlineMatchesOnly(target, text) {
       const matches = inlineMatches(text);
       let last = 0;
       for (const m of matches) {
@@ -376,6 +478,114 @@
       }
       if (last < text.length) {
         target.appendChild(document.createTextNode(text.slice(last)));
+      }
+    }
+
+    // Markdown render path. Strategy:
+    //   1) Run the text through marked → sanitized HTML, dropped into
+    //      a wrapper div (.md-body) so our CSS only scopes to it.
+    //   2) Walk that wrapper's text nodes (skipping <code>/<pre>) and
+    //      replace [m:ss] / [m:ss.f] tokens with clickable seek
+    //      buttons — preserving the click-to-seek behaviour without
+    //      letting the markdown renderer touch the timestamps.
+    //   3) Highlight code blocks via highlight.js when available.
+    //   4) Hide chat_artifact images that already appear in tool
+    //      cards (same de-dup rule as the legacy path).
+    function renderMarkdownWithSeeks(target, text) {
+      target.classList.add('md-body');
+      const rawHtml = window.marked.parse(text || '', {
+        breaks: true, gfm: true, mangle: false, headerIds: false,
+      });
+      const safeHtml = window.DOMPurify.sanitize(rawHtml, {
+        ADD_ATTR: ['target'],
+      });
+      target.innerHTML = safeHtml;
+
+      // Replace [seek] tokens that landed inside text nodes.
+      replaceSeekTokens(target);
+
+      // Highlight code blocks — best effort, ignore unknown languages.
+      if (typeof window.hljs !== 'undefined') {
+        target.querySelectorAll('pre code').forEach((el) => {
+          try { window.hljs.highlightElement(el); } catch (_e) { /* ignore */ }
+        });
+      }
+
+      // De-dup chat_artifact images vs tool cards (same rule as legacy).
+      target.querySelectorAll('img').forEach((img) => {
+        img.classList.add('chat-art');
+        const url = img.getAttribute('src') || '';
+        const dups = toolArtifactImgs.get(url);
+        if (!dups) return;
+        for (const e of dups) {
+          e.style.display = 'none';
+          const row = e._artRow;
+          if (row) {
+            const stillVisible = Array.from(row.children).some(
+              c => c.style.display !== 'none');
+            if (!stillVisible) {
+              row.style.display = 'none';
+              if (e._artLabel) e._artLabel.style.display = 'none';
+            }
+          }
+        }
+      });
+    }
+
+    // Walk text nodes (skipping code/pre) and turn [m:ss] / [m:ss.f]
+    // patterns into clickable seek buttons in place.
+    function replaceSeekTokens(root) {
+      const walker = document.createTreeWalker(
+        root, NodeFilter.SHOW_TEXT, {
+          acceptNode(n) {
+            // Skip text inside <code> or <pre> — timestamps in code
+            // shouldn't become buttons.
+            let p = n.parentNode;
+            while (p && p !== root) {
+              const tag = p.nodeName;
+              if (tag === 'CODE' || tag === 'PRE') {
+                return NodeFilter.FILTER_REJECT;
+              }
+              p = p.parentNode;
+            }
+            return NodeFilter.FILTER_ACCEPT;
+          },
+        },
+      );
+      const SEEK = /\[(\d{1,3}):([0-5]\d)(?:\.(\d{1,2}))?\]/g;
+      const targets = [];
+      let cur;
+      while ((cur = walker.nextNode())) {
+        if (SEEK.test(cur.nodeValue)) targets.push(cur);
+        SEEK.lastIndex = 0;
+      }
+      for (const node of targets) {
+        const parent = node.parentNode;
+        const text = node.nodeValue;
+        const frag = document.createDocumentFragment();
+        let last = 0;
+        for (const m of text.matchAll(SEEK)) {
+          if (m.index > last) {
+            frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+          }
+          const min = parseInt(m[1], 10);
+          const sec = parseInt(m[2], 10);
+          const frac = m[3] ? parseFloat('0.' + m[3]) : 0;
+          const t = min * 60 + sec + frac;
+          const label = m[3]
+            ? `${m[1]}:${m[2]}.${m[3]}` : `${m[1]}:${m[2]}`;
+          const btn = document.createElement('span');
+          btn.className = 'seek';
+          btn.textContent = label;
+          btn.title = `Jump to ${label}`;
+          btn.addEventListener('click', () => seekTo(t));
+          frag.appendChild(btn);
+          last = m.index + m[0].length;
+        }
+        if (last < text.length) {
+          frag.appendChild(document.createTextNode(text.slice(last)));
+        }
+        parent.replaceChild(frag, node);
       }
     }
 
@@ -629,7 +839,18 @@
                 messagesEl.scrollTop = messagesEl.scrollHeight;
               } else if (obj.event) {
                 const e = obj.event;
-                if (e.type === 'tool_use') {
+                if (e.type === 'round_start') {
+                  // A new Bedrock round is starting (model is about to
+                  // either run more tools or write the final answer).
+                  // Reset the active bubble + accumulator so the next
+                  // text deltas land in a fresh assistant message,
+                  // visually separated from this round's tool cards.
+                  placeholder = null;
+                  acc = '';
+                } else if (e.type === 'round_end') {
+                  // No-op for now — useful if we ever want to lock the
+                  // bubble, mark a 'finalised' style, etc.
+                } else if (e.type === 'tool_use') {
                   toolHandles[e.id] = addToolCard(e);
                 } else if (e.type === 'tool_result') {
                   // If the tool_use card never made it (page loaded
