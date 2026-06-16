@@ -34,7 +34,15 @@ from .match_tools import _frame_to_time
 # Default ± window for events without their own start_frame/end_frame.
 _DEFAULT_PRE_S = 2.0
 _DEFAULT_POST_S = 2.0
-# Goal/shot windows lean on highlights' build-up + celebration logic.
+# Tight ± window around shot/goal events for the page timeline. The
+# wider buildup-+-celebration framing in highlights is for clip
+# rendering, not for the live timeline — there it just smears the
+# event marker across many seconds. 0.5 s on each side keeps the
+# striker badge on for the kick + immediate aftermath only.
+_SHOT_PRE_S = 0.5
+_SHOT_POST_S = 0.5
+# Buildup/celebration constants kept for the (now unused on the page)
+# highlight clip path; left in place for cross-imports.
 _BUILDUP_MAX_S = 8.0
 _BUILDUP_PAD_S = 1.5
 _CELEBRATION_S = 4.0
@@ -404,21 +412,17 @@ def _event_window_frames(
     total = ctx.frame_count or None
 
     if et in {"goal", "shot"}:
-        md = event.get("metadata") or {}
-        side = md.get("goal_side") or md.get("side") or "right"
-        try:
-            start_f = find_buildup_start(
-                ctx, frame, side,
-                max_seconds=_BUILDUP_MAX_S,
-                padding_seconds=_BUILDUP_PAD_S,
-            )
-        except Exception:  # noqa: BLE001
-            start_f = max(0, frame - int(_BUILDUP_MAX_S * fps))
-        end_f = find_celebration_end(
-            frame, fps,
-            duration_seconds=_CELEBRATION_S,
-            total_frames=total,
-        )
+        # Tight window centred on the shot frame — just the kick and
+        # the moment after. The previous build-up-to-celebration
+        # framing was inherited from the highlight clip pipeline and
+        # made the timeline marker span 10+ seconds, which read as
+        # "the player was shooting for 10 s" on the live badge.
+        pre = int(_SHOT_PRE_S * fps)
+        post = int(_SHOT_POST_S * fps)
+        start_f = max(0, frame - pre)
+        end_f = frame + post
+        if total is not None:
+            end_f = min(end_f, total - 1)
         return start_f, end_f
 
     sf = event.get("start_frame")

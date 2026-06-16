@@ -880,11 +880,18 @@
     function refreshLivePlayers(now_s) {
       if (!payload || !Array.isArray(payload.events)) return;
       const live = new Map();   // player_id → action label
+      // Outcomes that are noise on the live badge: "Goal" duplicates the
+      // GOAL event type, "successful" is the default pass result and just
+      // adds visual clutter. Other outcomes (Saved, Off_Target, Blocked,
+      // failed) still surface so the user can see them.
+      const HIDE_OUTCOME = new Set(['goal', 'successful']);
       for (const e of payload.events) {
         if (e.player_id && e.start_s <= now_s && now_s < e.end_s) {
-          // Prefer goal/shot/save labels over generic ones when
-          // multiple events overlap (they shouldn't but defensive).
-          const label = (e.metadata?.outcome || e.type || '').toString().toUpperCase();
+          // Prefer outcome labels over generic ones when multiple
+          // events overlap, except for the muted ones above.
+          const raw = e.metadata?.outcome;
+          const useOutcome = raw && !HIDE_OUTCOME.has(String(raw).toLowerCase());
+          const label = ((useOutcome ? raw : e.type) || '').toString().toUpperCase();
           const prev = live.get(e.player_id);
           if (!prev || label.length < prev.length) live.set(e.player_id, label);
         }
@@ -955,11 +962,18 @@
         count.textContent = '';
         return;
       }
+      // Suppress the redundant outcome tags on the row meta column —
+      // "Goal" duplicates the event type chip, "successful" is the
+      // default pass result. Surfacing failures (Saved, Off_Target,
+      // Blocked, failed) is still useful so they pass through.
+      const HIDE_OUTCOME = new Set(['goal', 'successful']);
       list.innerHTML = events.map((e, i) => {
         const team = e.team_id && e.team_id !== 'unknown'
           ? `<span class="team-tag" style="background:${teamColor(e.team_id)}"></span>${e.team_id}` : '';
         const player = e.player_id ? ` · ${e.player_id}` : '';
-        const outcome = (e.metadata || {}).outcome ? ` · ${(e.metadata).outcome}` : '';
+        const rawOutcome = (e.metadata || {}).outcome;
+        const showOutcome = rawOutcome && !HIDE_OUTCOME.has(String(rawOutcome).toLowerCase());
+        const outcome = showOutcome ? ` · ${rawOutcome}` : '';
         return `<div class="row" data-i="${i}">
           <span>${fmtTime(e.start_s)} → ${fmtTime(e.end_s)}${player}</span>
           <span class="meta">${team}${outcome}</span>
@@ -1178,6 +1192,15 @@
         ]);
         meta = m;
         payload = p;
+        // ``goal`` is a derived status of a SHOT (the shot's outcome
+        // already encodes whether the ball went in), so it's noise as
+        // a standalone event row / chip / live badge — same treatment
+        // as the ``successful`` outcome we hide elsewhere. Filter at
+        // the source so all downstream UI (chip row, event list, live
+        // player badge, event count meta) stays consistent.
+        if (Array.isArray(payload.events)) {
+          payload.events = payload.events.filter(e => e.type !== 'goal');
+        }
         // tracks.json is keyed by str(frame); convert to plain object lookup
         // with integer keys so the rAF loop can index by current frame.
         tracksByFrame = {};
