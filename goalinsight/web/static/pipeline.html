@@ -86,6 +86,10 @@
                        padding: 9px 14px; font-weight: 600; font-size: 12px;
                        cursor: pointer; border-bottom: 2px solid transparent; }
     .vis-tabs button.active { color: #cfe3ff; border-bottom-color: #3b82f6; }
+    .vis-mode-toggle button { background: #1f2730; color: #9aa3ad; border: 1px solid #2a323c;
+      border-radius: 3px; cursor: pointer; }
+    .vis-mode-toggle button.active { background: #2c3a52; color: #cfe3ff;
+      border-color: #3b82f6; }
     .vis-body { padding: 12px; }
     .vis-slider-row { display: flex; gap: 10px; align-items: center;
                       font-size: 12px; color: #9aa3ad; margin-bottom: 8px; }
@@ -390,6 +394,8 @@
     }
 
     function renderStagePane(mf) {
+      // Stop any ongoing frame-playback in the previous pane.
+      if (typeof window._stopAllVisPlay === 'function') window._stopAllVisPlay();
       const pane = $("#stage-pane");
       if (!mf.exists) {
         pane.innerHTML = `<div class="stage-title"><h2>${escapeHTML(mf.stage)}</h2>
@@ -468,7 +474,7 @@
     function renderVis(mf) {
       const vis = mf.vis_dirs || [];
       if (!vis.length) {
-        // Check for top-level mp4s in files list — fall back to inline player.
+        // Fallback: if no frames dir but a stage mp4 exists, embed it.
         const mp4 = (mf.files || []).find(f => f.url.endsWith('.mp4'));
         if (mp4) {
           return `<div class="vis-card">
@@ -503,17 +509,34 @@
       const ext = vd.ext || '.jpg';
       const sample = String(first).padStart(pad, '0');
       const url = `/runs_static/${encodeURIComponent(activeRun)}/${vd.url_prefix}/frame_${sample}${ext}`;
+      // Inline playback: ▶/⏸ button + fps + resolution. Resolution
+      // is appended as ``?w=720|1080|1920|3840``; the server-side
+      // ``/runs_static`` handler downscales 4K source jpgs on the
+      // fly (cached). 1080p ≈ 250 KB / frame, easy to play at 10 fps.
       return `<div class="vis-body" data-vis-body="${index}"
                    style="display:${index === 0 ? '' : 'none'}">
         <div class="vis-slider-row">
+          <button data-vis-play="${index}" style="padding:3px 10px">▶</button>
+          <select data-vis-fps="${index}" style="padding:2px 4px" title="frames per second">
+            <option value="5">5 fps</option>
+            <option value="10" selected>10 fps</option>
+            <option value="15">15 fps</option>
+            <option value="30">30 fps</option>
+          </select>
+          <select data-vis-res="${index}" style="padding:2px 4px" title="image resolution">
+            <option value="720">720p</option>
+            <option value="1080" selected>1080p</option>
+            <option value="1920">1920px</option>
+            <option value="">original</option>
+          </select>
           <input type="range" min="0" max="${vd.frames.length - 1}" value="0"
-                 data-vis-slider="${index}">
+                 data-vis-slider="${index}" style="flex:1">
           <span class="vis-frame-label" data-vis-label="${index}">
             frame ${first}  (1/${vd.frames.length})
           </span>
         </div>
         <div class="vis-img-wrap">
-          <img data-vis-img="${index}" src="${url}" alt="frame">
+          <img data-vis-img="${index}" src="${url}?w=1080" alt="frame">
         </div>
       </div>`;
     }
@@ -526,6 +549,131 @@
             b.classList.toggle('active', b.dataset.visTab === idx));
           document.querySelectorAll('[data-vis-body]').forEach(b =>
             b.style.display = b.dataset.visBody === idx ? '' : 'none');
+        });
+      });
+      // Inline playback — ▶/⏸ steps the slider on a setInterval at
+      // the user-chosen fps. State is attached directly to the
+      // button DOM element (``btn._playTimer``) so it survives
+      // renderStagePane/wireVisHandlers re-runs and so a stop request
+      // doesn't get stranded in an old closure.
+      function stopPlay(btn) {
+        if (!btn || !btn._playTimer) return;
+        clearInterval(btn._playTimer);
+        btn._playTimer = null;
+        btn.textContent = '▶';
+      }
+      window._stopAllVisPlay = () => {
+        document.querySelectorAll('[data-vis-play]').forEach(stopPlay);
+      };
+      // Direct slider→image updater. The frame jpgs are 4K (~1.3 MB
+      // each), so we keep a small ahead-of-time prefetch buffer to
+      // hide network latency during playback. We also wait for each
+      // image to actually decode before swapping the visible <img>'s
+      // src — that prevents the "blink to white then load" you see
+      // when assigning .src on a still-downloading image.
+      const _prefetchCache = new Map();   // url → HTMLImageElement (decoded)
+      const _PREFETCH_WINDOW = 8;
+      function _resForIdx(idx) {
+        const sel = document.querySelector(`[data-vis-res="${idx}"]`);
+        return (sel?.value || '').trim();
+      }
+      function _frameUrl(vd, valueIdx, idx) {
+        const f = vd.frames[valueIdx];
+        const pad = vd.digits || 5;
+        const ext = vd.ext || '.jpg';
+        const sample = String(f).padStart(pad, '0');
+        const base = `/runs_static/${encodeURIComponent(activeRun)}/${vd.url_prefix}/frame_${sample}${ext}`;
+        const w = (idx !== undefined) ? _resForIdx(idx) : '';
+        // ``activeRun`` is constant per session, but frame jpgs may
+        // be re-rendered while the page stays open (e.g. when the
+        // user pokes the pipeline). Append a short page-load tag so
+        // the browser cache treats post-reload requests as fresh.
+        // Server-side resize cache stays sane (it keys on mtime_ns).
+        const cacheBust = window._pageLoadTag ||
+          (window._pageLoadTag = String(Date.now()));
+        const sep = w ? `?w=${w}&_=${cacheBust}` : `?_=${cacheBust}`;
+        return base + sep;
+      }
+      function _prefetch(url) {
+        if (_prefetchCache.has(url)) return _prefetchCache.get(url);
+        const img = new Image();
+        img.src = url;
+        _prefetchCache.set(url, img);
+        // Bound the cache so long playback doesn't leak memory.
+        if (_prefetchCache.size > 64) {
+          const oldest = _prefetchCache.keys().next().value;
+          _prefetchCache.delete(oldest);
+        }
+        return img;
+      }
+      function updateVisFrame(idx, valueIdx) {
+        const vd = currentManifest?.vis_dirs?.[parseInt(idx)];
+        if (!vd) return;
+        const url = _frameUrl(vd, valueIdx, idx);
+        const img = document.querySelector(`[data-vis-img="${idx}"]`);
+        const lab = document.querySelector(`[data-vis-label="${idx}"]`);
+        if (lab) {
+          lab.textContent = `frame ${vd.frames[valueIdx]}  (${valueIdx + 1}/${vd.frames.length})`;
+        }
+        if (!img) return;
+        // If already decoded, swap immediately. Otherwise kick off
+        // the load and only swap when complete (visible image stays
+        // on the previous frame in the meantime — no blinking).
+        const cached = _prefetch(url);
+        if (cached.complete && cached.naturalWidth > 0) {
+          img.src = url;
+        } else {
+          cached.onload = () => { img.src = url; };
+        }
+        // Prefetch the next N frames at the same resolution.
+        for (let k = 1; k <= _PREFETCH_WINDOW; k++) {
+          const next = (valueIdx + k) % vd.frames.length;
+          _prefetch(_frameUrl(vd, next, idx));
+        }
+      }
+
+      document.querySelectorAll('[data-vis-play]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const idx = btn.dataset.visPlay;
+          if (btn._playTimer) {
+            stopPlay(btn);
+            return;
+          }
+          const sl = document.querySelector(`[data-vis-slider="${idx}"]`);
+          const fpsSel = document.querySelector(`[data-vis-fps="${idx}"]`);
+          if (!sl) return;
+          const fps = parseInt(fpsSel?.value || '10', 10);
+          btn.textContent = '⏸';
+          const interval = Math.max(33, Math.round(1000 / fps));
+          btn._playTimer = setInterval(() => {
+            const max = parseInt(sl.max, 10);
+            let v = parseInt(sl.value, 10);
+            v = (v + 1) > max ? 0 : v + 1;
+            sl.value = String(v);
+            updateVisFrame(idx, v);
+          }, interval);
+        });
+      });
+      // Changing resolution: clear prefetch cache and refresh
+      // current frame at the new resolution. Cache is keyed on full
+      // URL (including ?w=), so old entries become naturally stale —
+      // dropping them keeps memory bounded.
+      document.querySelectorAll('[data-vis-res]').forEach((sel) => {
+        sel.addEventListener('change', () => {
+          const idx = sel.dataset.visRes;
+          _prefetchCache.clear();
+          const sl = document.querySelector(`[data-vis-slider="${idx}"]`);
+          if (sl) updateVisFrame(idx, parseInt(sl.value, 10));
+        });
+      });
+      // Changing fps mid-play: restart with new interval.
+      document.querySelectorAll('[data-vis-fps]').forEach((sel) => {
+        sel.addEventListener('change', () => {
+          const idx = sel.dataset.visFps;
+          const btn = document.querySelector(`[data-vis-play="${idx}"]`);
+          if (!btn || !btn._playTimer) return;
+          stopPlay(btn);
+          btn.click();
         });
       });
       document.querySelectorAll('[data-vis-slider]').forEach((sl) => {
@@ -653,7 +801,13 @@
                   ${origs.length} orig track${origs.length > 1 ? 's' : ''} · ${totalThumbs} thumbs
                 </span>
               </div>
-              ${origs.map(([orig, items]) => `
+              ${origs.map(([orig, items]) => {
+                const rec = llm[orig];
+                const isBatched = Array.isArray(rec?.batches) && rec.batches.length > 0;
+                const body = isBatched
+                  ? renderBatchedTrackBody(orig, rec, items)
+                  : renderLegacyTrackBody(orig, rec, items);
+                return `
                 <details class="orig-block" style="margin:4px 0 4px 4px">
                   <summary style="font-size:11px;color:#cfe3ff;cursor:pointer;
                                   padding:4px 6px;border-radius:4px;
@@ -663,53 +817,15 @@
                     <span class="caret" style="display:inline-block;width:10px;
                                                 color:#6b7380;transition:transform 0.1s">▶</span>
                     orig ${escapeHTML(orig)}
-                    <span style="color:#6b7380">(${items.length} crops)</span>
-                    ${renderLLMVerdictInline(llm[orig])}
+                    <span style="color:#6b7380">(${items.length} crops${isBatched ? ' · ' + rec.batches.length + ' batches' : ''})</span>
+                    ${renderLLMVerdictInline(rec)}
                   </summary>
                   <div style="padding:6px 0 0 14px">
-                    ${renderLLMVerdict(llm[orig])}
-                    <div class="thumb-grid">
-                      ${items.map(t => {
-                        const m = /_f0*(\d+)\.[a-z]+$/i.exec(t.name);
-                        const frame = m ? parseInt(m[1], 10) : null;
-                        const dataAttr = frame !== null ? ` data-frame="${frame}"` : '';
-                        const cls = frame !== null ? ' thumb-jump' : '';
-                        const title = frame !== null ? ` title="jump to frame ${frame}"` : '';
-                        // Look up the OCR verdict for this crop: per_track.json
-                        // stores the same crops (keyed by .name) with
-                        // ocr_reading / ocr_confidence / ocr_visible fields.
-                        const llmCrops = llm[orig]?.crops || [];
-                        const crop = llmCrops.find(c => c.name === t.name);
-                        let ocrLabel = '';
-                        if (crop) {
-                          const reading = crop.ocr_reading;
-                          const cc = crop.ocr_confidence;
-                          const visible = crop.ocr_visible || '';
-                          if (reading != null) {
-                            ocrLabel = `<div class="thumb-ocr ocr-hit"
-                              title="${escapeHTML(visible)}">
-                              #${reading}<span style="color:#9aa3ad">·${cc?.toFixed(2)}</span>
-                            </div>`;
-                          } else if (visible) {
-                            ocrLabel = `<div class="thumb-ocr ocr-miss"
-                              title="${escapeHTML(visible)}">
-                              ${escapeHTML(visible.length > 14
-                                ? visible.slice(0,14) + '…' : visible)}
-                            </div>`;
-                          }
-                        }
-                        return `<div>
-                          <img src="/runs_static/${encodeURIComponent(activeRun)}/${t.url}"
-                               alt="${escapeHTML(t.name)}" loading="lazy"
-                               class="thumb-img${cls}"${dataAttr}${title}
-                               style="cursor:${frame !== null ? 'pointer' : 'default'}">
-                          <div class="thumb-label">${escapeHTML(t.name.replace(/^track_\d+_/, ''))}</div>
-                          ${ocrLabel}
-                        </div>`;
-                      }).join('')}
-                    </div>
+                    ${renderLLMVerdict(rec)}
+                    ${body}
                   </div>
-                </details>`).join('')}
+                </details>`;
+              }).join('')}
             </div>`;
           }).join('')}
         </div>
@@ -760,6 +876,177 @@
         ${reason ? `<div style="color:#9aa3ad;margin-top:3px">↳ ${escapeHTML(reason)}</div>` : ''}
         ${mov ? `<div style="color:#6b7380;margin-top:2px;font-style:italic">${escapeHTML(mov)}</div>` : ''}
       </div>`;
+    }
+
+    // Lightbox helper — one shared overlay element that pops a
+    // full-size image when the user clicks any thumb / montage. Lazy
+    // creates the DOM on first use; ``Esc`` or click anywhere
+    // dismisses it.
+    function showLightbox(url) {
+      let lb = document.getElementById('lightbox-overlay');
+      if (!lb) {
+        lb = document.createElement('div');
+        lb.id = 'lightbox-overlay';
+        lb.style.cssText = `position:fixed;inset:0;background:rgba(0,0,0,0.85);
+                             display:none;align-items:center;justify-content:center;
+                             z-index:10000;cursor:zoom-out;padding:20px`;
+        const img = document.createElement('img');
+        img.id = 'lightbox-img';
+        img.style.cssText = `max-width:100%;max-height:100%;object-fit:contain;
+                              border:1px solid #2a323c;border-radius:4px`;
+        lb.appendChild(img);
+        lb.addEventListener('click', () => { lb.style.display = 'none'; });
+        document.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') lb.style.display = 'none';
+        });
+        document.body.appendChild(lb);
+      }
+      const img = document.getElementById('lightbox-img');
+      img.src = url;
+      lb.style.display = 'flex';
+    }
+    window.showLightbox = showLightbox;
+
+    // Render a track in the new "batched OCR" format:
+    //   - one collapsible <details> per LLM batch
+    //   - summary shows batch index, crop count, LLM read + confidence
+    //   - body shows the montage image (click to enlarge) + the
+    //     individual source crops that went into it
+    // No top-level thumb grid — the per-batch view IS the per-crop
+    // view, organised by what the LLM actually saw together.
+    function renderBatchedTrackBody(orig, rec, items) {
+      const batches = rec?.batches || [];
+      // Build a name → item lookup once so each batch can pull just
+      // its source crops cheaply.
+      const itemByName = new Map();
+      for (const it of items) itemByName.set(it.name, it);
+      const cropMeta = rec?.crops || [];
+      const cropByIdx = (idx) => {
+        const meta = cropMeta[idx];
+        if (!meta) return null;
+        return {
+          ...meta,
+          item: itemByName.get(meta.name),
+        };
+      };
+      const blocks = batches.map((b, bi) => {
+        const reading = b.ocr_reading;
+        const cc = b.ocr_confidence;
+        const visible = b.ocr_visible || '';
+        const idxs = b.crop_indices || [];
+        const montageUrl = `/runs_static/${encodeURIComponent(activeRun)}/track_consolidation/llm_inputs/montages/${b.name}`;
+
+        let summaryLabel;
+        if (reading != null) {
+          summaryLabel = `<span style="color:#cfe3ff;font-weight:600">#${reading}</span>
+            <span style="color:#9aa3ad">· conf ${cc?.toFixed(2)}</span>`;
+        } else {
+          summaryLabel = `<span style="color:#9aa3ad">no read</span>`;
+        }
+
+        // Source crops fed into this montage, in row-major order.
+        const sourceCrops = idxs.map(i => {
+          const meta = cropByIdx(i);
+          if (!meta || !meta.item) return '';
+          const it = meta.item;
+          const m = /_f0*(\d+)\.[a-z]+$/i.exec(it.name);
+          const frame = m ? parseInt(m[1], 10) : null;
+          const dataAttr = frame !== null ? ` data-frame="${frame}"` : '';
+          const cls = frame !== null ? ' thumb-jump' : '';
+          const title = frame !== null ? ` title="jump to frame ${frame}"` : '';
+          return `<div>
+            <img src="/runs_static/${encodeURIComponent(activeRun)}/${it.url}"
+                 alt="${escapeHTML(it.name)}" loading="lazy"
+                 class="thumb-img${cls}"${dataAttr}${title}>
+            <div class="thumb-label">${escapeHTML(it.name.replace(/^track_\d+_/, ''))}</div>
+          </div>`;
+        }).join('');
+
+        return `<details class="batch-block" style="margin:4px 0;
+                                                    border:1px solid #2a323c;
+                                                    border-radius:4px;
+                                                    background:#0d1116">
+          <summary style="font-size:11px;color:#cfe3ff;cursor:pointer;
+                          padding:6px 8px;list-style:none;
+                          display:flex;align-items:center;gap:8px;
+                          font-family:ui-monospace,'SF Mono',monospace">
+            <span class="caret" style="display:inline-block;width:10px;
+                                       color:#6b7380">▶</span>
+            <span>batch ${bi}</span>
+            <span style="color:#6b7380">· ${idxs.length} crops</span>
+            <span style="margin-left:auto">${summaryLabel}</span>
+          </summary>
+          <div style="padding:8px;display:grid;grid-template-columns:auto 1fr;gap:12px">
+            <div>
+              <img src="${montageUrl}" loading="lazy"
+                   onclick="window.showLightbox('${montageUrl}')"
+                   alt="${escapeHTML(b.name)}"
+                   style="height:240px;border:1px solid #1f2730;border-radius:3px;
+                          cursor:zoom-in;display:block">
+              <div style="font-size:10px;color:#6b7380;margin-top:4px;text-align:center">
+                click to enlarge
+              </div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:#9aa3ad;margin-bottom:4px">
+                LLM verdict — ${summaryLabel}
+              </div>
+              ${visible ? `<div style="font-size:11px;color:#cfe3ff;
+                                        background:#161c24;padding:4px 6px;
+                                        border-radius:3px;margin-bottom:8px">
+                ↳ ${escapeHTML(visible)}
+              </div>` : ''}
+              <div style="font-size:10px;color:#6b7380;margin-bottom:4px">
+                source crops fed to montage (${idxs.length}):
+              </div>
+              <div class="thumb-grid">${sourceCrops}</div>
+            </div>
+          </div>
+        </details>`;
+      }).join('');
+      return blocks || '<div style="color:#6b7380;font-size:11px">no batches</div>';
+    }
+
+    // Legacy per-crop renderer — kept for runs that pre-date the
+    // batched OCR change. Identical to the original thumb-grid +
+    // per-crop OCR label layout.
+    function renderLegacyTrackBody(orig, rec, items) {
+      const llmCrops = rec?.crops || [];
+      const cropMap = new Map(llmCrops.map(c => [c.name, c]));
+      const thumbs = items.map(t => {
+        const m = /_f0*(\d+)\.[a-z]+$/i.exec(t.name);
+        const frame = m ? parseInt(m[1], 10) : null;
+        const dataAttr = frame !== null ? ` data-frame="${frame}"` : '';
+        const cls = frame !== null ? ' thumb-jump' : '';
+        const title = frame !== null ? ` title="jump to frame ${frame}"` : '';
+        const crop = cropMap.get(t.name);
+        let ocrLabel = '';
+        if (crop) {
+          const reading = crop.ocr_reading;
+          const cc = crop.ocr_confidence;
+          const visible = crop.ocr_visible || '';
+          if (reading != null) {
+            ocrLabel = `<div class="thumb-ocr ocr-hit"
+              title="${escapeHTML(visible)}">
+              #${reading}<span style="color:#9aa3ad">·${cc?.toFixed(2)}</span>
+            </div>`;
+          } else if (visible) {
+            ocrLabel = `<div class="thumb-ocr ocr-miss"
+              title="${escapeHTML(visible)}">
+              ${escapeHTML(visible.length > 14
+                ? visible.slice(0,14) + '…' : visible)}
+            </div>`;
+          }
+        }
+        return `<div>
+          <img src="/runs_static/${encodeURIComponent(activeRun)}/${t.url}"
+               alt="${escapeHTML(t.name)}" loading="lazy"
+               class="thumb-img${cls}"${dataAttr}${title}>
+          <div class="thumb-label">${escapeHTML(t.name.replace(/^track_\d+_/, ''))}</div>
+          ${ocrLabel}
+        </div>`;
+      }).join('');
+      return `<div class="thumb-grid">${thumbs}</div>`;
     }
 
     function fmtSize(n) {

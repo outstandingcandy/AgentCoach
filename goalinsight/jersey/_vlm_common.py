@@ -102,6 +102,51 @@ SINGLE_OCR_PROMPT = (
     "contiguous, and unobstructed; lower for partial / blurry."
 )
 
+
+# Same rules as SINGLE_OCR_PROMPT but applied to a montage of N crops.
+# The N crops are all of the SAME player at different moments — the
+# model votes across them and returns ONE final number, not per-cell
+# verdicts. Cuts both API count and output tokens compared to per-
+# crop calls.
+BATCHED_OCR_PROMPT = (
+    "You will see ONE composite image containing {N} crops of the SAME "
+    "soccer player at different moments. They are arranged in a grid "
+    "(rows×cols) for compactness; treat them as {N} independent looks "
+    "at the same person's back/chest.\n\n"
+    "Determine that player's jersey number. CRITICAL: a single visible "
+    "digit is NEVER a number — most jerseys have two digits, and a "
+    "single visible digit usually means the OTHER digit is occluded by "
+    "an arm, shoulder, sleeve, side-of-body, or simply not facing the "
+    "camera. For example, if you see a '6' but no '1' immediately to "
+    "its left/right within the SAME crop, the number could be 6, 16, "
+    "26, 36, 46, 56, 60–69, 76, 86, or 96 — DO NOT commit. Only commit "
+    "to a single-digit number (1–9) when you can see in ≥1 crop the "
+    "ENTIRE jersey-back area unobstructed AND that area shows ONE "
+    "centred digit with empty fabric on both sides where a tens digit "
+    "would otherwise sit.\n\n"
+    "RULES:\n"
+    "  - ≥1 crop shows the full two-digit number sharp and unobstructed\n"
+    "    → return that number (10-99).\n"
+    "  - ≥1 crop shows the FULL back area with a single centred digit\n"
+    "    (no second-digit space being hidden) → return that single digit\n"
+    "    (1-9) and visible_digits='single digit, full back visible'.\n"
+    "  - Only ever see a single digit but the rest of the back is\n"
+    "    occluded / cropped / turned away → reading=null,\n"
+    "    visible_digits='partial: <digit>'. DO NOT guess the missing\n"
+    "    digit, even if a player is rumoured to wear that low number.\n"
+    "  - Ignore numbers on shorts, socks, or background.\n"
+    "  - Back never visible across all crops → reading=null,\n"
+    "    visible_digits='back not visible'.\n\n"
+    "Output a single JSON object on one line, no prose:\n"
+    '{{"reading": <int 1-99 or null>, '
+    '"visible_digits": "<short factual>", '
+    '"confidence": <float 0.0-1.0>}}\n\n'
+    "confidence: 0 if reading=null; 0.9+ when at least one crop shows\n"
+    "the full number sharp and unobstructed; 0.4–0.6 when committing\n"
+    "to a single digit because the full back is visible; lower when\n"
+    "crops disagree."
+)
+
 MULTI_SYSTEM = (
     "You are an expert at analysing soccer broadcast footage. You will "
     "receive multiple crops of the same detected person across different "
@@ -164,10 +209,14 @@ _MULTI_USER_TEMPLATE = (
     "  Position is ground-truth from camera calibration; trust it.\n\n"
     "STEP 3 — Role decision. Apply these rules IN ORDER; first match "
     "wins:\n"
-    "  3a) movement_pattern == 'tight_near_goal'  → role='goalkeeper', "
-    "team='unknown'. A GK kit is usually different from both outfield "
-    "kits (green / orange / bright yellow). The movement pattern is "
-    "decisive here — do NOT force a GK into team_A or team_B by colour.\n"
+    "  3a) movement_pattern == 'tight_near_goal'  AND  the target's "
+    "kit colour clearly DOES NOT match team_A_kit AND DOES NOT match "
+    "team_B_kit  → role='goalkeeper', team='unknown'. A GK kit is "
+    "deliberately distinct (green / orange / bright yellow / black) "
+    "from both outfield kits — that is a Laws-of-the-Game requirement. "
+    "If the target wears the same kit as one of the outfield teams, "
+    "they are NOT the goalkeeper, no matter how their movement was "
+    "labelled — fall through to 3b/3c.\n"
     "  3b) on_pitch AND target colour clearly matches team_A_kit → "
     "role='player', team='team_A'. (Even if movement pattern is "
     "'covers_whole_pitch' — short tracks can produce that pattern "
@@ -379,6 +428,80 @@ def parse_single_response(response: str) -> int | None:
         if 1 <= n <= 99:
             return n
     return None
+
+
+def parse_batched_ocr_response(
+    raw: str,
+) -> tuple[int | None, float, str]:
+    """Parse BATCHED_OCR_PROMPT's reply into a single track-level verdict.
+
+    The batched prompt now asks the model to vote across the montage
+    and return ONE number per call (not per-crop verdicts), so the
+    output mirrors :func:`parse_single_ocr_response`:
+    ``(reading, confidence, visible_digits)``. Returns
+    ``(None, 0.0, "")`` on an unparseable reply.
+    """
+    text = raw.strip()
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return None, 0.0, ""
+    try:
+        obj = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        obj = _try_parse_truncated(m.group(0)) or {}
+    if not isinstance(obj, dict):
+        return None, 0.0, ""
+    reading_raw = obj.get("reading")
+    try:
+        reading = int(reading_raw) if reading_raw not in (
+            None, "", "null", "none") else None
+    except (TypeError, ValueError):
+        reading = None
+    if reading is not None and not (1 <= reading <= 99):
+        reading = None
+    try:
+        conf = float(obj.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+    if reading is None:
+        conf = 0.0
+    visible = str(obj.get("visible_digits", "") or "")[:80]
+    # Defensive: the prompt forbids committing a single visible digit
+    # as a number unless the back is fully visible. The LLM still
+    # occasionally violates this (e.g. orig 50 on the kids clip:
+    # "single digit '6' visible on lower back" → reading=6, but
+    # the actual jersey was #16 with the '1' occluded by an arm).
+    # When ``visible_digits`` self-describes as a partial / single-digit
+    # observation, demote ``reading`` to null so the track-level vote
+    # doesn't latch onto the wrong number.
+    if reading is not None:
+        v_lo = visible.lower()
+        partial_markers = (
+            "single digit",
+            "partial",
+            "one digit",
+            "1 digit",
+            "obscured",
+            "occluded",
+            "only the",
+            "only see",
+            "side", # "visible on side" / "from the side"
+        )
+        looks_partial = any(m in v_lo for m in partial_markers)
+        # ``looks_partial`` should not fire when the description
+        # explicitly confirms the full back was visible — let those
+        # commits through.
+        confirms_full = any(
+            phrase in v_lo for phrase in (
+                "full number", "two digit", "centred", "centered",
+                "back fully", "full back",
+            )
+        )
+        if looks_partial and not confirms_full:
+            reading = None
+            conf = 0.0
+    return reading, conf, visible
 
 
 def parse_single_ocr_response(

@@ -392,9 +392,24 @@ def run_track_consolidation(
 
     _do_jersey_recognition(candidates)
     # Persist for inspection / the /pipeline page — NOT used as input
-    # cache on re-runs.
+    # cache on re-runs. Strip non-JSON-serializable scratch fields
+    # (``_montage`` carries an ndarray, kept around just long enough
+    # for ``_dump_llm_inputs`` to write the JPG).
+    def _json_safe_vote(v: dict[str, Any]) -> dict[str, Any]:
+        out = {}
+        for k, val in v.items():
+            if k == "per_crop_verdicts" and isinstance(val, list):
+                out[k] = [
+                    {kk: vv for kk, vv in (entry or {}).items()
+                     if not (isinstance(kk, str) and kk.startswith("_"))}
+                    for entry in val
+                ]
+            else:
+                out[k] = val
+        return out
     with open(output_dir / "jersey_votes.json", "w") as f:
-        json.dump({str(tid): v for tid, v in votes.items()}, f, indent=2)
+        json.dump({str(tid): _json_safe_vote(v) for tid, v in votes.items()},
+                  f, indent=2)
 
     # --- Dump the exact crops + context that fed the LLM -------------
     # The /pipeline page reads this to surface what the model actually
@@ -781,28 +796,64 @@ def _dump_llm_inputs(
             cv2.imwrite(
                 str(exemplars_dir / f"{team_label}_{i:02d}.jpg"), crop)
 
+    montages_dir = out_dir / "montages"
+    montages_dir.mkdir(exist_ok=True)
+    for old in montages_dir.glob("*.jpg"):
+        old.unlink()
+
     per_track: dict[str, Any] = {}
     for tid, frames in sampled.items():
         crop_files: list[dict[str, Any]] = []
-        # Pull the per-crop OCR verdicts (same order as ``frames``) so
-        # we can stamp the OCR reading + reasoning onto each thumb.
+        # Pull the OCR verdicts. Each entry corresponds to either:
+        #   (a) one source crop (legacy per-crop OCR), or
+        #   (b) one batched-OCR call covering ``_crop_indices`` source
+        #       crops, with ``_montage`` carrying the actual composite
+        #       image the LLM saw.
+        # When (b) we additionally save the montage JPG and emit a
+        # ``batches`` list so the /pipeline UI can show the LLM's
+        # exact view + verdict side by side.
         verdicts = (votes.get(tid) or {}).get("per_crop_verdicts") or []
         for idx, sf in enumerate(frames):
             fname = f"track_{tid:04d}_f{sf.frame_id:05d}.jpg"
             cv2.imwrite(str(tracks_dir / fname), sf.crop)
-            verdict = verdicts[idx] if idx < len(verdicts) else None
             crop_entry: dict[str, Any] = {
                 "frame_id": int(sf.frame_id),
                 "name": fname,
                 "score": float(sf.score),
             }
-            if verdict:
-                crop_entry["ocr_reading"] = verdict.get("reading")
-                crop_entry["ocr_confidence"] = round(
-                    float(verdict.get("crop_confidence", 0.0) or 0.0), 3,
-                )
-                crop_entry["ocr_visible"] = verdict.get("visible_digits") or ""
             crop_files.append(crop_entry)
+
+        batches_out: list[dict[str, Any]] = []
+        is_batched = any(
+            isinstance(v, dict) and "_montage" in v for v in verdicts
+        )
+        if is_batched:
+            for bi, v in enumerate(verdicts):
+                if not isinstance(v, dict):
+                    continue
+                montage = v.get("_montage")
+                idxs = v.get("_crop_indices") or []
+                if montage is None:
+                    continue
+                m_name = f"track_{tid:04d}_b{bi:02d}.jpg"
+                cv2.imwrite(str(montages_dir / m_name), montage)
+                batches_out.append({
+                    "name": m_name,
+                    "crop_indices": [int(i) for i in idxs],
+                    "ocr_reading": v.get("reading"),
+                    "ocr_confidence": round(
+                        float(v.get("crop_confidence", 0.0) or 0.0), 3),
+                    "ocr_visible": v.get("visible_digits") or "",
+                })
+        else:
+            for idx, ce in enumerate(crop_files):
+                v = verdicts[idx] if idx < len(verdicts) else None
+                if isinstance(v, dict):
+                    ce["ocr_reading"] = v.get("reading")
+                    ce["ocr_confidence"] = round(
+                        float(v.get("crop_confidence", 0.0) or 0.0), 3)
+                    ce["ocr_visible"] = v.get("visible_digits") or ""
+
         vote = votes.get(tid) or {}
         per_track[str(tid)] = {
             "tid": int(tid),
@@ -818,6 +869,7 @@ def _dump_llm_inputs(
             "n_frames": int(frame_count_by_track.get(tid, 0)),
             "n_crops_to_llm": len(crop_files),
             "crops": crop_files,
+            "batches": batches_out,
         }
 
     payload = {

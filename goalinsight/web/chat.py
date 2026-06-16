@@ -146,6 +146,11 @@ class ChatEngine:
     # can render the images directly via <img src="...">.
     artifact_dir: Path | None = None
     artifact_url_prefix: str = "/chat_artifacts"
+    # If a previous chat turn left an AgentCore Code Interpreter
+    # session alive, pass its id here to re-attach instead of starting
+    # cold. Dead-session detection in CodeSandbox handles the case
+    # where the inherited id has been reaped on the AWS side.
+    agentcore_session_id: str | None = None
 
     _client: Any = field(default=None, repr=False)
     _schema_brief: str | None = field(default=None, repr=False)
@@ -168,6 +173,14 @@ class ChatEngine:
             self._sandbox = CodeSandbox(
                 region=self.region,
                 pipeline_output_dir=self.ctx.pipeline_output_dir,
+                # Re-attach to a still-warm AgentCore session if the
+                # caller (SessionStore) gave us a previously-saved id;
+                # data files were already uploaded by the original
+                # session, so we skip the re-upload step too. If the
+                # id is stale, _invoke's dead-session retry will
+                # transparently respawn.
+                initial_session_id=self.agentcore_session_id,
+                data_already_uploaded=bool(self.agentcore_session_id),
             )
         return self._sandbox
 
@@ -381,20 +394,26 @@ class ChatEngine:
         self,
         messages: list[dict[str, str]],
         current_time: float,
-    ) -> Iterator[str]:
-        """Yield response text chunks; tool rounds are internal.
+    ) -> Iterator[dict[str, Any]]:
+        """Yield typed events (text/tool_use/tool_result) as the model runs.
+
+        Event shapes:
+          {"type": "text",        "delta": "..."}
+          {"type": "tool_use",    "id": "...", "name": "...", "input": {...}}
+          {"type": "tool_result", "id": "...", "name": "...", "result": {...}}
 
         Why streaming: middle-box idle timeouts (SSH/IDE port forwards,
         load balancers) silently drop connections that go quiet for
         more than a few seconds. We yield bytes within ~1s, keeping
-        the TCP connection lively. Tool-call rounds happen inside this
-        generator without surfacing their text to the client; only the
-        final assistant message is streamed out.
+        the TCP connection lively. tool_use / tool_result events are
+        emitted live so the frontend can show what the model is doing
+        between text deltas; only the FINAL assistant message's text
+        deltas are streamed (intermediate rounds' text is suppressed).
         """
         system_blocks = self._build_system_blocks(current_time)
         bedrock_messages = self._initial_messages(messages)
         if not bedrock_messages:
-            yield "(empty message)"
+            yield {"type": "text", "delta": "(empty message)"}
             return
 
         for round_idx in range(MAX_TOOL_ROUNDS):
@@ -482,25 +501,41 @@ class ChatEngine:
                         b["input"] = {}
 
             if stop_reason == "tool_use":
-                # Run tools, append assistant + tool_result, loop again.
-                # Don't yield this round's text deltas — they're usually
-                # empty anyway, but if Claude narrates while planning,
-                # keeping them would interleave with the final answer.
+                # Run tools, surface them to the client as structured
+                # events, append assistant + tool_result back into the
+                # Bedrock conversation, and loop. Intermediate-round
+                # text deltas are dropped — they're usually empty, and
+                # surfacing them would interleave with the final answer.
                 bedrock_messages.append({
                     "role": "assistant",
                     "content": ordered,
                 })
-                tool_results = []
+                tool_results_msg = []
                 for b in ordered:
                     if b.get("type") != "tool_use":
                         continue
-                    result = self._dispatch_tool(b.get("name", ""), b.get("input") or {})
-                    tool_results.append({
+                    tool_name = b.get("name", "")
+                    tool_id = b.get("id")
+                    tool_input = b.get("input") or {}
+                    yield {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": tool_input,
+                    }
+                    result = self._dispatch_tool(tool_name, tool_input)
+                    yield {
                         "type": "tool_result",
-                        "tool_use_id": b.get("id"),
+                        "id": tool_id,
+                        "name": tool_name,
+                        "result": result,
+                    }
+                    tool_results_msg.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
                         "content": json.dumps(result, ensure_ascii=False),
                     })
-                bedrock_messages.append({"role": "user", "content": tool_results})
+                bedrock_messages.append({"role": "user", "content": tool_results_msg})
                 continue
 
             # Final round — stream out the buffered text deltas in order.
@@ -508,7 +543,7 @@ class ChatEngine:
             # didn't yet know whether this round would end on tool_use.
             for _, text in text_deltas:
                 if text:
-                    yield text
+                    yield {"type": "text", "delta": text}
             return
 
         logger.warning("Stream hit MAX_TOOL_ROUNDS=%d", MAX_TOOL_ROUNDS)

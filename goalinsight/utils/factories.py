@@ -120,8 +120,19 @@ def get_jersey_recognizer(config: dict[str, Any] | None = None) -> "BaseJerseyRe
     elif backend == "claude":
         from ..jersey.claude_recognizer import ClaudeJerseyRecognizer
         return ClaudeJerseyRecognizer(jr_config.get("claude", jr_config))
+    elif backend == "gemini":
+        from ..jersey.gemini_recognizer import GeminiJerseyRecognizer
+        return GeminiJerseyRecognizer(jr_config.get("gemini", jr_config))
+    elif backend in ("qwen_vl", "qwen"):
+        # New OpenAI-compatible adapter (vLLM server). Goes through
+        # BaseVLMRecognizer so the same BATCHED_OCR_PROMPT + single-
+        # digit guard the Claude/Gemini backends use also applies here.
+        from ..jersey.qwen_vlm_recognizer import QwenVLMRecognizer
+        return QwenVLMRecognizer(jr_config)
     else:
-        # Default: Qwen VL
+        # Legacy Qwen path: HuggingFace-local model loader without the
+        # batched-OCR machinery. Kept for backwards compatibility with
+        # configs that don't have ``backend`` set explicitly.
         from ..jersey import QwenJerseyRecognizer
         recognizer_config = {
             "mode": jr_config.get("mode", "local"),

@@ -15,13 +15,13 @@ are unaffected.
 from __future__ import annotations
 
 import logging
-import shutil
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from ..highlights._context import MatchContext
+from ._sessions import SessionStore
 from ._workspace import VIDEO_EXTS, Workspace
 from .chat import ChatEngine
 from .chat_remote import (
@@ -43,6 +43,34 @@ RUN_CACHE_SIZE = 4
 CHAT_ARTIFACTS_URL = "/chat_artifacts"
 
 
+class IncompleteRunError(RuntimeError):
+    """Raised when a run is missing pipeline stages chat depends on.
+
+    Carries the per-stage completion map so the API layer can return a
+    structured 409 instead of a bare 500. Chat needs at minimum
+    track_consolidation (for the consolidated tracks + roster) and
+    benefits from event_detection; tracking is implied by both.
+    """
+
+    REQUIRED_STAGES = ("tracking", "track_consolidation")
+    RECOMMENDED_STAGES = ("event_detection",)
+
+    def __init__(self, run_name: str, stages: dict[str, bool]):
+        missing_required = [
+            s for s in self.REQUIRED_STAGES if not stages.get(s, False)
+        ]
+        super().__init__(
+            f"run {run_name!r} is missing required stages: "
+            f"{', '.join(missing_required)}"
+        )
+        self.run_name = run_name
+        self.stages = stages
+        self.missing_required = missing_required
+        self.missing_recommended = [
+            s for s in self.RECOMMENDED_STAGES if not stages.get(s, False)
+        ]
+
+
 @dataclass
 class RunHandle:
     run_name: str
@@ -51,8 +79,12 @@ class RunHandle:
     ctx: MatchContext
     # Built lazily on first chat call so analytics-only requests (heatmap,
     # stats) don't pay the boto3 / Bedrock startup cost.
+    # ``_engine`` is the legacy single-engine path (kept so /chat and
+    # /chat/stream without a session id still work); ``sessions`` is
+    # the per-session store the new UI uses.
     _engine: ChatEngineLike | None = None
     _engine_factory: Any = None
+    sessions: SessionStore | None = None
 
     @property
     def engine(self) -> ChatEngineLike:
@@ -63,12 +95,13 @@ class RunHandle:
         return self._engine
 
     def close(self) -> None:
-        if self._engine is None:
-            return
-        try:
-            self._engine.close()
-        except Exception:  # noqa: BLE001
-            logger.exception("engine close failed for %s", self.run_name)
+        if self._engine is not None:
+            try:
+                self._engine.close()
+            except Exception:  # noqa: BLE001
+                logger.exception("engine close failed for %s", self.run_name)
+        if self.sessions is not None:
+            self.sessions.close_all()
 
 
 def resolve_run_video(run_dir: Path) -> Path:
@@ -130,12 +163,30 @@ class RunRegistry:
         if not run_dir.is_dir():
             raise FileNotFoundError(f"run not found: {run_dir}")
 
+        # Surface "pipeline not finished yet" as a typed error so the API
+        # can return 409 + the stage map instead of a 500 from
+        # MatchContext's hard precondition check. Cheaper than letting
+        # MatchContext.from_output_dir raise: it skips the calibration
+        # metadata / video resolution work for runs we already know
+        # aren't usable.
+        stages = _detect_stage_completion(run_dir)
+        missing = [
+            s for s in IncompleteRunError.REQUIRED_STAGES
+            if not stages.get(s, False)
+        ]
+        if missing:
+            raise IncompleteRunError(run_name, stages)
+
         video_path = resolve_run_video(run_dir)
         ctx = MatchContext.from_output_dir(run_dir, video_path=video_path)
 
         artifact_dir = self.artifact_dir_for(run_name)
-        if artifact_dir.exists():
-            shutil.rmtree(artifact_dir)
+        # Don't wipe the per-run artifact dir on reload: the new
+        # multi-session UI persists each session's plots under
+        # ``<artifact_dir>/<session_id>/``, and a server restart should
+        # leave those alone. Legacy single-engine artifacts that landed
+        # directly in <artifact_dir>/*.png stay too — they're cheap and
+        # won't shadow new ones (per-session subdirs are URL-distinct).
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
         prefix = self.url_prefix_for(run_name)
@@ -167,12 +218,54 @@ class RunRegistry:
                 artifact_url_prefix=prefix,
             )
 
+        # Each chat session in the new multi-session API gets its own
+        # engine + AgentCore sandbox + artifact dir. We reuse the same
+        # factory above, but parametrised per-session.
+        def _build_session_engine(
+            *, sid: str, artifact_dir: Path,
+            artifact_url_prefix: str,
+            agentcore_session_id: str | None,
+        ) -> ChatEngineLike:
+            if runtime_arn:
+                # RemoteChatEngine doesn't expose AgentCore session
+                # reuse; in Runtime mode every session shares the
+                # remote runtime container's lifecycle.
+                if not s3_bucket:
+                    raise RuntimeError(
+                        "GOALINSIGHT_AGENTCORE_RUNTIME_ARN is set but "
+                        "GOALINSIGHT_S3_BUCKET is not — can't tell the "
+                        "runtime where to read this run's outputs from."
+                    )
+                return RemoteChatEngine(
+                    ctx=ctx,
+                    run_name=run_name,
+                    agent_runtime_arn=runtime_arn,
+                    s3_bucket=s3_bucket,
+                    s3_prefix=s3_prefix_for(run_name),
+                )
+            return ChatEngine(
+                ctx=ctx,
+                artifact_dir=artifact_dir,
+                artifact_url_prefix=artifact_url_prefix,
+                agentcore_session_id=agentcore_session_id,
+            )
+
+        sessions = SessionStore(
+            run_name=run_name,
+            run_dir=run_dir,
+            ctx=ctx,
+            artifact_root=artifact_dir,
+            artifact_url_prefix_root=prefix,
+            engine_factory=_build_session_engine,
+        )
+
         handle = RunHandle(
             run_name=run_name,
             run_dir=run_dir,
             video_path=video_path,
             ctx=ctx,
             _engine_factory=_build_engine,
+            sessions=sessions,
         )
         self._cache[run_name] = handle
         self._evict()

@@ -27,6 +27,7 @@ import numpy as np
 
 from ..interfaces import BaseJerseyRecognizer
 from ._vlm_common import (
+    BATCHED_OCR_PROMPT,
     MULTI_SYSTEM,
     SCENE_TASK_TEXT,
     SINGLE_OCR_PROMPT,
@@ -37,6 +38,7 @@ from ._vlm_common import (
     build_multi_user_text,
     build_scene_context_block,
     burn_id_banner,
+    parse_batched_ocr_response,
     parse_multi_response,
     parse_scene_response,
     parse_single_ocr_response,
@@ -270,37 +272,82 @@ class BaseVLMRecognizer(BaseJerseyRecognizer):
         self,
         crops: list[np.ndarray],
     ) -> list[dict[str, Any]]:
-        """Fan out one OCR call per crop, in parallel up to
-        ``ocr_per_track_concurrency`` (defaults to ``max_concurrency``).
-        Returns a list of verdict dicts in per-crop input order:
-        ``{reading, crop_confidence, visible_digits}``.
+        """Read jersey numbers across ``crops``.
 
-        Routes to either the LLM ``SINGLE_OCR_PROMPT`` path (default)
-        or local RapidOCR depending on ``ocr_backend``.
+        For the LLM backend, we montage crops in groups of
+        ``ocr_batch_size`` (default 16) into a grid and ask the model
+        to vote across the montage and return ONE number per call.
+        That number becomes one "verdict" for the whole batch, so a
+        300-crop track produces 300/16 ≈ 19 verdicts (one per batch)
+        instead of 300, while still letting the higher-level
+        ``aggregate_crop_verdicts`` re-vote across batches in case the
+        model commits to different numbers in different batches.
+        Groups are processed in parallel up to
+        ``ocr_per_track_concurrency`` (defaults to
+        ``max_concurrency``).
+
+        For RapidOCR (local CPU) we keep the per-crop path — there's
+        no API cost to amortise and montaging would only blur digits.
+
+        Returns a list of verdict dicts (one per LLM call for the LLM
+        path, one per crop for the RapidOCR path) — they share the
+        ``{reading, crop_confidence, visible_digits}`` shape so the
+        caller can pass either through ``aggregate_crop_verdicts``.
         """
         n = len(crops)
-        verdicts: list[dict[str, Any]] = [{}] * n
         per_track_workers = int(self.config.get(
             "ocr_per_track_concurrency", self.max_concurrency))
 
         if self.ocr_backend == "rapidocr":
-            ocr_fn = self._ocr_one_rapidocr
-        else:
-            ocr_fn = self._ocr_one_llm
+            verdicts: list[dict[str, Any]] = [{}] * n
+            with ThreadPoolExecutor(max_workers=per_track_workers) as pool:
+                futs = [pool.submit(self._ocr_one_rapidocr, crops[i])
+                        for i in range(n)]
+                for i, fut in enumerate(futs):
+                    try:
+                        verdicts[i] = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("OCR failed for crop %d: %s", i, exc)
+                        verdicts[i] = {
+                            "reading": None,
+                            "crop_confidence": 0.0,
+                            "visible_digits": f"error: {exc}",
+                        }
+            return verdicts
 
+        # LLM path — group crops into montages and vote per-montage.
+        # Each verdict carries the montage image (``_montage``) and the
+        # source-crop indices it covered (``_crop_indices``) so the
+        # caller can persist the *exact* image that fed the LLM next to
+        # its reading. These under-prefixed keys are stripped before
+        # the verdict is fed to ``aggregate_crop_verdicts``.
+        batch_size = max(1, int(self.config.get("ocr_batch_size", 16)))
+        groups = [list(range(i, min(i + batch_size, n)))
+                  for i in range(0, n, batch_size)]
+
+        def _run_group(idxs: list[int]) -> dict[str, Any]:
+            batch = [crops[i] for i in idxs]
+            try:
+                verdict = self._ocr_batch_llm(batch)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Batched OCR failed (n=%d): %s", len(idxs), exc)
+                verdict = {
+                    "reading": None, "crop_confidence": 0.0,
+                    "visible_digits": f"error: {exc}",
+                }
+            # Always attach the montage + indices; even on failure it's
+            # useful context for debugging the page.
+            verdict["_montage"] = _build_crop_montage(batch)
+            verdict["_crop_indices"] = list(idxs)
+            return verdict
+
+        batch_verdicts: list[dict[str, Any]] = [{} for _ in groups]
         with ThreadPoolExecutor(max_workers=per_track_workers) as pool:
-            futs = [pool.submit(ocr_fn, crops[i]) for i in range(n)]
-            for i, fut in enumerate(futs):
-                try:
-                    verdicts[i] = fut.result()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("OCR failed for crop %d: %s", i, exc)
-                    verdicts[i] = {
-                        "reading": None,
-                        "crop_confidence": 0.0,
-                        "visible_digits": f"error: {exc}",
-                    }
-        return verdicts
+            futs = {pool.submit(_run_group, g): gi
+                    for gi, g in enumerate(groups)}
+            for fut, gi in futs.items():
+                batch_verdicts[gi] = fut.result()
+        return batch_verdicts
 
     def _ocr_one_llm(self, crop: np.ndarray) -> dict[str, Any]:
         raw = self._call(
@@ -320,6 +367,46 @@ class BaseVLMRecognizer(BaseJerseyRecognizer):
             "crop_confidence": cc,
             "visible_digits": visible,
         }
+
+    def _ocr_batch_llm(
+        self, crops: list[np.ndarray],
+    ) -> dict[str, Any]:
+        """Single LLM call over a montage of up to ``ocr_batch_size`` crops.
+
+        Tiles ``crops`` into a square-ish grid (cols=ceil(sqrt(N))) and
+        asks the model to vote across the montage and return ONE final
+        number for the whole batch (not per-cell readings). Returns a
+        single verdict dict
+        ``{reading, crop_confidence, visible_digits}``. ``crop_confidence``
+        is named that way (rather than ``confidence``) so the verdict
+        is interchangeable with single-crop verdicts when fed to
+        ``aggregate_crop_verdicts``.
+        """
+        n = len(crops)
+        if n == 0:
+            return {"reading": None, "crop_confidence": 0.0,
+                    "visible_digits": "empty batch"}
+        if n == 1:
+            return self._ocr_one_llm(crops[0])
+
+        montage = _build_crop_montage(crops)
+        prompt = BATCHED_OCR_PROMPT.format(N=n)
+        # 1024 leaves headroom for chain-of-thought-style models
+        # (Qwen3 VL emits a paragraph of reasoning before the JSON
+        # by default; 200 truncated mid-thought and the JSON parser
+        # got an empty reply). Claude / Gemini still respond in <100
+        # tokens so the larger ceiling has no cost there.
+        raw = self._call(
+            [("text", prompt), ("image", montage)],
+            system=None,
+            max_tokens=max(self.max_tokens, 1024),
+        )
+        if raw is None:
+            return {"reading": None, "crop_confidence": 0.0,
+                    "visible_digits": "api error"}
+        reading, conf, visible = parse_batched_ocr_response(raw)
+        return {"reading": reading, "crop_confidence": conf,
+                "visible_digits": visible}
 
     def _ocr_one_rapidocr(self, crop: np.ndarray) -> dict[str, Any]:
         if self._rapid_reader is None:
@@ -349,3 +436,49 @@ class BaseVLMRecognizer(BaseJerseyRecognizer):
         Returns the raw response text (str) or ``None`` on failure.
         ``max_tokens`` defaults to ``self.max_tokens`` when unset.
         """
+
+
+def _build_crop_montage(
+    crops: list[np.ndarray],
+    cell_size: tuple[int, int] = (160, 160),
+) -> np.ndarray:
+    """Tile ``crops`` into a square-ish row-major grid for batched OCR.
+
+    Each crop is letterboxed (preserve aspect, pad black) into a
+    uniform ``cell_size`` so the model sees a predictable layout. The
+    grid uses ``cols = ceil(sqrt(N))`` rows then fills row-major so
+    the prompt's "row-major order" instruction matches the visual.
+    Empty cells (when N isn't a perfect square) stay black.
+    """
+    import cv2 as _cv2  # local import — avoid pulling cv2 at module load
+
+    n = len(crops)
+    if n == 0:
+        return np.zeros((cell_size[1], cell_size[0], 3), dtype=np.uint8)
+    cols = int(np.ceil(np.sqrt(n)))
+    rows = int(np.ceil(n / cols))
+    cw, ch = cell_size
+    canvas = np.zeros((rows * ch, cols * cw, 3), dtype=np.uint8)
+    for i, crop in enumerate(crops):
+        r, c = divmod(i, cols)
+        h, w = crop.shape[:2]
+        # Letterbox into cell_size preserving aspect.
+        scale = min(cw / max(w, 1), ch / max(h, 1))
+        nh, nw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+        resized = _cv2.resize(crop, (nw, nh), interpolation=_cv2.INTER_AREA)
+        if resized.ndim == 2:
+            resized = _cv2.cvtColor(resized, _cv2.COLOR_GRAY2BGR)
+        elif resized.shape[2] == 4:
+            resized = _cv2.cvtColor(resized, _cv2.COLOR_BGRA2BGR)
+        x = c * cw + (cw - nw) // 2
+        y = r * ch + (ch - nh) // 2
+        canvas[y:y + nh, x:x + nw] = resized
+        # Thin separator/border so the model can see cell boundaries.
+        _cv2.rectangle(
+            canvas,
+            (c * cw, r * ch),
+            (c * cw + cw - 1, r * ch + ch - 1),
+            (255, 255, 255),
+            1,
+        )
+    return canvas

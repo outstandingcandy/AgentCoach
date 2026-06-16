@@ -43,10 +43,23 @@ PITCH_MARGIN = 30     # px around the pitch
 
 def register_analytics_routes(app: FastAPI, runs: RunRegistry) -> None:
     def _get_ctx(run_name: str) -> MatchContext:
+        from ._runs import IncompleteRunError
         try:
             return runs.get(run_name).ctx
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc))
+        except IncompleteRunError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "incomplete_run",
+                    "run_name": exc.run_name,
+                    "message": str(exc),
+                    "stages": exc.stages,
+                    "missing_required": exc.missing_required,
+                    "missing_recommended": exc.missing_recommended,
+                },
+            ) from exc
 
     # ---- JSON ------------------------------------------------------------
 
