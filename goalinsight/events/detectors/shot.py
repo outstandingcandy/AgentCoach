@@ -241,16 +241,23 @@ class ShotDetector(BaseEventDetector):
                     kick_frame = kf
                     break
 
-        # ----- Step 2: shooter attribution at the kick frame -----
-        # The slow→fast transition pinpoints the EXACT frame the foot
-        # struck the ball — pick the nearest non-GK player to the ball
-        # at that frame (or the closest ball-detected frame to it). Do
-        # NOT widen the window to a vote: the kick frame is preceded by
-        # a contested-possession phase where a defender often hugs the
-        # ball-carrier as tightly as the attacker, and a vote across
-        # those frames would award the shot to the defender.
+        # ----- Step 2: shooter attribution by pre-kick possession -----
+        # The shooter is whoever had the ball under control IMMEDIATELY
+        # BEFORE the kick frame, not whoever happens to be nearest at the
+        # kick frame itself. At the moment of impact the kicker's foot
+        # extends, putting their bbox center 1-2 m from the ball — a
+        # defender who hadn't moved can transiently look "nearer" without
+        # ever having touched the ball.
+        #
+        # Strategy: in the 1.0 s window ending at the kick frame, count
+        # how many ball-observed frames each non-GK track was within
+        # ``possession_radius`` of the ball, with stricter weight close
+        # to the kick. The track with the highest weighted-vote score
+        # is the shooter. Falls back to single-frame nearest at the
+        # kick attribution frame only when no track met the proximity
+        # bar in the lead-up.
         search_radius = 3.0
-        proximity_radius = 1.5
+        possession_radius = 1.0  # m — ball under foot, not just nearby
         if goal_x is not None:
             _gx = goal_x
             exclude_fn = lambda _p, pp: abs(pp[0] - _gx) < 3.0
@@ -258,34 +265,40 @@ class ShotDetector(BaseEventDetector):
             exclude_fn = None
 
         kf = kick_frame if kick_frame is not None else goal_frame
-        # Find the nearest ball-detected frame to kf (kf itself, then
-        # +/-1, +/-2, ... up to the half-window).
-        kick_attr_frame: int | None = None
-        for offset in range(0, int(0.2 * ctx.fps) + 1):
-            for cand in (kf - offset, kf + offset):
-                if cand < 0 or cand > goal_frame:
-                    continue
-                if ctx.get_ball_at_frame(cand) is not None:
-                    kick_attr_frame = cand
-                    break
-            if kick_attr_frame is not None:
-                break
+        win_pre = int(1.0 * ctx.fps)  # 1.0 s look-back
+        win_start = max(0, kf - win_pre)
 
-        if kick_attr_frame is not None:
-            bs = ctx.get_ball_at_frame(kick_attr_frame)
+        from collections import defaultdict
+        scores: dict = defaultdict(float)
+        team_of: dict = {}
+        last_dist: dict = {}
+        for f in range(win_start, kf + 1):
+            bs = ctx.get_ball_at_frame(f)
+            if bs is None:
+                continue
+            # Linear weight ramp: a frame right at the kick gets weight 1.0,
+            # the earliest frame in the window gets weight ~0.1.
+            w = 0.1 + 0.9 * ((f - win_start) / max(1, kf - win_start))
             tid, team, dist = find_nearest_player(
-                ctx, kick_attr_frame,
-                (bs.position[0], bs.position[1]),
+                ctx, f, (bs.position[0], bs.position[1]),
                 exclude_fn=exclude_fn,
             )
-            if tid is not None and dist <= proximity_radius:
-                logger.info(
-                    "Shooter identified at kick frame: track_id=%s, "
-                    "team=%s, distance=%.1fm, kick_frame=%s, "
-                    "attribution_frame=%d",
-                    tid, team, dist, kick_frame, kick_attr_frame,
-                )
-                return tid, team, kick_attr_frame
+            if tid is None or dist > possession_radius:
+                continue
+            scores[tid] += w
+            team_of[tid] = team
+            last_dist[tid] = dist
+
+        if scores:
+            tid = max(scores, key=lambda t: scores[t])
+            logger.info(
+                "Shooter identified by pre-kick possession: track_id=%s, "
+                "team=%s, score=%.2f, last_dist=%.2fm, kick_frame=%s, "
+                "window=[%d, %d]",
+                tid, team_of[tid], scores[tid], last_dist[tid],
+                kick_frame, win_start, kf,
+            )
+            return tid, team_of[tid], kf
 
         # Last resort: original single-frame nearest search at goal_frame.
         # Reaches here only when no track stayed within 1.5 m for any
