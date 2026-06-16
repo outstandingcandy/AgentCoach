@@ -17,7 +17,7 @@ def find_nearest_player(
     team_filter: str | None = None,
     exclude_referee: bool = True,
     exclude_fn: Callable[[dict[str, Any], list[float]], bool] | None = None,
-) -> tuple[int | None, str | None, float]:
+) -> tuple[int | str | None, str | None, float]:
     """Find the nearest player to a ball position at a given frame.
 
     Args:
@@ -30,11 +30,13 @@ def find_nearest_player(
             If it returns True for a player, that player is skipped.
 
     Returns:
-        ``(track_id, team_id, distance)``. If no player qualifies,
-        returns ``(None, None, inf)``.
+        ``(track_id, team_id, distance)`` — ``track_id`` is an int when
+        running on raw tracker output, a consolidated player_id string
+        (``"A-7"``) when running after track_consolidation. Returns
+        ``(None, None, inf)`` if no player qualifies.
     """
     players = ctx.get_players_at_frame(frame)
-    best_id: int | None = None
+    best_id: int | str | None = None
     best_team: str | None = None
     best_dist = float("inf")
 

@@ -50,7 +50,7 @@ class EventDetectionContext:
     def get_players_at_frame(self, frame: int) -> list[dict]:
         return self.player_tracks.get(str(frame), [])
 
-    def get_team_for_track(self, track_id: int) -> str:
+    def get_team_for_track(self, track_id: int | str) -> str:
         return self.team_assignments.get(str(track_id), "unknown")
 
     def get_ball_at_frame(self, frame: int) -> BallState | None:

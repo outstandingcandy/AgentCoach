@@ -161,7 +161,7 @@ pipeline:
   stages:
     - field_registration
     - tracking
-    - event_detection
     - track_consolidation
+    - event_detection
     - player_profile
     - highlights

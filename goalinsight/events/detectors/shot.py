@@ -154,16 +154,22 @@ class ShotDetector(BaseEventDetector):
         goal_frame: int,
         lookback_seconds: float = 5.0,
         goal_side: str | None = None,
-    ) -> tuple[int | None, str | None, int]:
+    ) -> tuple[int | str | None, str | None, int]:
         """Find the player who took the shot.
 
-        Uses pixel-space kick detection (shared with ball_trajectory's
-        ``_segment_at_kicks``) to locate the kick frame, then searches
-        for the nearest non-goalkeeper player to the ball at that moment.
+        Picks the kick frame as "the last frame before ball pitch-speed
+        rises above ``shot_speed_min``" within the lookback window —
+        i.e. the moment the ball stops rolling/being controlled and
+        starts flying. This is more robust than the older pixel-
+        acceleration peak because it survives sparse/uneven ball
+        detections (kick spikes are easy to miss when ``dt`` is
+        irregular). Falls back to the pixel-acceleration approach when
+        no clear pitch-speed transition exists in the window.
 
-        Pixel acceleration is more reliable than pitch-coordinate speed
-        because pixel centers are direct observations — pitch positions
-        depend on 3D fitting quality which degrades for airborne balls.
+        Then attributes the shooter as the longest-bearing nearest
+        non-goalkeeper player in a small window around the kick frame
+        (single-frame nearest is fragile because the ball is already
+        airborne and the shooter is being left behind).
         """
         from goalinsight.tracking.ball_trajectory import detect_kick_frames
 
@@ -180,49 +186,124 @@ class ShotDetector(BaseEventDetector):
             else:
                 goal_x = None
 
-        # Step 1: Find kick frames using pixel-space acceleration
-        # (same algorithm as ball_trajectory._segment_at_kicks).
-        pixel_obs = [
-            (bs.frame, tuple(bs.pixel_center))
-            for bs in ctx.ball_states
-            if bs.pixel_center is not None
-            and start_frame <= bs.frame <= goal_frame
+        # ----- Step 1: locate kick frame -----
+        # Primary: pitch-speed transition (slow → fast) leading directly
+        # into the goal. ``ball_states`` carry dt-normalised speed in
+        # m/s so this works even with sparse/uneven detections.
+        # We want the FINAL slow→fast transition before the goal — and
+        # we require speed to remain elevated all the way through to the
+        # goal frame. Without that constraint we'd accept earlier "ball
+        # received, then redistributed" transitions which are not the
+        # shot.
+        kick_frame: int | None = None
+        # Thresholds chosen against ball-at-foot speeds: a player
+        # dribbling/receiving the ball reads at 2-7 m/s in pitch coords
+        # (a stationary ball next to a moving player still picks up
+        # ~5 m/s through smoothing + median filtering); a kicked ball
+        # is 10+ m/s. Pick a clear separation: pre-kick ≤ 7 m/s,
+        # post-kick ≥ 10 m/s.
+        SHOT_TRIGGER_SPEED = 10.0
+        SLOW_BEFORE = 7.0
+        SUSTAIN_FLOOR = 8.0  # ball must keep flying until the goal
+        win_states = [
+            bs for bs in ctx.ball_states
+            if start_frame <= bs.frame <= goal_frame
         ]
-        kick_frames = detect_kick_frames(pixel_obs)
-
-        # Take the last kick before the goal — that's the shot.
-        kick_frame = None
-        for kf in reversed(kick_frames):
-            if kf <= goal_frame:
-                kick_frame = kf
+        # Walk backwards to find the most recent slow→fast transition
+        # whose successor frames all stay ≥ SUSTAIN_FLOOR up to goal.
+        for i in range(len(win_states) - 1, 0, -1):
+            prev_bs = win_states[i - 1]
+            curr_bs = win_states[i]
+            if not (prev_bs.speed <= SLOW_BEFORE
+                    and curr_bs.speed >= SHOT_TRIGGER_SPEED):
+                continue
+            # Check that every state from i onward stays elevated.
+            sustained = all(
+                s.speed >= SUSTAIN_FLOOR for s in win_states[i:]
+            )
+            if sustained:
+                kick_frame = prev_bs.frame
                 break
 
-        # Step 2: Search for nearest player around the kick frame.
-        search_radius = 3.0
-        search_start = kick_frame if kick_frame is not None else goal_frame
-        search_end = max(0, search_start - lookback_frames)
+        # Fallback: pixel acceleration peak. Useful when the goal arrives
+        # before the ball ever goes through a clean slow→fast transition
+        # (e.g. close-range tap-in).
+        if kick_frame is None:
+            pixel_obs = [
+                (bs.frame, tuple(bs.pixel_center))
+                for bs in ctx.ball_states
+                if bs.pixel_center is not None
+                and start_frame <= bs.frame <= goal_frame
+            ]
+            kick_frames = detect_kick_frames(pixel_obs)
+            for kf in reversed(kick_frames):
+                if kf <= goal_frame:
+                    kick_frame = kf
+                    break
 
-        # Exclude goalkeeper-area players (within 3m of goal line)
+        # ----- Step 2: shooter attribution at the kick frame -----
+        # The slow→fast transition pinpoints the EXACT frame the foot
+        # struck the ball — pick the nearest non-GK player to the ball
+        # at that frame (or the closest ball-detected frame to it). Do
+        # NOT widen the window to a vote: the kick frame is preceded by
+        # a contested-possession phase where a defender often hugs the
+        # ball-carrier as tightly as the attacker, and a vote across
+        # those frames would award the shot to the defender.
+        search_radius = 3.0
+        proximity_radius = 1.5
         if goal_x is not None:
             _gx = goal_x
             exclude_fn = lambda _p, pp: abs(pp[0] - _gx) < 3.0
         else:
             exclude_fn = None
 
+        kf = kick_frame if kick_frame is not None else goal_frame
+        # Find the nearest ball-detected frame to kf (kf itself, then
+        # +/-1, +/-2, ... up to the half-window).
+        kick_attr_frame: int | None = None
+        for offset in range(0, int(0.2 * ctx.fps) + 1):
+            for cand in (kf - offset, kf + offset):
+                if cand < 0 or cand > goal_frame:
+                    continue
+                if ctx.get_ball_at_frame(cand) is not None:
+                    kick_attr_frame = cand
+                    break
+            if kick_attr_frame is not None:
+                break
+
+        if kick_attr_frame is not None:
+            bs = ctx.get_ball_at_frame(kick_attr_frame)
+            tid, team, dist = find_nearest_player(
+                ctx, kick_attr_frame,
+                (bs.position[0], bs.position[1]),
+                exclude_fn=exclude_fn,
+            )
+            if tid is not None and dist <= proximity_radius:
+                logger.info(
+                    "Shooter identified at kick frame: track_id=%s, "
+                    "team=%s, distance=%.1fm, kick_frame=%s, "
+                    "attribution_frame=%d",
+                    tid, team, dist, kick_frame, kick_attr_frame,
+                )
+                return tid, team, kick_attr_frame
+
+        # Last resort: original single-frame nearest search at goal_frame.
+        # Reaches here only when no track stayed within 1.5 m for any
+        # window frame — likely a long-range shot from outside the box.
+        search_start = kick_frame if kick_frame is not None else goal_frame
+        search_end = max(0, search_start - lookback_frames)
         for f in range(search_start, search_end - 1, -1):
             bs = ctx.get_ball_at_frame(f)
             if bs is None:
                 continue
-
             track_id, team, best_dist = find_nearest_player(
                 ctx, f, (bs.position[0], bs.position[1]),
                 exclude_fn=exclude_fn,
             )
-
             if track_id is not None and best_dist <= search_radius:
                 logger.info(
-                    "Shooter identified: track_id=%d, team=%s, "
-                    "distance=%.1fm, frame=%d (kick_frame=%s)",
+                    "Shooter identified (fallback nearest): track_id=%s, "
+                    "team=%s, distance=%.1fm, frame=%d (kick_frame=%s)",
                     track_id, team, best_dist, f, kick_frame,
                 )
                 return track_id, team, f

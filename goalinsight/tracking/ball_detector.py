@@ -59,6 +59,14 @@ class BallDetector:
         self.max_size = self.config.get("max_size", 100)
         self.min_aspect_ratio = self.config.get("min_aspect_ratio", 0.5)
         self.max_aspect_ratio = self.config.get("max_aspect_ratio", 2.0)
+        # High-confidence detections bypass the aspect-ratio filter — a fast
+        # ball gets motion-blurred into an ellipse with width/height up to ~3,
+        # which the static circular prior would incorrectly reject. YOLO's
+        # confidence on those wide bboxes is still high (≥0.6 typical), so use
+        # confidence as the trust signal instead.
+        self.aspect_filter_conf_skip = self.config.get(
+            "aspect_filter_conf_skip", 0.6
+        )
 
         # SAHI sliced inference parameters
         self.use_sahi = self.config.get("use_sahi", False)
@@ -274,10 +282,13 @@ class BallDetector:
             if width > max_size or height > max_size:
                 continue
 
-            # Check aspect ratio (ball should be roughly circular)
+            # Check aspect ratio (ball should be roughly circular). High-conf
+            # detections skip this — a fast ball is motion-blurred into a
+            # 2–3× ellipse but YOLO still locks on with conf ≥0.6.
             aspect_ratio = width / height if height > 0 else 0
             if aspect_ratio < min_ar or aspect_ratio > max_ar:
-                continue
+                if det.get("confidence", 0.0) < self.aspect_filter_conf_skip:
+                    continue
 
             filtered.append(det)
 

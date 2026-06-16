@@ -78,7 +78,7 @@ class PossessionDetector(BaseEventDetector):
         spans: list[PossessionSpan] = []
 
         # Candidate tracking
-        candidate_id: int | None = None
+        candidate_id: int | str | None = None
         candidate_team: str | None = None
         candidate_frames: list[int] = []
         candidate_positions: list[list[float]] = []
@@ -140,7 +140,7 @@ class PossessionDetector(BaseEventDetector):
     @staticmethod
     def _flush_span(
         spans: list[PossessionSpan],
-        player_id: int | None,
+        player_id: int | str | None,
         team_id: str | None,
         frames: list[int],
         positions: list[list[float]],

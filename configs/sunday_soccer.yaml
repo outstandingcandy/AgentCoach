@@ -1,19 +1,23 @@
 video:
-  process_fps: 30            # 30 fps source = process every video frame (dense
-                             # tracking). Smaller per-frame displacements make
-                             # IoU/pitch gates much tighter, killing the
-                             # "two-same-team-players-close-together" ID
-                             # switches. fps-sensitive tracker defaults
-                             # (max_age, pitch_gate_m, reid_pitch_max_m) auto-
-                             # scale by effective_fps/10, so physical meaning
-                             # is preserved.
+  process_fps: 30            # 60 fps source → sample every 2nd frame for
+                             # 30 fps processing (dense tracking). Smaller
+                             # per-frame displacements make IoU/pitch gates
+                             # much tighter, killing the "two-same-team-
+                             # players-close-together" ID switches. fps-
+                             # sensitive tracker defaults (max_age,
+                             # pitch_gate_m, reid_pitch_max_m) auto-scale
+                             # by effective_fps/10, so physical meaning is
+                             # preserved.
 
 # Single source of truth for "compute every Nth video frame" used both
 # for the per-stage compute path and for the per-frame jpg/json vis
 # sink. Keeping these in sync means the vis sample lines up exactly
 # with what each stage actually processed — no missing-detection holes.
 sample:
-  stride: 1                  # process every video frame (matches process_fps=30 on 30fps source)
+  stride: 1                  # leave per-stage sampling fps-driven
+                             # (process_fps=30 on a 60fps source ⇒ every
+                             # 2nd frame is processed). Setting stride>1
+                             # here would compound on top of process_fps.
 
 # Standard FIFA-spec adult pitch (105 × 68 m). Used by the
 # physical backend's PnP + the rest of the pipeline (events, highlights,
@@ -51,7 +55,11 @@ field_registration:
     # exclusive to this run.
     detection_batch_size: 16
     ransac_reproj_error: 50.0
-    line_weight: 1.0
+    # line_weight=0 disables the LM line residual term entirely (the
+    # line model is buggy on this footage; use_line_model already
+    # turns off the dedicated detector, but lines derived from KP
+    # pairs still feed the LM unless we zero the weight here).
+    line_weight: 0.0
     line_sample_points: 20
     max_reproj_error: 25.0
     use_line_model: false
@@ -65,21 +73,22 @@ field_registration:
     joint_optimize: false
     world_error_threshold: 8.0
 
-    # Approximate camera prior. Inferred from KP image-y order: keypoints
-    # at world y=+34 land on TOP of the image (small image y) and KPs
-    # at world y=+9 land lower — meaning the camera is on the -y side
-    # looking towards +y. half_w = 34, so y=-34 is the near sideline;
-    # the user measured the camera at ~5m beyond it, so y=-39. Clip is
-    # zoomed in on the right half so x prior is positive (~7m).
-    # Camera position is HARD-LOCKED — Sunday cup is a fixed sideline
-    # rig, the camera doesn't move during the clip. With lock=true the
-    # LM removes tvec from optimization (recomputes it as -R·C every
-    # step) and only solves rvec + fx. This eliminates the failure
-    # mode where LM drifts the camera centre to a wrong basin trying
-    # to compensate for a sparse / noisy keypoint set.
-    camera_position: [7.0, -39.0, 5.0]
-    lock_camera_position: true
-    position_weight: 25.0  # unused when lock=true
+    # Camera position — two-pass solve.
+    # Pass 1: lock=false, the LM picks per-frame cam_pos freely under
+    # a soft prior + wide bounds. Pass 2 (in physical_runner): take
+    # the median across well-fit Pass 1 frames, hard-lock that, and
+    # re-solve every frame at 4-DOF (rvec + fx). The prior here is
+    # only the cold-start guess; the run will refine it. Previous
+    # human-estimated (7, -37, 5) was off by several meters; the LM
+    # consistently lands near (0.6, -41, 6.1) on this clip.
+    camera_position: [0.6, -41.0, 6.1]
+    lock_camera_position: false
+    position_weight: 1.0
+    # Per-axis hard bounds in metres around the prior. Wide enough
+    # for LM to find the true cam_pos when the prior is rough; tight
+    # enough that tvec can't drift to absurd places (e.g. inside the
+    # pitch).
+    position_bounds_m: [12.0, 10.0, 3.0]
 
     # Camera tilt below horizon (degrees). Sunday-cup rig sits low
     # (~5m tall, ~35m behind goal line), so the camera looks nearly
@@ -103,12 +112,23 @@ field_registration:
     # matching, so downstream PnP sees full-res points.
     gap_fill_chain:
       enabled: true
+      # Tracking samples every 2 video frames (process_fps=30 on
+      # 60fps source); fill at the same cadence so every tracker
+      # frame has a camera pose. Default frame_step=3 left holes
+      # at 100/103/104/106/... causing tracker.update() to run
+      # without a pose and tracks.json gaps.
+      frame_step: 1
       # Use the GPU LightGlue+SuperPoint matcher (~20× faster than
       # the CPU SIFT+FLANN backend on 4K, with comparable inlier
       # quality). Falls back to SIFT if lightglue isn't installed.
       matcher_backend: lightglue
-      anchor_max_reproj_px: 30.0
-      overwrite_above_reproj_px: 30.0
+      # Anchor gate at 30px rejected ~22% of stage1 frames where the
+      # KP detector found 3 line constraints instead of 6 (mid-zoom
+      # frames where the touchline isn't framed). 30→40 brings anchor
+      # coverage from 78% to 86% — 40px is 1% of image width, well
+      # within "good enough to seed SIFT propagation" tolerance.
+      anchor_max_reproj_px: 40.0
+      overwrite_above_reproj_px: 40.0
       method: improved
       smoothing_window: 5
       use_masking: false
@@ -116,15 +136,18 @@ field_registration:
       max_anchor_distance_frames: 120
       sift_top_skip_frac: 0.25
 
-  # KP + Line both fine-tuned on 2 sunday_cup annotations
-  # (workspace/models/keypoint_20260612_143742 + line_20260612_151703).
+  # KP fine-tuned on 4 sunday_cup annotations (frames 0/301/681/1103,
+  # re-annotated 2026-06-15). Best val loss 0.000032 @ epoch 100.
+  # The line head is permanently disabled on this footage — the
+  # finetuned line model produces noisy detections that hurt LM
+  # convergence rather than helping. Both ``use_lines`` (controls the
+  # KP-derived line residual at solve time) and ``use_line_model``
+  # (above, in the physical block) are off.
   pnlcalib:
-    keypoint_model_path: "workspace/models/keypoint_20260614_111633/run_20260614_111637/models/best_model.pt"
+    keypoint_model_path: "workspace/models/keypoint_20260615_070147/run_20260615_070203/models/best_model.pt"
     keypoint_weights: "SV_kp"
     keypoint_threshold: 0.15
     use_lines: false
-    line_model_path: "workspace/models/line_20260612_151703/run_20260612_151707/models/best_model.pt"
-    line_weights: "SV_lines"
     line_threshold: 0.10
 
 device: "cuda"
@@ -134,8 +157,21 @@ device: "cuda"
 # YOLO-miss rate that drove the orig 64 / orig 73 frame-897 swap
 # (right-side player not detected at imgsz=1280 → tracker had only
 # one detection in the area → wrong assignment cascaded).
-detection:
+#
+# iou_threshold raised from 0.45 → 0.55 so YOLO's NMS keeps both
+# bboxes when two players overlap heavily (frame 897 cluster: #8 and
+# the player hugging him have IoU≈0.50; at 0.45 NMS suppressed the
+# lower-conf #8). 0.55 keeps both; 0.7+ would keep way too many
+# duplicates of single players.
+#
+# imgsz / iou_threshold MUST live under ``unified_detection`` (the
+# default fused player+ball pass uses that block); putting them under
+# ``detection`` is now a hard error. ``detection.confidence_threshold``
+# below is the only ``detection`` key still honoured in unified mode —
+# it gates the post-hoc PlayerDetector filter.
+unified_detection:
   imgsz: 1920
+  iou_threshold: 0.55
 
 # PRTReID is fine-tuned on SoccerNet (player-level), 256-dim with HRNet32.
 # Same choice as the kids config — better same-team discrimination than OSNet.
@@ -148,7 +184,24 @@ reid:
 # metre teleports through the pitch sanity check.
 tracking:
   pitch_gate_m: 1.33                # was 4.0 @10fps → 1.33 @30fps
-  reid_pitch_max_m: 0.5             # was 1.5 @10fps → 0.5 @30fps
+  # reid_pitch_max_m raised 0.5 → 0.8 because the strict 0.5×scale
+  # gate sat right at the borderline for legitimate 1-sample
+  # reattachments (e.g. orig 6 at f=103: pitch jump ~0.9m vs limit
+  # 1.0m, jitter pushed it across). 0.8 gives ~1.6m budget at
+  # tsu=1, still half the per-frame sprint distance, while letting
+  # routine reattachments through.
+  reid_pitch_max_m: 0.8
+
+# Jersey number recognition backend. Tried Qwen3.6-27B-FP8 (local
+# vLLM) and Gemini 2.5 Flash; both committed to single-digit reads
+# more often than Claude Opus, dropping ~3 jerseys vs the Claude
+# baseline (15/20 vs 18/20 with jersey). Sticking with Claude Opus
+# 4.7 via Bedrock for now.
+jersey_recognition:
+  enabled: true
+  backend: claude
+  model_id: "us.anthropic.claude-opus-4-7"
+  region: "us-east-1"
 
 track_consolidation:
   # 30 frames at process_fps=30 ≈ 1 second of observations — filters
@@ -156,17 +209,23 @@ track_consolidation:
   # tids.
   min_track_frames: 30
 
-  # Phase-2 jersey OCR runs through the LLM (Bedrock Claude Opus).
+  # ``ocr_batch_size: 16`` montages 16 crops into one LLM call (4×4
+  # grid), so even at frame_stride=2 a 600-frame track is ~300 crops
+  # = 19 batched calls, not 300 single calls. Keeps voting fidelity
+  # while making dense sampling tractable.
   jersey:
     ocr_backend: llm
-  # stride=10 keeps OCR cost bounded at ~60 LLM calls per long track.
-  frame_stride: 10
+    ocr_batch_size: 16
+  # stride=2: sample every 2nd frame so far-side / occluded tracks
+  # have enough chances at a clean digit-visible angle. Combined with
+  # batched OCR the cost stays bounded.
+  frame_stride: 2
 
 pipeline:
   stages:
     - field_registration
     - tracking
-    - event_detection
     - track_consolidation
+    - event_detection
     - player_profile
     - highlights
