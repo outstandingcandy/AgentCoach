@@ -71,10 +71,26 @@ def register_match_detail_routes(app: FastAPI, runs: RunRegistry) -> None:
 
 
 def _build_payload(handle: RunHandle) -> dict[str, Any]:
-    cached = getattr(handle, "_match_detail_payload", None)
-    if cached is not None:
-        return cached
+    """Build the match-detail payload fresh on each request.
+
+    Previously this was cached on the RunHandle, but that meant
+    re-running event_detection (or any pipeline stage that rewrites
+    its outputs) wasn't visible to the page until the web process
+    restarted. We also drop the MatchContext-side ``_events`` cache
+    here so the in-handle ctx re-reads ``events.json`` from disk.
+    Player clips and camera-fov polygons are also dependent on the
+    pipeline outputs and get re-derived per request.
+    """
     ctx = handle.ctx
+    # Invalidate the lazy MatchContext caches that read pipeline
+    # outputs from disk. Static-once fields (fps, pitch dims, video
+    # geometry) are kept; tracks / ball / events / team_assignments
+    # are re-read on next access.
+    ctx._events = None  # type: ignore[attr-defined]
+    ctx._player_tracks = None  # type: ignore[attr-defined]
+    ctx._ball_tracks = None  # type: ignore[attr-defined]
+    ctx._team_assignments = None  # type: ignore[attr-defined]
+    ctx._camera_poses = None  # type: ignore[attr-defined]
     payload = {
         "fps": ctx.fps,
         "frame_count": ctx.frame_count,
@@ -94,7 +110,6 @@ def _build_payload(handle: RunHandle) -> dict[str, Any]:
         "player_clips": _player_clips(ctx),
         "camera_fov": _camera_fov_polygons(ctx),
     }
-    handle._match_detail_payload = payload  # type: ignore[attr-defined]
     return payload
 
 
