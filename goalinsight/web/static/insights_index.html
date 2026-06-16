@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>GoalInsight — Insights</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; background: #101418; color: #e6e9ee;
+                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+    header { padding: 10px 16px; border-bottom: 1px solid #262b33; background: #161b21;
+             display: flex; gap: 16px; align-items: center; font-size: 14px; }
+    header strong { color: #fff; }
+    header .hint { color: #6b7380; font-size: 12px; margin-left: auto; }
+    main { flex: 1; min-height: 0; overflow-y: auto; padding: 16px; }
+
+    .grid { display: grid; gap: 12px;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+    .card { background: #1a2027; border: 1px solid #232a32; border-radius: 8px;
+            padding: 12px 14px; transition: border-color 0.12s; cursor: pointer; }
+    .card:hover { border-color: #3b82f6; }
+    .card.disabled { opacity: 0.5; cursor: not-allowed; }
+    .card .name { color: #cfe3ff; font-weight: 600; margin-bottom: 6px;
+                  word-break: break-all; }
+    .card .badges { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+    .badge { font-size: 11px; padding: 2px 6px; border-radius: 4px; font-weight: 600; }
+    .badge.ok { background: #1d3a2a; color: #6ee7b7; border: 1px solid #2d5a3f; }
+    .badge.miss { background: #2a323c; color: #6b7380; border: 1px solid #2a323c; }
+    .card .reason { color: #fda4af; font-size: 12px; margin-top: 4px; }
+    .card .actions { display: flex; gap: 6px; margin-top: 8px; }
+    .card .actions a { color: #cfe3ff; font-size: 12px; padding: 4px 8px;
+                       border-radius: 5px; background: #2a323c; text-decoration: none; }
+    .card .actions a:hover { background: #3b82f6; color: white; }
+    .card .actions a.primary { background: #3b82f6; color: white; }
+    .empty { color: #6b7380; padding: 24px; text-align: center; font-size: 14px; }
+  </style>
+  <script defer src="/static/nav.js"></script>
+</head>
+<body>
+  <header>
+    <strong>Insights</strong>
+    <span style="color:#9aa3ad">Pick a run to open the chat insights viewer</span>
+    <span class="hint">a session picker is shown after you open a run</span>
+  </header>
+  <main>
+    <div id="grid" class="grid"></div>
+  </main>
+  <script>
+    function badge(ok, label) {
+      return `<span class="badge ${ok ? 'ok' : 'miss'}">${label}</span>`;
+    }
+
+    async function load() {
+      const grid = document.getElementById('grid');
+      let runs;
+      try {
+        runs = await (await fetch('/api/library/runs')).json();
+      } catch (e) {
+        grid.innerHTML = `<div class="empty">failed to load runs: ${e}</div>`;
+        return;
+      }
+      if (!runs.length) {
+        grid.innerHTML = '<div class="empty">No runs yet. Create one from the Library page.</div>';
+        return;
+      }
+      // Insights chat needs at least the annotated video (so the user
+      // can scrub) and tracks (so the chat agent can answer about
+      // players/events). Everything else is bonus context.
+      grid.innerHTML = runs.map(r => {
+        const s = r.stages || {};
+        const ready = !!(s.tracking && s.annotated_video);
+        const onclick = ready
+          ? `onclick="location.href='/insights/${encodeURIComponent(r.run_name)}'"`
+          : '';
+        const reason = ready ? '' :
+          `<div class="reason">missing ${[
+            !s.tracking && 'tracking',
+            !s.annotated_video && 'annotated_video',
+          ].filter(Boolean).join(', ')}</div>`;
+        return `<div class="card ${ready ? '' : 'disabled'}" ${onclick}>
+          <div class="name">${r.run_name}</div>
+          <div class="badges">
+            ${badge(s.tracking, 'tracking')}
+            ${badge(s.track_consolidation, 'consol')}
+            ${badge(s.event_detection, 'events')}
+            ${badge(s.annotated_video, 'video')}
+          </div>
+          ${reason}
+          <div class="actions">
+            ${ready
+              ? `<a class="primary" href="/insights/${encodeURIComponent(r.run_name)}">Open insights</a>`
+              : ''}
+            <a href="/match/${encodeURIComponent(r.run_name)}">Match</a>
+            <a href="/pipeline?run=${encodeURIComponent(r.run_name)}">Pipeline</a>
+          </div>
+        </div>`;
+      }).join('');
+    }
+    load();
+  </script>
+</body>
+</html>

@@ -49,8 +49,10 @@
     { id: 'match', label: 'Match',
       href: () => RUN_NAME ? `/match/${encodeURIComponent(RUN_NAME)}` : '/match/' },
     { id: 'insights', label: 'Insights',
-      requiresRun: true,
-      href: () => RUN_NAME ? `/insights/${encodeURIComponent(RUN_NAME)}` : null },
+      // Always clickable: with a run we go straight to the chat;
+      // without one we land on /insights index, which is a run
+      // picker. Same UX as Match.
+      href: () => RUN_NAME ? `/insights/${encodeURIComponent(RUN_NAME)}` : '/insights' },
     { id: 'tracking', label: 'Tracking',
       requiresRun: true,
       href: () => RUN_NAME ? `/tracking/${encodeURIComponent(RUN_NAME)}` : null },

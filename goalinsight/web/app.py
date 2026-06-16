@@ -163,6 +163,18 @@ def create_workspace_app(
             raise HTTPException(503, "pipeline.html not yet installed")
         return FileResponse(path, headers=no_cache)
 
+    @app.get("/insights")
+    @app.get("/insights/")
+    def insights_index_page() -> FileResponse:
+        # Run picker — same pattern as /match/ / /library: lists every
+        # run with a tracking + annotated_video output and lets the user
+        # click into one. Matches the nav-tab convention so Insights
+        # is always reachable, even when no run is in the URL yet.
+        path = STATIC_DIR / "insights_index.html"
+        if not path.exists():
+            raise HTTPException(503, "insights_index.html not yet installed")
+        return FileResponse(path, headers=no_cache)
+
     @app.get("/insights/{run_name}")
     def viewer_page(run_name: str) -> FileResponse:
         # Path is just the entry point; client uses run_name to call
