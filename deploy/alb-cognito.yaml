@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  goal-insight-v3 — ALB (internet-facing) + Cognito user pool fronting the
+  EC2 web server (port 8000). EC2's only inbound becomes ALB SG → 8000;
+  no other public ports. SSH stays open per existing SG (out of scope).
+  Mirrors the raw2real deployment: self-signed cert imported into ACM,
+  Cognito callback at the ALB's *.elb.amazonaws.com DNS.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-06089b82eb1655d0d
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two public subnets in different AZs.
+    # us-east-1a + us-east-1c (matches raw2real-viewer)
+    Default: "subnet-091a27b8f87b45644,subnet-0dda83a574abfa858"
+  Ec2InstanceId:
+    Type: AWS::EC2::Instance::Id
+    Default: i-0dc7112f988ab9522
+  Ec2ExistingSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: The EC2's primary SG (the one whose inbound we'll modify).
+    Default: sg-06819b1e0637790e1   # launch-wizard-10
+  AppPort:
+    Type: Number
+    Default: 8000
+  ImportedCertArn:
+    Type: String
+    Description: >
+      ARN of the self-signed certificate we imported into ACM (run
+      bootstrap.sh first). Cannot be created by CFN — ACM ImportCertificate
+      isn't a CFN resource.
+  CognitoDomainPrefix:
+    Type: String
+    Description: Cognito hosted UI subdomain prefix (must be globally unique within region).
+    Default: goal-insight-683638520402
+  AdminEmail:
+    Type: String
+    Description: Email address that will be created as the first admin user.
+
+Resources:
+  # ---------------- Cognito ----------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: goal-insight-users
+      # Admin-create only; no self-signup. Mirror raw2real if you want signup
+      # later, set AllowAdminCreateUserOnly=false here.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Ref CognitoDomainPrefix
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: goal-insight-alb
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true        # required for ALB authenticate-cognito
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !Sub "https://${LoadBalancer.DNSName}/oauth2/idpresponse"
+      LogoutURLs:
+        - !Sub "https://${LoadBalancer.DNSName}/"
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  AdminUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref AdminEmail
+      DesiredDeliveryMediums: [EMAIL]
+      UserAttributes:
+        - Name: email
+          Value: !Ref AdminEmail
+        - Name: email_verified
+          Value: "true"
+
+  # ---------------- ALB security group ----------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: goal-insight-alb-sg
+      GroupDescription: Public ingress 80/443 → goal-insight ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP public (redirects to 443)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS public
+
+  # Open EC2 :8000 to the ALB SG only. The existing SG keeps its other
+  # rules (e.g. SSH 22) untouched — we only add this one ingress.
+  Ec2AppPortFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref Ec2ExistingSecurityGroupId
+      IpProtocol: tcp
+      FromPort: !Ref AppPort
+      ToPort: !Ref AppPort
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: ALB to goal-insight web
+
+  # ---------------- ALB ----------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: goal-insight-alb
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: goal-insight-tg
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: !Ref AppPort
+      TargetType: instance
+      Targets:
+        - Id: !Ref Ec2InstanceId
+          Port: !Ref AppPort
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200-399
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: HTTP_301
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !Ref ImportedCertArn
+      DefaultActions:
+        - Type: authenticate-cognito
+          Order: 1
+          AuthenticateCognitoConfig:
+            UserPoolArn: !GetAtt UserPool.Arn
+            UserPoolClientId: !Ref UserPoolClient
+            UserPoolDomain: !Ref UserPoolDomain
+            Scope: "openid email"
+            OnUnauthenticatedRequest: authenticate
+            SessionTimeout: 86400
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  AlbDns:
+    Value: !GetAtt LoadBalancer.DNSName
+    Description: Open https://<this>/ in a browser (skip the cert warning).
+  CognitoUserPoolId:
+    Value: !Ref UserPool
+  CognitoClientId:
+    Value: !Ref UserPoolClient
+  CognitoHostedUIDomain:
+    Value: !Sub "${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"
+  TargetGroupArn:
+    Value: !Ref TargetGroup
