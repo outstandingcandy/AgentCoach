@@ -178,36 +178,153 @@ def consolidate(
     clusters: list[PlayerCluster] = []
     track_to_player: dict[int, str] = {}
 
-    # ---- Stage A: ReID-first greedy clustering -------------------------
-    # Process tracks largest-first so they seed clusters; smaller
-    # fragments either join (cosine ≥ threshold + no cooccur + no team
-    # conflict) or seed a new cluster.
-    metas_sorted = sorted(metas, key=lambda g: -g.frame_count)
-    seeded: list[PlayerCluster] = []
-    for m in metas_sorted:
-        best_cluster: PlayerCluster | None = None
-        best_sim = -1.0
-        for c in seeded:
-            if _conflicts(c, m) or _team_conflicts(c, m):
+    # ---- Stage A: constrained connected-components clustering ----------
+    # Build a graph where two tids share an edge iff:
+    #   1. cosine(reid_i, reid_j) ≥ same_person_threshold
+    #   2. (i, j) ∉ cooccur_pairs                  (physical impossibility)
+    #   3. team_compatible(i, j)
+    #   4. jersey numbers don't STRONGLY disagree  (cannot-link if both
+    #      tids have a strong-confidence jersey vote pointing at
+    #      different numbers — independent OCR observations of two
+    #      different numbers is much stronger evidence of "two people"
+    #      than ReID alone, especially on uniformed-team footage where
+    #      cross-player cosine is 0.89-0.96 and overlaps same-player).
+    # Then connected-components on the resulting graph, processing edges
+    # in descending cosine order with an anti-transitivity guard so a
+    # chain a-b-c never sneaks past a (a, c) cooccur or jersey-conflict.
+    #
+    # Why this replaces greedy ReID-first: the previous "process tracks
+    # largest-first, attach to best existing cluster ≥ threshold" was
+    # order-dependent and let a single tid pull a competing-jersey
+    # cluster into its bucket once their centroids merged. Constrained
+    # CC is order-invariant, transitive, and uses the LLM jersey vote
+    # as a hard cannot-link signal at the right place.
+    meta_by_tid = {m.track_id: m for m in metas}
+
+    def _strong_jersey(m: TrackMeta) -> int | None:
+        """Top-candidate jersey number iff its weighted score ≥ 1.0.
+
+        Stage A uses a stricter bar than Stage B's
+        ``min_jersey_confidence`` because here we're using OCR as a
+        cannot-link signal — false positives split same-person tids.
+        Weighted score ≥ 1.0 typically means at least 2 frames
+        independently agreed on the number.
+        """
+        if not m.jersey_candidates:
+            return None
+        try:
+            n, s = m.jersey_candidates[0]
+        except (TypeError, ValueError):
+            return None
+        if float(s) < 1.0:
+            return None
+        try:
+            return int(n)
+        except (TypeError, ValueError):
+            return None
+
+    def _jersey_conflicts(a: TrackMeta, b: TrackMeta) -> bool:
+        ja, jb = _strong_jersey(a), _strong_jersey(b)
+        return ja is not None and jb is not None and ja != jb
+
+    # Order-stable but determinism-friendly: union-find indexed by tid.
+    parent = {m.track_id: m.track_id for m in metas}
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _comp_members(root: int) -> list[int]:
+        return [t for t in parent if _find(t) == root]
+
+    # Pre-build cluster-level cannot-link checker. We keep it as a
+    # function so the anti-transitivity guard sees the live components.
+    def _would_violate(ra: int, rb: int) -> bool:
+        members_a = _comp_members(ra)
+        members_b = _comp_members(rb)
+        for x in members_a:
+            mx = meta_by_tid[x]
+            for y in members_b:
+                my = meta_by_tid[y]
+                lo, hi = (x, y) if x < y else (y, x)
+                if (lo, hi) in cooccur_pairs:
+                    return True
+                if _jersey_conflicts(mx, my):
+                    return True
+                # Different known teams stay split.
+                if (mx.team not in ("unknown", "")
+                        and my.team not in ("unknown", "")
+                        and mx.team != my.team):
+                    return True
+        return False
+
+    # Build the candidate edge list (passes the local pair filter).
+    edges: list[tuple[float, int, int]] = []
+    metas_indexed = list(metas)
+    for i in range(len(metas_indexed)):
+        a = metas_indexed[i]
+        for j in range(i + 1, len(metas_indexed)):
+            b = metas_indexed[j]
+            if a.reid_centroid is None or b.reid_centroid is None:
                 continue
-            sim = cosine(m.reid_centroid, c.reid_centroid)
-            if sim > best_sim:
-                best_sim = sim
-                best_cluster = c
-        if best_cluster is not None and best_sim >= same_person_threshold:
-            _merge_into(best_cluster, m)
+            lo, hi = (a.track_id, b.track_id) if a.track_id < b.track_id \
+                else (b.track_id, a.track_id)
+            if (lo, hi) in cooccur_pairs:
+                continue
+            if (a.team not in ("unknown", "") and b.team not in ("unknown", "")
+                    and a.team != b.team):
+                continue
+            if _jersey_conflicts(a, b):
+                continue
+            sim = cosine(a.reid_centroid, b.reid_centroid)
+            if sim >= same_person_threshold:
+                edges.append((sim, a.track_id, b.track_id))
+
+    # Strongest edges merge first (deterministic tie-break by tid).
+    edges.sort(key=lambda e: (-e[0], e[1], e[2]))
+    for _sim, a_tid, b_tid in edges:
+        ra, rb = _find(a_tid), _find(b_tid)
+        if ra == rb:
+            continue
+        if _would_violate(ra, rb):
+            continue
+        # Lower tid wins as the root (stable, deterministic).
+        if ra < rb:
+            parent[rb] = ra
         else:
-            # Seed a new cluster; team / jersey are filled in below by
-            # _vote_jersey_for_cluster + the rename pass.
-            seeded.append(PlayerCluster(
-                player_id="",  # set by rename pass
-                team=m.team,
-                role=m.role,
-                jersey_number=None,
-                jersey_confidence=0.0,
-                source_tracks=[m.track_id],
-                reid_centroid=m.reid_centroid,
-            ))
+            parent[ra] = rb
+
+    # Materialise clusters from the connected components. Each cluster's
+    # centroid is the L2-normalised mean of its tids' centroids; the
+    # seed metadata (team / role) is taken from the largest member —
+    # Stage B will re-vote on it anyway.
+    components: dict[int, list[TrackMeta]] = {}
+    for m in metas:
+        components.setdefault(_find(m.track_id), []).append(m)
+
+    seeded: list[PlayerCluster] = []
+    for tids in components.values():
+        # Pick the largest tid by frame_count as the seed metadata
+        # provider; stage B re-votes anyway so this is just a stub.
+        seed = max(tids, key=lambda m: m.frame_count)
+        cents = [m.reid_centroid for m in tids if m.reid_centroid is not None]
+        merged_centroid = (
+            l2_normalize(np.mean(np.stack(cents, axis=0), axis=0))
+            if cents else None
+        )
+        seeded.append(PlayerCluster(
+            player_id="",
+            team=seed.team,
+            role=seed.role,
+            jersey_number=None,
+            jersey_confidence=max(
+                (m.jersey_confidence for m in tids), default=0.0
+            ),
+            source_tracks=[m.track_id for m in tids],
+            reid_centroid=merged_centroid,
+        ))
 
     # ---- Stage B: confidence-weighted jersey vote per cluster ----------
     # For each cluster, look at all source tracks and pick the jersey
@@ -215,7 +332,7 @@ def consolidate(
     # count). A single high-conf vote can override several mid-conf
     # disagreements, but two equally-confident different numbers will
     # leave the cluster's number as None (handled at orphan stage).
-    meta_by_tid = {m.track_id: m for m in metas}
+    # ``meta_by_tid`` was already built in Stage A.
     for c in seeded:
         c.jersey_number, c.jersey_confidence = _vote_jersey_for_cluster(
             c, meta_by_tid, min_jersey_confidence,

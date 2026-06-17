@@ -28,6 +28,7 @@ import numpy as np
 from ..interfaces import BaseJerseyRecognizer
 from ._vlm_common import (
     BATCHED_OCR_PROMPT,
+    BATCHED_OCR_PROMPT_IMAGE_LIST,
     MULTI_SYSTEM,
     SCENE_TASK_TEXT,
     SINGLE_OCR_PROMPT,
@@ -371,16 +372,27 @@ class BaseVLMRecognizer(BaseJerseyRecognizer):
     def _ocr_batch_llm(
         self, crops: list[np.ndarray],
     ) -> dict[str, Any]:
-        """Single LLM call over a montage of up to ``ocr_batch_size`` crops.
+        """Single LLM call over up to ``ocr_batch_size`` crops.
 
-        Tiles ``crops`` into a square-ish grid (cols=ceil(sqrt(N))) and
-        asks the model to vote across the montage and return ONE final
-        number for the whole batch (not per-cell readings). Returns a
-        single verdict dict
-        ``{reading, crop_confidence, visible_digits}``. ``crop_confidence``
-        is named that way (rather than ``confidence``) so the verdict
-        is interchangeable with single-crop verdicts when fed to
-        ``aggregate_crop_verdicts``.
+        Two transport modes (``ocr_image_list`` flag):
+        - ``False`` (default): tile crops into a montage grid and send
+          ONE image. Cheap (1× image-token minimum per call) but a
+          tightly cropped player + a teammate standing nearby end up
+          in the same 160×160 cell, which the model can't always
+          isolate.
+        - ``True``: send N independent images in the user message. Each
+          image is just one bbox crop with the target centred, so
+          adjacent players appear only as bbox-edge slivers — the
+          model never has to disambiguate "two backs in one cell".
+          Costs N× the image-token minimum (~1568 tokens per image
+          on Anthropic), so pair with a smaller ``ocr_batch_size``
+          (e.g. 4) and a larger ``frame_stride`` to keep total token
+          spend reasonable.
+
+        Returns ``{reading, crop_confidence, visible_digits}``;
+        ``crop_confidence`` is named that way (not ``confidence``)
+        so the verdict is interchangeable with single-crop verdicts
+        when fed to ``aggregate_crop_verdicts``.
         """
         n = len(crops)
         if n == 0:
@@ -389,18 +401,26 @@ class BaseVLMRecognizer(BaseJerseyRecognizer):
         if n == 1:
             return self._ocr_one_llm(crops[0])
 
-        montage = _build_crop_montage(crops)
-        prompt = BATCHED_OCR_PROMPT.format(N=n)
         # 1024 leaves headroom for chain-of-thought-style models
         # (Qwen3 VL emits a paragraph of reasoning before the JSON
         # by default; 200 truncated mid-thought and the JSON parser
         # got an empty reply). Claude / Gemini still respond in <100
         # tokens so the larger ceiling has no cost there.
-        raw = self._call(
-            [("text", prompt), ("image", montage)],
-            system=None,
-            max_tokens=max(self.max_tokens, 1024),
-        )
+        max_tok = max(self.max_tokens, 1024)
+        if bool(self.config.get("ocr_image_list", False)):
+            # Image-list mode: prompt + each crop as a separate image.
+            prompt = BATCHED_OCR_PROMPT_IMAGE_LIST.format(N=n)
+            blocks: list[Block] = [("text", prompt)]
+            for c in crops:
+                blocks.append(("image", c))
+            raw = self._call(blocks, system=None, max_tokens=max_tok)
+        else:
+            prompt = BATCHED_OCR_PROMPT.format(N=n)
+            montage = _build_crop_montage(crops)
+            raw = self._call(
+                [("text", prompt), ("image", montage)],
+                system=None, max_tokens=max_tok,
+            )
         if raw is None:
             return {"reading": None, "crop_confidence": 0.0,
                     "visible_digits": "api error"}

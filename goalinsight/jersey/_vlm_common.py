@@ -84,6 +84,13 @@ SINGLE_PROMPT = (
 SINGLE_OCR_PROMPT = (
     "Read the jersey number on this soccer player's back/chest.\n\n"
     "RULES:\n"
+    "  - The crop is supposed to contain ONE target player. If the crop\n"
+    "    shows MULTIPLE players overlapping (two or more visible jersey\n"
+    "    backs / faces close together so it's ambiguous which one is\n"
+    "    the target), return reading=null with\n"
+    "    visible_digits='multiple players in crop' — DO NOT pick any\n"
+    "    number even if one is clearly readable, because we don't know\n"
+    "    which player you'd be reading.\n"
     "  - If you can FULLY see the number's digits, sharp and unobstructed,\n"
     "    return that number (1-99).\n"
     "  - If you can only see ONE digit clearly (e.g. a '0' but the tens\n"
@@ -107,7 +114,8 @@ SINGLE_OCR_PROMPT = (
 # The N crops are all of the SAME player at different moments — the
 # model votes across them and returns ONE final number, not per-cell
 # verdicts. Cuts both API count and output tokens compared to per-
-# crop calls.
+# crop calls. Wording is grid-specific; the image-list path below uses
+# its own variant where each crop arrives as its own image block.
 BATCHED_OCR_PROMPT = (
     "You will see ONE composite image containing {N} crops of the SAME "
     "soccer player at different moments. They are arranged in a grid "
@@ -125,18 +133,37 @@ BATCHED_OCR_PROMPT = (
     "centred digit with empty fabric on both sides where a tens digit "
     "would otherwise sit.\n\n"
     "RULES:\n"
-    "  - ≥1 crop shows the full two-digit number sharp and unobstructed\n"
-    "    → return that number (10-99).\n"
-    "  - ≥1 crop shows the FULL back area with a single centred digit\n"
-    "    (no second-digit space being hidden) → return that single digit\n"
-    "    (1-9) and visible_digits='single digit, full back visible'.\n"
+    "  - The composite image is a GRID of independent crops separated by\n"
+    "    cell borders. Each cell is meant to contain ONE target player.\n"
+    "    The grid as a whole obviously shows many cells with different\n"
+    "    moments — that's expected. The problem case is when a SINGLE\n"
+    "    CELL contains the target plus ANOTHER player overlapping the\n"
+    "    target's body (e.g. another player's back / shoulder / number\n"
+    "    visibly intruding into the same cell as the target).\n"
+    "  - ABSOLUTE RULE for multi-player cells: if the number you would\n"
+    "    read appears ONLY in cells that also contain another player\n"
+    "    overlapping the target, you must NOT report that number — even\n"
+    "    if the digits are sharp and easy to read. The number could\n"
+    "    belong to either player and we cannot tell which is the target.\n"
+    "    Set reading=null with\n"
+    "    visible_digits='multiple players in crop'.\n"
+    "  - To commit to a number, you need ≥1 cell where (a) exactly one\n"
+    "    player is visible (no second player overlapping their body),\n"
+    "    and (b) that player's number is sharp and unobstructed:\n"
+    "      • full two-digit number visible → return 10-99\n"
+    "      • full back area with a single centred digit (no second-\n"
+    "        digit space being hidden) → return that single digit (1-9)\n"
+    "        and visible_digits='single digit, full back visible'\n"
+    "  - Subtle test: if you see a number in cell X but in cell X you\n"
+    "    can also see two backs, two shoulders, or two heads close\n"
+    "    enough to be in the same cell — DO NOT use that cell.\n"
     "  - Only ever see a single digit but the rest of the back is\n"
     "    occluded / cropped / turned away → reading=null,\n"
     "    visible_digits='partial: <digit>'. DO NOT guess the missing\n"
     "    digit, even if a player is rumoured to wear that low number.\n"
     "  - Ignore numbers on shorts, socks, or background.\n"
-    "  - Back never visible across all crops → reading=null,\n"
-    "    visible_digits='back not visible'.\n\n"
+    "  - Back never visible across all single-player cells →\n"
+    "    reading=null, visible_digits='back not visible'.\n\n"
     "Output a single JSON object on one line, no prose:\n"
     '{{"reading": <int 1-99 or null>, '
     '"visible_digits": "<short factual>", '
@@ -145,6 +172,65 @@ BATCHED_OCR_PROMPT = (
     "the full number sharp and unobstructed; 0.4–0.6 when committing\n"
     "to a single digit because the full back is visible; lower when\n"
     "crops disagree."
+)
+
+
+# Image-list variant: N crops arrive as N separate image blocks in the
+# user message (no montage tile). The "multi-player overlap" risk is
+# significantly lower because each image is just one bbox crop with the
+# target centred — adjacent players appear only as the small bbox-edge
+# slivers they are. Same JSON output shape as the montage prompt so
+# downstream parsing is identical.
+BATCHED_OCR_PROMPT_IMAGE_LIST = (
+    "You will see {N} separate images, each a crop of the SAME soccer "
+    "player at a different moment. Each image was extracted from the "
+    "video using a single tracker bounding box and is supposed to "
+    "contain ONE target player at its centre. Treat them as {N} "
+    "independent looks at the same person's back/chest.\n\n"
+    "Determine that player's jersey number. CRITICAL: a single visible "
+    "digit is NEVER a number — most jerseys have two digits, and a "
+    "single visible digit usually means the OTHER digit is occluded by "
+    "an arm, shoulder, sleeve, side-of-body, or simply not facing the "
+    "camera. For example, if you see a '6' but no '1' immediately to "
+    "its left/right within the SAME image, the number could be 6, 16, "
+    "26, 36, 46, 56, 60–69, 76, 86, or 96 — DO NOT commit. Only commit "
+    "to a single-digit number (1–9) when ≥1 image shows the ENTIRE "
+    "jersey-back area unobstructed AND that area shows ONE centred "
+    "digit with empty fabric on both sides where a tens digit would "
+    "otherwise sit.\n\n"
+    "RULES:\n"
+    "  - Each image is supposed to contain ONE target player. The bbox\n"
+    "    edges may catch slivers of teammates standing nearby — that's\n"
+    "    fine; ignore those slivers and read only the player at the\n"
+    "    image centre. The problem case is when an image clearly shows\n"
+    "    TWO players' jersey backs both fully visible inside the same\n"
+    "    image (overlapping torsos, two numbers visible). For those\n"
+    "    images you cannot tell which is the target — ignore them.\n"
+    "    If MOST images individually show two-or-more fully visible\n"
+    "    jersey backs, return reading=null with\n"
+    "    visible_digits='multiple players in crop'.\n"
+    "  - To commit to a number, you need ≥1 image where (a) the\n"
+    "    centred player's body is the dominant figure, and (b) that\n"
+    "    player's number is sharp and unobstructed:\n"
+    "      • full two-digit number visible → return 10-99\n"
+    "      • full back area with a single centred digit (no second-\n"
+    "        digit space being hidden) → return that single digit (1-9)\n"
+    "        and visible_digits='single digit, full back visible'\n"
+    "  - Only ever see a single digit but the rest of the back is\n"
+    "    occluded / cropped / turned away → reading=null,\n"
+    "    visible_digits='partial: <digit>'. DO NOT guess the missing\n"
+    "    digit, even if a player is rumoured to wear that low number.\n"
+    "  - Ignore numbers on shorts, socks, or background.\n"
+    "  - Back never visible across all images → reading=null,\n"
+    "    visible_digits='back not visible'.\n\n"
+    "Output a single JSON object on one line, no prose:\n"
+    '{{"reading": <int 1-99 or null>, '
+    '"visible_digits": "<short factual>", '
+    '"confidence": <float 0.0-1.0>}}\n\n'
+    "confidence: 0 if reading=null; 0.9+ when at least one image shows\n"
+    "the full number sharp and unobstructed; 0.4–0.6 when committing\n"
+    "to a single digit because the full back is visible; lower when\n"
+    "images disagree."
 )
 
 MULTI_SYSTEM = (
