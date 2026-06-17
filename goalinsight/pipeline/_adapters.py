@@ -172,18 +172,26 @@ class EventDetectionStage(Stage):
         with open(out / "goals.json", "w") as f:
             json.dump(goals, f, indent=2, default=str)
 
-        # Render annotated video
-        from ..events.visualization import render_event_video
-        events_cfg = ctx.config.get("events", {}) if ctx.config else {}
-        default_stride = _default_vis_stride(ctx.config)
-        render_event_video(
-            video_path=ctx.video_path,
-            events=event_dicts,
-            output_path=out / "events.mp4",
-            tracking_dir=tracking_dir if tracking_dir.exists() else None,
-            banner_duration_sec=events_cfg.get("banner_duration_sec", 3.0),
-            vis_frame_stride=int(events_cfg.get("vis_frame_stride", default_stride)),
+        # Render annotated video — gated on --no-viz / output.save_visualizations.
+        # The event-detection logic itself is millisecond-level CPU; the
+        # video render is the multi-minute bottleneck and skippable when
+        # iterating on detector logic.
+        save_vis = (
+            ctx.config.get("output", {}).get("save_visualizations", True)
+            if ctx.config else True
         )
+        if save_vis:
+            from ..events.visualization import render_event_video
+            events_cfg = ctx.config.get("events", {}) if ctx.config else {}
+            default_stride = _default_vis_stride(ctx.config)
+            render_event_video(
+                video_path=ctx.video_path,
+                events=event_dicts,
+                output_path=out / "events.mp4",
+                tracking_dir=tracking_dir if tracking_dir.exists() else None,
+                banner_duration_sec=events_cfg.get("banner_duration_sec", 3.0),
+                vis_frame_stride=int(events_cfg.get("vis_frame_stride", default_stride)),
+            )
 
         by_type = {}
         for e in events:
@@ -274,8 +282,15 @@ class TrackConsolidationStage(Stage):
         # Render mp4 + per-frame jpg with consolidated player IDs overlaid.
         # The stage itself only emits JSON (players.json / player_map.json /
         # ...); without this hook track_consolidation/ has no visualization.
+        # Gated on --no-viz / output.save_visualizations because the render
+        # is multi-minute on long clips and skippable when iterating on
+        # consolidation logic.
+        save_vis = (
+            ctx.config.get("output", {}).get("save_visualizations", True)
+            if ctx.config else True
+        )
         tracking_dir = ctx.stage_dir("tracking")
-        if (tracking_dir / "tracks.json").exists() and (out / "players.json").exists():
+        if save_vis and (tracking_dir / "tracks.json").exists() and (out / "players.json").exists():
             try:
                 # scripts/ isn't a python package, so import from disk.
                 import importlib.util as _ilu

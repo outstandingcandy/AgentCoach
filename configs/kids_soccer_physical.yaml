@@ -48,7 +48,9 @@ field_registration:
     line_sample_points: 20
     max_reproj_error: 15.0
     use_line_model: true
-    focal_bounds: [2300.0, 4000.0]   # wide upper for late-clip zoom-in
+    focal_hfov_deg_bounds: [27.0, 45.3]   # wide upper for late-clip zoom-in;
+                                          # resolver converts to px focal at the
+                                          # source's actual width (1920 → [2300, 4000])
     world_residual_weight: 0.0
     joint_optimize: false             # camera zooms during clip — keep per-frame f
     world_error_threshold: 5.0
@@ -124,15 +126,9 @@ device: "cuda"
 reid:
   backend: "prtreid"
 
-# 30fps tracking — scale per-sample motion budgets by 10/effective_fps.
-# At 30fps a sprinting 8 m/s player covers 0.27 m/sample; the looser
-# 10fps defaults (4 m gate, 1.5 m reid pitch) silently admitted multi-
-# metre teleports through the pitch sanity check. Tighten across the
-# board so a single-frame physical-impossible jump cannot survive any
-# matching stage.
-tracking:
-  pitch_gate_m: 1.33                # was 4.0 @10fps → 1.33 @30fps
-  reid_pitch_max_m: 0.5             # was 1.5 @10fps → 0.5 @30fps
+# 30fps tracking — both pitch_gate_m and reid_pitch_max_m auto-derive to
+# the values this clip was tuned at (4.0 * 10/30 = 1.33 m,
+# 1.5 * 10/30 = 0.5 m). No per-clip overrides needed.
 
 # Per-stage vis sinks. mp4 outputs are full-rate; the per-frame jpg/json
 # stride matches sample.stride (set at top-level) so vis frames line up
@@ -141,11 +137,10 @@ tracking:
 # different cadence.
 
 track_consolidation:
-  # ~600 sampled frames at process_fps=30. Was 10 (=5%) at 200-frame baseline;
-  # scale to 30 (still ~5%) so the bar stays the same in physical terms —
-  # filter genuine 1-2-frame YOLO false positives but keep fragmented player
-  # tids.
-  min_track_frames: 30
+  # 1 s at process_fps=30 ≈ 30 frames. Filters genuine 1–2 frame YOLO
+  # false positives while keeping fragmented player tids. Resolver
+  # converts seconds → frames at the effective process_fps.
+  min_track_seconds: 1.0
 
   # Phase-2 jersey OCR runs through the LLM (Bedrock). RapidOCR is
   # fast but misses partial / occluded numbers (e.g. orig 11 all 51

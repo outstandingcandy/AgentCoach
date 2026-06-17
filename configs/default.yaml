@@ -2,9 +2,9 @@
 
 # Video Processing
 video:
-  process_fps: 10         # Frames per second to process (e.g., 10 = process 10 frames per second)
-                          # Set to null or 0 to process all frames
-                          # Example: video at 50fps with process_fps=10 will process every 5th frame
+  # Set to null/omit to let the resolver default it to min(30, source_fps).
+  # Override here only when you want a slower/faster sample rate than that.
+  process_fps: 10
   resize_width: 1920      # Resize width (null for original)
   resize_height: 1080     # Resize height (null for original)
 
@@ -37,7 +37,13 @@ field_registration:
     line_sample_points: 20              # Points sampled along each line
     max_reproj_error: 15.0              # Temporal tracker error threshold
     use_line_model: false               # Use HRNet line model (vs derive from keypoints)
-    focal_bounds: [1200.0, 2200.0]    # Focal length optimization bounds (px)
+    # Focal length optimization bounds are derived from horizontal field
+    # of view (degrees) at runtime: f_px = W / (2 * tan(hfov/2)). This
+    # keeps them resolution-independent. Override the px values directly
+    # via ``focal_bounds: [px_min, px_max]`` if you have hard data on the
+    # sensor's true focal range — the resolver leaves any explicit
+    # ``focal_bounds`` untouched.
+    focal_hfov_deg_bounds: [27.0, 50.0]  # ~telephoto sideline to wide handheld
     cx_bounds: [-100.0, 100.0]       # Optical center cx offset bounds (px)
     cy_bounds: [-50.0, 50.0]         # Optical center cy offset bounds (px)
     k1_bounds: [-0.35, -0.15]        # Radial distortion k1 absolute bounds
@@ -282,7 +288,10 @@ highlights:
 # Track Consolidation (Claude Opus jersey + OSNet ReID merge)
 track_consolidation:
   enabled: false
-  min_track_frames: 30          # filter tracks with fewer observations
+  # Filter tracks with fewer observations. Specify in seconds and the
+  # resolver converts to frames at the effective process_fps; the legacy
+  # ``min_track_frames`` (frame count) still wins when set.
+  min_track_seconds: 3.0
   # frames_per_track:
   #   - 0 (default): take EVERY frame the track appears in (jersey OCR
   #     fans out one parallel LLM call per crop; aggregation in Python).
@@ -342,7 +351,12 @@ track_consolidation:
 
     # --- Shared tuning ------------------------------------------------
     # Cross-track parallelism (how many tracks resolved concurrently).
-    max_concurrency: 16
+    # Bedrock Claude Opus in us-east-1 typically allows 60-200 RPM. 32
+    # leaves headroom for the per-track OCR fan-out (each track may
+    # spawn ocr_per_track_concurrency=8 subcalls) — at 32 that's up to
+    # 256 in-flight, but most cluster fast enough that the steady state
+    # stays well under quota. boto3 retries 429s automatically.
+    max_concurrency: 32
     # Within-track parallelism for per-crop OCR (Phase 2 of
     # recognize_multi). Each track fans out N OCR calls, one per crop;
     # this caps that fan-out so a single 200-crop track doesn't

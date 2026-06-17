@@ -63,12 +63,13 @@ field_registration:
     line_sample_points: 20
     max_reproj_error: 25.0
     use_line_model: false
-    focal_bounds: [4000.0, 12000.0]  # 4K focal range. Camera zooms during
-                                     # the clip — frame 681 converges to
-                                     # fx≈6000, frame 301 to fx≈9000. The
-                                     # upper bound must cover the most-zoomed
-                                     # frame; otherwise PnP RANSAC can't find
-                                     # a focal that fits.
+    # Camera zooms during the clip — frame 681 converges to fx≈6000
+    # (~36° hfov on 4K), frame 301 to fx≈9000 (~24°). The bounds need to
+    # cover the most-zoomed frame; otherwise PnP RANSAC can't find a
+    # focal that fits. Expressed as HFOV degrees so the same range
+    # transfers to a 1080p downsample without edits — the resolver
+    # converts to px focal at the source's actual width.
+    focal_hfov_deg_bounds: [18.18, 51.28]
     world_residual_weight: 0.0
     joint_optimize: false
     world_error_threshold: 8.0
@@ -124,11 +125,13 @@ field_registration:
       matcher_backend: lightglue
       # Anchor gate at 30px rejected ~22% of stage1 frames where the
       # KP detector found 3 line constraints instead of 6 (mid-zoom
-      # frames where the touchline isn't framed). 30→40 brings anchor
-      # coverage from 78% to 86% — 40px is 1% of image width, well
+      # frames where the touchline isn't framed). The ~1% of image
+      # width gate brings anchor coverage from 78 % to 86 % — well
       # within "good enough to seed SIFT propagation" tolerance.
-      anchor_max_reproj_px: 40.0
-      overwrite_above_reproj_px: 40.0
+      # Expressed as a fraction so the same gate transfers across
+      # resolutions; resolver multiplies by image width.
+      anchor_max_reproj_frac: 0.0104
+      overwrite_above_reproj_frac: 0.0104
       method: improved
       smoothing_window: 5
       use_masking: false
@@ -178,18 +181,17 @@ unified_detection:
 reid:
   backend: "prtreid"
 
-# 30fps tracking — scale per-sample motion budgets by 10/effective_fps.
-# At 30fps a sprinting 8 m/s player covers 0.27 m/sample; the looser
-# 10fps defaults (4 m gate, 1.5 m reid pitch) silently admitted multi-
-# metre teleports through the pitch sanity check.
+# 30fps tracking — pitch_gate_m auto-derives to 4.0 * 10/30 = 1.33 m,
+# which is exactly what this clip needs at process_fps=30. Only override
+# what's *not* the auto-scaled default.
+#
+# reid_pitch_max_m raised from auto default (0.5 m) → 0.8 m: the strict
+# 0.5×scale gate sat right at the borderline for legitimate 1-sample
+# reattachments (e.g. orig 6 at f=103: pitch jump ~0.9m vs limit 1.0m,
+# jitter pushed it across). 0.8 gives ~1.6m budget at tsu=1, still half
+# the per-frame sprint distance, while letting routine reattachments
+# through.
 tracking:
-  pitch_gate_m: 1.33                # was 4.0 @10fps → 1.33 @30fps
-  # reid_pitch_max_m raised 0.5 → 0.8 because the strict 0.5×scale
-  # gate sat right at the borderline for legitimate 1-sample
-  # reattachments (e.g. orig 6 at f=103: pitch jump ~0.9m vs limit
-  # 1.0m, jitter pushed it across). 0.8 gives ~1.6m budget at
-  # tsu=1, still half the per-frame sprint distance, while letting
-  # routine reattachments through.
   reid_pitch_max_m: 0.8
 
 # Jersey number recognition backend. Tried Qwen3.6-27B-FP8 (local
@@ -204,22 +206,30 @@ jersey_recognition:
   region: "us-east-1"
 
 track_consolidation:
-  # 30 frames at process_fps=30 ≈ 1 second of observations — filters
-  # genuine 1-2-frame YOLO false positives but keeps fragmented player
-  # tids.
-  min_track_frames: 30
+  # 1 s of observations — filters genuine 1–2 frame YOLO false positives
+  # but keeps fragmented player tids. Resolver converts to frames at the
+  # effective process_fps (30 fps × 1 s = 30 frames here).
+  min_track_seconds: 1.0
 
-  # ``ocr_batch_size: 16`` montages 16 crops into one LLM call (4×4
-  # grid), so even at frame_stride=2 a 600-frame track is ~300 crops
-  # = 19 batched calls, not 300 single calls. Keeps voting fidelity
-  # while making dense sampling tractable.
+  # ``ocr_batch_size: 4`` packs 4 crops into ONE LLM call as separate
+  # images (image-list mode, no montage tile), so each crop occupies
+  # its own image slot. This avoids the multi-player-bleed issue
+  # montage cells have — when bbox padding catches a teammate
+  # standing close, the LLM saw a 160×160 cell with two backs and
+  # often committed to whichever number was clearer. Independent
+  # images each contain just one bbox crop with the target centred,
+  # so adjacent players appear as the small bbox-edge slivers they
+  # actually are.
   jersey:
     ocr_backend: llm
-    ocr_batch_size: 16
-  # stride=2: sample every 2nd frame so far-side / occluded tracks
-  # have enough chances at a clean digit-visible angle. Combined with
-  # batched OCR the cost stays bounded.
-  frame_stride: 2
+    ocr_batch_size: 4
+    ocr_image_list: true   # pass crops as image-list, not as a montage
+  # stride=8: ~3.75 fps sampling per track (60 fps source × 1/2 tracker
+  # decimation × 1/8 jersey decimation). At 60-frame tracks that's
+  # 22 crops / track ≈ 6 LLM calls — enough voting redundancy for
+  # OCR to commit on a clean angle without paying the per-call image
+  # premium that image-list mode adds (each crop = 1568 token min).
+  frame_stride: 8
 
 pipeline:
   stages:
