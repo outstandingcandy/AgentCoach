@@ -172,14 +172,15 @@ class EventDetectionStage(Stage):
         with open(out / "goals.json", "w") as f:
             json.dump(goals, f, indent=2, default=str)
 
-        # Render annotated video — gated on --no-viz / output.save_visualizations.
-        # The event-detection logic itself is millisecond-level CPU; the
-        # video render is the multi-minute bottleneck and skippable when
-        # iterating on detector logic.
-        save_vis = (
-            ctx.config.get("output", {}).get("save_visualizations", True)
-            if ctx.config else True
-        )
+        # Per-frame jpg overlays — always rendered (the /pipeline and
+        # /match pages need them). The encoded mp4 is opt-in via
+        # ``output.write_videos`` because the encoding is the multi-
+        # minute tail of the stage and the web UI doesn't consume it.
+        # ``output.save_visualizations: false`` (set by --no-viz)
+        # disables both, for runs that won't use the web UI at all.
+        out_cfg = ctx.config.get("output", {}) if ctx.config else {}
+        save_vis = out_cfg.get("save_visualizations", True)
+        write_mp4 = out_cfg.get("write_videos", False)
         if save_vis:
             from ..events.visualization import render_event_video
             events_cfg = ctx.config.get("events", {}) if ctx.config else {}
@@ -191,6 +192,7 @@ class EventDetectionStage(Stage):
                 tracking_dir=tracking_dir if tracking_dir.exists() else None,
                 banner_duration_sec=events_cfg.get("banner_duration_sec", 3.0),
                 vis_frame_stride=int(events_cfg.get("vis_frame_stride", default_stride)),
+                write_mp4=write_mp4,
             )
 
         by_type = {}
@@ -279,16 +281,14 @@ class TrackConsolidationStage(Stage):
             config=config,
         )
 
-        # Render mp4 + per-frame jpg with consolidated player IDs overlaid.
-        # The stage itself only emits JSON (players.json / player_map.json /
-        # ...); without this hook track_consolidation/ has no visualization.
-        # Gated on --no-viz / output.save_visualizations because the render
-        # is multi-minute on long clips and skippable when iterating on
-        # consolidation logic.
-        save_vis = (
-            ctx.config.get("output", {}).get("save_visualizations", True)
-            if ctx.config else True
-        )
+        # Per-frame annotated jpgs (always when save_visualizations=True)
+        # + opt-in encoded consolidated.mp4 (output.write_videos=True).
+        # The /pipeline page only reads the jpgs, so the mp4 is dead
+        # weight on the typical iteration path. ``--no-viz`` flips
+        # save_visualizations off → neither is written.
+        out_cfg = ctx.config.get("output", {}) if ctx.config else {}
+        save_vis = out_cfg.get("save_visualizations", True)
+        write_mp4 = out_cfg.get("write_videos", False)
         tracking_dir = ctx.stage_dir("tracking")
         if save_vis and (tracking_dir / "tracks.json").exists() and (out / "players.json").exists():
             try:
@@ -309,6 +309,7 @@ class TrackConsolidationStage(Stage):
                     output_path=out / "consolidated.mp4",
                     show_panel=True,
                     vis_frame_stride=stride,
+                    write_mp4=write_mp4,
                 )
             except Exception as exc:
                 # Vis failure is non-fatal — the stage's JSON outputs are

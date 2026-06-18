@@ -51,7 +51,23 @@ class BallDetector:
         # Sports ball class (32 in COCO)
         self.classes = self.config.get("classes", [self.BALL_CLASS_ID])
         # Higher resolution for small object detection
-        self.imgsz = self.config.get("imgsz", 1920)
+        # ``imgsz`` accepts:
+        #   * a positive int (e.g. 1920)            → use that, as before
+        #   * ``0`` or ``None`` or "native" (str)   → use the source frame's
+        #                                             longer side, rounded up
+        #                                             to a multiple of 32
+        #
+        # Native is the new default — small/distant balls in the upper
+        # frame band were missed at 1920 (47×47-px ball got down-sampled
+        # to 23×23 and YOLO's confidence dropped below threshold). Cost:
+        # YOLO inference roughly scales O(W²); 4K → ~4× slower per frame
+        # vs 1920. Override ``imgsz: 1920`` (or smaller) per-config when
+        # detection latency matters more than recall on small balls.
+        cfg_imgsz = self.config.get("imgsz", 0)
+        if cfg_imgsz in (None, 0, "native", ""):
+            self.imgsz: int | None = None     # resolved per-frame
+        else:
+            self.imgsz = int(cfg_imgsz)
         self.device = self.config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
 
         # Size filtering parameters
@@ -118,7 +134,7 @@ class BallDetector:
             conf=self.confidence_threshold,
             iou=self.iou_threshold,
             classes=self.classes,
-            imgsz=self.imgsz,
+            imgsz=self._resolve_imgsz(frame),
             verbose=False,
         )
 
@@ -147,6 +163,22 @@ class BallDetector:
 
         return detections
 
+    def _resolve_imgsz(self, frame: np.ndarray) -> int:
+        """Return the YOLO ``imgsz`` to use for this frame.
+
+        When the user configured an explicit positive int (legacy path)
+        return that. Otherwise — the new default — use the frame's
+        longer side rounded up to the nearest multiple of 32 (YOLO's
+        stride). This keeps the inference image at the source's native
+        resolution so small balls aren't down-sampled into oblivion.
+        """
+        if self.imgsz is not None:
+            return self.imgsz
+        h, w = frame.shape[:2]
+        long_edge = max(int(h), int(w))
+        # Round up to multiple of 32 for YOLO stride alignment.
+        return ((long_edge + 31) // 32) * 32
+
     def detect_batch(self, frames: list[np.ndarray]) -> list[list[dict[str, Any]]]:
         """Detect ball in a batch of frames using standard YOLO inference.
 
@@ -166,7 +198,7 @@ class BallDetector:
             conf=self.confidence_threshold,
             iou=self.iou_threshold,
             classes=self.classes,
-            imgsz=self.imgsz,
+            imgsz=self._resolve_imgsz(frames[0]),
             verbose=False,
             batch=len(frames),
         )
@@ -197,7 +229,12 @@ class BallDetector:
         if AutoDetectionModel is None:
             raise ImportError("sahi package is required for SAHI inference. Install with: pip install sahi")
 
-        # Lazily create the SAHI detection model wrapper
+        # Lazily create the SAHI detection model wrapper. ``image_size``
+        # here is the size that SAHI passes through to YOLO when running
+        # the *standard* full-frame pass (sahi_perform_standard_pred);
+        # the slice path always sees the configured slice_size (e.g.
+        # 640). For native-resolution mode we use the slice size as the
+        # standard-pass size since SAHI's main job is the slices anyway.
         if self._sahi_model is None:
             model_path = self.model_path or f"{self.model_name}.pt"
             self._sahi_model = AutoDetectionModel.from_pretrained(
@@ -205,7 +242,7 @@ class BallDetector:
                 model_path=str(model_path),
                 confidence_threshold=self.confidence_threshold,
                 device=self.device,
-                image_size=self.imgsz,
+                image_size=self.imgsz or self.sahi_slice_size,
             )
 
         result = get_sliced_prediction(
