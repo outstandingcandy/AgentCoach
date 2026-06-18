@@ -177,7 +177,8 @@ annotated_video/      full match with overlays (optional)
 | `--video` | required | Source video path. |
 | `--output` | required | Run output directory. |
 | `--config` | required | YAML config file (deep-merged onto `configs/default.yaml`). |
-| `--stages` | `field_registration,tracking` | Comma-separated subset of `field_registration,tracking,event_detection,track_consolidation,annotated_video,highlights`. |
+| `--stages` | `field_registration,tracking` | Comma-separated subset of `field_registration,tracking,track_consolidation,event_detection,player_profile,highlights,annotated_video`. `track_consolidation` must precede `event_detection` so events carry stable `A-9`-style player_ids. |
+| `--no-viz` | off | Skip the tracking visualization video (saves time and memory). |
 | `--keypoint-model` | from config | Override `field_registration.keypoint_model_path`. |
 | `--remote-stages` | `none` | Comma-separated stages to run on SageMaker instead of locally (see [SageMaker](#sagemaker-remote-execution-optional)). |
 | `--skip-existing` | off | Skip a stage if its output already exists. Useful for partial reruns. |

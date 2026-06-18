@@ -39,6 +39,18 @@
     #queue-hud button.secondary { background: #2a323c; color: #cfe3ff; }
     #queue-hud .label { color: #9aa3ad; }
 
+    /* Spotlight pill — same visual family as queue-hud, but parked top-right
+       so the two never overlap when both pop up briefly mid-transition. */
+    #spotlight-pill { position: absolute; top: 8px; right: 8px; z-index: 5;
+                      background: rgba(20,28,38,0.92); border: 1px solid #2a323c;
+                      border-radius: 6px; padding: 8px 10px; font-size: 12px;
+                      color: #cfe3ff; display: flex; gap: 8px; align-items: center; }
+    #spotlight-pill #spotlight-label { color: #f59e0b; font-weight: 600; }
+    #spotlight-pill button { background: #2a323c; color: #cfe3ff; border: 0;
+                             border-radius: 5px; padding: 5px 10px; font-weight: 600;
+                             cursor: pointer; font-size: 12px; }
+    #spotlight-pill button:hover { background: #3b82f6; color: #fff; }
+
     /* Controls now stack: Player status (primary) on top, More
        drawer below. The collapsed drawer is just a one-line summary,
        so the grid expands naturally. ``grid-column: 1/-1`` on each
@@ -235,6 +247,10 @@
         <button id="queue-next">Next ▶</button>
         <button id="queue-stop" class="secondary">Stop</button>
       </div>
+      <div id="spotlight-pill" style="display:none">
+        <span id="spotlight-label">Spotlight</span>
+        <button id="spotlight-back" class="secondary">Back to broadcast</button>
+      </div>
     </div>
     <div id="pitch-panel">
       <canvas id="mini"></canvas>
@@ -313,14 +329,21 @@
     const queueHud = document.getElementById('queue-hud');
     const queueLabel = document.getElementById('queue-label');
 
-    player.src = `${API}/video`;
+    const MAIN_VIDEO_URL = `${API}/video`;
+    player.src = MAIN_VIDEO_URL;
+    // Track whether the <video> element is currently showing a per-player
+    // spotlight clip. Used to suppress queue HUD / clip-window overlays
+    // (the spotlight clip has its own concatenated timeline).
+    let isSpotlight = false;
 
     // ---------- Colors ----------
-    // Mirror events/visualization.py:TEAM_COLORS but in CSS-friendly form.
-    // The Python code stores BGR, here we use the equivalent RGB.
+    // Match the actual kit colors observed in sunday_20sec broadcast
+    // footage: team A wear blue, team B wear red. (Earlier this mirrored
+    // events/visualization.py with the opposite mapping; that file's
+    // colors were never tied to a real fixture, just placeholder.)
     const TEAM_COLORS = {
-      team_A: '#ff3b30',   // red
-      team_B: '#3b82ff',   // blue
+      team_A: '#3b82ff',   // blue
+      team_B: '#ff3b30',   // red
       referee: '#f7c948',  // yellow-ish
       unknown: '#9aa3ad',
     };
@@ -461,7 +484,32 @@
       return null;
     }
 
+    // Spotlight clips have their own concatenated timeline that doesn't
+    // align with broadcast frame indices. We persist the per-output-frame
+    // mapping in spotlights/<pid>.frames.json and consult it here so the
+    // 2D pitch panel + selected-player highlight stay in sync.
+    const spotlightFrames = new Map();   // pid → {fps, broadcast_frames}
+    function spotlightMapping(pid) {
+      return spotlightFrames.get(pid) || null;
+    }
+
     function frameAtPlayhead() {
+      // While a spotlight clip is showing, translate the clip's playhead
+      // back to a broadcast frame index via the sidecar mapping. Falls
+      // through to broadcast math whenever the mapping isn't loaded yet.
+      if (isSpotlight && selectedPlayer) {
+        const m = spotlightMapping(selectedPlayer);
+        if (m && m.broadcast_frames && m.broadcast_frames.length) {
+          const idx = Math.max(
+            0,
+            Math.min(
+              m.broadcast_frames.length - 1,
+              Math.round(player.currentTime * m.fps),
+            ),
+          );
+          return m.broadcast_frames[idx];
+        }
+      }
       const fps = (payload && payload.fps) || (meta && meta.fps) || 30;
       return Math.round(player.currentTime * fps);
     }
@@ -496,11 +544,24 @@
       miniCtx.clearRect(0, 0, mini.width, mini.height);
       const scale = overlay._scale;
 
+      // Resolve current frame via frameAtPlayhead, which transparently
+      // remaps spotlight-clip time → broadcast frame using the per-pid
+      // sidecar mapping when isSpotlight is on.
       const frame = frameAtPlayhead();
       const trackKey = nearestFrameKey(tracksByFrame, frame, 6);
       const tracks = trackKey != null ? tracksByFrame[trackKey] : [];
       const ballKey = nearestFrameKey(ballByFrame, frame, 6);
       const ball = ballKey != null ? ballByFrame[ballKey] : null;
+
+      // In spotlight mode we paint ONLY the right-side 2D pitch (which
+      // the user wants for situational context + selected-player
+      // highlight). The video-overlay canvas would be wrong because the
+      // spotlight clip is a cropped 4K→1080p stitch with no fixed scale
+      // back to the broadcast pixel grid.
+      if (isSpotlight) {
+        drawMiniPitch(tracks, ball);
+        return;
+      }
 
       const possHolder = overlays.possession ? activePossessionAt(frame) : null;
       const possId = possHolder ? String(possHolder.player_id) : null;
@@ -814,6 +875,10 @@
     // ---------- Clip queue ----------
     function startQueue(windows, label) {
       if (!windows || !windows.length) return;
+      // Clip windows are indexed against the broadcast timeline; if the
+      // user is currently on a per-player spotlight clip, fall back to
+      // broadcast first so seek targets line up.
+      if (isSpotlight) exitSpotlight();
       queue = { windows, idx: 0, label };
       seekToCurrentClip();
       updateQueueHud();
@@ -912,6 +977,11 @@
       });
     }
     player.addEventListener('timeupdate', () => {
+      // Live highlights are indexed against the broadcast timeline. The
+      // spotlight clip's currentTime points into the player's stitched
+      // presence, not the broadcast, so let the existing card.active
+      // state carry "this player is selected" instead.
+      if (isSpotlight) return;
       const now_ms = Date.now();
       // Throttle to 4 Hz so we don't repaint every video frame.
       if (now_ms - _lastLiveAt < 250) return;
@@ -920,7 +990,10 @@
     });
     // Also refresh on seek, so the right card lights up the moment
     // the user clicks a different point in the timeline.
-    player.addEventListener('seeked', () => refreshLivePlayers(player.currentTime));
+    player.addEventListener('seeked', () => {
+      if (isSpotlight) return;
+      refreshLivePlayers(player.currentTime);
+    });
 
     // ---------- Event filter ----------
     function buildEventChips() {
@@ -1031,8 +1104,12 @@
           const pid = card.dataset.pid;
           if (selectedPlayer === pid) {
             selectedPlayer = null;
+            exitSpotlight();
           } else {
             selectedPlayer = pid;
+            const p = (payload.players || []).find(x => x.player_id === pid);
+            if (p && p.spotlight_video_url) enterSpotlight(p);
+            else exitSpotlight();
           }
           grid.querySelectorAll('.player-card').forEach(c =>
             c.classList.toggle('active', c.dataset.pid === selectedPlayer));
@@ -1149,10 +1226,62 @@
       };
       clear.onclick = () => {
         selectedPlayer = null;
+        exitSpotlight();
         document.querySelectorAll('.player-card').forEach(c => c.classList.remove('active'));
         updatePlayerControls();
       };
     }
+
+    // ---------- Spotlight (per-player follow-cam clip) ----------
+    async function enterSpotlight(player_obj) {
+      // Swap the broadcast video for the per-player follow-cam clip and
+      // expose a "Back to broadcast" pill so the user can always return.
+      // Any in-flight clip queue is dropped — the spotlight clip has its
+      // own concatenated timeline that doesn't share frame indices with
+      // the broadcast.
+      if (queue) { queue = null; updateQueueHud(); }
+      try { player.pause(); } catch {}
+      player.src = player_obj.spotlight_video_url;
+      try { player.currentTime = 0; } catch {}
+      player.play().catch(() => {});
+      isSpotlight = true;
+      const pill = document.getElementById('spotlight-pill');
+      const label = document.getElementById('spotlight-label');
+      label.textContent = `Spotlight: ${player_obj.player_id}`;
+      pill.style.display = 'flex';
+
+      // Fetch the spotlight frame mapping in the background so the 2D
+      // pitch panel can sync with the spotlight clip's playhead. Until
+      // it lands, frameAtPlayhead() falls back to broadcast math (which
+      // is wrong for spotlight but harmlessly stale by < 1 s).
+      const url = player_obj.spotlight_frames_url;
+      const pid = player_obj.player_id;
+      if (url && !spotlightFrames.has(pid)) {
+        try {
+          const r = await fetch(url);
+          if (r.ok) spotlightFrames.set(pid, await r.json());
+        } catch (e) { /* drop — pitch will use stale broadcast time */ }
+      }
+    }
+
+    function exitSpotlight() {
+      // Restore the broadcast feed at the same wall-clock position the
+      // spotlight clip was at — the broadcast is the canonical timeline
+      // (events, queues) so coming back at t=0 would feel jarring.
+      if (!isSpotlight) return;
+      try { player.pause(); } catch {}
+      player.src = MAIN_VIDEO_URL;
+      isSpotlight = false;
+      const pill = document.getElementById('spotlight-pill');
+      pill.style.display = 'none';
+    }
+
+    document.getElementById('spotlight-back').addEventListener('click', () => {
+      selectedPlayer = null;
+      exitSpotlight();
+      document.querySelectorAll('.player-card').forEach(c => c.classList.remove('active'));
+      updatePlayerControls();
+    });
 
     // ---------- Possession spans (load once from raw events) ----------
     async function loadPossessionSpans() {

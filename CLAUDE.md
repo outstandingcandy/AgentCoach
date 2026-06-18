@@ -4,7 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GoalInsight is a soccer video analysis pipeline: field registration (camera calibration), player tracking/identification, ball tracking with 3D trajectory estimation, event detection, and highlight generation.
+GoalInsight is a soccer video analysis pipeline plus an LLM chat surface
+on top of the resulting match data:
+
+- **Field registration** (camera calibration, 5 backends).
+- **Tracking** (player + ball detection, ReID, team classification).
+- **Track consolidation** (fragmented track_ids → stable `A-9` / `B-10` player_ids via ReID + jersey OCR).
+- **Event detection** (possession-driven state machine: pass / shot / carry / tackle / interception, with shot subsuming goal).
+- **Player profile** (per-player front/back crops, heatmap, distance, optional follow-cam "spotlight" clips).
+- **Highlights** (recipe-based per-event clips with crop/zoom + slow-motion replay).
+- **Annotated video** (full-match render with HUD overlays).
+- **Web app** (FastAPI viewer + Bedrock-backed chat with five tools, optionally proxied to AgentCore Runtime).
 
 ## Environment & Running
 
@@ -26,9 +36,16 @@ python scripts/run_full_pipeline.py [same args]
 bash scripts/pipeline.sh            # PnLCalib (finetuned)
 bash scripts/pipeline_broadtrack.sh # BroadTrack backend
 bash scripts/pipeline_physical.sh   # Physical calibration
+bash scripts/pipeline_homography.sh # Plain DLT homography
 ```
 
-CLI flags: `--video`, `--output`, `--config`, `--keypoint-model`, `--stages` (comma-separated), `--skip-existing`, `--no-timestamp`, `--run-name`.
+CLI flags:
+- `--video`, `--output`, `--config` (required)
+- `--stages` (comma-separated subset)
+- `--keypoint-model` (override `field_registration.keypoint_model_path`)
+- `--remote-stages` (comma-separated; offload `field_registration[,tracking]` to SageMaker)
+- `--skip-existing`, `--no-timestamp`, `--run-name`
+- `--no-viz` (skip tracking visualization video)
 
 Python 3.12, dependencies in `requirements.txt`, packaging in `pyproject.toml`.
 
@@ -36,7 +53,9 @@ Python 3.12, dependencies in `requirements.txt`, packaging in `pyproject.toml`.
 
 ### Pipeline Framework
 
-The pipeline is config-driven via `goalinsight/pipeline/`. Stages register themselves with `@register_stage` decorator into `STAGE_REGISTRY` and execute in order:
+The pipeline is config-driven via `goalinsight/pipeline/`. Stages register
+themselves with `@register_stage` decorator into `STAGE_REGISTRY` and execute
+in the order listed under `pipeline.stages`:
 
 ```yaml
 # configs/default.yaml
@@ -46,7 +65,9 @@ pipeline:
     - tracking
 ```
 
-Available stages: `field_registration`, `tracking`, `event_detection`, `highlights`.
+Available stages (declared in `goalinsight/pipeline/_adapters.py`):
+`field_registration`, `tracking`, `track_consolidation`, `event_detection`,
+`player_profile`, `highlights`, `annotated_video`.
 
 ```python
 from goalinsight import Pipeline
@@ -55,11 +76,12 @@ pipeline.run(video_path, output_dir)
 ```
 
 Key classes in `goalinsight/pipeline/`:
-- `Stage` (ABC): base class with `run(ctx)` method
-- `PipelineContext`: carries video path, config, stage output dirs, stats
-- `Pipeline`: reads config, builds stage list, executes stages in order
-- `STAGE_REGISTRY`: maps stage names to Stage subclasses
+- `Stage` (ABC, `_base.py`): base class with `run(ctx)` method
+- `PipelineContext` (`_base.py`): carries video path, config, stage output dirs, stats
+- `Pipeline` (`_pipeline.py`): reads config, builds stage list, executes stages in order
+- `STAGE_REGISTRY` (`_registry.py`): maps stage names to Stage subclasses
 - Adapters in `_adapters.py`: bridge Stage interface to business modules
+- Remote execution in `_remote.py`: SageMaker submission/polling for `field_registration` and `tracking`
 
 ### Data Flow
 
@@ -68,18 +90,41 @@ field_registration (field_registration/*_runner.py)
   Output: homographies.pkl, camera_poses.pkl/.json, calibration_metadata.json
     ↓
 tracking (tracking/orchestrator.py)
-  Input: Video + field_registration output (homographies.pkl, camera_poses)
+  Input: Video + field_registration/ (homographies.pkl, camera_poses)
   Output: tracks.json, ball_tracks.json, track_features.json, team_assignments.json, tracking.mp4
     ↓
-event_detection (events/)
-  Input: tracking/ (ball_tracks.json, tracks.json, team_assignments.json) + field_registration/camera_poses.json
+track_consolidation (track_consolidation/_runner.py)
+  Input: tracking/ (tracks.json + features) + jersey crops
+  Output: players.json, player_map.json, tracks_consolidated.json,
+          jersey/<frame>.json, consolidated.mp4
+  Logic: ReID-first greedy clustering → jersey vote per cluster →
+         team split → orphan absorption → naming (A-9, B-10, A-GK, ...)
+    ↓
+event_detection (events/_orchestrator.py)
+  Input: tracking/ (ball_tracks.json) + track_consolidation/ (consolidated tracks
+         with stable player_ids) + field_registration/camera_poses.json
   Output: events.json (all events), goals.json (backward compat)
   Detectors: possession → pass, shot, carry, defensive (dependency-ordered)
     ↓
-highlights (highlights/)
-  Input: events.json + tracking/ + video
+player_profile (player_profile/_runner.py)
+  Input: tracking/ + track_consolidation/players.json + (optional) video for spotlights
+  Output: players_profile.json, crops/<pid>_front.jpg, crops/<pid>_back.jpg,
+          heatmaps/<pid>.png, spotlights/<pid>.mp4 (when enabled)
+    ↓
+highlights (highlights/_orchestrator.py)
+  Input: events.json + tracking/ + track_consolidation/ + video
   Output: highlight clip MP4s per recipe (e.g. goal_highlight_0001.mp4)
+    ↓
+annotated_video (annotated_video/_renderer.py)
+  Input: tracking/ + track_consolidation/ + events.json + video
+  Output: annotated.mp4 (full match with HUD: jersey numbers, team colors,
+          ball trail, event banners)
 ```
+
+The graph above is the canonical full-pipeline order. `track_consolidation`
+**must** run before `event_detection` so events.json carries stable
+player_id strings (`"A-7"`) instead of raw int track_ids — this is enforced
+by the comment in `configs/default.yaml` next to the stages list.
 
 ### Field Registration: Calibration Backends
 
@@ -88,12 +133,32 @@ Selected via `field_registration.backend` config. Runner files in `field_registr
 - **PnLCalib** (default, `pnlcalib_runner.py`): Iterative PnP with multi-candidate sweep, LM optimization, full 5-param distortion. Uses HRNet for keypoint/line detection.
 - **BroadTrack** (`broadtrack_runner.py`): 9-parameter camera model with Cauchy robust loss and arc-length line constraints.
 - **NBJW** (`pnlcalib_runner.py`): Alternative calibration backend (`field_registration/nbjw/`).
-- **Physical** (`physical_runner.py`): Fixed camera intrinsics from `camera_profiles.yaml`. 7-DOF bounded optimization, 2-pass pipeline.
+- **Physical** (`physical_runner.py`): Fixed camera intrinsics from `camera_profiles.yaml`. 7-DOF bounded extrinsics, 2-pass pipeline. Most stable on non-FIFA pitches.
 - **Homography** (`homography_runner.py`): Direct ground-plane homography via DLT.
+
+A finetune machinery for the PnLCalib HRNet keypoint and line heads lives
+under `field_registration/pnlcalib/finetune_*.py`. Frame annotations come
+from the Annotate tab in `goalinsight-web` (or directly under
+`workspace/annotations/<video_stem>/`).
 
 ### Tracking: Multi-threaded Pipeline
 
-`tracking/orchestrator.py` runs a threaded I/O pipeline: frame prefetch → YOLOv8 inference → tracking/ReID/team classification → output writing. Ball processing runs via `tracking/ball_pipeline.py`.
+`tracking/orchestrator.py` runs a threaded I/O pipeline: frame prefetch →
+YOLOv8 inference → tracking/ReID/team classification → output writing.
+Ball processing runs via `tracking/ball_pipeline.py`.
+
+**Multi-object tracker backends** (selected via `tracking.backend`):
+- **StrongSORT** (default, `tracking/strongsort/` package): Cascaded matching pipeline
+  (tentative-IoU → tentative-pitch → confirmed-IoU → confirmed-ReID), pitch-distance
+  gating in metres (not pixels), Kalman-coast handling, stationary-track killer for
+  banner/fence false positives. Decomposed into `Gate` / `MatchingStage` / `TrackLifecycle`
+  abstractions; covered by unit tests under `tests/tracking/`.
+- **BoT-SORT** (`tracking/botsort_tracker.py`): GMC-aware alternative; ReID flows
+  through the tracker's own embedding interface.
+
+ReID extractors are pluggable via `reid.backend`:
+- **OSNet** (default): 512-dim, `osnet_x1_0` backbone via TorchReID.
+- **PRTReID**: 256-dim Part-based ReID (with an albumentations 2.x compat shim).
 
 ### Ball Tracking and 3D Trajectory
 
@@ -104,13 +169,34 @@ Selected via `field_registration.backend` config. Runner files in `field_registr
   - Pass 2: Classify each segment as ground-roll vs airborne (via ground-plane speed and out-of-bounds analysis), then fit per-segment. Ground segments use Z=0 projection; airborne segments fit `P(t) = [x0+vx·dt, y0+vy·dt, z0+vz·dt-0.5·g·dt²]` with ground-contact anchors at segment boundaries and dynamic velocity bounds.
 - **Goal detection** (`goal_detection.py`): DEPRECATED — delegates to `events` module. Kept for backward compatibility.
 
+### Track Consolidation (`track_consolidation/`)
+
+Merges fragmented `track_id`s emitted by the tracker into stable
+`player_id`s used everywhere downstream. Five-stage greedy pipeline in
+`_consolidator.py`:
+
+- **Stage A** — ReID-first greedy clustering (cosine ≥ same_person_threshold,
+  no temporal co-occurrence).
+- **Stage B** — Confidence-weighted jersey vote per cluster (image-list LLM
+  call to fuse redundant high-conf jerseys and rescue low-conf misreads).
+- **Stage C** — Team split: same-cluster cross-team tracks get separated.
+- **Stage D** — Orphan absorption against existing clusters at a looser
+  threshold.
+- **Stage E** — Naming: `A-9`, `B-10`, `A-GK`, `B-unk-01`, etc.
+
+Sampling for the LLM input is in `_sampler.py`; the samples-and-votes
+JSON is written under `track_consolidation/jersey/`. The vis renderer
+hooked into the stage paints consolidated boxes (referees green,
+unmapped-but-on-field tracks blue) and writes `consolidated.mp4`. Gated
+by `output.save_visualizations`.
+
 ### Event Detection (`events/`)
 
 Config-driven event detection framework. Detectors run in dependency order (possession first).
 
 - **Possession** (`detectors/possession.py`): Foundation state machine. Tracks ball-player proximity over consecutive frames.
-- **Pass** (`detectors/pass_detector.py`): Detects passes from possession transitions with ball speed jumps. Classifies successful/failed.
-- **Shot** (`detectors/shot.py`): Detects shots on goal via ball speed + trajectory toward goal. Subsumes goal detection. Outcome: Goal, Saved, Off_Target, Blocked. Shooter attribution via kick-frame detection (ball speed spike) + nearest non-goalkeeper proximity. Emits both SHOT and GOAL events with `player_id`, `team_id`, `shooter_frame` in metadata.
+- **Pass** (`detectors/pass_detector.py`): Detects passes from possession transitions with ball speed jumps. Classifies successful/failed; catches one-touch passes (no carry between).
+- **Shot** (`detectors/shot.py`): Detects shots on goal via ball speed + trajectory toward goal. Subsumes goal detection. Outcome: Goal, Saved, Off_Target, Blocked. Shooter attribution via pre-kick possession (not nearest-at-kick) so a defender briefly closer at the moment the ball leaves the foot doesn't get charged. Emits both SHOT and GOAL events with `player_id`, `team_id`, `shooter_frame` in metadata.
 - **Carry** (`detectors/carry.py`): Detects dribbles with forward progress during sustained possession.
 - **Defensive** (`detectors/defensive.py`): Detects tackles (possession change + deflection) and interceptions (failed pass + possession gain).
 
@@ -121,6 +207,24 @@ Key classes:
 - `DETECTOR_REGISTRY`: maps detector names to classes (like pipeline's STAGE_REGISTRY)
 
 Config: `events.detectors` lists enabled detectors; per-detector thresholds under `events.<name>`.
+
+### Player Profile (`player_profile/`)
+
+Per-player artifacts for the Insights / match-detail view.
+
+- `build_player_profiles` in `_runner.py` walks the consolidated tracks,
+  picks a front-on and a back-on crop per player from the available
+  detections, computes a pitch heatmap (`heatmap_bins` configurable), and
+  estimates total distance run.
+- **Spotlights** (`_spotlight.py`, opt-in via `player_profile.spotlights.enabled`):
+  per-player follow-cam MP4s. The player is centered, scaled to ~2/3 frame
+  height, with optional team-coloured ellipse, name badge (`#9 player`),
+  and a pitch-trail polyline. Cuts (rather than bridging) on detection
+  gaps longer than `presence_gap_seconds`. Skips players with fewer than
+  `min_observations` detections.
+- Outputs land under `player_profile/`: `players_profile.json`,
+  `crops/<pid>_front.jpg`, `crops/<pid>_back.jpg`, `heatmaps/<pid>.png`,
+  `spotlights/<pid>.mp4` (when enabled).
 
 ### Highlights System (`highlights/`)
 
@@ -135,9 +239,34 @@ Recipe-based agent pipeline: **Detector → Analyzer → Composer**. Recipes are
 - `_closeup.py`: `extract_closeup()` crops and scales frames; `interpolate_bbox()` interpolates/extrapolates with a max-distance limit.
 - `_temporal.py`: `find_buildup_start()`, `find_celebration_end()` compute temporal windows.
 
+### Annotated Video (`annotated_video/`)
+
+Full-match HUD render. `_renderer.py` reads the consolidated tracks,
+events.json, ball trajectory, and calibration, and writes
+`annotated.mp4` with per-frame overlays: team-coloured player boxes
+with jersey numbers, ball trail, projected pitch lines, and event
+banners. Optional video2x upscaling integrates the same way as the
+highlights composer.
+
+### Jersey Recognition (`jersey/`)
+
+Per-track jersey number reading, used by `track_consolidation` to label
+clusters. Multiple backends, selected via `track_consolidation.jersey.backend`:
+
+- **claude** (`claude_recognizer.py`) — Bedrock Claude with a multi-image
+  prompt. Reads role/team in phase 1 and per-crop numbers in phase 2.
+- **gemini** (`gemini_recognizer.py`) — same shape via the Gemini API.
+- **qwen** (`qwen_vlm_recognizer.py` / `qwen_vllm_recognizer.py`) — local
+  Qwen-VL via HuggingFace transformers or a vLLM server (start with
+  `bash scripts/start_qwen_vllm.sh`).
+- **mmocr** (`mmocr_recognizer.py`) — DBNet+SAR text recognition pipeline.
+- **rapidocr** (`rapidocr.py`) — fast lightweight OCR; `ocr_backend: rapidocr`
+  switches the per-crop number reader away from the LLM while keeping the
+  LLM for role/team.
+
 ### Video Enhancement (`video_enhancement/`)
 
-Upscaling and frame interpolation using [video2x](https://github.com/k4yt3x/video2x) (Vulkan GPU). Used inline by the highlights `SegmentComposer` — when `video_enhancement.enabled` is set, upscales source frames *before* composition so cropping/effects/slow-motion operate on high-res frames. Replay slow-motion uses RIFE optical-flow interpolation.
+Upscaling and frame interpolation using [video2x](https://github.com/k4yt3x/video2x) (Vulkan GPU). Used inline by the highlights `SegmentComposer` and the `annotated_video` renderer — when `video_enhancement.enabled` is set, upscales source frames *before* composition so cropping/effects/slow-motion operate on high-res frames. Replay slow-motion uses RIFE optical-flow interpolation.
 
 - **Modes**: `binary` (local video2x) or `docker` (container with GPU passthrough, needed on older glibc systems).
 - **Upscaling**: Real-ESRGAN, Real-CUGAN, or libplacebo (Anime4K shaders). 2x or 4x scale.
@@ -159,23 +288,80 @@ Abstract base classes live in `goalinsight/interfaces/`.
 
 Input uses 115 SoccerNet-GSR keypoints; internal processing uses 57 PnLCalib keypoints. `KeypointMapper` in `keypoint_mapping.py` converts between formats. 4 non-ground crossbar points (IDs {12,14,16,18}) are at z=-2.44m.
 
+## Web app (`goalinsight/web/`)
+
+Single FastAPI app — `python -m goalinsight.web --workspace ./workspace`
+(default `http://127.0.0.1:8000/`). Tabs:
+
+- `/library` — videos under `<workspace>/videos/` and runs under `<workspace>/runs/<name>/`.
+- `/pipeline` — launch / monitor pipeline jobs (driven by `jobs.py`).
+- `/insights` — index of runs; `/insights/<run>` is the per-run video viewer + chat.
+- `/match/<run>` — per-run match-detail page (events, player profiles, spotlight clips).
+- `/tracking/<run>` — tracking diagnostics (raw YOLO dumps, consolidation viewer).
+- `/annotate` — pitch keypoint annotator (Gradio under the hood) for the
+  PnLCalib finetune loop.
+
+The viewer streams the match video alongside a Bedrock-backed chat with
+five tools (defined in `match_tools.py`):
+
+- `list_events` — filter events by type/team/player/time window
+- `get_player_stats` — per-player distance, top speed, touches, passes, shots, goals
+- `get_team_stats` — possession share, pass success, shots, tackles, interceptions
+- `get_frame_snapshot` — who's on screen and what's near the ball at a moment
+- `run_python` — execute Python in an AgentCore Code Interpreter sandbox
+  (driven by `code_sandbox.py`); plots come back as inline images
+
+The chat path streams responses live as SSE tokens with markdown
+rendering on the client. Message history per session is in
+`_sessions.py`.
+
+### Chat on AgentCore Runtime (opt-in)
+
+When `GOALINSIGHT_AGENTCORE_RUNTIME_ARN` is set, the FastAPI app routes
+chat turns through `chat_remote.py` → `bedrock-agentcore.InvokeAgentRuntime`
+instead of running `ChatEngine` in-process. The runtime container is
+built and deployed from `deploy/agentcore_runtime/` (ARM64 image, Python
+3.12, exposes 8080, implements `/invocations` SSE + `/ping`). It pulls
+the run's JSON output from S3 once per session and stays warm for the
+MicroVM's lifetime. Unset the env var to revert to local chat. See
+`deploy/agentcore_runtime/README.md` for setup.
+
+### Web deployment (`deploy/`)
+
+`deploy/alb-cognito.yaml` is a CloudFormation stack that fronts the
+`goal-insight-web` service (port 8000) with an ALB and Cognito-based
+authentication. `deploy/bootstrap.sh` is the EC2 user-data script that
+installs the app on a fresh host.
+
 ## Configuration
 
 YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merge_configs`). Key settings:
 - `pipeline.stages`: list of stages to run
 - `field_registration.backend`: `pnlcalib` | `broadtrack` | `physical` | `nbjw` | `homography`
 - `field_registration.keypoint_threshold`, `ransac_threshold` (default 30px)
-- `video.process_fps`: frame sampling rate
+- `video.process_fps`: frame sampling rate (`video.tracking_fps` overrides for tracking)
+- `sample.stride`: pipeline-wide vis-frame stride (per-stage `<stage>.vis_frame_stride` overrides)
 - `detection.model`: YOLOv8 variant (yolov8n/s/m/l/x, yolo11*)
 - `ball_detection.*`: ball detector config
+- `tracking.backend`: `strongsort` (default) | `botsort`
+- `tracking.reid_iou_min`, `reid_pitch_max_m`, `pitch_gate_m`, `stationary_window`, ...
+- `tracking.dump_yolo_raw`: dump raw YOLO detections to `yolo_raw/` for offline inspection
 - `reid.backend`: `osnet` | `prtreid`
 - `team_classification.backend`: `kmeans` | `tracklet`
-- `jersey_recognition.backend`: `qwen` | `mmocr`
+- `track_consolidation.jersey.backend`: `claude` | `gemini` | `qwen` | `mmocr`
+- `track_consolidation.jersey.ocr_backend`: `llm` (LLM does numbers too) | `rapidocr` (LLM does role/team only)
 - `events.detectors`: list of enabled detectors (`possession`, `pass`, `shot`, `carry`, `defensive`)
 - `events.<detector>.*`: per-detector thresholds (distance, speed, angle, etc.)
+- `player_profile.heatmap_bins`, `player_profile.spotlights.*` (enabled, output_size, target_player_height_frac, presence_gap_seconds, ellipse, trail, name_badge, min_observations, ...)
 - `highlights.recipes`: list of highlight recipes (each with detector, analyzer, composer)
 - `highlights.temporal.*`: buildup/celebration durations, view types
 - `highlights.effects.*`: shooter spotlight, ball trail settings
+- `video_enhancement.enabled`, `mode` (binary/docker)
+- `output.save_visualizations`: gates the per-stage vis renders (track_consolidation `consolidated.mp4`, raw YOLO JPGs, etc.)
+
+Per-video pitch + camera intrinsics can be supplied via a sparse
+`overrides.yaml` next to the video file (used by the kids/youth configs
+and any non-FIFA pitch).
 
 ## Remote stage execution (SageMaker)
 
@@ -185,9 +371,19 @@ YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merg
 
 - `tools/make_comparison.py`: Creates picture-in-picture comparison video (enhanced full-screen + raw source as PiP in bottom-right). Reads highlight metadata JSON to reconstruct segment timing. Usage: `python tools/make_comparison.py --enhanced <highlight.mp4> --raw <source.mp4> --output <out.mp4> --label`
 
+Useful diagnostic / one-off scripts under `scripts/`:
+- `run_full_pipeline.py` — same flags as `goalinsight`, kept as a script.
+- `run_highlights.py --run-dir output/<run>` — re-run only the highlights agent on an existing run.
+- `render_consolidated_tracking.py` — re-render `consolidated.mp4` from existing JSON (also called from the pipeline adapter).
+- `dump_raw_yolo.py`, `audit_track_dropouts.py` — tracking diagnostics.
+- `diagnose_calibration.py`, `eval_finetune_on_train.py` — calibration sanity checks.
+- `train_finetune.py`, `select_finetune_candidates.py` — PnLCalib finetune loop.
+
 ## Testing
 
-Ad-hoc test scripts at repo root (`test_*.py`, `debug_*.py`). No formal test suite. Run individual scripts directly:
-```bash
-python test_calibration.py
-```
+`tests/tracking/` covers the StrongSORT package (gates, matching stages,
+lifecycle). Run with `pytest tests/`.
+
+Beyond that, ad-hoc test/debug scripts at the repo root (`test_*.py`,
+`debug_*.py`) are gitignored — they're for one-off exploration, not a
+formal suite.
