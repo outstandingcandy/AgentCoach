@@ -51,11 +51,20 @@ def build_player_profiles(
     out_dir: Path,
     *,
     heatmap_bins: int = 30,
+    video_path: Path | None = None,
+    spotlights_cfg: dict[str, Any] | None = None,
+    skip_existing: bool = False,
 ) -> dict[str, Any]:
     """Build per-player profiles, writing all artifacts under *out_dir*.
 
     Returns a stats dict for the pipeline driver — total players,
     counts of front / back crops actually picked, etc.
+
+    When *video_path* + ``spotlights_cfg.enabled`` are provided, also
+    renders ``spotlights/<pid>.mp4`` per player (a follow-cam clip with
+    the player centered, ~2/3 frame height, plus optional ellipse /
+    trail / name-badge overlays). Skipped silently if the source video
+    or homographies are missing.
     """
     pipeline_output_dir = Path(pipeline_output_dir)
     out_dir = Path(out_dir)
@@ -81,8 +90,11 @@ def build_player_profiles(
     fps = _load_fps(pipeline_output_dir)
 
     # Pre-compute per-player observations once instead of scanning
-    # tracks.json N times (one per player).
+    # tracks.json N times (one per player). For spotlight rendering we
+    # also need the per-frame bbox; build that side-table in the same
+    # walk to avoid a second pass.
     obs_by_pid = _index_observations_by_player(tracks)
+    bbox_by_pid = _index_bboxes_by_player(tracks)
 
     # Pitch dimensions for the heatmap come from calibration metadata so
     # non-FIFA pitches (kids 66.28×43.15) render at the right aspect.
@@ -145,6 +157,18 @@ def build_player_profiles(
             "heatmap": heatmap_url,
         })
 
+    spot_count = _maybe_render_spotlights(
+        profiles=profiles,
+        out_dir=out_dir,
+        pipeline_output_dir=pipeline_output_dir,
+        video_path=video_path,
+        bbox_by_pid=bbox_by_pid,
+        obs_by_pid=obs_by_pid,
+        fps=fps,
+        cfg=spotlights_cfg or {},
+        skip_existing=skip_existing,
+    )
+
     profile_path = out_dir / "players_profile.json"
     profile_path.write_text(json.dumps(profiles, indent=2))
 
@@ -153,6 +177,7 @@ def build_player_profiles(
         "front_crops": front_count,
         "back_crops": back_count,
         "heatmaps": heatmap_count,
+        "spotlights": spot_count,
     }
 
 
@@ -411,3 +436,183 @@ def _index_observations_by_player(
 
 def _safe_name(pid: str) -> str:
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in str(pid))
+
+
+def _index_bboxes_by_player(
+    tracks: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """``player_id -> [{frame, bbox}, ...]`` sorted by frame."""
+    out: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for k, items in tracks.items():
+        try:
+            f = int(k)
+        except (TypeError, ValueError):
+            continue
+        for t in items:
+            pid = t.get("track_id")
+            bbox = t.get("bbox")
+            if pid is None or bbox is None:
+                continue
+            out[str(pid)].append({"frame": f, "bbox": bbox})
+    for pid in out:
+        out[pid].sort(key=lambda r: r["frame"])
+    return out
+
+
+# Default BGR colors for team-color badges. Resolved by team label
+# (kmeans/tracklet emit team_a / team_b strings; we map both forms).
+_TEAM_COLORS_BGR: dict[str, tuple[int, int, int]] = {
+    "team_a": (180, 70, 40),    # blue
+    "team_a_kit": (180, 70, 40),
+    "A": (180, 70, 40),
+    "team_b": (40, 60, 200),    # red
+    "team_b_kit": (40, 60, 200),
+    "B": (40, 60, 200),
+    "referee": (45, 45, 45),
+    "unknown": (130, 130, 130),
+}
+
+
+def _resolve_team_color(team: str | None) -> tuple[int, int, int]:
+    if not team:
+        return _TEAM_COLORS_BGR["unknown"]
+    # Tracker emits "team_A" / "team_B"; consolidator sometimes lowercases
+    # to "team_a". Match either by normalizing.
+    key = str(team).lower()
+    return _TEAM_COLORS_BGR.get(key, _TEAM_COLORS_BGR["unknown"])
+
+
+def _badge_text(profile: dict[str, Any]) -> str:
+    jersey = profile.get("jersey_number")
+    role = profile.get("role") or ""
+    if jersey not in (None, "", "unknown"):
+        return f"#{jersey} {role}".strip()
+    pid = str(profile.get("player_id") or "?")
+    return f"{pid} {role}".strip()
+
+
+def _maybe_render_spotlights(
+    *,
+    profiles: list[dict[str, Any]],
+    out_dir: Path,
+    pipeline_output_dir: Path,
+    video_path: Path | None,
+    bbox_by_pid: dict[str, list[dict[str, Any]]],
+    obs_by_pid: dict[str, list[tuple[int, float, float]]],
+    fps: float,
+    cfg: dict[str, Any],
+    skip_existing: bool,
+) -> int:
+    """Render per-player spotlight clips. No-op when disabled / impossible.
+
+    Mutates *profiles* in place to add ``spotlight_video`` and
+    ``spotlight_duration_s`` fields. Returns the count of clips rendered
+    (or already-present skipped) so the stage stats reflect coverage.
+    """
+    if not cfg.get("enabled", True):
+        return 0
+    if video_path is None or not Path(video_path).exists():
+        logger.warning(
+            "player_profile: spotlight render skipped — video_path missing/unreadable"
+        )
+        return 0
+
+    # Lazy imports: keep the rest of the stage import-cheap when we're
+    # not rendering (e.g. legacy runs, --skip-existing already done).
+    import pickle
+
+    from ._spotlight import render_player_spotlight
+
+    homographies = None
+    h_path = pipeline_output_dir / "field_registration" / "homographies.pkl"
+    if h_path.exists():
+        try:
+            homographies = pickle.load(open(h_path, "rb"))
+        except Exception:  # noqa: BLE001 — bad pickle just disables trail
+            logger.warning("player_profile: failed to load homographies for trail")
+            homographies = None
+
+    spotlight_dir = out_dir / "spotlights"
+    spotlight_dir.mkdir(exist_ok=True)
+
+    output_size = tuple(cfg.get("output_size") or (1920, 1080))
+    target_frac = float(cfg.get("target_player_height_frac", 2 / 3))
+    presence_gap_s = float(cfg.get("presence_gap_seconds", 1.0))
+    enable_ellipse = bool(cfg.get("ellipse", True))
+    enable_trail = bool(cfg.get("trail", True)) and homographies is not None
+    enable_badge = bool(cfg.get("name_badge", True))
+    trail_seconds = float(cfg.get("trail_seconds", 1.5))
+    crf = int(cfg.get("crf", 23))
+    preset = str(cfg.get("preset", "medium"))
+    min_obs = int(cfg.get("min_observations", 30))
+
+    rendered = 0
+    for profile in profiles:
+        pid = str(profile["player_id"])
+        traj = bbox_by_pid.get(pid) or []
+        if len(traj) < min_obs:
+            continue
+
+        out_mp4 = spotlight_dir / f"{_safe_name(pid)}.mp4"
+        rel_url = f"spotlights/{out_mp4.name}"
+        if out_mp4.exists() and skip_existing:
+            profile["spotlight_video"] = rel_url
+            # Best-effort fps×frames if we don't probe; Player_profile
+            # doesn't run ffprobe to keep the stage hermetic. The frontend
+            # will still play it; duration is informational.
+            rendered += 1
+            continue
+
+        # Pitch positions for trail are already keyed by frame in obs_by_pid
+        # (frame, x, y) tuples — flatten to dict[frame] -> [(x, y)].
+        pps = obs_by_pid.get(pid) or []
+        pp_by_frame: dict[int, list[tuple[float, float]]] = {}
+        for f, x, y in pps:
+            pp_by_frame.setdefault(f, []).append((x, y))
+
+        try:
+            meta = render_player_spotlight(
+                video_path=Path(video_path),
+                player_id=pid,
+                trajectory=traj,
+                pitch_positions_by_frame=pp_by_frame if enable_trail else None,
+                homographies=homographies if enable_trail else None,
+                fps=fps,
+                output_path=out_mp4,
+                output_size=output_size,
+                target_player_height_frac=target_frac,
+                presence_gap_seconds=presence_gap_s,
+                enable_ellipse=enable_ellipse,
+                enable_trail=enable_trail,
+                enable_name_badge=enable_badge,
+                trail_seconds=trail_seconds,
+                name_badge_text=_badge_text(profile) if enable_badge else None,
+                name_badge_team_color=_resolve_team_color(profile.get("team_id")),
+                crf=crf,
+                preset=preset,
+            )
+        except Exception:  # noqa: BLE001 — one player failing shouldn't kill the stage
+            logger.exception("player_profile: spotlight render failed for %s", pid)
+            continue
+
+        profile["spotlight_video"] = rel_url
+        profile["spotlight_duration_s"] = round(float(meta["duration_s"]), 2)
+
+        # Sidecar maps spotlight clip frame N → broadcast frame, used by
+        # the match-page frontend to keep the right-side 2D pitch view
+        # in sync (highlight selected player + draw teammates) while the
+        # spotlight clip plays. Tiny JSON (a few KB per player).
+        sidecar = spotlight_dir / f"{_safe_name(pid)}.frames.json"
+        sidecar.write_text(json.dumps({
+            "fps": float(fps),
+            "broadcast_frames": meta.get("broadcast_frames") or [],
+        }))
+        profile["spotlight_frames_json"] = f"spotlights/{sidecar.name}"
+
+        rendered += 1
+        logger.info(
+            "[%s] spotlight: %d frames → %s (%.1f s)",
+            pid, meta["frames_rendered"], rel_url, meta["duration_s"],
+        )
+
+    return rendered

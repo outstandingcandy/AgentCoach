@@ -227,6 +227,9 @@ def _load_profiles(
             "front_crop_url": _abs_url(base, row.get("front_crop")),
             "back_crop_url": _abs_url(base, row.get("back_crop")),
             "heatmap_url": _abs_url(base, row.get("heatmap")),
+            "spotlight_video_url": _abs_url(base, row.get("spotlight_video")),
+            "spotlight_duration_s": row.get("spotlight_duration_s"),
+            "spotlight_frames_url": _abs_url(base, row.get("spotlight_frames_json")),
         }
     return out
 

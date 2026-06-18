@@ -513,6 +513,24 @@ events:
     tackle_max_gap_seconds: 1.0     # seconds — max gap between possession spans for tackle
     deflection_window_seconds: 0.5  # seconds — window for computing ball deflection angle
 
+# Per-player profile artifacts (stage: player_profile).
+# Front/back crops + heatmap PNGs are always produced; per-player follow-cam
+# clips ("spotlights") are opt-in via spotlights.enabled.
+player_profile:
+  heatmap_bins: 30
+  spotlights:
+    enabled: true
+    output_size: [1920, 1080]
+    target_player_height_frac: 0.66666  # player ~2/3 of frame height after resize
+    presence_gap_seconds: 1.0           # gap between detections > this → cut, no bridge
+    trail: false                        # pitch-trail polyline (off by default; visually busy)
+    trail_seconds: 1.5
+    ellipse: true
+    name_badge: true
+    crf: 23
+    preset: medium
+    min_observations: 30                # skip players with fewer detections than this
+
 # Pipeline orchestration
 # Available stages: field_registration, tracking, track_consolidation, event_detection, player_profile, highlights, annotated_video
 # NOTE: track_consolidation must run BEFORE event_detection so events.json

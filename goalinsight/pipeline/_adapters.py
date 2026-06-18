@@ -219,6 +219,9 @@ class PlayerProfileStage(Stage):
             pipeline_output_dir=ctx.output_dir,
             out_dir=out,
             heatmap_bins=int(cfg.get("heatmap_bins", 30)),
+            video_path=ctx.video_path,
+            spotlights_cfg=cfg.get("spotlights") or {},
+            skip_existing=ctx.skip_existing,
         )
 
     def should_skip(self, ctx: PipelineContext) -> bool:
