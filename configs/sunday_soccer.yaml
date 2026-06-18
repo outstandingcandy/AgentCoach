@@ -104,7 +104,11 @@ field_registration:
     pitch_width: 68.0
 
     calibration_skip: 1
-    vis_interval: 1
+    # Per-frame calibration JPG audit. Interval=30 (~1/sec on 30fps
+    # processed stream) keeps the overlay legible without exploding
+    # disk on long clips — a 10 min run drops from ~14 GB calibration
+    # JPGs to ~470 MB.
+    vis_interval: 30
 
     # SIFT chain gap-fill — re-enabled now that FeatureMatcher
     # downscales 4K input to 1080p before SIFT (max_long_side=1920),
@@ -113,12 +117,14 @@ field_registration:
     # matching, so downstream PnP sees full-res points.
     gap_fill_chain:
       enabled: true
-      # Tracking samples every 2 video frames (process_fps=30 on
-      # 60fps source); fill at the same cadence so every tracker
-      # frame has a camera pose. Default frame_step=3 left holes
-      # at 100/103/104/106/... causing tracker.update() to run
-      # without a pose and tracks.json gaps.
-      frame_step: 1
+      # Targets are sampled every Nth frame; remaining tracker frames
+      # get filled by ``_interpolate_camera_poses`` in tracking. step=3
+      # gives ~20 gap-fill anchors per second of 60fps footage — dense
+      # enough that 1/3-second linear pose interpolation introduces
+      # sub-pixel drift on a slow-panning sideline rig, and 3× faster
+      # than step=1 (which on 36k-frame 1080p clips ran into both
+      # wall-clock and OOM walls).
+      frame_step: 3
       # Use the GPU LightGlue+SuperPoint matcher (~20× faster than
       # the CPU SIFT+FLANN backend on 4K, with comparable inlier
       # quality). Falls back to SIFT if lightglue isn't installed.
@@ -136,7 +142,13 @@ field_registration:
       smoothing_window: 5
       use_masking: false
       max_gap_frames: 60
-      max_anchor_distance_frames: 120
+      # Anchors farther than this many frames from the target are
+      # skipped. 60 frames ≈ 1 s on 60fps footage — within that window
+      # the camera barely moves, and SIFT/LightGlue matches are nearly
+      # all true positives. Larger windows (was 120) added 2× the SIFT
+      # tries per target with diminishing returns: most extras failed
+      # the inlier threshold or got rejected at PnP.
+      max_anchor_distance_frames: 60
       sift_top_skip_frac: 0.25
 
   # KP fine-tuned on 4 sunday_cup annotations (frames 0/301/681/1103,
@@ -173,7 +185,13 @@ device: "cuda"
 # below is the only ``detection`` key still honoured in unified mode —
 # it gates the post-hoc PlayerDetector filter.
 unified_detection:
-  imgsz: 1920
+  imgsz: 0                # native (longer side rounded to multiple of
+                          # 32). 1920 down-samples a 47-px ball to
+                          # ~23 px and YOLO loses confidence on small
+                          # / distant balls (frame 2738 was the
+                          # smoking gun). 4K runs ~4× slower than
+                          # 1920 but recall on small balls is much
+                          # better.
   iou_threshold: 0.55
 
 # PRTReID is fine-tuned on SoccerNet (player-level), 256-dim with HRNet32.
@@ -193,6 +211,16 @@ reid:
 # through.
 tracking:
   reid_pitch_max_m: 0.8
+  # Per-frame tracking JPG audit: every 60 video frames ≈ 1/sec on a
+  # 60fps source. Default (sample.stride=1) writes a JPG per processed
+  # frame, which cost ~2 GB on the 10 min clip; this keeps per-second
+  # diagnostic coverage at ~30 MB.
+  vis_frame_stride: 60
+  # Diagnostic dumps for ball detection are large (~9 GB each on this
+  # clip) and only useful when actively debugging the ball pipeline.
+  # Off by default; flip to true on demand.
+  dump_yolo_raw: false
+  dump_ball_diag: false
 
 # Jersey number recognition backend. Tried Qwen3.6-27B-FP8 (local
 # vLLM) and Gemini 2.5 Flash; both committed to single-digit reads

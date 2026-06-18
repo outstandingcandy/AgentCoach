@@ -552,18 +552,46 @@
         });
       });
       // Inline playback — ▶/⏸ steps the slider on a setInterval at
-      // the user-chosen fps. State is attached directly to the
-      // button DOM element (``btn._playTimer``) so it survives
-      // renderStagePane/wireVisHandlers re-runs and so a stop request
-      // doesn't get stranded in an old closure.
-      function stopPlay(btn) {
-        if (!btn || !btn._playTimer) return;
-        clearInterval(btn._playTimer);
-        btn._playTimer = null;
-        btn.textContent = '▶';
+      // the user-chosen fps. Timer ids are kept in a module-level Map
+      // keyed by the vis-pane index, NOT on the button DOM element:
+      // renderStagePane reassigns ``pane.innerHTML`` which destroys
+      // the old button object, so a timer reference attached to that
+      // button would be unreachable. The Map outlives DOM rebuilds
+      // so a stale timer can always be cleared.
+      window._visPlayTimers = window._visPlayTimers || new Map();
+      // Per-vis-pane epoch. Each play() bumps the epoch; pending
+      // ``cached.onload`` swaps capture the epoch they were issued
+      // under and bail out if a newer epoch is current. Without this
+      // the prefetch onload callbacks queued just before stopPlay()
+      // keep advancing the visible image for ~_PREFETCH_WINDOW frames
+      // after the timer is gone (looks like "pause has no effect").
+      window._visPlayEpoch = window._visPlayEpoch || new Map();
+      function _btnByIdx(idx) {
+        return document.querySelector(`[data-vis-play="${idx}"]`);
+      }
+      function _currentEpoch(idx) {
+        return window._visPlayEpoch.get(String(idx)) || 0;
+      }
+      function _bumpEpoch(idx) {
+        const k = String(idx);
+        const next = (_currentEpoch(k) + 1) >>> 0;
+        window._visPlayEpoch.set(k, next);
+        return next;
+      }
+      function stopPlay(idx) {
+        const t = window._visPlayTimers.get(String(idx));
+        if (t) clearInterval(t);
+        window._visPlayTimers.delete(String(idx));
+        // Invalidate any in-flight prefetch onload swaps from the
+        // previous play epoch.
+        _bumpEpoch(idx);
+        const btn = _btnByIdx(idx);
+        if (btn) btn.textContent = '▶';
       }
       window._stopAllVisPlay = () => {
-        document.querySelectorAll('[data-vis-play]').forEach(stopPlay);
+        for (const idx of Array.from(window._visPlayTimers.keys())) {
+          stopPlay(idx);
+        }
       };
       // Direct slider→image updater. The frame jpgs are 4K (~1.3 MB
       // each), so we keep a small ahead-of-time prefetch buffer to
@@ -619,11 +647,17 @@
         // If already decoded, swap immediately. Otherwise kick off
         // the load and only swap when complete (visible image stays
         // on the previous frame in the meantime — no blinking).
+        // Capture the current play epoch so a stop request between
+        // request-issue and onload-fire can short-circuit the swap.
+        const epoch = _currentEpoch(idx);
         const cached = _prefetch(url);
         if (cached.complete && cached.naturalWidth > 0) {
           img.src = url;
         } else {
-          cached.onload = () => { img.src = url; };
+          cached.onload = () => {
+            if (_currentEpoch(idx) !== epoch) return;
+            img.src = url;
+          };
         }
         // Prefetch the next N frames at the same resolution.
         for (let k = 1; k <= _PREFETCH_WINDOW; k++) {
@@ -635,8 +669,8 @@
       document.querySelectorAll('[data-vis-play]').forEach((btn) => {
         btn.addEventListener('click', () => {
           const idx = btn.dataset.visPlay;
-          if (btn._playTimer) {
-            stopPlay(btn);
+          if (window._visPlayTimers.has(String(idx))) {
+            stopPlay(idx);
             return;
           }
           const sl = document.querySelector(`[data-vis-slider="${idx}"]`);
@@ -645,13 +679,14 @@
           const fps = parseInt(fpsSel?.value || '10', 10);
           btn.textContent = '⏸';
           const interval = Math.max(33, Math.round(1000 / fps));
-          btn._playTimer = setInterval(() => {
+          const t = setInterval(() => {
             const max = parseInt(sl.max, 10);
             let v = parseInt(sl.value, 10);
             v = (v + 1) > max ? 0 : v + 1;
             sl.value = String(v);
             updateVisFrame(idx, v);
           }, interval);
+          window._visPlayTimers.set(String(idx), t);
         });
       });
       // Changing resolution: clear prefetch cache and refresh
@@ -670,10 +705,10 @@
       document.querySelectorAll('[data-vis-fps]').forEach((sel) => {
         sel.addEventListener('change', () => {
           const idx = sel.dataset.visFps;
-          const btn = document.querySelector(`[data-vis-play="${idx}"]`);
-          if (!btn || !btn._playTimer) return;
-          stopPlay(btn);
-          btn.click();
+          if (!window._visPlayTimers.has(String(idx))) return;
+          stopPlay(idx);
+          const btn = _btnByIdx(idx);
+          if (btn) btn.click();
         });
       });
       document.querySelectorAll('[data-vis-slider]').forEach((sl) => {

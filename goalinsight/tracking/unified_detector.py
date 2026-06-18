@@ -29,7 +29,17 @@ class UnifiedDetector:
         self.confidence_threshold = self.config.get("confidence_threshold", 0.3)
         self.iou_threshold = self.config.get("iou_threshold", 0.45)
         self.classes = self.config.get("classes", [PERSON_CLASS_ID, BALL_CLASS_ID])
-        self.imgsz = self.config.get("imgsz", 1920)
+        # ``imgsz`` accepts a positive int OR ``0`` / None / "native" —
+        # the latter trio means "use the source frame's longer side
+        # rounded up to a multiple of 32". Native is preferred for
+        # small-ball recall (1920 down-samples a 47×47-px ball to ~23
+        # px and YOLO confidence falls below threshold). Cost: ~4×
+        # slower at 4K vs 1920.
+        cfg_imgsz = self.config.get("imgsz", 0)
+        if cfg_imgsz in (None, 0, "native", ""):
+            self.imgsz: int | None = None
+        else:
+            self.imgsz = int(cfg_imgsz)
         self.device = self.config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
 
@@ -56,7 +66,7 @@ class UnifiedDetector:
             conf=self.confidence_threshold,
             iou=self.iou_threshold,
             classes=self.classes,
-            imgsz=self.imgsz,
+            imgsz=self._resolve_imgsz(frames[0]),
             verbose=False,
         )
 
@@ -85,6 +95,15 @@ class UnifiedDetector:
             all_detections.append(frame_detections)
 
         return all_detections
+
+    def _resolve_imgsz(self, frame: np.ndarray) -> int:
+        """Return YOLO ``imgsz`` for this frame: configured int, or the
+        frame's longer side rounded up to a multiple of 32 (stride)."""
+        if self.imgsz is not None:
+            return self.imgsz
+        h, w = frame.shape[:2]
+        long_edge = max(int(h), int(w))
+        return ((long_edge + 31) // 32) * 32
 
     @staticmethod
     def split_by_class(

@@ -175,6 +175,7 @@ def render_consolidated_video(
     show_panel: bool = True,
     max_frames: int | None = None,
     vis_frame_stride: int = 0,
+    write_mp4: bool = False,
 ) -> dict:
     """Render the tracking video with consolidated player_ids overlaid.
 
@@ -183,6 +184,11 @@ def render_consolidated_video(
 
     ``vis_frame_stride`` > 0 saves ``output_path.parent / 'frames' /
     frame_NNN.jpg`` every Nth video frame for offline auditing.
+
+    ``write_mp4`` controls whether the encoded ``output_path`` mp4 is
+    actually written. The web UI's /pipeline page only reads the per-
+    frame jpgs, so the mp4 is dead weight for that path — encoding 4K
+    @ 60fps is the multi-minute tail of the stage. Default False.
     """
     # The consolidation stage writes its tracks.json (player_id strings,
     # jersey numbers populated) into its own dir; the raw tracker file
@@ -204,8 +210,11 @@ def render_consolidated_video(
     out_w = width + (360 if show_panel else 0)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (out_w, height))
+    if write_mp4:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (out_w, height))
+    else:
+        writer = None
 
     frames_dir = output_path.parent / "frames"
     if vis_frame_stride > 0:
@@ -274,7 +283,8 @@ def render_consolidated_video(
         if show_panel:
             frame = _draw_side_panel(frame, players, visible_ids)
 
-        writer.write(frame)
+        if writer is not None:
+            writer.write(frame)
         # Only dump per-frame JPGs for video frames that actually had
         # tracker output. The tracker samples at process_fps (e.g. 30
         # on a 60 fps source), so half the video frames have an empty
@@ -292,9 +302,13 @@ def render_consolidated_video(
 
     pbar.close()
     cap.release()
-    writer.release()
-    logger.info("wrote %s (%d frames, %dx%d @ %.1f fps)",
-                output_path, n_processed, out_w, height, fps)
+    if writer is not None:
+        writer.release()
+        logger.info("wrote %s (%d frames, %dx%d @ %.1f fps)",
+                    output_path, n_processed, out_w, height, fps)
+    else:
+        logger.info("rendered %d annotated frames (mp4 skipped)",
+                    n_processed)
 
     stats = {
         "total_players": len(players),

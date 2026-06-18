@@ -55,6 +55,7 @@ def render_event_video(
     fps: float | None = None,
     banner_duration_sec: float = 3.0,
     vis_frame_stride: int = 10,
+    write_mp4: bool = False,
 ) -> None:
     """Render full video with event annotations.
 
@@ -66,6 +67,10 @@ def render_event_video(
             to also draw player/ball overlays.
         fps: Override output FPS. If None, uses source video FPS.
         banner_duration_sec: How long each event banner stays on screen.
+        write_mp4: When False (default), only the per-frame jpg sink
+            is written; the encoded mp4 is skipped. The /pipeline page
+            and /match page only consume the jpgs, so the mp4 is dead
+            weight on the typical path.
     """
     cap = cv2.VideoCapture(str(video_path))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -74,8 +79,11 @@ def render_event_video(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     out_fps = fps or video_fps
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(str(output_path), fourcc, out_fps, (width, height))
+    if write_mp4:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(str(output_path), fourcc, out_fps, (width, height))
+    else:
+        out = None
 
     # Per-frame jpg sink at fixed stride for inspection. mp4 stays full-rate.
     frames_dir = output_path.parent / "frames"
@@ -139,13 +147,15 @@ def render_event_video(
             fps=video_fps,
         )
 
-        out.write(frame)
+        if out is not None:
+            out.write(frame)
         if vis_frame_stride > 0 and frame_idx % vis_frame_stride == 0:
             cv2.imwrite(str(frames_dir / f"frame_{frame_idx:05d}.jpg"), frame)
 
     cap.release()
-    out.release()
-    print(f"  Event video saved: {output_path}")
+    if out is not None:
+        out.release()
+        print(f"  Event video saved: {output_path}")
     if vis_frame_stride > 0:
         print(f"  Event per-frame jpg @ every {vis_frame_stride}th: {frames_dir}/")
 

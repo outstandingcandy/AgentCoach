@@ -85,8 +85,16 @@ unified_detection:
   # model_path: null
   confidence_threshold: 0.3            # Use ball's lower threshold; player filtering is post-hoc
   iou_threshold: 0.45
-  imgsz: 1920                          # Full resolution for ball detection
-  batch_size: 8                        # Conservative for 1920px (adjust based on GPU VRAM)
+  # ``imgsz: 0`` → use the source frame's native resolution rounded
+  # up to a multiple of 32 (YOLO stride). 1920 down-samples a 47-px
+  # ball to ~23 px and YOLO loses confidence on small / distant
+  # balls (sunday_highlights frame 2738 was the smoking gun: 0
+  # detections at 1920, conf=0.54 at 3840). Override with a positive
+  # int when detection latency matters more than recall on small
+  # balls — inference scales O(W²), so 4K is ~4× slower than 1920.
+  imgsz: 0
+  batch_size: 4                        # 4K input + yolov8x: 4 fits on a 46GB GPU.
+                                       # Drop to 2 if you OOM on 24GB cards.
   player_confidence_threshold: 0.5     # Post-hoc filter applied to player detections
 
 # Stage 2: Tracking and Identification
@@ -106,7 +114,18 @@ ball_detection:
   confidence_threshold: 0.3  # Lower threshold for small object
   iou_threshold: 0.45
   classes: [32]              # Sports ball class
-  imgsz: 1920                # Higher resolution for small ball
+  # ``imgsz: 0`` (or null / "native") tells the ball detector to use
+  # the source frame's native resolution, rounded up to the nearest
+  # multiple of 32 (YOLO stride). This is the default because at
+  # 1920 a 47-px native ball was being down-sampled to ~23 px and
+  # YOLO confidence dropped below threshold on small / distant /
+  # high-arc shots (sunday_highlights frame 2738 was the smoking gun
+  # — model returned conf=0.54 at 3840 but missed entirely at 1920).
+  # Override to a fixed int (e.g. ``imgsz: 1920``) when detection
+  # latency matters more than recall on small balls — inference cost
+  # scales roughly O(W²), so 4K is ~4× slower than 1920.
+  imgsz: 0
+
   min_size: 3                # Minimum bbox dimension in pixels
   max_size: 100              # Maximum bbox dimension in pixels
   min_aspect_ratio: 0.5      # Ball should be roughly circular

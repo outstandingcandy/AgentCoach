@@ -225,9 +225,10 @@ def run_tracking(
                 f"ships defaults). To use the legacy two-pass path "
                 f"instead, set ``unified_detection.enabled: false``."
             )
+        _imgsz_disp = unified_config["imgsz"] or "native"
         logger.info(
-            "  unified_detection: model=%s  imgsz=%d  iou=%.2f  conf=%.2f",
-            unified_config["model"], unified_config["imgsz"],
+            "  unified_detection: model=%s  imgsz=%s  iou=%.2f  conf=%.2f",
+            unified_config["model"], _imgsz_disp,
             unified_config["iou_threshold"],
             unified_config["confidence_threshold"],
         )
@@ -1243,8 +1244,11 @@ def run_tracking(
         else:
             logger.info("  No valid ball trajectory found after filtering")
 
-        # Render diagnostic visualization
-        if all_ball_dets_diag:
+        # Render diagnostic visualization. Same gate as ``dump_yolo_raw``
+        # — these per-frame ball-detection composites cost ~8 GB on a 10
+        # min 1080p clip and are only useful when actively debugging the
+        # ball pipeline.
+        if all_ball_dets_diag and bool(tracking_cfg.get("dump_ball_diag", True)):
             _render_ball_detection_diag(
                 video_path, sampler, all_ball_dets_diag, output_dir,
             )
