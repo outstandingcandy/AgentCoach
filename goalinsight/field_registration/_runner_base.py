@@ -48,6 +48,26 @@ def open_video(video_path: Path) -> VideoInfo:
     )
 
 
+def probe_video(video_path: Path) -> tuple[int, float, int, int]:
+    """Read (frame_count, fps, width, height) without holding a capture open.
+
+    Used by callers that only need metadata (resolver, PipelineContext init)
+    and don't want to leak an open ``cv2.VideoCapture``.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+    try:
+        return (
+            int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+            cap.get(cv2.CAP_PROP_FPS),
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        )
+    finally:
+        cap.release()
+
+
 def make_sampler(
     video: VideoInfo,
     process_fps: float | None,

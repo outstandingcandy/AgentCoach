@@ -15,7 +15,7 @@ field_registration:
     line_sample_points: 20
     max_reproj_error: 15.0
     use_line_model: false
-    focal_bounds: [400.0, 3500.0]
+    focal_hfov_deg_bounds: [30.7, 134.8]   # 1080p → [400, 3500] px
     world_residual_weight: 0.0
     joint_optimize: false
     world_error_threshold: 5.0
