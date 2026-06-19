@@ -1016,17 +1016,25 @@ def _physical_chain_gap_fill(
         anchor_imgs[af] = frame
         anchor_H_inv[af] = H_a_inv
 
+    fm_max_long_side = chain_cfg.get("feature_matcher_max_long_side", 1920)
     matcher = FeatureMatcherCls(
         n_features=2000,
         ratio_threshold=0.75,
         min_matches=min_inliers,
+        max_long_side=fm_max_long_side,
     )
 
     # Cache extracted SIFT features per anchor so we don't re-extract on
-    # every target. Only kp/desc are cached; raw image already in anchor_imgs.
+    # every target. Drop the raw image immediately after — at ~6 MB / frame
+    # × thousands of anchors, holding the originals OOM'd the process on
+    # 10 min 1080p footage. ``_solve_one_anchor`` reads only the cached
+    # (kp, desc); the dict's keys still drive the `in extended_anchor_imgs`
+    # candidate check below, so we replace the values with ``None`` rather
+    # than deleting the entries.
     anchor_feat: dict[int, tuple] = {}
-    for af, img in anchor_imgs.items():
-        anchor_feat[af] = matcher.extract_features(img, mask=sift_mask)
+    for af in list(anchor_imgs.keys()):
+        anchor_feat[af] = matcher.extract_features(anchor_imgs[af], mask=sift_mask)
+        anchor_imgs[af] = None  # release the BGR frame; keep the key
 
     def _solve_one_anchor(target_img: np.ndarray, af: int) -> tuple[np.ndarray, float] | None:
         """SIFT match anchor->target; run 4-DOF PnP. Returns (rvec, focal)."""
@@ -1263,12 +1271,16 @@ def _physical_chain_gap_fill(
             # Promote into the anchor pool for the next hop. We need the H
             # to back-project SIFT inliers (computed above as H_locked) plus
             # the target image's SIFT features (re-extract once, cached).
-            extended_anchor_imgs[fi] = target_img.copy()
+            # The frame's BGR is dropped immediately after feature extract —
+            # the per-hop loop only consults extended_anchor_feat / _H_inv,
+            # not the raw image. Keep the dict key so the candidate `in`
+            # check still works.
             try:
                 extended_anchor_H_inv[fi] = np.linalg.inv(H_locked)
             except np.linalg.LinAlgError:
                 continue
             kp_fi, desc_fi = matcher.extract_features(target_img, mask=sift_mask)
+            extended_anchor_imgs[fi] = None
             extended_anchor_feat[fi] = (kp_fi, desc_fi)
 
         if not solved_this_hop:

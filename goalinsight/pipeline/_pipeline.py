@@ -63,12 +63,29 @@ class Pipeline:
         """
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Probe video metadata once so stages and the resolver share a
+        # consistent view of (W, H, fps, n_frames) without each one
+        # re-opening a cv2 capture for the same numbers.
+        from ..field_registration._runner_base import probe_video
+
+        try:
+            n_frames, fps, width, height = probe_video(video_path)
+        except RuntimeError:
+            # Tolerate an unreadable / not-yet-existing video here so
+            # stages that don't need it (or fail with a clearer error
+            # later) can still run; metadata stays None.
+            n_frames = fps = width = height = None
+
         ctx = PipelineContext(
             video_path=video_path,
             output_dir=output_dir,
             config=self._config,
             skip_existing=skip_existing,
             cancel_event=cancel_event,
+            video_fps=fps,
+            video_width=width,
+            video_height=height,
+            frame_count=n_frames,
         )
 
         completed: list[str] = []

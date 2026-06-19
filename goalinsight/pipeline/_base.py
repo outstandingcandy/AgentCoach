@@ -32,6 +32,15 @@ class PipelineContext:
     # ``None`` means "no cancel support wired in" — pure-CLI invocations
     # leave it unset and run to completion.
     cancel_event: Event | None = None
+    # Source video metadata, cached so resolver/stages don't re-probe.
+    # Populated by ``Pipeline.run`` (or any caller building a context
+    # directly). Optional because tests/legacy callers may construct a
+    # context without a real video; ``video_meta()`` lazily fills these
+    # on first access.
+    video_fps: float | None = None
+    video_width: int | None = None
+    video_height: int | None = None
+    frame_count: int | None = None
 
     def stage_dir(self, name: str) -> Path:
         """Get (and register) the output directory for a named stage."""

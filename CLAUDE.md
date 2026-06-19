@@ -335,11 +335,12 @@ installs the app on a fresh host.
 
 ## Configuration
 
-YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merge_configs`). Key settings:
+YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merge_configs`). After merging, the CLI runs `resolve_config(merged, video_w, video_h, video_fps)` (`goalinsight/utils/config_resolver.py`) once to fill in resolution/fps-coupled values from the source video — per-video YAMLs should describe physical facts (camera position, pitch dims, sensor identity, model paths) and let the resolver handle the rest. Key settings:
+
 - `pipeline.stages`: list of stages to run
 - `field_registration.backend`: `pnlcalib` | `broadtrack` | `physical` | `nbjw` | `homography`
 - `field_registration.keypoint_threshold`, `ransac_threshold` (default 30px)
-- `video.process_fps`: frame sampling rate (`video.tracking_fps` overrides for tracking)
+- `video.process_fps`: frame sampling rate (auto-defaults to `min(30, source_fps)` when unset; `video.tracking_fps` overrides for tracking)
 - `sample.stride`: pipeline-wide vis-frame stride (per-stage `<stage>.vis_frame_stride` overrides)
 - `detection.model`: YOLOv8 variant (yolov8n/s/m/l/x, yolo11*)
 - `ball_detection.*`: ball detector config
@@ -362,6 +363,23 @@ YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merg
 Per-video pitch + camera intrinsics can be supplied via a sparse
 `overrides.yaml` next to the video file (used by the kids/youth configs
 and any non-FIFA pitch).
+
+### Auto-derived from video metadata
+
+The resolver fills these in based on the source video's `(W, H, fps)`. Legacy explicit keys (in parentheses) always win when present, so old configs keep working unchanged.
+
+| Key | Derived from | Legacy override |
+|---|---|---|
+| `video.process_fps` | `min(30, source_fps)` when unset | (explicit value) |
+| `field_registration.physical.focal_bounds` | `focal_hfov_deg_bounds: [minDeg, maxDeg]` → `f = W / (2*tan(deg/2))` | `focal_bounds: [px, px]` |
+| `field_registration.physical.gap_fill_chain.anchor_max_reproj_px` | `anchor_max_reproj_frac` × image width | `anchor_max_reproj_px` |
+| `field_registration.physical.gap_fill_chain.overwrite_above_reproj_px` | `overwrite_above_reproj_frac` × image width | `overwrite_above_reproj_px` |
+| `unified_detection.imgsz` | `min(1920, max(W, H))` when unset | (explicit value) |
+| `track_consolidation.min_track_frames` | `min_track_seconds` × effective_fps | `min_track_frames` |
+
+`tracking.{max_age, pitch_gate_m, reid_pitch_max_m, stationary_window}` are auto-scaled by `effective_fps/10` inside the tracker (`tracking/orchestrator.py:299–333`); event detector and highlight recipe thresholds already accept seconds and convert at runtime. So at process_fps=30 the tracker computes `pitch_gate_m = 4.0 * 10/30 = 1.33` m on its own — no per-video YAML override needed.
+
+`field_registration.physical.camera_profile` is **not** auto-picked: profile naming carries sensor identity (veo vs phone vs broadcast vs kids long-focal) beyond resolution. Pick the profile that matches your sensor; the runner already scales `fx/fy` if the source's resolution differs from the profile's `image_size` (see `_load_camera_profile` in `physical_runner.py:142–156`).
 
 ## Remote stage execution (SageMaker)
 

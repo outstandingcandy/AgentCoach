@@ -18,6 +18,7 @@ from pathlib import Path
 
 from goalinsight.pipeline import Pipeline
 from goalinsight.utils.config import get_default_config, load_config, merge_configs
+from goalinsight.utils.config_resolver import resolve_config
 
 
 def main():
@@ -136,6 +137,19 @@ def main():
     if args.remote_stages:
         remote = [s.strip() for s in args.remote_stages.split(",") if s.strip()]
         config.setdefault("execution", {})["remote_stages"] = remote
+
+    # Resolve resolution/fps-derived keys (focal bounds, imgsz, gap-fill
+    # px thresholds, min_track_frames, …) against the source video so
+    # stages see fully-derived values without each yaml hand-encoding
+    # them. Legacy explicit keys still win.
+    try:
+        from goalinsight.field_registration._runner_base import probe_video
+        n_frames, fps, width, height = probe_video(video_path)
+    except RuntimeError:
+        # Tolerate an unreadable / not-yet-existing video so dry-run /
+        # config-validation paths still work; resolver no-ops on None.
+        n_frames = fps = width = height = None
+    config = resolve_config(config, width, height, fps)
 
     # Build and run pipeline
     if args.stages:
