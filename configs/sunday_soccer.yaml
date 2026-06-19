@@ -266,4 +266,3 @@ pipeline:
     - track_consolidation
     - event_detection
     - player_profile
-    - highlights

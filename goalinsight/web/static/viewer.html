@@ -97,8 +97,28 @@
             border: 1px solid #3b82f6; user-select: none; }
     .seek:hover { background: #3b82f6; color: #fff; }
     .msg img.chat-art { max-width: 100%; border-radius: 6px;
-                        border: 1px solid #2a323c; margin: 6px 0; display: block; }
+                        border: 1px solid #2a323c; margin: 6px 0; display: block;
+                        cursor: zoom-in; }
+    .msg img.chat-art:hover { border-color: #3b82f6; }
     .msg .caption { font-size: 11px; color: #9aa3ad; margin-bottom: 6px; }
+
+    /* Lightbox: click any .chat-art to enlarge. Plain CSS+JS, no
+       library; closes on Esc or overlay click. The zoomed image is
+       capped at 95% of viewport so margins remain a clear hit-target
+       for closing. */
+    #lightbox { position: fixed; inset: 0; z-index: 1000;
+                background: rgba(0, 0, 0, 0.85);
+                display: none; align-items: center; justify-content: center;
+                cursor: zoom-out; }
+    #lightbox.show { display: flex; }
+    #lightbox img { max-width: 95vw; max-height: 95vh;
+                    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+                    border-radius: 6px; }
+    #lightbox .close-hint {
+      position: absolute; top: 12px; right: 16px;
+      color: #cfe3ff; font-size: 12px; opacity: 0.7;
+      pointer-events: none;
+    }
 
     /* Tool-call cards (run_python and the canned match tools) */
     .tool-card { align-self: flex-start; max-width: 92%; width: 92%;
@@ -279,12 +299,48 @@
     </div>
   </div>
 
+  <div id="lightbox" role="dialog" aria-label="Image preview">
+    <img id="lightbox-img" alt="" />
+    <span class="close-hint">click anywhere or press Esc to close</span>
+  </div>
+
   <script>
     const player = document.getElementById('player');
     const messagesEl = document.getElementById('messages');
     const inputEl = document.getElementById('input');
     const sendBtn = document.getElementById('send');
     const timeEl = document.getElementById('meta-time');
+
+    // ---------- Image lightbox ----------
+    // One delegated click handler on the messages container covers BOTH
+    // sources of artifact images: (a) markdown-rendered ![]() in the
+    // assistant's reply, and (b) thumbnails inside tool cards. Anything
+    // tagged ``.chat-art`` is openable.
+    (() => {
+      const lightbox = document.getElementById('lightbox');
+      const lightboxImg = document.getElementById('lightbox-img');
+      function open(src, alt) {
+        lightboxImg.src = src;
+        lightboxImg.alt = alt || '';
+        lightbox.classList.add('show');
+      }
+      function close() {
+        lightbox.classList.remove('show');
+        // Clear src so the next open doesn't briefly flash the previous
+        // image while the new one decodes.
+        lightboxImg.removeAttribute('src');
+      }
+      messagesEl.addEventListener('click', (e) => {
+        const img = e.target.closest('img.chat-art');
+        if (!img) return;
+        e.preventDefault();
+        open(img.currentSrc || img.src, img.alt);
+      });
+      lightbox.addEventListener('click', close);
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && lightbox.classList.contains('show')) close();
+      });
+    })();
 
     // Run name comes from URL path /insights/<run_name>; if the page is
     // served outside that prefix (legacy mount, dev preview) we fall back
