@@ -85,3 +85,10 @@ secrets.yml
 # AgentCore deploy outputs (per-env state)
 .agentcore_runtime_arn
 .agentcore_session_salt
+
+# PPT outputs (generated from docs/ppt_outline*.md) and external templates.
+# We track the markdown outlines (the source); the .pptx artifacts and the
+# Amazon-summit template bundle are not source-of-truth.
+*.pptx
+*.pptx_files/
+【上屏PPT模板】*
