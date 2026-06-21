@@ -42,6 +42,24 @@ def _discover_videos(videos_root: Path) -> list[Path]:
     return sorted(out, key=lambda p: p.name)
 
 
+def video_group_prefix(video_name: str) -> str:
+    """Group key for an annotation video — the part before the first ``_``.
+
+    Examples:
+        ``sunday_cup_0050-0110``     → ``sunday``
+        ``sunday_soccer_10min``      → ``sunday``
+        ``football_sunday_full``     → ``football``
+        ``kids_soccer_match``        → ``kids``
+        ``standalone``               → ``standalone`` (no underscore)
+
+    Used by both the annotate-page UI (collapsible group headers) and
+    the finetune launcher (so a "train sunday group" job concatenates
+    every annotation directory whose video name shares the prefix).
+    """
+    head, _, _ = video_name.partition("_")
+    return head or video_name
+
+
 def register_annotation_routes(
     app: FastAPI,
     annotator: AnchorAnnotator,
@@ -142,12 +160,122 @@ def register_annotation_routes(
                 "available": available,
                 "annotated_count": len(frames),
                 "is_active": name == annotator.video_name,
+                "group": video_group_prefix(name),
             })
         return JSONResponse(out)
 
     @app.get(f"{p}/annotated_frames")
     def annotated_frames() -> JSONResponse:
         return JSONResponse(index.get_annotated_frame_stats())
+
+    @app.post(f"{p}/train_group")
+    async def train_group(request: Request) -> JSONResponse:
+        """Submit a finetune job that trains on every annotated video in a
+        given prefix-group at once.
+
+        Body: ``{group: str, kind: "keypoint"|"line" (default keypoint)}``.
+        We resolve the group's annotation directories from the index and
+        forward them as a comma-separated ``--annotations_dir`` to the
+        existing trainer (which already accepts that form).
+
+        The pretrained weight file is auto-picked from
+        ``workspace/models/SV_kp.pt`` / ``SV_lines.pt`` — same convention
+        the pipeline page uses; users can still hit
+        ``POST /api/jobs/train`` directly for fully-explicit submissions.
+        """
+        manager = getattr(request.app.state, "jobs", None)
+        if manager is None:
+            raise HTTPException(503, "JobManager not available")
+
+        body = await request.json()
+        group = (body.get("group") or "").strip()
+        kind = (body.get("kind") or "keypoint").strip()
+        if not group:
+            raise HTTPException(400, "missing 'group'")
+        if kind not in ("keypoint", "line"):
+            raise HTTPException(400, f"unknown kind: {kind!r}")
+
+        # Collect on-disk annotation dirs for every video in the group.
+        ann_root = Path(annotator.annotations_dir)
+        all_video_names = set(index.get_all_video_names())
+        group_dirs: list[Path] = []
+        for name in sorted(all_video_names):
+            if video_group_prefix(name) != group:
+                continue
+            d = ann_root / name
+            if d.is_dir():
+                group_dirs.append(d)
+
+        if not group_dirs:
+            raise HTTPException(
+                404,
+                f"no annotation directories found for group '{group}'",
+            )
+
+        # Auto-pick the pretrained weights from the workspace mirror.
+        ws = getattr(request.app.state, "workspace", None)
+        if ws is None:
+            raise HTTPException(503, "Workspace not available")
+        weight_name = "SV_kp.pt" if kind == "keypoint" else "SV_lines.pt"
+        pretrained = ws.models_dir / weight_name
+        if not pretrained.is_file():
+            raise HTTPException(
+                400,
+                f"{pretrained} not found — drop the SV_kp.pt / "
+                f"SV_lines.pt weights into <workspace>/models/ first.",
+            )
+
+        rec = manager.submit_train(
+            kind=kind,
+            annotations_dir=group_dirs,
+            pretrained=pretrained,
+        )
+        return JSONResponse({
+            **rec.to_public(),
+            "group": group,
+            "dirs": [str(d) for d in group_dirs],
+        }, status_code=202)
+
+    @app.get(f"{p}/groups")
+    def groups() -> JSONResponse:
+        """Aggregate per-prefix-group stats for the UI + finetune button.
+
+        Group key = ``video_group_prefix(stem)`` — the part before the
+        first underscore. The returned list mirrors the per-video
+        endpoint but rolls up annotation counts across siblings.
+        """
+        on_disk = {pp.stem: pp for pp in _discover_videos(videos_root_path)}
+        in_index = set(index.get_all_video_names())
+        names = sorted(set(on_disk) | in_index)
+
+        by_prefix: dict[str, dict] = {}
+        for name in names:
+            prefix_key = video_group_prefix(name)
+            entry = by_prefix.setdefault(prefix_key, {
+                "prefix": prefix_key,
+                "videos": [],
+                "available_videos": 0,
+                "annotated_videos": 0,
+                "annotated_frames": 0,
+                "annotation_dirs": [],
+            })
+            n_frames = len(index.get_annotated_frames(name))
+            available = name in on_disk
+            entry["videos"].append(name)
+            if available:
+                entry["available_videos"] += 1
+            if n_frames > 0:
+                entry["annotated_videos"] += 1
+                entry["annotated_frames"] += n_frames
+                # Resolve the on-disk annotation dir for this video so
+                # the finetune launcher can pass them all to the trainer
+                # as a comma-separated list.
+                ann_dir = Path(annotator.annotations_dir) / name
+                if ann_dir.is_dir():
+                    entry["annotation_dirs"].append(str(ann_dir))
+        return JSONResponse(sorted(
+            by_prefix.values(), key=lambda g: g["prefix"]
+        ))
 
     # ------------------------------------------------------------------
     # Image endpoints

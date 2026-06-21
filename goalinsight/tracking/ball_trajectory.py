@@ -173,6 +173,13 @@ class BallTrajectory3D:
         # 40 m/s is a hard shot; if ground-projected speed exceeds this,
         # the projection is wrong → ball is above ground.
         self.airborne_speed_threshold = config.get("airborne_speed_threshold", 35.0)
+        # Pixel reprojection error threshold (median, in pixels) for the
+        # ground-fit confirmation step in ``_is_airborne``. If a segment
+        # has fast ground-projected speed but the smoothed z=0 model
+        # reprojects to within this many pixels of the observed
+        # centres, the segment is treated as a fast ground roll, not
+        # airborne. 12 px ≈ ~25% of a typical 50 px ball bbox edge.
+        self.ground_fit_px_threshold = config.get("ground_fit_px_threshold", 12.0)
         # Pixel acceleration threshold to detect kicks (segment boundaries)
         self.kick_accel_threshold = config.get("kick_accel_threshold", 50.0)
 
@@ -181,43 +188,30 @@ class BallTrajectory3D:
         observations: list[tuple[int, tuple[float, float], dict]],
         fps: float,
     ) -> dict[int, dict]:
-        """Fit 3D trajectory for an entire tracker track.
+        """Compute per-frame ball pitch position via z=0 ground projection.
 
         Args:
             observations: list of (frame_idx, pixel_center, camera_pose)
                 sorted by frame_idx, with predicted frames already filtered out.
-            fps: Video frame rate.
+            fps: Video frame rate (unused; kept for API compatibility).
 
         Returns:
             dict of frame_idx → {position_3d, velocity_3d, pitch_position,
-            height, on_ground}. Frames where estimation fails are omitted.
+            height, on_ground}. height is always 0 — z is fixed by
+            assumption.
+
+        Simplest possible behaviour: each frame is independently
+        ground-projected. We tried two more elaborate paths
+        (airborne-vs-ground branching, and a unified 6-parameter z=0 LS)
+        — both produced systematic position errors on long
+        zoom-and-pan segments because the multi-frame fit couldn't
+        absorb the camera motion that the per-frame pose already
+        compensates for. Reliable airborne / ground discrimination
+        is left as future work; for now ``height`` is reported as 0
+        for every frame and downstream consumers (events, highlights)
+        treat the ball as ground-projected.
         """
-        if len(observations) < 2:
-            return self._ground_project_all(observations)
-
-        # Build Obs tuples with time
-        obs_list: list[Obs] = [
-            (fidx, fidx / fps if fps > 0 else 0.0, center, pose)
-            for fidx, center, pose in observations
-        ]
-
-        # Pass 1: segment at kick boundaries
-        segments = self._segment_at_kicks(obs_list)
-
-        # Pass 2: classify and fit each segment
-        results: dict[int, dict] = {}
-        for seg in segments:
-            if len(seg) < 2:
-                results.update(self._ground_project_all_obs(seg))
-                continue
-
-            if self._is_airborne(seg, fps):
-                seg_results = self._fit_airborne_segment(seg)
-            else:
-                seg_results = self._ground_project_all_obs(seg)
-            results.update(seg_results)
-
-        return results
+        return self._ground_project_all(observations)
 
     # Keep old interface for backward compatibility (orchestrator still calls
     # add_observation/estimate in a loop).  Redirect to batch fit internally.
@@ -321,22 +315,32 @@ class BallTrajectory3D:
     def _is_airborne(self, segment: list[Obs], fps: float) -> bool:
         """Detect if a segment contains airborne flight.
 
-        Two independent signals (either one triggers airborne):
+        Three signals; only the OOB signal alone is sufficient. The
+        speed signal acts as a NECESSARY trigger that has to be
+        confirmed by a physics check, because a fast ground roll can
+        legitimately project to 35-50 m/s under calibration jitter.
 
-        1. Speed signal: ground-projected inter-frame speeds exceed the
-           airborne threshold (35 m/s). A ground ball rarely exceeds this;
-           speeds of 60+ m/s are telltale of altitude.
-
-        2. Out-of-bounds signal: ground-projected positions fall outside
+        1. Out-of-bounds signal: ground-projected positions fall outside
            the pitch boundaries. A ball on the ground can't be at x=-72m
            on a 91m pitch — the Z=0 projection is wrong because the ball
            is above ground, causing the ray-ground intersection to overshoot.
+
+        2. Speed-trigger + ground-fit-confirm: if ground-projected speed
+           exceeds the airborne threshold (35 m/s), don't immediately
+           commit to airborne. First check whether the ground-projected
+           trajectory (x(t), y(t)) is well-explained by a smooth
+           uniform-deceleration model — that's what a fast ground roll
+           looks like. Re-project the smoothed model back to pixels;
+           if the pixel reprojection error is small (≤ a few px), the
+           ground hypothesis fits → NOT airborne. If the smoothed model
+           can't even reproject the original pixels, the ball isn't
+           sliding on z=0 → airborne.
         """
         ground_positions = []
         for fidx, t, center, pose in segment:
             gp = project_to_ground(center, pose)
             if gp is not None:
-                ground_positions.append((fidx, t, gp))
+                ground_positions.append((fidx, t, gp, center, pose))
 
         if len(ground_positions) < 2:
             return False
@@ -349,29 +353,79 @@ class BallTrajectory3D:
         oob_count = 0
         n_pairs = len(ground_positions) - 1
 
-        for i, (fidx, t, gp) in enumerate(ground_positions):
+        for i, (_, t, gp, _, _) in enumerate(ground_positions):
             # Check out-of-bounds
             if abs(gp[0]) > hl or abs(gp[1]) > hw:
                 oob_count += 1
 
             # Check speed
             if i > 0:
-                _, t0, p0 = ground_positions[i - 1]
+                _, t0, p0, _, _ = ground_positions[i - 1]
                 dt = t - t0
                 if dt > 1e-6:
                     dist = ((gp[0] - p0[0]) ** 2 + (gp[1] - p0[1]) ** 2) ** 0.5
                     if dist / dt > self.airborne_speed_threshold:
                         speed_violations += 1
 
-        # Signal 1: >20% of frame pairs exceed speed threshold
-        if n_pairs > 0 and speed_violations / n_pairs > 0.2:
-            return True
-
-        # Signal 2: >30% of positions are outside pitch bounds
+        # Signal 1 (sufficient): >30% of positions are outside pitch
+        # bounds. Z=0 projection only overshoots the pitch when the ball
+        # is genuinely above ground, so this is a hard signal.
         if oob_count / len(ground_positions) > 0.3:
             return True
 
-        return False
+        # Signal 2 (necessary trigger): need ≥20% high-speed pairs
+        # before we even consider airborne. If the ball never moves
+        # fast in ground space it definitely isn't flying.
+        if n_pairs == 0 or speed_violations / n_pairs <= 0.2:
+            return False
+
+        # Signal 2 confirm: try to explain the ground trajectory as a
+        # smooth uniform-deceleration roll, then re-project that
+        # smoothed (x_t, y_t, z=0) back to pixels and compare with the
+        # observed pixel centres. A real fast ground roll has tiny
+        # pixel-reprojection error (the z=0 projection is perfectly
+        # consistent with the observation it came from). A genuinely
+        # airborne ball produces a z=0 model whose forward kinematics
+        # don't fit the pixels — re-projection diverges.
+        ts = np.array([t for _, t, _, _, _ in ground_positions], dtype=np.float64)
+        xs = np.array([gp[0] for _, _, gp, _, _ in ground_positions], dtype=np.float64)
+        ys = np.array([gp[1] for _, _, gp, _, _ in ground_positions], dtype=np.float64)
+        # Fit a quadratic in t for each axis (uniform deceleration).
+        # Quadratic > linear because real ground rolls decelerate from
+        # friction; the second-order term captures that.
+        try:
+            cx = np.polyfit(ts, xs, 2)
+            cy = np.polyfit(ts, ys, 2)
+        except (np.linalg.LinAlgError, ValueError):
+            return True   # fit failed — fall back to airborne
+
+        px_errs = []
+        for i, (_, t, _, center, pose) in enumerate(ground_positions):
+            x_smooth = float(cx[0]*t*t + cx[1]*t + cx[2])
+            y_smooth = float(cy[0]*t*t + cy[1]*t + cy[2])
+            pred_px = project_3d_to_pixel(
+                np.array([x_smooth, y_smooth, 0.0]), pose,
+            )
+            if pred_px is None:
+                continue
+            dx = float(pred_px[0]) - float(center[0])
+            dy = float(pred_px[1]) - float(center[1])
+            px_errs.append((dx*dx + dy*dy) ** 0.5)
+
+        if not px_errs:
+            return True
+
+        # Threshold tuned against bbox jitter on a 4K stream:
+        #   ball bbox is ~50×50 px, centre noise ~2-3 px, projection
+        #   from a smoothed (x, y) at z=0 should land within a handful
+        #   of pixels of the observation if z=0 is the right plane.
+        median_err = float(np.median(px_errs))
+        if median_err <= self.ground_fit_px_threshold:
+            # The fast ground-projected speed is explained by a
+            # decelerating roll; no need to switch to the airborne
+            # parabola.
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Pass 2a: Ground segment — simple projection
@@ -412,7 +466,142 @@ class BallTrajectory3D:
         return results
 
     # ------------------------------------------------------------------
-    # Pass 2b: Airborne segment — global parabola fit
+    # Pass 2: Unified ground fit — single z=0 model for every segment
+    # ------------------------------------------------------------------
+
+    def _fit_ground_segment(self, segment: list[Obs]) -> dict[int, dict]:
+        """Fit a 6-parameter z=0 ground motion model to ``segment``.
+
+        Model: x(t) = x0 + vx·dt + 0.5·ax·dt²
+               y(t) = y0 + vy·dt + 0.5·ay·dt²
+               z    = 0
+        Six parameters, one solve per segment, residuals are pixel
+        reprojection of (x_t, y_t, 0) at each frame's camera pose.
+
+        Why a single model for both ground rolls and airborne shots:
+        the per-frame z=0 ground projection is the canonical "ball
+        location on the pitch" used by events and highlights —
+        whether the ball is rolling or in the air, that projection is
+        the right horizontal coordinate. Fitting all observations
+        jointly under this z=0 prior averages out the calibration
+        jitter that single-frame ground projections suffer at long
+        ranges, and the acceleration term picks up the deceleration
+        of a real ground roll. Compared to the previous 6-parameter
+        airborne parabola fit (which had three z-related dofs), this
+        4-parameter-effective fit (vx, vy, ax, ay) is much harder to
+        push into a wildly wrong (x, y) basin while still matching
+        pixel observations.
+
+        Falls back to per-frame ground projection if the LS fails or
+        the segment is too short.
+        """
+        if len(segment) < self.min_segment_length:
+            return self._ground_project_all_obs(segment)
+
+        t_ref = segment[0][1]
+        T = segment[-1][1] - t_ref
+        if T < 1e-6:
+            return self._ground_project_all_obs(segment)
+
+        # Initial estimate from first two valid ground projections.
+        early_gps: list[tuple[float, float, float]] = []
+        for fidx, t, center, pose in segment[:min(4, len(segment))]:
+            gp = project_to_ground(center, pose)
+            if gp is not None:
+                early_gps.append((t - t_ref, gp[0], gp[1]))
+            if len(early_gps) >= 2:
+                break
+
+        if len(early_gps) < 2:
+            return self._ground_project_all_obs(segment)
+
+        x0_est = early_gps[0][1]
+        y0_est = early_gps[0][2]
+        dt01 = early_gps[1][0] - early_gps[0][0]
+        if dt01 < 1e-6:
+            return self._ground_project_all_obs(segment)
+
+        vx_est = (early_gps[1][1] - early_gps[0][1]) / dt01
+        vy_est = (early_gps[1][2] - early_gps[0][2]) / dt01
+        max_v = self.max_ball_speed
+        vx_est = float(np.clip(vx_est, -max_v, max_v))
+        vy_est = float(np.clip(vy_est, -max_v, max_v))
+
+        x0_params = np.array([x0_est, y0_est, vx_est, vy_est, 0.0, 0.0])
+
+        # Bounds. Position must stay within 2× pitch dimensions even
+        # at the end of the segment, otherwise calibration drift could
+        # let the LS chase a far-field rabbit hole.
+        margin = 10.0
+        hl = self.pitch_half_length + margin
+        hw = self.pitch_half_width + margin
+        # Velocity / accel bounds: ax/ay are decelerations. Friction
+        # gives roughly -1 to -5 m/s² for rolling balls; allow up to
+        # ±30 m/s² to absorb the rapid speed changes a deflection or
+        # initial spin can produce.
+        max_a = 30.0
+        lower = [-hl, -hw, -max_v, -max_v, -max_a, -max_a]
+        upper = [hl, hw, max_v, max_v, max_a, max_a]
+        x0_params = np.clip(x0_params, lower, upper)
+
+        try:
+            result = least_squares(
+                self._ground_residuals,
+                x0_params,
+                args=(t_ref, segment),
+                method="trf",
+                loss="cauchy",
+                f_scale=5.0,
+                bounds=(lower, upper),
+                max_nfev=200,
+            )
+            params = result.x
+        except Exception:
+            return self._ground_project_all_obs(segment)
+
+        x0, y0, vx, vy, ax, ay = params
+        results: dict[int, dict] = {}
+        for fidx, t, _center, _pose in segment:
+            dt = t - t_ref
+            px = x0 + vx * dt + 0.5 * ax * dt * dt
+            py = y0 + vy * dt + 0.5 * ay * dt * dt
+            results[fidx] = {
+                "position_3d": [float(px), float(py), 0.0],
+                "velocity_3d": [
+                    float(vx + ax * dt),
+                    float(vy + ay * dt),
+                    0.0,
+                ],
+                "pitch_position": [float(px), float(py)],
+                "height": 0.0,
+                "on_ground": True,
+            }
+        return results
+
+    def _ground_residuals(
+        self,
+        params: np.ndarray,
+        t_ref: float,
+        segment: list[Obs],
+    ) -> np.ndarray:
+        """Pixel-reprojection residuals for the 6-param ground fit."""
+        x0, y0, vx, vy, ax, ay = params
+        residuals = []
+        for _, t, pixel_center, pose in segment:
+            dt = t - t_ref
+            px = x0 + vx * dt + 0.5 * ax * dt * dt
+            py = y0 + vy * dt + 0.5 * ay * dt * dt
+            pred_2d = project_3d_to_pixel(np.array([px, py, 0.0]), pose)
+            if pred_2d is None:
+                residuals.extend([0.0, 0.0])
+                continue
+            residuals.append(pred_2d[0] - pixel_center[0])
+            residuals.append(pred_2d[1] - pixel_center[1])
+        return np.array(residuals)
+
+    # ------------------------------------------------------------------
+    # Pass 2b: Airborne segment — global parabola fit (DEPRECATED, kept
+    #          for back-compat / debugging — fit_track no longer calls it)
     # ------------------------------------------------------------------
 
     def _fit_airborne_segment(self, segment: list[Obs]) -> dict[int, dict]:

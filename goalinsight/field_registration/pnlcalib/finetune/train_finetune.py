@@ -384,7 +384,13 @@ def main():
         "--annotations_dir",
         type=str,
         required=True,
-        help="Directory containing *_all_points.json and *_raw.jpg files",
+        help=(
+            "Directory containing *_all_points.json and *_raw.jpg files. "
+            "Pass a comma-separated list (e.g. ``dirA,dirB``) to combine "
+            "multiple per-video annotation directories into one training "
+            "set — the annotate-page 'Train this group' button uses this "
+            "to lump every video sharing a name prefix."
+        ),
     )
     parser.add_argument(
         "--pretrained",
@@ -559,11 +565,17 @@ def main():
         print("Freezing backbone layers")
         freeze_backbone(model, freeze=True)
 
+    # Resolve --annotations_dir which may be comma-separated. The
+    # downstream Dataset classes accept ``str`` or ``list[str]`` and
+    # union the file lists.
+    ann_dirs = [d.strip() for d in args.annotations_dir.split(",") if d.strip()]
+    annotations_arg = ann_dirs if len(ann_dirs) > 1 else ann_dirs[0]
+
     # Create dataset
-    print(f"Loading annotations from {args.annotations_dir}")
+    print(f"Loading annotations from {annotations_arg}")
     print(f"Zoom augmentation: range={args.zoom_range}, prob={args.zoom_prob}")
     train_dataset = AugmentedPointDataset(
-        annotations_dir=args.annotations_dir,
+        annotations_dir=annotations_arg,
         augment_factor=args.augment_factor,
         image_size=tuple(args.image_size),
         zoom_range=tuple(args.zoom_range),
@@ -575,7 +587,7 @@ def main():
     # For validation, use pre-cached augmented data (fixed across epochs)
     val_augment = args.val_augment_factor if args.val_augment_factor else args.augment_factor
     val_dataset = CachedAugmentedDataset(
-        annotations_dir=args.annotations_dir,
+        annotations_dir=annotations_arg,
         augment_factor=val_augment,
         image_size=tuple(args.image_size),
         zoom_range=tuple(args.zoom_range),

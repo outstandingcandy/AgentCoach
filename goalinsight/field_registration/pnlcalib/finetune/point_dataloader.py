@@ -362,7 +362,7 @@ class PointAnnotationDataset(Dataset):
 
     def __init__(
         self,
-        annotations_dir: str,
+        annotations_dir: str | list[str],
         transform: Callable | None = None,
         image_size: tuple[int, int] = (960, 540),
         num_keypoints: int = 57,
@@ -374,6 +374,10 @@ class PointAnnotationDataset(Dataset):
 
         Args:
             annotations_dir: Directory containing *_all_points.json and *_raw.jpg files.
+                Can also be a list of directories — every file from every dir
+                is concatenated into one training set. Used by the
+                ``annotate``-page "Train this group" button so finetune sees
+                annotations from every video sharing a name prefix.
             transform: Optional transform to apply to images.
             image_size: Target image size (width, height) for resizing.
             num_keypoints: Number of keypoint channels (57 for PnLCalib).
@@ -381,7 +385,13 @@ class PointAnnotationDataset(Dataset):
             sigma: Gaussian standard deviation for heatmaps.
             tolerance: World coordinate matching tolerance (meters).
         """
-        self.annotations_dir = Path(annotations_dir)
+        dirs = (
+            [Path(d) for d in annotations_dir]
+            if isinstance(annotations_dir, (list, tuple))
+            else [Path(annotations_dir)]
+        )
+        self.annotations_dir = dirs[0]  # legacy single-dir attribute
+        self.annotations_dirs = dirs
         self.transform = transform
         self.image_size = image_size
         self.num_keypoints = num_keypoints
@@ -391,15 +401,25 @@ class PointAnnotationDataset(Dataset):
         # Initialize mapper
         self.mapper = HRNetToPnLCalibMapper(tolerance=tolerance)
 
-        # Find all annotation files
-        self.annotation_files = sorted(glob.glob(
-            str(self.annotations_dir / "*_all_points.json")
-        ))
+        # Find all annotation files across every directory.
+        self.annotation_files: list[str] = []
+        for d in dirs:
+            self.annotation_files.extend(
+                sorted(glob.glob(str(d / "*_all_points.json")))
+            )
 
         if not self.annotation_files:
-            raise ValueError(f"No annotation files found in {annotations_dir}")
+            raise ValueError(
+                f"No annotation files found in {[str(d) for d in dirs]}"
+            )
 
-        print(f"Found {len(self.annotation_files)} annotation files")
+        if len(dirs) > 1:
+            print(
+                f"Found {len(self.annotation_files)} annotation files "
+                f"across {len(dirs)} directories"
+            )
+        else:
+            print(f"Found {len(self.annotation_files)} annotation files")
 
     def __len__(self) -> int:
         return len(self.annotation_files)
@@ -511,7 +531,7 @@ class AugmentedPointDataset(PointAnnotationDataset):
 
     def __init__(
         self,
-        annotations_dir: str,
+        annotations_dir: str | list[str],
         augment_factor: int = 10,
         zoom_range: tuple[float, float] = (1.0, 1.5),
         zoom_prob: float = 0.5,
@@ -695,7 +715,7 @@ class CachedAugmentedDataset(Dataset):
 
     def __init__(
         self,
-        annotations_dir: str,
+        annotations_dir: str | list[str],
         augment_factor: int = 10,
         zoom_range: tuple[float, float] = (1.0, 1.5),
         zoom_prob: float = 0.5,
@@ -745,12 +765,22 @@ class CachedAugmentedDataset(Dataset):
             rng=self.rng,
         )
 
-        # Find annotation files
-        annotations_dir = Path(annotations_dir)
-        annotation_files = sorted(glob.glob(str(annotations_dir / "*_all_points.json")))
+        # Find annotation files across one or more directories.
+        dirs = (
+            [Path(d) for d in annotations_dir]
+            if isinstance(annotations_dir, (list, tuple))
+            else [Path(annotations_dir)]
+        )
+        annotation_files: list[str] = []
+        for d in dirs:
+            annotation_files.extend(
+                sorted(glob.glob(str(d / "*_all_points.json")))
+            )
 
         if not annotation_files:
-            raise ValueError(f"No annotation files found in {annotations_dir}")
+            raise ValueError(
+                f"No annotation files found in {[str(d) for d in dirs]}"
+            )
 
         print(f"Pre-generating {len(annotation_files) * augment_factor} cached validation samples...")
 

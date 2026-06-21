@@ -172,28 +172,28 @@ class EventDetectionStage(Stage):
         with open(out / "goals.json", "w") as f:
             json.dump(goals, f, indent=2, default=str)
 
-        # Per-frame jpg overlays — always rendered (the /pipeline and
-        # /match pages need them). The encoded mp4 is opt-in via
-        # ``output.write_videos`` because the encoding is the multi-
-        # minute tail of the stage and the web UI doesn't consume it.
-        # ``output.save_visualizations: false`` (set by --no-viz)
-        # disables both, for runs that won't use the web UI at all.
+        # Per-frame jpg overlays — ALWAYS rendered. The /pipeline and
+        # /match pages read them and the page is empty without. The
+        # ``output.save_visualizations`` / ``--no-viz`` flag only
+        # gates heavy / opt-in artefacts (mp4 encode, big debug
+        # dumps); frames jpgs are mandatory web-UI fuel.
+        # The encoded mp4 is opt-in via ``output.write_videos``
+        # because the encoding is the multi-minute tail of the stage
+        # and the web UI doesn't consume it.
         out_cfg = ctx.config.get("output", {}) if ctx.config else {}
-        save_vis = out_cfg.get("save_visualizations", True)
         write_mp4 = out_cfg.get("write_videos", False)
-        if save_vis:
-            from ..events.visualization import render_event_video
-            events_cfg = ctx.config.get("events", {}) if ctx.config else {}
-            default_stride = _default_vis_stride(ctx.config)
-            render_event_video(
-                video_path=ctx.video_path,
-                events=event_dicts,
-                output_path=out / "events.mp4",
-                tracking_dir=tracking_dir if tracking_dir.exists() else None,
-                banner_duration_sec=events_cfg.get("banner_duration_sec", 3.0),
-                vis_frame_stride=int(events_cfg.get("vis_frame_stride", default_stride)),
-                write_mp4=write_mp4,
-            )
+        from ..events.visualization import render_event_video
+        events_cfg = ctx.config.get("events", {}) if ctx.config else {}
+        default_stride = _default_vis_stride(ctx.config)
+        render_event_video(
+            video_path=ctx.video_path,
+            events=event_dicts,
+            output_path=out / "events.mp4",
+            tracking_dir=tracking_dir if tracking_dir.exists() else None,
+            banner_duration_sec=events_cfg.get("banner_duration_sec", 3.0),
+            vis_frame_stride=int(events_cfg.get("vis_frame_stride", default_stride)),
+            write_mp4=write_mp4,
+        )
 
         by_type = {}
         for e in events:
@@ -284,16 +284,15 @@ class TrackConsolidationStage(Stage):
             config=config,
         )
 
-        # Per-frame annotated jpgs (always when save_visualizations=True)
-        # + opt-in encoded consolidated.mp4 (output.write_videos=True).
-        # The /pipeline page only reads the jpgs, so the mp4 is dead
-        # weight on the typical iteration path. ``--no-viz`` flips
-        # save_visualizations off → neither is written.
+        # Per-frame annotated jpgs — ALWAYS rendered (the /pipeline
+        # page reads them and is the main inspection surface). mp4 is
+        # opt-in via ``output.write_videos`` since the encoding is the
+        # multi-minute tail of the stage. ``--no-viz`` no longer
+        # disables the jpgs — those are web-UI fuel, not heavy debug.
         out_cfg = ctx.config.get("output", {}) if ctx.config else {}
-        save_vis = out_cfg.get("save_visualizations", True)
         write_mp4 = out_cfg.get("write_videos", False)
         tracking_dir = ctx.stage_dir("tracking")
-        if save_vis and (tracking_dir / "tracks.json").exists() and (out / "players.json").exists():
+        if (tracking_dir / "tracks.json").exists() and (out / "players.json").exists():
             try:
                 # scripts/ isn't a python package, so import from disk.
                 import importlib.util as _ilu

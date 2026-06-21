@@ -198,7 +198,14 @@ def validate_lines(
 
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune PnLCalib line model")
-    parser.add_argument("--annotations_dir", type=str, required=True)
+    parser.add_argument(
+        "--annotations_dir", type=str, required=True,
+        help=(
+            "Annotation directory; pass a comma-separated list "
+            "(e.g. ``dirA,dirB``) to combine multiple per-video dirs "
+            "into one training set, matching the keypoint trainer."
+        ),
+    )
     parser.add_argument("--pretrained", type=str, required=True,
                         help="Path to pretrained SV_lines weights file")
     parser.add_argument("--output_dir", type=str, default="data/finetuned_line_models")
@@ -253,9 +260,11 @@ def main():
         print("Freezing backbone (head-only finetune)")
         freeze_backbone(model, freeze=True)
 
-    print(f"Loading annotations from {args.annotations_dir}")
+    ann_dirs = [d.strip() for d in args.annotations_dir.split(",") if d.strip()]
+    annotations_arg = ann_dirs if len(ann_dirs) > 1 else ann_dirs[0]
+    print(f"Loading annotations from {annotations_arg}")
     train_dataset = AugmentedLineDataset(
-        annotations_dir=args.annotations_dir,
+        annotations_dir=annotations_arg,
         augment_factor=args.augment_factor,
         image_size=tuple(args.image_size),
         num_classes=23,
@@ -268,7 +277,7 @@ def main():
 
     val_aug = args.val_augment_factor if args.val_augment_factor else args.augment_factor
     val_dataset = CachedAugmentedLineDataset(
-        annotations_dir=args.annotations_dir,
+        annotations_dir=annotations_arg,
         augment_factor=val_aug,
         image_size=tuple(args.image_size),
         num_classes=23,

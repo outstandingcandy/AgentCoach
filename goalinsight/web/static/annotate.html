@@ -106,8 +106,16 @@
   .video-list li.active, .frames-list li.active { background: #2a3d5a; color: #cfe0ff; }
   .video-list li.unavailable { opacity: 0.4; pointer-events: none; cursor: not-allowed; }
   .frames-list li .meta { color: var(--muted); font-size: 11px; }
-  .frames-group { margin-bottom: 4px; }
-  .frames-group > summary { padding: 4px 6px; }
+  .frames-group, .video-group { margin-bottom: 4px; }
+  .frames-group > summary, .video-group > summary { padding: 4px 6px; }
+  .video-group > summary { display: flex; align-items: center; gap: 6px; }
+  .video-group > summary .grp-name { color: #cfe0ff; font-weight: 500; flex: 1; font-family: ui-monospace, monospace; }
+  .video-group > summary .grp-meta { color: var(--muted); font-size: 11px; }
+  .video-group .train-btn { font-size: 11px; padding: 2px 8px; border-radius: 3px;
+    background: #2a3d5a; color: #cfe0ff; border: 1px solid #3a517a; cursor: pointer; }
+  .video-group .train-btn:hover { background: #3a517a; }
+  .video-group .train-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .video-group ul.video-list { max-height: none; }
 </style>
   <script defer src="/static/nav.js"></script>
 </head>
@@ -180,7 +188,7 @@
     <div class="scrollarea">
       <div class="panel">
         <h3>Videos</h3>
-        <ul class="video-list" id="video-list"></ul>
+        <div id="video-groups"></div>
       </div>
 
       <div class="panel">
@@ -458,18 +466,47 @@ async function refreshVideosAndFrames() {
     const activeName = lastState ? lastState.video_name : null;
     const activeFrame = lastState ? lastState.frame_idx : null;
 
-    $("#video-list").innerHTML = videos.map(v => {
-      const cls = [];
-      if (v.is_active) cls.push("active");
-      if (!v.available) cls.push("unavailable");
-      const tag = !v.available ? `<span class="badge red">missing</span>`
-                : v.annotated_count > 0 ? `<span class="badge green">${v.annotated_count} ann</span>`
-                : `<span class="badge">0 ann</span>`;
-      return `<li class="${cls.join(' ')}" data-video="${v.name}">
-        <span>${v.name}</span>
-        ${tag}
-      </li>`;
-    }).join("") || "<li>(no videos found)</li>";
+    // Group videos by their prefix (the part before the first ``_``).
+    // Annotation directories under the same prefix are trained together
+    // when the user clicks the group's "Train" button.
+    const byGroup = new Map();
+    for (const v of videos) {
+      const g = v.group || v.name;
+      if (!byGroup.has(g)) byGroup.set(g, []);
+      byGroup.get(g).push(v);
+    }
+
+    const groupHtml = [];
+    for (const [groupName, vs] of [...byGroup.entries()].sort()) {
+      const annTotal = vs.reduce((s, v) => s + (v.annotated_count || 0), 0);
+      const hasActive = vs.some(v => v.is_active);
+      const open = hasActive ? "open" : "";
+      const items = vs.map(v => {
+        const cls = [];
+        if (v.is_active) cls.push("active");
+        if (!v.available) cls.push("unavailable");
+        const tag = !v.available ? `<span class="badge red">missing</span>`
+                  : v.annotated_count > 0 ? `<span class="badge green">${v.annotated_count} ann</span>`
+                  : `<span class="badge">0 ann</span>`;
+        return `<li class="${cls.join(' ')}" data-video="${v.name}">
+          <span>${v.name}</span>
+          ${tag}
+        </li>`;
+      }).join("");
+      const trainDisabled = annTotal === 0 ? "disabled" : "";
+      const trainTitle = annTotal === 0
+        ? "no annotations in this group yet"
+        : `Train keypoint head on ${annTotal} annotations across ${vs.length} video(s)`;
+      groupHtml.push(`<details class="video-group" ${open}>
+        <summary>
+          <span class="grp-name">${groupName}</span>
+          <span class="grp-meta">${vs.length} video${vs.length===1?"":"s"} · ${annTotal} ann</span>
+          <button class="train-btn" data-group="${groupName}" ${trainDisabled} title="${trainTitle}">Train</button>
+        </summary>
+        <ul class="video-list">${items}</ul>
+      </details>`);
+    }
+    $("#video-groups").innerHTML = groupHtml.join("") || "<div style='color: var(--muted); font-size: 12px;'>(no videos found)</div>";
 
     // Group frames by video.
     const byVideo = new Map();
@@ -763,7 +800,29 @@ async function init() {
   });
 
   // Video & frames panels (delegated)
-  $("#video-list").addEventListener("click", async (e) => {
+  $("#video-groups").addEventListener("click", async (e) => {
+    // "Train this group" button
+    const btn = e.target.closest("button.train-btn");
+    if (btn && !btn.disabled) {
+      e.preventDefault();   // don't toggle the <details>
+      e.stopPropagation();
+      const group = btn.dataset.group;
+      btn.disabled = true;
+      btn.textContent = "starting…";
+      try {
+        const resp = await api("POST", "/api/annotate/train_group", { group });
+        btn.textContent = "queued";
+        $("#status").textContent = `Finetune job queued: ${resp.job_id || group} (${resp.dirs?.length || "?"} dirs)`;
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = "Train";
+        $("#status").textContent = `Train failed: ${err.message || err}`;
+      }
+      return;
+    }
+    // Toggle expand/collapse — let <details> handle it natively when
+    // the click is on the summary itself, except when it falls through
+    // to a child <li>.
     const li = e.target.closest("li[data-video]");
     if (!li || li.classList.contains("unavailable")) return;
     await jumpTo(li.dataset.video, 0);

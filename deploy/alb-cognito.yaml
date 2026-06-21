@@ -1,10 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  goal-insight-v3 — ALB (internet-facing) + Cognito user pool fronting the
-  EC2 web server (port 8000). EC2's only inbound becomes ALB SG → 8000;
+  goal-insight-v3 - ALB (internet-facing) + Cognito user pool fronting the
+  EC2 web server (port 8000). EC2 only inbound becomes ALB SG -> 8000;
   no other public ports. SSH stays open per existing SG (out of scope).
   Mirrors the raw2real deployment: self-signed cert imported into ACM,
-  Cognito callback at the ALB's *.elb.amazonaws.com DNS.
+  Cognito callback at the ALB *.elb.amazonaws.com DNS.
 
 Parameters:
   VpcId:
@@ -100,7 +100,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: goal-insight-alb-sg
-      GroupDescription: Public ingress 80/443 → goal-insight ALB
+      GroupDescription: Public ingress 80/443 to goal-insight ALB
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp

@@ -156,14 +156,21 @@ class JobManager:
     def submit_train(
         self,
         *,
-        kind: str,                      # "keypoint" | "line"
-        annotations_dir: Path,
+        kind: str,                                       # "keypoint" | "line"
+        annotations_dir: Path | list[Path],              # one dir, or many to combine
         pretrained: Path,
         extra_argv: list[str] | None = None,
         remote: bool = False,
     ) -> JobRecord:
         if kind not in {"keypoint", "line"}:
             raise ValueError(f"kind must be 'keypoint' or 'line', got {kind!r}")
+        # Allow a list of dirs for "train this prefix-group" — passed
+        # through to the trainer as a single comma-separated argument
+        # (its argparse accepts that form).
+        if isinstance(annotations_dir, (list, tuple)):
+            ann_payload = ",".join(str(d) for d in annotations_dir)
+        else:
+            ann_payload = str(annotations_dir)
         ts = time.strftime("%Y%m%d_%H%M%S")
         out_dir = self.workspace.models_dir / f"{kind}_{ts}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -171,7 +178,7 @@ class JobManager:
             "train", None,
             payload={
                 "kind": kind,
-                "annotations_dir": str(annotations_dir),
+                "annotations_dir": ann_payload,
                 "pretrained": str(pretrained),
                 "output_dir": str(out_dir),
                 "remote": remote,
