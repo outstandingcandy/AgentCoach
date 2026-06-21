@@ -28,6 +28,63 @@ logger = logging.getLogger(__name__)
 # Ground-only line IDs (exclude crossbars and goal posts)
 GROUND_LINE_IDS = set(range(23)) - {6, 7, 8, 9, 10, 11}
 
+# Symmetric ±roll cap (degrees) for the locked-C look-at LM. Wide enough
+# for handheld jitter; tight enough that "camera flipped sideways"
+# degenerate solutions can't fit. 15° matches the existing default
+# pitch_bounds_deg upper end (``configs/sunday_soccer.yaml``: [2, 15]).
+_LOOKAT_ROLL_BOUND_DEG = 15.0
+
+
+def _lookat_to_R(yaw: float, el: float, roll: float) -> np.ndarray:
+    """Build OpenCV ``R`` (world→camera) from (yaw, el, roll).
+
+    Convention:
+      - yaw: rotation about world +Z (yaw=0 → optical axis along +Y_world)
+      - el:  elevation BELOW horizon in radians (positive = looking down,
+             matching the existing ``pitch_bounds_deg`` semantics)
+      - roll: rotation of the camera "up" vector about the optical axis,
+              positive = counter-clockwise as seen from behind the
+              camera looking forward.
+
+    OpenCV camera frame: +z forward, +y down, +x right. The returned
+    rows are [x_cam_w; y_cam_w; z_cam_w] — exactly what
+    ``cv2.Rodrigues`` would produce from the equivalent rvec.
+    """
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    ce, se = np.cos(el), np.sin(el)
+    cr, sr = np.cos(roll), np.sin(roll)
+    # Forward / no-roll up basis derived from yaw + elevation.
+    fwd = np.array([ce * sy, ce * cy, -se])
+    up0 = np.array([se * sy, se * cy, ce])
+    # Apply roll about fwd: rotate up0 toward (fwd × up0).
+    up = up0 * cr + np.cross(fwd, up0) * sr
+    z_cam = fwd
+    y_cam = -up                          # camera y points DOWN
+    x_cam = np.cross(y_cam, z_cam)       # right-handed: x = y × z
+    return np.stack([x_cam, y_cam, z_cam], axis=0)
+
+
+def _R_to_lookat(R: np.ndarray) -> tuple[float, float, float]:
+    """Inverse of :func:`_lookat_to_R`. Returns (yaw, el, roll) radians.
+
+    Uses ``arctan2`` so the extraction is stable across the full sphere.
+    Round-trips ``_lookat_to_R`` to machine precision (verified against
+    a sample of real-world poses on the Sunday cup clip).
+    """
+    fwd = R[2]
+    y_cam_w = R[1]
+    el = float(np.arcsin(-np.clip(fwd[2], -1.0, 1.0)))
+    yaw = float(np.arctan2(fwd[0], fwd[1]))
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    ce, se = np.cos(el), np.sin(el)
+    fwd1 = np.array([ce * sy, ce * cy, -se])
+    up1 = np.array([se * sy, se * cy, ce])
+    minus_y = -y_cam_w
+    a = float(np.dot(minus_y, up1))
+    b = float(np.dot(minus_y, np.cross(fwd1, up1)))
+    roll = float(np.arctan2(b, a))
+    return yaw, el, roll
+
 # Re-exported for backward compat with code that imports
 # LINE_INTERSECTIONS from this module. Built lazily from FIFA defaults
 # since the legacy constant was the FIFA-spec table.
@@ -846,7 +903,12 @@ class PhysicalCalibrator:
         # samples. Walk the allowed range in fixed steps.
         f_min, f_max = self.focal_bounds
         focal_step = max(100.0, (f_max - f_min) / 20.0)
-        focal_candidates = list(np.arange(f_min, f_max + 1.0, focal_step))
+        # ``arange(start, f_max + 1.0, step)`` can produce a candidate
+        # one step beyond f_max; clip so a winning candidate never
+        # sets self.K[0,0] outside the LM's bounds.
+        focal_candidates = [
+            min(f, f_max) for f in np.arange(f_min, f_max + 1.0, focal_step)
+        ]
 
         # P3P needs exactly 3 points; for n>3 try multiple subsets so
         # disambiguation has more signal. Cap at 4 subsets for speed.
@@ -980,9 +1042,17 @@ class PhysicalCalibrator:
         Two modes:
         - Standard: state = [rvec(3), tvec(3), f] (7-DOF). camera_position
           is enforced as a soft residual (cauchy + replicated copies).
-        - Locked (lock_camera_position=True): state = [rvec(3), f] (4-DOF).
-          tvec is recomputed every step as -R · C_target, removing the
-          focal/distance ambiguity entirely.
+        - Locked (lock_camera_position=True): state = [yaw, el, roll, f]
+          (4-DOF) using a look-at parameterization (yaw around world Z,
+          elevation below horizon, roll about optical axis). ``el`` is
+          box-bounded by ``pitch_bounds_deg`` and ``roll`` by
+          ``_LOOKAT_ROLL_BOUND_DEG`` so the LM literally cannot reach
+          camera-pointing-up / heavily tilted poses — Rodrigues rvec
+          can't express that as a box bound (its components have no
+          single-axis physical meaning). The standard path stays on
+          rvec because RANSAC warm starts and the joint-focal stage
+          still rely on it; the locked path is where degenerate
+          orientations were biting (Pass 2 lock-C frames with ≤5 KP).
 
         cx/cy fixed at image center, distortion fixed at zero.
         """
@@ -991,6 +1061,15 @@ class PhysicalCalibrator:
         cy_fixed = self.K[1, 2]
         dist_zero = np.zeros(5, dtype=np.float64)
 
+        # Defensive: clamp f_init into focal_bounds. The few-point P3P
+        # path (``_solve_few_pts_p3p``) walks ``np.arange(f_min, f_max +
+        # 1.0, step)`` which can sample one step past f_max; if that
+        # candidate wins, ``self.K[0,0]`` ends up just above the bound
+        # and scipy's TRF rejects the next frame's ``x0``. Clamp here so
+        # the LM always starts inside the box.
+        f_lo, f_hi = self.focal_bounds
+        f_init = float(np.clip(f_init, f_lo, f_hi))
+
         locked = self.lock_camera_position
         pos_target = (
             np.array(self.camera_position, dtype=np.float64)
@@ -998,7 +1077,18 @@ class PhysicalCalibrator:
         )
 
         if locked:
-            x0 = np.concatenate([rvec_init.ravel(), [f_init]])
+            # Convert the rvec warm start to look-at angles (yaw, el, roll)
+            # and clamp into the same bounds the LM will see, so scipy's
+            # TRF doesn't reject ``x0`` for being on the boundary.
+            R_init, _ = cv2.Rodrigues(np.asarray(rvec_init).reshape(3, 1))
+            yaw0, el0, roll0 = _R_to_lookat(R_init)
+            el_lo_rad = np.radians(self.pitch_bounds_deg[0]) if self.pitch_bounds_deg else -np.pi / 2 + 1e-3
+            el_hi_rad = np.radians(self.pitch_bounds_deg[1]) if self.pitch_bounds_deg else +np.pi / 2 - 1e-3
+            roll_lim_rad = np.radians(_LOOKAT_ROLL_BOUND_DEG)
+            eps = 1e-4
+            el0 = float(np.clip(el0, el_lo_rad + eps, el_hi_rad - eps))
+            roll0 = float(np.clip(roll0, -roll_lim_rad + eps, roll_lim_rad - eps))
+            x0 = np.array([yaw0, el0, roll0, f_init], dtype=np.float64)
         else:
             x0 = np.concatenate([rvec_init.ravel(), tvec_init.ravel(), [f_init]])
 
@@ -1024,9 +1114,11 @@ class PhysicalCalibrator:
 
         def unpack(x):
             if locked:
-                rvec = x[:3]
+                yaw, el, roll = x[0], x[1], x[2]
                 f = x[3]
-                R, _ = cv2.Rodrigues(rvec)
+                R = _lookat_to_R(yaw, el, roll)
+                rvec, _ = cv2.Rodrigues(R)
+                rvec = rvec.ravel()
                 tvec = -R @ pos_target
             else:
                 rvec = x[:3]
@@ -1113,11 +1205,13 @@ class PhysicalCalibrator:
                     # legitimate reprojection cost.
                     all_residuals.append(excess * 1000.0)
 
-            # Camera tilt (pitch_deg) hard barrier — emit a 1-element
-            # residual that's 0 inside the bounds and grows linearly with
-            # the violation (in degrees). Same fixed-length pattern as
-            # position_bounds_m above.
-            if self.pitch_bounds_deg is not None:
+            # Camera tilt (pitch_deg) barrier.
+            # In the locked path, ``el`` is a box-bounded LM variable so
+            # the constraint is enforced exactly by scipy's TRF — no
+            # residual needed. In the standard (rvec-parameterised) path,
+            # we keep the soft barrier as before because rvec components
+            # don't have a single-axis physical meaning.
+            if self.pitch_bounds_deg is not None and not locked:
                 R_tilt, _ = cv2.Rodrigues(rvec)
                 fwd_z = float((R_tilt.T @ np.array([0.0, 0.0, 1.0]))[2])
                 # Clamp domain for arcsin stability; sin range is [-1, 1].
@@ -1138,9 +1232,22 @@ class PhysicalCalibrator:
             return np.concatenate(all_residuals)
 
         if locked:
+            # Look-at parameterisation: [yaw, el, roll, f].
+            # ``el`` (below-horizon angle, positive = looking down) is
+            # box-bounded by pitch_bounds_deg — this is the whole reason
+            # for the reparametrisation: rvec components can't express
+            # "camera not pointing up" as a box.
+            # ``roll`` is bounded to a small symmetric window (±15°);
+            # legitimate handheld/sideline rigs are roughly level.
+            # ``yaw`` is left unbounded modulo 2π — TRF works fine with
+            # +inf bounds and the ``arctan2`` extraction returns into
+            # (-π, π].
+            el_lo_rad = np.radians(self.pitch_bounds_deg[0]) if self.pitch_bounds_deg else -np.pi / 2 + 1e-3
+            el_hi_rad = np.radians(self.pitch_bounds_deg[1]) if self.pitch_bounds_deg else +np.pi / 2 - 1e-3
+            roll_lim_rad = np.radians(_LOOKAT_ROLL_BOUND_DEG)
             bounds = (
-                [-np.inf] * 3 + [self.focal_bounds[0]],
-                [+np.inf] * 3 + [self.focal_bounds[1]],
+                [-np.inf, el_lo_rad, -roll_lim_rad, self.focal_bounds[0]],
+                [+np.inf, el_hi_rad, +roll_lim_rad, self.focal_bounds[1]],
             )
         else:
             bounds = (

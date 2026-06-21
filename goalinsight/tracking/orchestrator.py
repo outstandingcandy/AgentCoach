@@ -1294,42 +1294,61 @@ def run_tracking(
                 "pitch_half_width": float(pitch_half_width),
             },
         )
-        if config.get("output", {}).get("save_visualizations", True):
-            render_yolo_raw_diag(
-                video_path, yolo_raw_records, output_dir,
-            )
-        logger.info(
-            f"  Raw YOLO dump: {len(yolo_raw_records)} frames → "
-            f"{output_dir}/yolo_raw/")
+    # Vis layering for the tracking stage:
+    #   * Per-frame jpg overlays (frames/) — ALWAYS rendered. The
+    #     /pipeline web page reads them and is the main way humans
+    #     inspect tracker output. Skipping them leaves the page blank.
+    #   * Encoded mp4 (tracking.mp4) — opt-in via output.write_videos.
+    #   * yolo_raw/ + ball_detection_diag/ — heavy diagnostic dumps,
+    #     gated on output.save_visualizations (skipped by --no-viz).
+    out_cfg = config.get("output", {}) or {}
+    save_vis = out_cfg.get("save_visualizations", True)
+    write_mp4 = out_cfg.get("write_videos", False)
+
+    if save_vis:
+        render_yolo_raw_diag(
+            video_path, yolo_raw_records, output_dir,
+        )
+    logger.info(
+        f"  Raw YOLO dump: {len(yolo_raw_records)} frames → "
+        f"{output_dir}/yolo_raw/")
 
     # Team / role / jersey classification and off-field filtering have
     # all moved to the track_consolidation stage.
 
-    if config.get("output", {}).get("save_visualizations", True):
-        _render_tracking_video(
-            video_path=video_path,
-            output_dir=output_dir,
-            sampler=sampler,
-            all_tracks=all_tracks,
-            all_ball_tracks=all_ball_tracks,
-            ball_debug_log=ball_debug_log,
-            ball_enabled=ball_enabled,
-            out=out,
-            fps=fps,
-            height=height,
-            pitch_length=pitch_length,
-            pitch_width=pitch_width,
-            camera_poses=camera_poses,
-            vis_frame_stride=int(
-                config.get("tracking", {}).get(
-                    "vis_frame_stride",
-                    (config.get("sample") or {}).get("stride", 1),
-                )
-            ),
-        )
-    else:
+    # Always render per-frame jpgs — the web page needs them. mp4 +
+    # heavy debug renders gated separately.
+    _render_tracking_video(
+        video_path=video_path,
+        output_dir=output_dir,
+        sampler=sampler,
+        all_tracks=all_tracks,
+        all_ball_tracks=all_ball_tracks,
+        ball_debug_log=ball_debug_log,
+        ball_enabled=ball_enabled,
+        out=out,
+        fps=fps,
+        height=height,
+        pitch_length=pitch_length,
+        pitch_width=pitch_width,
+        camera_poses=camera_poses,
+        vis_frame_stride=int(
+            config.get("tracking", {}).get(
+                "vis_frame_stride",
+                (config.get("sample") or {}).get("stride", 1),
+            )
+        ),
+        write_mp4=write_mp4,
+    )
+    # _render_tracking_video releases ``out`` only when write_mp4=True.
+    # Without mp4 we still hold the writer; release + delete the empty
+    # 0-byte stub so /pipeline doesn't list a useless tracking.mp4.
+    if not write_mp4:
         out.release()
-        logger.info("Skipping tracking visualization (save_visualizations=false)")
+        try:
+            (output_dir / "tracking.mp4").unlink(missing_ok=True)
+        except OSError:
+            pass
 
     return _save_tracking_outputs(
         output_dir=output_dir,
@@ -1366,6 +1385,7 @@ def _render_tracking_video(
     pitch_width: float,
     camera_poses: dict | None = None,
     vis_frame_stride: int = 10,
+    write_mp4: bool = False,
 ) -> None:
     """Render the tracking visualization video with ball + raw-track overlays.
 
@@ -1506,7 +1526,8 @@ def _render_tracking_video(
         combined = np.hstack([vis, topdown])
 
         fname = f"frame_{frame_idx:05d}"
-        _write_queue.put(("video", combined))
+        if write_mp4:
+            _write_queue.put(("video", combined))
         if vis_frame_stride <= 1 or frame_idx % vis_frame_stride == 0:
             _write_queue.put(("image", str(vis_frames_dir / f"{fname}.jpg"), combined))
             _write_queue.put(("json", str(vis_frames_dir / f"{fname}.json"), {
@@ -1521,7 +1542,8 @@ def _render_tracking_video(
     _writer.join()
 
     render_prefetcher.shutdown()
-    out.release()
+    if write_mp4:
+        out.release()
 
 
 def _save_tracking_outputs(

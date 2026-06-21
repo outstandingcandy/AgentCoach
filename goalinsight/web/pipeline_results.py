@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -23,6 +24,24 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+
+
+def _json_safe(obj: Any) -> Any:
+    """Replace non-finite floats (NaN / ±Inf) with None recursively.
+
+    ``pipeline_stats.json`` may contain ``Infinity`` for divide-by-zero
+    aggregate stats (median_world_error etc.). stdlib json reads them
+    back fine but ``JSONResponse`` rejects them ("Out of range float
+    values are not JSON compliant"). Cleansing at the API boundary lets
+    the file format stay loose without breaking the web layer.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 from ._workspace import Workspace
 from .library import _safe_filename
@@ -439,7 +458,7 @@ def register_pipeline_results_routes(app: FastAPI, workspace: Workspace) -> None
             stage: (run_dir / stage).is_dir()
             for stage in _BUILDERS
         }
-        return JSONResponse({
+        return JSONResponse(_json_safe({
             "run_name": run_name,
             "video_path": ps.get("video_path"),
             "video_name": ps.get("video_name"),
@@ -447,7 +466,7 @@ def register_pipeline_results_routes(app: FastAPI, workspace: Workspace) -> None
             "stages_run": ps.get("stages_run", []),
             "stage_present": present,
             "totals": ps.get("stats", {}),
-        })
+        }))
 
     @app.get("/api/runs/{run_name}/pipeline/stage/{stage}")
     def stage_manifest(run_name: str, stage: str) -> JSONResponse:
@@ -461,4 +480,4 @@ def register_pipeline_results_routes(app: FastAPI, workspace: Workspace) -> None
         # Convert dataclasses to dicts for JSON.
         out = asdict(manifest)
         # asdict turns VisDir into dict — already correct shape.
-        return JSONResponse(out)
+        return JSONResponse(_json_safe(out))

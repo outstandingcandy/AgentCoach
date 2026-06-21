@@ -209,25 +209,34 @@ class LineAnnotationDataset(Dataset):
 
     def __init__(
         self,
-        annotations_dir: str,
+        annotations_dir: str | list[str],
         image_size: tuple[int, int] = (960, 540),
         num_classes: int = 23,
         down_ratio: int = 2,
         sigma: float = 2.0,
     ):
-        self.annotations_dir = Path(annotations_dir)
+        dirs = (
+            [Path(d) for d in annotations_dir]
+            if isinstance(annotations_dir, (list, tuple))
+            else [Path(annotations_dir)]
+        )
+        self.annotations_dir = dirs[0]  # legacy single-dir attribute
+        self.annotations_dirs = dirs
         self.image_size = image_size
         self.num_classes = num_classes
         self.down_ratio = down_ratio
         self.sigma = sigma
 
-        # We deliberately glob for the line-annotation JSON, not the
-        # *_all_points.json variant. The two share a frame_<idx> stem.
-        all_jsons = sorted(glob.glob(str(self.annotations_dir / "frame_*.json")))
-        # Filter out _all_points.json — those carry no `lines` key.
-        candidates = [p for p in all_jsons if not p.endswith("_all_points.json")]
+        # Glob ``frame_*.json`` (line annotations, NOT the ``*_all_points``
+        # variant) across every directory and keep files that actually
+        # carry a non-empty ``lines`` field. Multi-dir input is used by
+        # the annotate-page "Train this group" button to combine every
+        # sibling video's annotations into one training set.
+        candidates: list[str] = []
+        for d in dirs:
+            ds_jsons = sorted(glob.glob(str(d / "frame_*.json")))
+            candidates.extend(p for p in ds_jsons if not p.endswith("_all_points.json"))
 
-        # Keep only files that actually have at least one mapped line.
         self.annotation_files: list[str] = []
         for path in candidates:
             with open(path) as f:
@@ -237,10 +246,16 @@ class LineAnnotationDataset(Dataset):
 
         if not self.annotation_files:
             raise ValueError(
-                f"No line annotations found in {annotations_dir}. "
+                f"No line annotations found in {[str(d) for d in dirs]}. "
                 "Expected frame_<idx>.json with a non-empty 'lines' field."
             )
-        print(f"[lines] Found {len(self.annotation_files)} annotation files")
+        if len(dirs) > 1:
+            print(
+                f"[lines] Found {len(self.annotation_files)} annotation files "
+                f"across {len(dirs)} directories"
+            )
+        else:
+            print(f"[lines] Found {len(self.annotation_files)} annotation files")
 
     def __len__(self) -> int:
         return len(self.annotation_files)
@@ -297,7 +312,7 @@ class AugmentedLineDataset(LineAnnotationDataset):
 
     def __init__(
         self,
-        annotations_dir: str,
+        annotations_dir: str | list[str],
         augment_factor: int = 10,
         zoom_range: tuple[float, float] = (1.0, 1.5),
         zoom_prob: float = 0.5,
