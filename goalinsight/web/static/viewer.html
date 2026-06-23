@@ -11,7 +11,11 @@
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
   <link rel="stylesheet"
         href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github-dark.min.css">
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/highlight.min.js"></script>
+  <!-- cdn-release build bundles ~30 common languages (incl. python,
+       bash, json, javascript) — the core ``lib/highlight.min.js`` ships
+       with no language defs, so without this build hljs.highlightElement
+       is a no-op on every snippet the agent emits. -->
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/highlight.min.js"></script>
   <style>
     * { box-sizing: border-box; }
     html, body { height: 100%; margin: 0; background: #101418; color: #e6e9ee;
@@ -769,9 +773,15 @@
         lbl.className = 'tool-label';
         lbl.textContent = 'code';
         const pre = document.createElement('pre');
-        pre.textContent = evt.input?.code || '';
+        const code = document.createElement('code');
+        code.className = 'language-python';
+        code.textContent = evt.input?.code || '';
+        pre.appendChild(code);
         body.appendChild(lbl);
         body.appendChild(pre);
+        if (typeof window.hljs !== 'undefined') {
+          try { window.hljs.highlightElement(code); } catch (_e) { /* ignore */ }
+        }
       }
       card.appendChild(body);
 
