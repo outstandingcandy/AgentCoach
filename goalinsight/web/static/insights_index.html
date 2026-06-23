@@ -63,20 +63,19 @@
         grid.innerHTML = '<div class="empty">No runs yet. Create one from the Library page.</div>';
         return;
       }
-      // Insights chat needs at least the annotated video (so the user
-      // can scrub) and tracks (so the chat agent can answer about
-      // players/events). Everything else is bonus context.
+      // Insights chat needs tracks (so the chat agent can answer about
+      // players/events). The viewer falls back to the source video when
+      // annotated.mp4 isn't built, so annotated_video is no longer
+      // required to open insights — the badge below still shows whether
+      // the HUD render exists.
       grid.innerHTML = runs.map(r => {
         const s = r.stages || {};
-        const ready = !!(s.tracking && s.annotated_video);
+        const ready = !!s.tracking;
         const onclick = ready
           ? `onclick="location.href='/insights/${encodeURIComponent(r.run_name)}'"`
           : '';
         const reason = ready ? '' :
-          `<div class="reason">missing ${[
-            !s.tracking && 'tracking',
-            !s.annotated_video && 'annotated_video',
-          ].filter(Boolean).join(', ')}</div>`;
+          `<div class="reason">missing tracking</div>`;
         return `<div class="card ${ready ? '' : 'disabled'}" ${onclick}>
           <div class="name">${r.run_name}</div>
           <div class="badges">

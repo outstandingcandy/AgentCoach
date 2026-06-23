@@ -92,15 +92,17 @@
     .event-list .meta { color: #9aa3ad; font-size: 11px; }
     .event-list .empty { padding: 8px; color: #6b7380; font-size: 12px; text-align: center; }
 
-    .player-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+    .player-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
                    gap: 4px; }
     /* Player card: background = player's profile crop, dark gradient
        overlay so the white text stays readable. ``.live`` flips the
        border to amber and surfaces an action badge when the playhead
-       is inside an event involving this player (goal/shot/pass...). */
+       is inside an event involving this player (goal/shot/pass...).
+       aspect-ratio 1:2 (W:H) gives a tall portrait card that frames
+       the player crop better than the old square. */
     .player-card { background: #2a323c; border: 1px solid #2a323c; border-radius: 5px;
                    padding: 6px 8px; font-size: 12px; cursor: pointer; min-width: 0;
-                   position: relative; min-height: 96px; overflow: hidden;
+                   position: relative; aspect-ratio: 1 / 2; overflow: hidden;
                    background-size: cover; background-position: center top;
                    background-repeat: no-repeat;
                    color: #fff;
@@ -399,6 +401,8 @@
     // ---------- Header / overlay toggle UI ----------
     function buildToggles() {
       const row = document.getElementById('toggles');
+      // Visual overlays painted on the video canvas. Each entry binds
+      // to a key in ``overlays`` and is read by the rAF draw loop.
       const items = [
         ['ellipse', 'Ellipse under feet'],
         ['jersey', 'Jersey #'],
@@ -408,12 +412,37 @@
         ['pass_arrows', 'Pass arrows'],
         ['possession', 'Possession'],
       ];
-      row.innerHTML = items.map(([k, lbl]) =>
-        `<span class="toggle ${overlays[k] ? 'on' : ''}" data-k="${k}">${lbl}</span>`
+      // Player-controls (separate state — these wire straight onto
+      // <video> properties rather than into ``overlays``). Rendered
+      // alongside the overlay toggles in the same row so the user
+      // sees one unified switch panel.
+      const playerToggles = [
+        ['loop', 'Loop video', () => player.loop, (on) => {
+          player.loop = on;
+          // Native ``loop`` only takes effect on the next 'ended'; if
+          // the video already ended (paused at end) hitting play here
+          // makes the toggle feel responsive.
+          if (on && player.ended) player.play().catch(() => {});
+        }],
+      ];
+      const overlayHtml = items.map(([k, lbl]) =>
+        `<span class="toggle ${overlays[k] ? 'on' : ''}" data-k="${k}" data-kind="overlay">${lbl}</span>`
       ).join('');
+      const playerHtml = playerToggles.map(([k, lbl, getter]) =>
+        `<span class="toggle ${getter() ? 'on' : ''}" data-k="${k}" data-kind="player">${lbl}</span>`
+      ).join('');
+      row.innerHTML = overlayHtml + playerHtml;
       row.querySelectorAll('.toggle').forEach(el => {
         el.addEventListener('click', () => {
           const k = el.dataset.k;
+          if (el.dataset.kind === 'player') {
+            const entry = playerToggles.find(t => t[0] === k);
+            if (!entry) return;
+            const next = !entry[2]();
+            entry[3](next);
+            el.classList.toggle('on', next);
+            return;
+          }
           overlays[k] = !overlays[k];
           el.classList.toggle('on', overlays[k]);
         });
@@ -1310,52 +1339,69 @@
     }
 
     // ---------- Boot sequence ----------
-    (async () => {
+    // Progressive render: each fetch fills its own UI block as soon
+    // as it lands. The big tracks.json (~2 MB) used to gate the
+    // event list and player grid because everything was awaited in
+    // a single Promise.all — now it doesn't.
+    (() => {
       buildToggles();
-      try {
-        const [m, p, tj, bj] = await Promise.all([
-          fetch(`${API}/meta`).then(r => r.json()),
-          fetch(`${API}/match/data`).then(r => r.json()),
-          fetch(`/runs_static/${encodeURIComponent(RUN_NAME)}/track_consolidation/tracks.json`).then(r => r.ok ? r.json() : {}),
-          fetch(`/runs_static/${encodeURIComponent(RUN_NAME)}/tracking/ball_tracks.json`).then(r => r.ok ? r.json() : {}),
-        ]);
+
+      const metaP = fetch(`${API}/meta`).then(r => r.json()).catch(e => {
+        document.getElementById('meta-name').textContent = `(meta failed: ${e})`;
+        return null;
+      });
+      const matchP = fetch(`${API}/match/data`).then(r => r.json()).catch(() => null);
+      const tracksP = fetch(`/runs_static/${encodeURIComponent(RUN_NAME)}/track_consolidation/tracks.json`)
+        .then(r => r.ok ? r.json() : {}).catch(() => ({}));
+      const ballP = fetch(`/runs_static/${encodeURIComponent(RUN_NAME)}/tracking/ball_tracks.json`)
+        .then(r => r.ok ? r.json() : {}).catch(() => ({}));
+
+      // Stage 1: video metadata (cheap, text-only labels).
+      metaP.then(m => {
+        if (!m) return;
         meta = m;
+        document.getElementById('meta-name').textContent = meta.video_name;
+        document.getElementById('meta-duration').textContent =
+          `${fmtTime(meta.duration_s)} (${meta.frame_count} frames @ ${(meta.fps || 0).toFixed(1)} fps)`;
+      });
+
+      // Stage 2: events + players + pitch dims. Renders the event
+      // chips, event list, player grid, FOV polygon — i.e. all the
+      // controls below the video — without waiting for tracks.json.
+      matchP.then(p => {
+        if (!p) return;
         payload = p;
         // ``goal`` is a derived status of a SHOT (the shot's outcome
         // already encodes whether the ball went in), so it's noise as
         // a standalone event row / chip / live badge — same treatment
-        // as the ``successful`` outcome we hide elsewhere. Filter at
-        // the source so all downstream UI (chip row, event list, live
-        // player badge, event count meta) stays consistent.
+        // as the ``successful`` outcome we hide elsewhere.
         if (Array.isArray(payload.events)) {
           payload.events = payload.events.filter(e => e.type !== 'goal');
         }
-        // tracks.json is keyed by str(frame); convert to plain object lookup
-        // with integer keys so the rAF loop can index by current frame.
-        tracksByFrame = {};
-        for (const k of Object.keys(tj || {})) tracksByFrame[parseInt(k, 10)] = tj[k];
-        ballByFrame = {};
-        for (const k of Object.keys(bj || {})) ballByFrame[parseInt(k, 10)] = bj[k];
-
-        document.getElementById('meta-name').textContent = meta.video_name;
-        document.getElementById('meta-duration').textContent =
-          `${fmtTime(meta.duration_s)} (${meta.frame_count} frames @ ${(meta.fps || 0).toFixed(1)} fps)`;
         const idCount = (payload.players || []).filter(isIdentifiedPlayer).length;
         const totalCount = (payload.players || []).length;
         document.getElementById('meta-players').textContent =
           idCount === totalCount ? `${totalCount}` : `${idCount} (of ${totalCount})`;
         document.getElementById('meta-events').textContent = `${(payload.events || []).length}`;
-
         buildEventChips();
         renderEventList();
         buildPlayerGrid();
         updatePlayerControls();
         setFovFrames((payload.camera_fov || {}).frames || []);
-        await loadPossessionSpans();
+        loadPossessionSpans();   // fire-and-forget; not blocking layout
         syncOverlayLayout();
-      } catch (e) {
-        document.getElementById('meta-name').textContent = `(load failed: ${e})`;
-      }
+      });
+
+      // Stage 3: tracks + ball positions. Populates the per-frame
+      // lookup tables the rAF loop reads to paint the video overlay
+      // and 2D pitch. Until they land the pitch panel just stays
+      // empty (no error).
+      Promise.all([tracksP, ballP]).then(([tj, bj]) => {
+        tracksByFrame = {};
+        for (const k of Object.keys(tj || {})) tracksByFrame[parseInt(k, 10)] = tj[k];
+        ballByFrame = {};
+        for (const k of Object.keys(bj || {})) ballByFrame[parseInt(k, 10)] = bj[k];
+      });
     })();
   </script>
 </body>

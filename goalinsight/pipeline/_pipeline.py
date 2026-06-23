@@ -128,8 +128,68 @@ class Pipeline:
         with open(output_dir / "pipeline_stats.json", "w") as f:
             json.dump(run_metadata, f, indent=2)
 
+        # When ``GOALINSIGHT_VIDEO_S3_BUCKET`` is set, sync the run's
+        # videos + frame jpgs to S3 so the web app can redirect
+        # browsers there instead of streaming bytes through EC2.
+        # Best-effort: a sync failure logs but does not fail the run.
+        _maybe_sync_to_s3(output_dir, video_path)
+
         if cancelled:
             raise PipelineCancelled(
                 f"cancelled after {len(completed)} stage(s): {completed}"
             )
         return run_metadata
+
+
+def _maybe_sync_to_s3(output_dir: Path, video_path: Path) -> None:
+    """Sync this run's mp4s + frame jpgs to S3 when configured.
+
+    Best-effort, never raises — failed uploads only log. Runs in-process
+    so the run is fully synced before ``Pipeline.run`` returns; this
+    keeps state simple at the cost of a few extra seconds at the end of
+    long jobs (8 GB / ~9 k objects ran ~5 min on this host).
+    """
+    import logging
+    import os
+    import subprocess
+    log = logging.getLogger(__name__)
+
+    bucket = os.environ.get("GOALINSIGHT_VIDEO_S3_BUCKET", "").strip()
+    if not bucket:
+        return
+
+    run_name = output_dir.name
+    s3_prefix = f"s3://{bucket}/runs/{run_name}/"
+    log.info("Syncing run %s to %s ...", run_name, s3_prefix)
+    cmd = [
+        "aws", "s3", "sync", str(output_dir) + "/", s3_prefix,
+        "--exclude", "*",
+        "--include", "*.mp4",
+        "--include", "*.jpg",
+        "--include", "*.jpeg",
+        "--include", "*.png",
+        "--exclude", "*.pre_*/*",
+        "--exclude", "*.qwen_*/*",
+        "--no-progress",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        if proc.returncode != 0:
+            log.warning(
+                "S3 sync exited %d: %s",
+                proc.returncode, proc.stderr[-2000:],
+            )
+        else:
+            n = sum(1 for line in proc.stdout.splitlines() if line.startswith("upload:"))
+            log.info("S3 sync done — %d new uploads", n)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("S3 sync failed: %s", exc)
+
+    # Also upload the source video so /api/runs/<run>/video can
+    # redirect to S3 even when the run hasn't produced annotated_video
+    # / consolidated.mp4.
+    try:
+        from goalinsight.web._s3_video import upload_source_video
+        upload_source_video(video_path, bucket=bucket)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("source-video S3 upload failed: %s", exc)
