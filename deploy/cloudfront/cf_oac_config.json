@@ -1,0 +1,1 @@
+{"Name": "goalinsight-videos-oac", "Description": "OAC for goalinsight-videos bucket", "OriginAccessControlOriginType": "s3", "SigningBehavior": "always", "SigningProtocol": "sigv4"}

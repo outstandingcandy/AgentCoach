@@ -18,7 +18,7 @@ from typing import Any
 import json
 
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -26,6 +26,15 @@ from ._runs import (
     CHAT_ARTIFACTS_URL as RUNS_ARTIFACTS_URL,
     IncompleteRunError,
     RunRegistry,
+)
+from ._s3_video import (
+    presigned_url_for_key,
+    presigned_video_url,
+    s3_key_exists,
+    s3_object_exists,
+    source_video_key,
+    upload_source_video,
+    video_bucket,
 )
 from ._workspace import Workspace, resolve_workspace
 from .analytics import register_analytics_routes
@@ -284,8 +293,43 @@ def create_workspace_app(
         })
 
     @app.get("/api/runs/{run_name}/video")
-    def run_video(run_name: str) -> FileResponse:
+    def run_video(run_name: str):
+        """Serve the run's playable mp4.
+
+        When ``GOALINSIGHT_VIDEO_S3_BUCKET`` is set, redirect the
+        browser to a short-lived presigned S3 GET URL so EC2 stops
+        being the byte-pump. Two key shapes are supported:
+
+          - Run-derived mp4 (``runs/<run>/<stage>/<file>``) — when the
+            chosen video lives inside the run dir.
+          - Source video (``videos/<file>``) — when the run hasn't
+            produced annotated_video / consolidated and we're
+            falling back to the original input. Auto-uploaded on
+            first hit so existing runs don't need a pre-bake.
+
+        Falls back to streaming from local disk when S3 isn't
+        configured or the object can't be found / signed.
+        """
         handle = _get_run_or_http(run_name)
+        bucket = video_bucket()
+        if bucket:
+            try:
+                rel = handle.video_path.relative_to(handle.run_dir).as_posix()
+                if s3_object_exists(run_name, rel, bucket=bucket):
+                    url = presigned_video_url(run_name, rel, bucket=bucket)
+                    if url:
+                        return RedirectResponse(url, status_code=302)
+            except ValueError:
+                # Source video lives outside run_dir — key it by
+                # basename and lazily upload on first miss.
+                key = source_video_key(handle.video_path)
+                if not s3_key_exists(key, bucket=bucket):
+                    logger.info("uploading source video %s on first hit", key)
+                    upload_source_video(handle.video_path, bucket=bucket)
+                if s3_key_exists(key, bucket=bucket):
+                    url = presigned_url_for_key(key, bucket=bucket)
+                    if url:
+                        return RedirectResponse(url, status_code=302)
         return FileResponse(handle.video_path, media_type="video/mp4")
 
     @app.post("/api/runs/{run_name}/chat")
@@ -598,13 +642,38 @@ def create_workspace_app(
     @app.get("/runs_static/{path:path}")
     def _runs_static_handler(path: str, w: int | None = None):
         full = ws.runs_dir / path
-        if not full.is_file():
-            raise HTTPException(status_code=404, detail="not found")
         # Frame jpgs get re-rendered while the browser stays open;
         # disable client caching so the user always sees fresh bytes.
         # The server-side LRU still amortises decoding/encoding cost.
         no_cache = {"Cache-Control": "no-cache, no-store, must-revalidate"}
         is_jpg = path.lower().endswith((".jpg", ".jpeg"))
+
+        # When S3 video bucket is configured AND this is an as-is
+        # request for a heavy media file (mp4 / jpg / png), redirect
+        # to a presigned URL so EC2 stops pumping bytes. Skip the
+        # HEAD check — S3 returns 403/404 directly to the browser if
+        # the key isn't there yet, and at scale a HEAD per request
+        # would dominate latency. Resize requests (?w=720|1080|...)
+        # still go through the local decoder + LRU cache.
+        #
+        # JSON / other small files stay local so the browser doesn't
+        # have to round-trip to S3 for every API-shaped JSON the
+        # /match and /pipeline pages fetch (tracks.json, events.json,
+        # players.json, ...). Their bytes are negligible and they're
+        # consumed once per page load.
+        _S3_REDIRECT_EXTS = (".mp4", ".webm", ".jpg", ".jpeg", ".png", ".webp")
+        if (
+            w is None
+            and path.lower().endswith(_S3_REDIRECT_EXTS)
+            and video_bucket()
+        ):
+            key = f"runs/{path.lstrip('/')}"
+            url = presigned_url_for_key(key)
+            if url:
+                return RedirectResponse(url, status_code=302)
+
+        if not full.is_file():
+            raise HTTPException(status_code=404, detail="not found")
         if w is None or not is_jpg:
             mime, _ = _mt.guess_type(str(full))
             return _FileResponse(

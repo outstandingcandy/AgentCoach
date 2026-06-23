@@ -107,15 +107,27 @@ class RunHandle:
 def resolve_run_video(run_dir: Path) -> Path:
     """Pick the video file the viewer should serve for *run_dir*.
 
-    Mirrors the original ``create_app`` logic: prefer the web-optimized
-    re-encode under ``annotated_video/`` if present, then the full annotated
-    video, then any video referenced in ``calibration_metadata.json``.
+    Preference order:
+      1. ``annotated_video/annotated_web.mp4`` (browser-optimized HUD)
+      2. ``annotated_video/annotated.mp4`` (full HUD render)
+      3. ``track_consolidation/consolidated.mp4`` if it's a real
+         render (>1 KB; consolidated.mp4 may exist as a 257-byte
+         placeholder when the stage was run with ``--no-viz``)
+      4. The source video recorded in ``calibration_metadata.json``
+         (only the field_registration stage ran).
     """
-    video_dir = run_dir / "annotated_video"
-    candidates = [video_dir / "annotated_web.mp4", video_dir / "annotated.mp4"]
+    candidates = [
+        run_dir / "annotated_video" / "annotated_web.mp4",
+        run_dir / "annotated_video" / "annotated.mp4",
+    ]
     for c in candidates:
         if c.exists():
             return c
+    cons = run_dir / "track_consolidation" / "consolidated.mp4"
+    # 1024 bytes is well above the empty-mp4 stub size (~257 B) but
+    # safely below any real render even at the lowest bitrate.
+    if cons.exists() and cons.stat().st_size > 1024:
+        return cons
     # Fall back to the source video recorded in calibration metadata so
     # users can still open a viewer for runs that haven't produced
     # annotated_video yet (e.g. only field_registration ran).
@@ -131,7 +143,8 @@ def resolve_run_video(run_dir: Path) -> Path:
             pass
     raise FileNotFoundError(
         f"no playable video found for run {run_dir.name}: "
-        f"{video_dir / 'annotated.mp4'} missing"
+        f"annotated_video/, track_consolidation/consolidated.mp4 "
+        "and source-video fallback all missing"
     )
 
 
