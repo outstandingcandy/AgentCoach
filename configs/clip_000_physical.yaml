@@ -1,13 +1,11 @@
-# Configuration for physical calibration backend with Veo camera
-# Uses fixed camera intrinsics and 6-DOF extrinsic optimization
+# clip_000_physical.yaml
+# Comments / rationale live in docs/config_notes.md (#clip_000_physical.yaml).
 
 video:
-  process_fps: 5        # Stage 1 calibration fps
-  tracking_fps: 10      # Stage 2 tracking fps (interpolates camera poses)
-
+  process_fps: 5
+  tracking_fps: 10
 field_registration:
   backend: "physical"
-
   physical:
     camera_profile: "veo_1080p"
     ransac_reproj_error: 30.0
@@ -15,7 +13,7 @@ field_registration:
     line_sample_points: 20
     max_reproj_error: 15.0
     use_line_model: false
-    focal_hfov_deg_bounds: [30.7, 134.8]   # 1080p → [400, 3500] px
+    focal_hfov_deg_bounds: [30.7, 134.8]
     world_residual_weight: 0.0
     joint_optimize: false
     world_error_threshold: 5.0
@@ -23,18 +21,12 @@ field_registration:
     position_weight: 200.0
     pitch_length: 89.7
     pitch_width: 56.5
-    calibration_skip: 2              # Calibrate every 2nd frame, interpolate the rest
-
+    calibration_skip: 2
   pnlcalib:
-    # keypoint_weights: "SV_kp"
     keypoint_model_path: "data/finetuned_models/run_20260319_135637/models/best_model.pt"
-    # keypoint_model_path: "data/pretrain_models/SV_kp"
     keypoint_threshold: 0.3434
-    # keypoint_threshold: 0.15
-
 ball_detection:
-  confidence_threshold: 0.15  # Lower threshold; tracker Kalman filter handles false positives
-
+  confidence_threshold: 0.15
 video_enhancement:
   enabled: true
   mode: "docker"

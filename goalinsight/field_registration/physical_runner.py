@@ -136,28 +136,50 @@ def _load_camera_profile(config: dict, video_width: int, video_height: int):
 
     profile = profiles[profile_name]
     K = np.array(profile["K"], dtype=np.float64)
-    dist_coeffs = np.array(profile["dist_coeffs"], dtype=np.float64).ravel()
+    dist_coeffs = np.array(
+        profile.get("dist_coeffs", [0.0, 0.0, 0.0, 0.0, 0.0]),
+        dtype=np.float64,
+    ).ravel()
+    # Pad to 5 entries so cv2 is happy regardless of yaml length.
+    if dist_coeffs.size < 5:
+        dist_coeffs = np.pad(dist_coeffs, (0, 5 - dist_coeffs.size))
+    elif dist_coeffs.size > 5:
+        dist_coeffs = dist_coeffs[:5]
+
     expected_size = profile.get("image_size", [video_width, video_height])
 
     if expected_size[0] != video_width or expected_size[1] != video_height:
+        sx = video_width / expected_size[0]
+        sy = video_height / expected_size[1]
         logger.warning(
             "Video resolution %dx%d doesn't match profile '%s' expected %dx%d. "
-            "Scaling focal length.",
+            "Scaling K by (sx=%.3f, sy=%.3f).",
             video_width, video_height, profile_name,
-            expected_size[0], expected_size[1],
+            expected_size[0], expected_size[1], sx, sy,
         )
-        sx = video_width / expected_size[0]
+        # fx and cx scale with x; fy and cy scale with y. Distortion is
+        # in normalised image coordinates, so it's resolution-invariant.
         K[0, 0] *= sx
-        K[1, 1] *= sx
+        K[1, 1] *= sy
+        K[0, 2] *= sx
+        K[1, 2] *= sy
 
-    # Fix principal point to image geometric center, zero distortion
-    K[0, 2] = video_width / 2.0
-    K[1, 2] = video_height / 2.0
-    dist_coeffs = np.zeros(5, dtype=np.float64)
+    # Honour the profile's principal point + distortion. Earlier this
+    # function forced cx, cy = (W/2, H/2) and zeroed dist_coeffs; that
+    # baked in a "pinhole + centered sensor" assumption that's wrong
+    # for many real cameras. If your footage is already undistorted
+    # offline, ship a profile whose dist_coeffs are [0,0,0,0,0] — the
+    # value travels from the yaml unchanged.
 
     logger.info(f"  Camera profile: {profile_name}")
-    logger.info(f"  K: f={K[0,0]:.1f}, cx={K[0,2]:.1f} (center), cy={K[1,2]:.1f} (center)")
-    logger.info(f"  Distortion: disabled (images assumed undistorted)")
+    logger.info(
+        f"  K: fx={K[0,0]:.1f}, fy={K[1,1]:.1f}, "
+        f"cx={K[0,2]:.1f}, cy={K[1,2]:.1f}"
+    )
+    if np.any(dist_coeffs):
+        logger.info(f"  dist_coeffs: {dist_coeffs.tolist()}")
+    else:
+        logger.info("  dist_coeffs: zero (pinhole)")
 
     return K, dist_coeffs
 
@@ -315,6 +337,7 @@ def run_stage1_physical(
             else None
         ),
         pitch_dims=pitch_dims,
+        dist_coeffs=dist_coeffs,
     )
 
     # Initialize temporal tracker

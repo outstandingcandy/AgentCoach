@@ -1,268 +1,78 @@
+# sunday_soccer.yaml
+# Comments / rationale live in docs/config_notes.md (#sunday_soccer.yaml).
+
 video:
-  process_fps: 30            # 60 fps source → sample every 2nd frame for
-                             # 30 fps processing (dense tracking). Smaller
-                             # per-frame displacements make IoU/pitch gates
-                             # much tighter, killing the "two-same-team-
-                             # players-close-together" ID switches. fps-
-                             # sensitive tracker defaults (max_age,
-                             # pitch_gate_m, reid_pitch_max_m) auto-scale
-                             # by effective_fps/10, so physical meaning is
-                             # preserved.
-
-# Single source of truth for "compute every Nth video frame" used both
-# for the per-stage compute path and for the per-frame jpg/json vis
-# sink. Keeping these in sync means the vis sample lines up exactly
-# with what each stage actually processed — no missing-detection holes.
+  process_fps: 30
 sample:
-  stride: 1                  # leave per-stage sampling fps-driven
-                             # (process_fps=30 on a 60fps source ⇒ every
-                             # 2nd frame is processed). Setting stride>1
-                             # here would compound on top of process_fps.
-
-# Standard FIFA-spec adult pitch (105 × 68 m). Used by the
-# physical backend's PnP + the rest of the pipeline (events, highlights,
-# pitch labels, etc.). All measurements in metres.
-pitch:
-  pitch_length: 105.0
-  pitch_width: 68.0
-  penalty_area_width: 40.32
-  penalty_area_length: 16.5
-  goal_area_width: 18.32
-  goal_area_length: 5.5
-  goal_line_to_penalty_mark: 11.0
-  center_circle_radius: 9.15
-  goal_height: 2.44
-  goal_length: 7.32
-
+  stride: 1
+pitch_type: fifa
 field_registration:
   backend: "physical"
-
-  # Calibration changes slowly across frames (camera doesn't pan/zoom
-  # at 30 fps). Run field_registration at 10 fps to cut wall-clock
-  # ~3× without affecting downstream stages — tracking still consumes
-  # the full 30 fps stream because video.process_fps stays at 30.
   process_fps: 10
-
   physical:
-    # Generic 4K profile (3500 fx, no distortion) — matches the
-    # 3840x2160 Sunday-cup footage which is from a non-Veo camera
-    # (phone / GoPro). Wide focal_bounds let LM refine the rough
-    # initial fx; camera_position is a soft prior, not locked.
     camera_profile: "generic_4k"
-    # Detection batch size: 16 fits comfortably in 30GB of L40S VRAM
-    # alongside the web server's own model copy. ~1.7× faster than
-    # the project default of 8. Push to 32 only when the GPU is
-    # exclusive to this run.
     detection_batch_size: 16
     ransac_reproj_error: 50.0
-    # line_weight=0 disables the LM line residual term entirely (the
-    # line model is buggy on this footage; use_line_model already
-    # turns off the dedicated detector, but lines derived from KP
-    # pairs still feed the LM unless we zero the weight here).
     line_weight: 0.0
     line_sample_points: 20
     max_reproj_error: 25.0
     use_line_model: false
-    # Camera zooms during the clip — frame 681 converges to fx≈6000
-    # (~36° hfov on 4K), frame 301 to fx≈9000 (~24°). The bounds need to
-    # cover the most-zoomed frame; otherwise PnP RANSAC can't find a
-    # focal that fits. Expressed as HFOV degrees so the same range
-    # transfers to a 1080p downsample without edits — the resolver
-    # converts to px focal at the source's actual width.
     focal_hfov_deg_bounds: [18.18, 51.28]
     world_residual_weight: 0.0
     joint_optimize: false
     world_error_threshold: 8.0
-
-    # Camera position — two-pass solve.
-    # Pass 1: lock=false, the LM picks per-frame cam_pos freely under
-    # a soft prior + wide bounds. Pass 2 (in physical_runner): take
-    # the median across well-fit Pass 1 frames, hard-lock that, and
-    # re-solve every frame at 4-DOF (rvec + fx). The prior here is
-    # only the cold-start guess; the run will refine it. Previous
-    # human-estimated (7, -37, 5) was off by several meters; the LM
-    # consistently lands near (0.6, -41, 6.1) on this clip.
     camera_position: [0.6, -41.0, 6.1]
     lock_camera_position: false
     position_weight: 1.0
-    # Per-axis hard bounds in metres around the prior. Wide enough
-    # for LM to find the true cam_pos when the prior is rough; tight
-    # enough that tvec can't drift to absurd places (e.g. inside the
-    # pitch).
     position_bounds_m: [12.0, 10.0, 3.0]
-
-    # Camera tilt below horizon (degrees). Sunday-cup rig sits low
-    # (~5m tall, ~35m behind goal line), so the camera looks nearly
-    # horizontally — typical pitch_deg is 3–10°, never near broadcast
-    # truck levels (20–30°). Bound the LM to a generous [2, 15] band:
-    # this catches the runaway-into-near-flat (≤2°) and inverted
-    # (>15° looks-down) failure modes without rejecting legitimate
-    # frames. Barrier: 100 px / degree of violation, fixed-length.
     pitch_bounds_deg: [2.0, 15.0]
-
-    pitch_length: 105.0
-    pitch_width: 68.0
-
     calibration_skip: 1
-    # Per-frame calibration JPG audit. Interval=30 (~1/sec on 30fps
-    # processed stream) keeps the overlay legible without exploding
-    # disk on long clips — a 10 min run drops from ~14 GB calibration
-    # JPGs to ~470 MB.
     vis_interval: 30
-
-    # SIFT chain gap-fill — re-enabled now that FeatureMatcher
-    # downscales 4K input to 1080p before SIFT (max_long_side=1920),
-    # roughly a 4× speedup with the same descriptors. Keypoint coords
-    # are rescaled back to native 4K resolution before homography
-    # matching, so downstream PnP sees full-res points.
     gap_fill_chain:
       enabled: true
-      # Targets are sampled every Nth frame; remaining tracker frames
-      # get filled by ``_interpolate_camera_poses`` in tracking. step=3
-      # gives ~20 gap-fill anchors per second of 60fps footage — dense
-      # enough that 1/3-second linear pose interpolation introduces
-      # sub-pixel drift on a slow-panning sideline rig, and 3× faster
-      # than step=1 (which on 36k-frame 1080p clips ran into both
-      # wall-clock and OOM walls).
       frame_step: 3
-      # Use the GPU LightGlue+SuperPoint matcher (~20× faster than
-      # the CPU SIFT+FLANN backend on 4K, with comparable inlier
-      # quality). Falls back to SIFT if lightglue isn't installed.
       matcher_backend: lightglue
-      # Anchor gate at 30px rejected ~22% of stage1 frames where the
-      # KP detector found 3 line constraints instead of 6 (mid-zoom
-      # frames where the touchline isn't framed). The ~1% of image
-      # width gate brings anchor coverage from 78 % to 86 % — well
-      # within "good enough to seed SIFT propagation" tolerance.
-      # Expressed as a fraction so the same gate transfers across
-      # resolutions; resolver multiplies by image width.
       anchor_max_reproj_frac: 0.0104
       overwrite_above_reproj_frac: 0.0104
       method: improved
       smoothing_window: 5
       use_masking: false
       max_gap_frames: 60
-      # Anchors farther than this many frames from the target are
-      # skipped. 60 frames ≈ 1 s on 60fps footage — within that window
-      # the camera barely moves, and SIFT/LightGlue matches are nearly
-      # all true positives. Larger windows (was 120) added 2× the SIFT
-      # tries per target with diminishing returns: most extras failed
-      # the inlier threshold or got rejected at PnP.
       max_anchor_distance_frames: 60
       sift_top_skip_frac: 0.25
-
-  # KP fine-tuned on 4 sunday_cup annotations (frames 0/301/681/1103,
-  # re-annotated 2026-06-15). Best val loss 0.000032 @ epoch 100.
-  # The line head is permanently disabled on this footage — the
-  # finetuned line model produces noisy detections that hurt LM
-  # convergence rather than helping. Both ``use_lines`` (controls the
-  # KP-derived line residual at solve time) and ``use_line_model``
-  # (above, in the physical block) are off.
   pnlcalib:
     keypoint_model_path: "workspace/models/keypoint_20260615_070147/run_20260615_070203/models/best_model.pt"
     keypoint_weights: "SV_kp"
     keypoint_threshold: 0.15
     use_lines: false
     line_threshold: 0.10
-
 device: "cuda"
-
-# 4K source — letterbox to 1920 long edge (vs default 1280) so far-end
-# players keep enough pixels for YOLO to detect them. Cuts the
-# YOLO-miss rate that drove the orig 64 / orig 73 frame-897 swap
-# (right-side player not detected at imgsz=1280 → tracker had only
-# one detection in the area → wrong assignment cascaded).
-#
-# iou_threshold raised from 0.45 → 0.55 so YOLO's NMS keeps both
-# bboxes when two players overlap heavily (frame 897 cluster: #8 and
-# the player hugging him have IoU≈0.50; at 0.45 NMS suppressed the
-# lower-conf #8). 0.55 keeps both; 0.7+ would keep way too many
-# duplicates of single players.
-#
-# imgsz / iou_threshold MUST live under ``unified_detection`` (the
-# default fused player+ball pass uses that block); putting them under
-# ``detection`` is now a hard error. ``detection.confidence_threshold``
-# below is the only ``detection`` key still honoured in unified mode —
-# it gates the post-hoc PlayerDetector filter.
 unified_detection:
-  imgsz: 0                # native (longer side rounded to multiple of
-                          # 32). 1920 down-samples a 47-px ball to
-                          # ~23 px and YOLO loses confidence on small
-                          # / distant balls (frame 2738 was the
-                          # smoking gun). 4K runs ~4× slower than
-                          # 1920 but recall on small balls is much
-                          # better.
+  imgsz: 0
   iou_threshold: 0.55
-
-# PRTReID is fine-tuned on SoccerNet (player-level), 256-dim with HRNet32.
-# Same choice as the kids config — better same-team discrimination than OSNet.
 reid:
   backend: "prtreid"
-
-# 30fps tracking — pitch_gate_m auto-derives to 4.0 * 10/30 = 1.33 m,
-# which is exactly what this clip needs at process_fps=30. Only override
-# what's *not* the auto-scaled default.
-#
-# reid_pitch_max_m raised from auto default (0.5 m) → 0.8 m: the strict
-# 0.5×scale gate sat right at the borderline for legitimate 1-sample
-# reattachments (e.g. orig 6 at f=103: pitch jump ~0.9m vs limit 1.0m,
-# jitter pushed it across). 0.8 gives ~1.6m budget at tsu=1, still half
-# the per-frame sprint distance, while letting routine reattachments
-# through.
 tracking:
   reid_pitch_max_m: 0.8
-  # Per-frame tracking JPG audit: every 60 video frames ≈ 1/sec on a
-  # 60fps source. Default (sample.stride=1) writes a JPG per processed
-  # frame, which cost ~2 GB on the 10 min clip; this keeps per-second
-  # diagnostic coverage at ~30 MB.
   vis_frame_stride: 60
-  # Diagnostic dumps for ball detection are large (~9 GB each on this
-  # clip) and only useful when actively debugging the ball pipeline.
-  # Off by default; flip to true on demand.
   dump_yolo_raw: false
   dump_ball_diag: false
-
-# Jersey number recognition backend. Tried Qwen3.6-27B-FP8 (local
-# vLLM) and Gemini 2.5 Flash; both committed to single-digit reads
-# more often than Claude Opus, dropping ~3 jerseys vs the Claude
-# baseline (15/20 vs 18/20 with jersey). Sticking with Claude Opus
-# 4.7 via Bedrock for now.
 jersey_recognition:
   enabled: true
   backend: claude
   model_id: "us.anthropic.claude-opus-4-7"
   region: "us-east-1"
-
 track_consolidation:
-  # 1 s of observations — filters genuine 1–2 frame YOLO false positives
-  # but keeps fragmented player tids. Resolver converts to frames at the
-  # effective process_fps (30 fps × 1 s = 30 frames here).
   min_track_seconds: 1.0
-
-  # ``ocr_batch_size: 4`` packs 4 crops into ONE LLM call as separate
-  # images (image-list mode, no montage tile), so each crop occupies
-  # its own image slot. This avoids the multi-player-bleed issue
-  # montage cells have — when bbox padding catches a teammate
-  # standing close, the LLM saw a 160×160 cell with two backs and
-  # often committed to whichever number was clearer. Independent
-  # images each contain just one bbox crop with the target centred,
-  # so adjacent players appear as the small bbox-edge slivers they
-  # actually are.
   jersey:
     ocr_backend: llm
     ocr_batch_size: 4
-    ocr_image_list: true   # pass crops as image-list, not as a montage
-  # stride=8: ~3.75 fps sampling per track (60 fps source × 1/2 tracker
-  # decimation × 1/8 jersey decimation). At 60-frame tracks that's
-  # 22 crops / track ≈ 6 LLM calls — enough voting redundancy for
-  # OCR to commit on a clean angle without paying the per-call image
-  # premium that image-list mode adds (each crop = 1568 token min).
+    ocr_image_list: true
   frame_stride: 8
-
 pipeline:
   stages:
-    - field_registration
-    - tracking
-    - track_consolidation
-    - event_detection
-    - player_profile
+  - field_registration
+  - tracking
+  - track_consolidation
+  - event_detection
+  - player_profile

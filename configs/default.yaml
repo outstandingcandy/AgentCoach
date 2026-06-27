@@ -1,297 +1,189 @@
-# SoccerMaster Data Curation Pipeline - Default Configuration
+# default.yaml
+# Comments / rationale live in docs/config_notes.md (#default.yaml).
 
-# Video Processing
 video:
-  # Set to null/omit to let the resolver default it to min(30, source_fps).
-  # Override here only when you want a slower/faster sample rate than that.
   process_fps: 10
-  resize_width: 1920      # Resize width (null for original)
-  resize_height: 1080     # Resize height (null for original)
-
-# Stage 1: Field Registration
+  resize_width: 1920
+  resize_height: 1080
 field_registration:
-  backend: "pnlcalib"     # "pnlcalib" (default), "broadtrack", "physical", or "nbjw"
-
-  # PnLCalib backend settings (used when backend="pnlcalib")
+  backend: "pnlcalib"
   pnlcalib:
-    keypoint_weights: "SV_kp"    # "SV_kp", "WC14_kp", or "TSWC_kp"
+    keypoint_weights: "SV_kp"
     keypoint_threshold: 0.3434
-    line_weights: "SV_lines"     # "SV_lines", "WC14_lines", or "TSWC_lines"
+    line_weights: "SV_lines"
     line_threshold: 0.15
-    pnl_refine: false            # Enable joint point+line optimization
-    line_weight: 1.0             # Relative weight of line constraints vs points
-
-  # NBJW backend settings (used when backend="nbjw")
+    pnl_refine: false
+    line_weight: 1.0
   nbjw:
-    use_prev_homography: true    # Use previous frame's H on failure
-    weights_dir: null            # Path to weights (null = auto-download)
-
-  # Physical calibrator settings (used when backend="physical")
-  # Uses fixed camera intrinsics from a profile, optimizes only 6-DOF extrinsics
+    use_prev_homography: true
+    weights_dir:
   physical:
-    camera_profile: "veo_1080p"        # Profile name from camera_profiles.yaml
-    camera_profiles_path: null          # Path to camera_profiles.yaml (null = auto)
+    camera_profile: "veo_1080p"
+    camera_profiles_path:
     detection_batch_size: 8
-    ransac_reproj_error: 15.0           # PnP RANSAC reprojection threshold (px)
-    line_weight: 1.0                    # Weight for line residuals vs point residuals
-    line_sample_points: 20              # Points sampled along each line
-    max_reproj_error: 15.0              # Temporal tracker error threshold
-    use_line_model: false               # Use HRNet line model (vs derive from keypoints)
-    # Focal length optimization bounds are derived from horizontal field
-    # of view (degrees) at runtime: f_px = W / (2 * tan(hfov/2)). This
-    # keeps them resolution-independent. Override the px values directly
-    # via ``focal_bounds: [px_min, px_max]`` if you have hard data on the
-    # sensor's true focal range — the resolver leaves any explicit
-    # ``focal_bounds`` untouched.
-    focal_hfov_deg_bounds: [27.0, 50.0]  # ~telephoto sideline to wide handheld
-    cx_bounds: [-100.0, 100.0]       # Optical center cx offset bounds (px)
-    cy_bounds: [-50.0, 50.0]         # Optical center cy offset bounds (px)
-    k1_bounds: [-0.35, -0.15]        # Radial distortion k1 absolute bounds
-    k2_bounds: [-0.05, 0.10]         # Radial distortion k2 absolute bounds
-    k3_bounds: [-0.05, 0.05]         # Radial distortion k3 absolute bounds
-    world_residual_weight: 0.0       # Weight for world-space back-projection residuals (0=disabled)
-    world_error_threshold: 5.0       # World-error outlier rejection threshold (meters). Use .inf to disable.
-    calibration_skip: 1              # Calibrate every Nth frame (1=all, 2=half, etc). Skipped frames are interpolated.
-
-  # Legacy settings for backwards compatibility
+    ransac_reproj_error: 15.0
+    line_weight: 1.0
+    line_sample_points: 20
+    max_reproj_error: 15.0
+    use_line_model: false
+    focal_hfov_deg_bounds: [27.0, 50.0]
+    cx_bounds: [-100.0, 100.0]
+    cy_bounds: [-50.0, 50.0]
+    k1_bounds: [-0.35, -0.15]
+    k2_bounds: [-0.05, 0.10]
+    k3_bounds: [-0.05, 0.05]
+    world_residual_weight: 0.0
+    world_error_threshold: 5.0
+    calibration_skip: 1
   keypoint_detector:
-    backend: "resnet50"   # "resnet50" (default) or "pnlcalib"
-    model: "resnet50"     # Backbone for resnet50 backend
+    backend: "resnet50"
+    model: "resnet50"
     confidence_threshold: 0.5
-    num_keypoints: 115    # SoccerNet-GSR format (115 for resnet50, 58 for pnlcalib)
+    num_keypoints: 115
     pnlcalib:
       weights: "SV_kp"
       confidence_threshold: 0.3434
-
   line_detector:
-    backend: "hough"      # "hough" (default) or "pnlcalib"
+    backend: "hough"
     hough_threshold: 50
     min_line_length: 100
     max_line_gap: 10
     pnlcalib:
       weights: "SV_lines"
       confidence_threshold: 0.15
-
   pnl_solver:
     ransac_iterations: 1000
     reprojection_threshold: 8.0
     pnl_refine: false
     line_weight: 1.0
-
-# Unified detection: single YOLO pass for both players and ball
 unified_detection:
-  enabled: true                         # Set false to use legacy separate detectors
+  enabled: true
   model: "yolov8x"
-  # model_path: null
-  confidence_threshold: 0.3            # Use ball's lower threshold; player filtering is post-hoc
+  confidence_threshold: 0.3
   iou_threshold: 0.45
-  # ``imgsz: 0`` → use the source frame's native resolution rounded
-  # up to a multiple of 32 (YOLO stride). 1920 down-samples a 47-px
-  # ball to ~23 px and YOLO loses confidence on small / distant
-  # balls (sunday_highlights frame 2738 was the smoking gun: 0
-  # detections at 1920, conf=0.54 at 3840). Override with a positive
-  # int when detection latency matters more than recall on small
-  # balls — inference scales O(W²), so 4K is ~4× slower than 1920.
   imgsz: 0
-  batch_size: 4                        # 4K input + yolov8x: 4 fits on a 46GB GPU.
-                                       # Drop to 2 if you OOM on 24GB cards.
-  player_confidence_threshold: 0.5     # Post-hoc filter applied to player detections
-
-# Stage 2: Tracking and Identification
+  batch_size: 4
+  player_confidence_threshold: 0.5
 detection:
-  model: "yolov8x"        # YOLO model name (yolov8x, yolo11x, etc.)
-  # model_path: null       # Optional: explicit path to .pt weights file
+  model: "yolov8x"
   confidence_threshold: 0.5
   iou_threshold: 0.45
-  classes: [0]            # Person class only
+  classes: [0]
   imgsz: 1280
-
-# Ball Detection (sports ball class 32 in COCO)
 ball_detection:
   enabled: true
-  model: "yolov8x"           # YOLO model name (yolov8x, yolo11x, etc.)
-  # model_path: null          # Optional: explicit path to .pt weights file
-  confidence_threshold: 0.3  # Lower threshold for small object
+  model: "yolov8x"
+  confidence_threshold: 0.3
   iou_threshold: 0.45
-  classes: [32]              # Sports ball class
-  # ``imgsz: 0`` (or null / "native") tells the ball detector to use
-  # the source frame's native resolution, rounded up to the nearest
-  # multiple of 32 (YOLO stride). This is the default because at
-  # 1920 a 47-px native ball was being down-sampled to ~23 px and
-  # YOLO confidence dropped below threshold on small / distant /
-  # high-arc shots (sunday_highlights frame 2738 was the smoking gun
-  # — model returned conf=0.54 at 3840 but missed entirely at 1920).
-  # Override to a fixed int (e.g. ``imgsz: 1920``) when detection
-  # latency matters more than recall on small balls — inference cost
-  # scales roughly O(W²), so 4K is ~4× slower than 1920.
+  classes: [32]
   imgsz: 0
-
-  min_size: 3                # Minimum bbox dimension in pixels
-  max_size: 100              # Maximum bbox dimension in pixels
-  min_aspect_ratio: 0.5      # Ball should be roughly circular
-  max_aspect_ratio: 3.0      # Loosened from 2.0 → 3.0 — a hard kick blurs the
-                             # ball into a w/h≈2.7 ellipse for ~3 frames
-                             # before/after impact. Used to drop the actual
-                             # shot frame at goal time. The conf-skip below
-                             # is the wider safety net.
-  # High-confidence detections bypass the aspect filter entirely. A
-  # motion-blurred ball is non-circular by definition, but YOLO still
-  # locks on at conf ≥ 0.6 and the downstream pitch/speed filters guard
-  # against false positives anyway.
+  min_size: 3
+  max_size: 100
+  min_aspect_ratio: 0.5
+  max_aspect_ratio: 3.0
   aspect_filter_conf_skip: 0.6
-  # SAHI sliced inference for improved small ball detection
-  use_sahi: false # SAHI is slower and produces more false positives; disable by default
-  sahi_slice_size: 640                    # Slice dimensions (pixels)
-  sahi_overlap_ratio: 0.2                 # Overlap between adjacent slices
-  sahi_perform_standard_pred: true        # Also run full-frame inference (catches large balls)
-  sahi_postprocess_type: "GREEDYNMM"     # "NMS", "NMM", or "GREEDYNMM"
+  use_sahi: false
+  sahi_slice_size: 640
+  sahi_overlap_ratio: 0.2
+  sahi_perform_standard_pred: true
+  sahi_postprocess_type: "GREEDYNMM"
   sahi_postprocess_match_threshold: 0.5
-  # Two-pass detection: scan whole video first, then crop+enlarge missed frames
-  two_pass: true                          # Enable two-pass ball detection
-  pass1_confidence_threshold: 0.5         # High threshold for anchor detections in pass 1
-  crop_size: 300                          # Crop region size around interpolated position (pixels)
-  crop_enlarge_to: 640                    # Resize crop to this before detection
-  max_interpolation_gap: 300              # Max frames to interpolate across (skip if gap is larger)
-  pass1_batch_size: 8                     # Batch size for pass 1 GPU inference (full-res, needs more VRAM)
-  pass2_batch_size: 32                    # Batch size for pass 2 GPU inference (640x640 crops, lighter)
-  # Field-space trajectory filtering (applied after tracking)
+  two_pass: true
+  pass1_confidence_threshold: 0.5
+  crop_size: 300
+  crop_enlarge_to: 640
+  max_interpolation_gap: 300
+  pass1_batch_size: 8
+  pass2_batch_size: 32
   field_filter:
     enabled: true
-    max_speed_ms: 40.0            # Max realistic ball speed (m/s)
-    position_margin: 8.0           # Meters beyond pitch boundary to allow
-    min_trajectory_length: 3       # Minimum observations per trajectory
-    smoothness_threshold: 0.6      # Min average cosine of direction changes
-    speed_violation_ratio: 0.2     # Max fraction of frames exceeding speed limit
-    min_displacement: 1.0          # Min total displacement (meters) between first and last point
-    merge_max_distance: 40.0       # Max pitch distance (m) to nearest existing frame when merging trajectories
-
-# Ball Tracking (ByteTrack / BoT-SORT)
+    max_speed_ms: 40.0
+    position_margin: 8.0
+    min_trajectory_length: 3
+    smoothness_threshold: 0.6
+    speed_violation_ratio: 0.2
+    min_displacement: 1.0
+    merge_max_distance: 40.0
 ball_tracking:
   enabled: true
-  tracker_type: botsort       # "bytetrack" or "botsort"
-  track_high_thresh: 0.15    # High-confidence threshold for first-stage matching
-  track_low_thresh: 0.1      # Low-confidence threshold for second-stage IoU rescue
-  track_buffer: 60           # Frames to keep lost tracks. Raised 15→60 so a
-                             # 1s ball-detection gap during a kick (motion
-                             # blur + small object) doesn't kill the track
-                             # and force a new-track promotion on the next
-                             # isolated detection — which BoT-SORT's
-                             # unconfirmed→confirmed state machine then
-                             # silently drops at typical 0.5-conf detections.
-  match_thresh: 0.8          # Distance threshold for matching (normalized center distance)
-  new_track_thresh: 0.4      # Min confidence for new track initialization (higher than track_high to avoid false positives)
-  max_position_distance: 120  # Max pixel distance for center-distance matching
-  fuse_score: true            # Fuse detection score into distance matrix
-  # BoT-SORT specific (ignored when tracker_type=bytetrack)
-  gmc_method: "none"          # Camera motion compensation: "sparseOptFlow", "orb", "none"
-  with_reid: false            # Ball appearance is uniform, ReID not useful
-  proximity_thresh: 0.5       # Spatial proximity threshold
-  appearance_thresh: 0.25     # Appearance similarity threshold
-  # 3D trajectory estimation (physics-based parabolic model)
+  tracker_type: botsort
+  track_high_thresh: 0.15
+  track_low_thresh: 0.1
+  track_buffer: 60
+  match_thresh: 0.8
+  new_track_thresh: 0.4
+  max_position_distance: 120
+  fuse_score: true
+  gmc_method: "none"
+  with_reid: false
+  proximity_thresh: 0.5
+  appearance_thresh: 0.25
   trajectory_3d:
     enabled: true
-    window_size: 15           # Max observations in sliding window
-    min_observations: 4       # Minimum frames to attempt 3D fit
-    gravity: 9.81             # m/s²
-    ball_real_diameter: 0.22  # FIFA size 5 ball diameter in meters (unused in 3D estimation)
-    bbox_padding: 1.0        # Legacy: no longer used for depth estimation
-    ground_contact_weight: 2.0  # Soft penalty weight for Z≈0 at trajectory endpoints
-
+    window_size: 15
+    min_observations: 4
+    gravity: 9.81
+    ball_real_diameter: 0.22
+    bbox_padding: 1.0
+    ground_contact_weight: 2.0
 tracking:
   algorithm: "strongsort"
-  max_age: 30             # Max frames to keep lost tracks
-  min_hits: 3             # Min detections before track is confirmed
+  max_age: 30
+  min_hits: 3
   iou_threshold: 0.3
-  # IoU thresholds for the cascaded matcher (1 - IoU; higher = more permissive).
-  # Confirmed-stage stays loose so a one-frame ReID hiccup falls back to bbox
-  # geometry. Tentative-stage is tighter: a freshly-spawned track has no
-  # appearance history, so a high-IoU-but-physically-distant detection (the
-  # perspective failure where ~70 px vertical drift on a far player has IoU
-  # ≈ 0.4 yet pitch distance ≈ 3 m) was stealing the wrong identity. Reject
-  # via IoU here and let tentative-pitch (4 m gate) re-attach.
   max_iou_distance: 0.7
   max_iou_distance_tentative: 0.55
-  # Confirmed-ReID stage hybrid gate: a (track, det) pair passes if
-  # EITHER the predicted bbox IoU ≥ reid_iou_min OR pitch distance
-  # ≤ reid_pitch_max_m. Without the IoU half, ReID alone can teleport
-  # a confirmed track to a 2 m-away same-team player whose ReID
-  # cosine is marginally smaller (the orig 1 frame 303→306 case in
-  # the kids clip). Without the pitch half, fast wingers whose bbox
-  # crosses its own width in one sample fail. tentative-pitch keeps
-  # the looser pitch_gate_m (4 m default) so newly-spawned tracks
-  # can still re-attach after IoU dropouts.
   reid_iou_min: 0.1
   reid_pitch_max_m: 1.5
-  # Dump raw YOLO detections (per-frame JSON + annotated diagnostic JPGs)
-  # under <output>/yolo_raw/ so dropouts at conf/size/pitch filters can be
-  # inspected offline. Set false to skip — JSON is cheap, the JPG render
-  # adds ~25s/200-frame clip and is gated by output.save_visualizations.
   dump_yolo_raw: true
-  # Ghost-track killer: delete a track whose bbox centre has not moved
-  # more than `stationary_max_pixels` over the last `stationary_window`
-  # tracking-frame updates.  Targets the "YOLO false-positive on a
-  # banner / fence / spectator" failure mode where the same static
-  # detection keeps re-binding to an old track via ReID and produces
-  # a 5-15s ghost bbox.  Set stationary_window=0 to disable.
-  stationary_window: 30          # 30 tracking frames ≈ 3s at 10fps
+  stationary_window: 30
   stationary_max_pixels: 5.0
-
 reid:
-  backend: "osnet"        # "osnet" (default) or "prtreid"
-  model: "osnet_x1_0"     # Model for OSNet backend
-  feature_dim: 512        # Feature dimension (512 for OSNet, 256 for PRTReID)
+  backend: "osnet"
+  model: "osnet_x1_0"
+  feature_dim: 512
   batch_size: 32
-
-  # OSNet backend settings (used when backend="osnet")
   osnet:
     model: "osnet_x1_0"
     feature_dim: 512
-
-  # PRTReID backend settings (used when backend="prtreid")
   prtreid:
     feature_dim: 256
     referee_confidence_threshold: 0.85
     goalkeeper_confidence_threshold: 0.7
-    weights_path: null    # Path to weights (null = auto-download)
-
-# Team classification — consumed by the track_consolidation stage
-# (tracker itself no longer does team/role assignment).
+    weights_path:
 team_classification:
   backend: "kmeans"
-  position_weight: 0.1    # Weight for position features in KMeans
-  min_samples_per_team: 5 # Minimum samples before classification
-
+  position_weight: 0.1
+  min_samples_per_team: 5
 visualization:
-  backend: "minimal"      # "minimal" (default) or "step"
-
-# Highlight Clipping (agent-based)
+  backend: "minimal"
 highlights:
   enabled: false
   output_fps: 25.0
   crossfade_frames: 4
   closeup:
-    output_size: [640, 360]       # Close-up crop resolution (w, h)
-    padding_factor: 2.0           # How much to expand bbox for close-up
-    smooth_alpha: 0.3             # EMA alpha for crop center smoothing
-    medium_padding_factor: 4.0    # Padding for "medium" view type
+    output_size: [640, 360]
+    padding_factor: 2.0
+    smooth_alpha: 0.3
+    medium_padding_factor: 4.0
   temporal:
-    buildup_max_seconds: 10.0     # Max lookback for build-up start
-    buildup_padding_seconds: 2.0  # Extra padding before build-up start
-    buildup_view: wide            # wide / medium / closeup
-    strike_pre_seconds: 0.5       # Seconds before shooter_frame (short — cut lands on the kick)
-    strike_post_seconds: 1.5      # Seconds after goal_frame (ball enters net)
-    strike_view: closeup          # Closeup on ball during shot
-    celebration_seconds: 10.0     # Max celebration duration (or until track lost)
-    celebration_view: medium      # wide / medium / closeup
-    replay_enabled: true          # Slow-motion replay of the strike
-    replay_speed: 0.4             # Playback speed for replay (0.4 = 2.5x slower)
+    buildup_max_seconds: 10.0
+    buildup_padding_seconds: 2.0
+    buildup_view: wide
+    strike_pre_seconds: 0.5
+    strike_post_seconds: 1.5
+    strike_view: closeup
+    celebration_seconds: 10.0
+    celebration_view: medium
+    replay_enabled: true
+    replay_speed: 0.4
   effects:
-    shooter_spotlight: true       # Glow ellipse under scorer's feet
-    spotlight_color: [0, 215, 255] # Gold (BGR)
+    shooter_spotlight: true
+    spotlight_color: [0, 215, 255]
     spotlight_alpha: 0.4
-    ball_trail: true              # Trajectory trail after shot
-    trail_length: 15              # Frames of trail history
-    trail_color: [0, 255, 255]    # Yellow (BGR)
+    ball_trail: true
+    trail_length: 15
+    trail_color: [0, 255, 255]
   overlays:
     enabled: true
     show_event_label: true
@@ -299,144 +191,44 @@ highlights:
   goal_detection:
     min_confidence: 0.15
   recipes:
-    - name: "goal_highlight"
-      detector: "goal"
-      analyzer: "scorer"
-      composer: "segment"
-
-# Track Consolidation (Claude Opus jersey + OSNet ReID merge)
+  - name: "goal_highlight"
+    detector: "goal"
+    analyzer: "scorer"
+    composer: "segment"
 track_consolidation:
   enabled: false
-  # Filter tracks with fewer observations. Specify in seconds and the
-  # resolver converts to frames at the effective process_fps; the legacy
-  # ``min_track_frames`` (frame count) still wins when set.
   min_track_seconds: 3.0
-  # frames_per_track:
-  #   - 0 (default): take EVERY frame the track appears in (jersey OCR
-  #     fans out one parallel LLM call per crop; aggregation in Python).
-  #     A 100-frame track = 100 small parallel calls.
-  #   - >0: top-K sampling like the old behaviour — picks bbox-area
-  #     largest then time-spreads. Cheaper but noisier.
   frames_per_track: 0
-  # Hard ceiling on how many crops one track can spend on the LLM. A
-  # rare 1000-frame track is bounded so cost stays predictable. Crops
-  # beyond the cap are dropped lowest-bbox-area first.
   max_crops_per_track: 200
-  # Optional temporal stride: take every Nth frame in the track's
-  # appearance list instead of top-K or all-frames. When unset, the
-  # consolidator defaults to stride=10 if jersey.ocr_backend=rapidocr
-  # (cheap OCR per call, no API rate limit but still 50 ms each), or
-  # falls back to frames_per_track / max_crops_per_track for the LLM
-  # backend.
-  # frame_stride: 10
   sampler:
-    min_bbox_height: 80         # upscale crops smaller than this
-    upper_body_ratio: 0.65      # focus on torso (jersey number region)
+    min_bbox_height: 80
+    upper_body_ratio: 0.65
   jersey:
-    # Backend selector. Only one of {claude, gemini, qwen} is used per run.
-    # Each sub-section is read only when its name matches backend.
     backend: claude
-
-    # Phase-2 (per-crop number reading) backend. Phase 1 (role / team
-    # decision) always uses the LLM ``backend`` above — only the per-
-    # crop OCR can be swapped.
-    #   - llm (default): ``SINGLE_OCR_PROMPT`` LLM call per crop. Best
-    #     accuracy. Capped at ~30 crops/track to control cost / rate
-    #     limits.
-    #   - rapidocr: local PaddleOCR ONNX runtime via rapidocr-onnxruntime.
-    #     Free and fast, so the consolidator OCRs every frame in each
-    #     track instead of sub-sampling. Less accurate on partial /
-    #     blurry digits; the per-crop voting aggregator washes the
-    #     noise out.
     ocr_backend: llm
-    # rapidocr-specific tuning (only read when ocr_backend == rapidocr):
     rapidocr:
-      upscale: 4.0           # bicubic upscale before OCR (kids jerseys are tiny)
-      min_confidence: 0.5    # drop OCR rec hits below this score
-
-    # --- Claude Opus (AWS Bedrock) -----------------------------------
+      upscale: 4.0
+      min_confidence: 0.5
     model_id: "us.anthropic.claude-opus-4-7"
     region: "us-east-1"
-
-    # --- Gemini (Google AI Studio, uses GOOGLE_API_KEY) --------------
-    # Set backend: gemini and override model_id below.
-    # model_id: "gemini-2.5-pro"           # or "gemini-2.5-flash"
-    # api_key_env: "GOOGLE_API_KEY"
-
-    # --- Qwen VL via local vLLM server -------------------------------
-    # Set backend: qwen, launch ``bash scripts/start_qwen_vllm.sh``, then:
-    # model_id: "Qwen/Qwen3.6-27B-FP8"
-    # base_url: "http://localhost:8000/v1"
-
-    # --- Shared tuning ------------------------------------------------
-    # Cross-track parallelism (how many tracks resolved concurrently).
-    # Bedrock Claude Opus in us-east-1 typically allows 60-200 RPM. 32
-    # leaves headroom for the per-track OCR fan-out (each track may
-    # spawn ocr_per_track_concurrency=8 subcalls) — at 32 that's up to
-    # 256 in-flight, but most cluster fast enough that the steady state
-    # stays well under quota. boto3 retries 429s automatically.
     max_concurrency: 32
-    # Within-track parallelism for per-crop OCR (Phase 2 of
-    # recognize_multi). Each track fans out N OCR calls, one per crop;
-    # this caps that fan-out so a single 200-crop track doesn't
-    # monopolise the API quota. Total in-flight LLM calls roughly =
-    # max_concurrency × ocr_per_track_concurrency, so be conservative.
     ocr_per_track_concurrency: 8
-    # Crop subset size sent to the role/team decision call (Phase 1).
-    # 8 sharpest evenly-spaced crops is enough for "is this a player /
-    # what team" without burning tokens.
     decision_subset_size: 8
     max_retries: 2
     max_tokens: 128
     max_crop_dim: 384
     jpeg_quality: 85
-    # Per-track jersey confidence threshold; below this the LLM's
-    # winning number is treated as unknown. With per-crop OCR over
-    # ALL frames in the track (frames_per_track=0), conf ranges
-    # roughly:
-    #   - winner_score / N_crops × purity, sqrt'd. So a 132-crop
-    #     track with 50 strong votes for #20 and 5 spurious ≈
-    #     sqrt(50/132 * 50/55) ≈ 0.59 → keep.
-    #   - 42-crop track, 12 strong votes for #18 with no rivals ≈
-    #     sqrt(12/42 * 1.0) ≈ 0.53 → keep.
-    #   - mixed-identity track: top vote outscores rivals 4×, but
-    #     per-N is low: sqrt(20/95 * 20/35) ≈ 0.34 → drop ✅.
-    # 0.25 — lowered from 0.4 to recover long tracks where the
-    # player's back is visible on only ~1/3 of frames (e.g. orig 90,
-    # 10 strong #21 votes / 48 crops → conf 0.34). The geometric mean
-    # punishes long tracks for having lots of back-not-visible crops
-    # even when the readable subset is unanimous.
     min_confidence: 0.25
   reid:
-    # ReID-first consolidation (see _consolidator.consolidate). Cosine
-    # gate for the primary clustering. 0.9 fits PRTReID's same-person
-    # centroid distribution on Veo kids footage; raise to 0.92+ for
-    # higher-fidelity broadcast where cross-team cosines are tighter.
     same_person_threshold: 0.9
-    orphan_absorb_threshold: 0.92  # second-chance absorption above this
-    # Two clusters that ended up with the same (team, jersey_number)
-    # but didn't merge in Stage A get a second-pass merge if their
-    # ReID cosine is at least this much. Jersey number is a second
-    # independent identity signal — same kit + same number + ReID
-    # near-miss is still very likely the same player who reappeared
-    # after a long-interval gap. 0.8 is well above the cross-team
-    # noise floor (~0.65) but below the same-team-different-player
-    # ceiling (~0.87), so this catches reappearances without
-    # collapsing two real same-team-same-number players.
+    orphan_absorb_threshold: 0.92
     jersey_aware_merge_threshold: 0.8
   goalkeeper:
-    enabled: true                # post-consolidation GK identification
-    goal_area_depth: 16.5        # metres — cluster mean x must be within this of own goal line
-  # The ``output`` block used to control in-place rewrites of
-  # tracking/tracks.json + tracking/team_assignments.json. With the
-  # additive layout (consolidated copies live under
-  # track_consolidation/) those flags no longer do anything; downstream
-  # readers select via goalinsight.track_consolidation.load_tracks.
-
-# Annotated Full-Video Render (HUD-style)
+    enabled: true
+    goal_area_depth: 16.5
 annotated_video:
   enabled: false
-  output_fps: null              # null = source fps
+  output_fps:
   glow:
     enabled: true
     alpha: 0.35
@@ -444,7 +236,7 @@ annotated_video:
     max_distance_m: 2.0
     exclude_goalkeeper: true
     hysteresis_frames: 5
-    outline_color: [0, 255, 255]   # weak yellow (BGR)
+    outline_color: [0, 255, 255]
   distance_network:
     n_opponents: 3
     max_edge_m: 20.0
@@ -465,92 +257,65 @@ annotated_video:
     height_frac: 0.28
     alpha: 0.85
     margin_px: 20
-
-# Output
 output:
-  format: "json"          # Output format
+  format: "json"
   save_visualizations: true
   visualization_fps: 10
-  save_embeddings: false  # Whether to save ReID embeddings
-
-# Hardware
-device: "cuda"            # "cuda" or "cpu"
+  save_embeddings: false
+device: "cuda"
 num_workers: 4
 batch_size: 16
-
-# Event Detection
 events:
   detectors:
-    - possession
-    - pass
-    - shot
-    - carry
-    - defensive
+  - possession
+  - pass
+  - shot
+  - carry
+  - defensive
   possession:
-    distance_threshold: 3.0         # meters — max player-ball distance for possession (wider for tracking noise)
-    min_consecutive_seconds: 0.5    # seconds — minimum duration to confirm possession (catch short touches)
-    speed_break_threshold: 20.0     # m/s — ball speed above which possession breaks (allow fast dribbles)
+    distance_threshold: 3.0
+    min_consecutive_seconds: 0.5
+    speed_break_threshold: 20.0
   pass:
-    pass_speed_threshold: 3.0       # m/s — minimum ball speed to qualify as a pass (catch short passes)
-    max_transit_seconds: 3.0        # seconds — max gap between possession spans (allow longer aerial passes)
+    pass_speed_threshold: 3.0
+    max_transit_seconds: 3.0
   shot:
-    shot_speed_threshold: 8.0       # m/s — minimum ball speed for a shot (filter slow crosses)
-    max_angle_to_goal: 30.0         # degrees — max angle deviation from goal
-    min_confidence: 0.15            # minimum ball detection confidence
-    shooter_lookback_seconds: 5.0   # seconds — how far back to look for shooter (wider window)
-    dedup_gap_seconds: 2.0          # seconds — deduplication window
-    approach_window_seconds: 1.5    # seconds — approach direction check window
-    max_frame_gap_seconds: 1.0      # seconds — max gap between consecutive ball obs
-    approach_margin: 3.0            # meters — detect shots when ball is within this distance of goal line
-    tracking_lost_seconds: 1.0      # seconds — gap in tracking that indicates ball left the field
+    shot_speed_threshold: 8.0
+    max_angle_to_goal: 30.0
+    min_confidence: 0.15
+    shooter_lookback_seconds: 5.0
+    dedup_gap_seconds: 2.0
+    approach_window_seconds: 1.5
+    max_frame_gap_seconds: 1.0
+    approach_margin: 3.0
+    tracking_lost_seconds: 1.0
   carry:
-    min_duration_seconds: 1.0       # seconds — minimum possession duration (catch shorter carries)
-    min_total_distance: 3.0         # meters — total displacement threshold
-    min_forward_distance: 2.0       # meters — forward progress threshold
+    min_duration_seconds: 1.0
+    min_total_distance: 3.0
+    min_forward_distance: 2.0
   defensive:
-    tackle_proximity: 3.0           # meters — defender must be this close to ball
-    tackle_deflection_angle: 30.0   # degrees — ball direction change threshold (more sensitive)
-    tackle_max_gap_seconds: 1.0     # seconds — max gap between possession spans for tackle
-    deflection_window_seconds: 0.5  # seconds — window for computing ball deflection angle
-
-# Per-player profile artifacts (stage: player_profile).
-# Front/back crops + heatmap PNGs are always produced; per-player follow-cam
-# clips ("spotlights") are opt-in via spotlights.enabled.
+    tackle_proximity: 3.0
+    tackle_deflection_angle: 30.0
+    tackle_max_gap_seconds: 1.0
+    deflection_window_seconds: 0.5
 player_profile:
   heatmap_bins: 30
   spotlights:
     enabled: true
     output_size: [1920, 1080]
-    target_player_height_frac: 0.66666  # player ~2/3 of frame height after resize
-    presence_gap_seconds: 1.0           # gap between detections > this → cut, no bridge
-    trail: false                        # pitch-trail polyline (off by default; visually busy)
+    target_player_height_frac: 0.66666
+    presence_gap_seconds: 1.0
+    trail: false
     trail_seconds: 1.5
     ellipse: true
     name_badge: true
     crf: 23
     preset: medium
-    min_observations: 30                # skip players with fewer detections than this
-
-# Pipeline orchestration
-# Available stages: field_registration, tracking, track_consolidation, event_detection, player_profile, highlights, annotated_video
-# NOTE: track_consolidation must run BEFORE event_detection so events.json
-# carries stable player_id strings (e.g. "A-7") instead of raw int track_ids.
+    min_observations: 30
 pipeline:
   stages:
-    - field_registration
-    - tracking
-
-# Stage execution options. Remote execution is opt-in: pass
-# --remote-stages=field_registration,tracking on the CLI (or set
-# execution.remote_stages here) to run those stages on a SageMaker
-# Processing Job. Default is local — leave this commented out.
-# execution:
-#   remote_stages: []
-
-# SageMaker Processing Job settings — populate with the values printed
-# by sagemaker/setup_aws.sh. Leaving any of region/role_arn/image_uri/
-# s3_bucket unset disables remote execution (the stage adapter falls
-# back to local with an explicit error).
+  - field_registration
+  - tracking
 sagemaker:
   region: ""
   role_arn: ""
@@ -562,4 +327,4 @@ sagemaker:
   instance_count: 1
   volume_size_gb: 50
   max_runtime_seconds: 3600
-  fetch_visualizations: false  # set true if you need vis dumps locally
+  fetch_visualizations: false

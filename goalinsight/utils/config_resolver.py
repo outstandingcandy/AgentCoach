@@ -14,8 +14,11 @@ Legacy explicit keys always win, so existing configs keep working.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _hfov_deg_to_focal_px(hfov_deg: float, width: int) -> float:
@@ -41,6 +44,15 @@ def resolve_config(
     callers (tests, weird CLI paths) build a context without a real video.
     """
     out = _deep_copy_dict(config)
+
+    # ---------- pitch_type alias ----------
+    # ``pitch_type: <name>`` is a shorthand for the full ``pitch:`` block.
+    # Resolve it against ``configs/pitches/*.yaml`` and let any inline
+    # ``pitch:`` keys win field-by-field (same precedence as per-video
+    # overrides). Unknown names are logged and dropped, leaving any
+    # explicit ``pitch:`` block alone — a typo shouldn't silently swap
+    # the pitch out from under the user.
+    _expand_pitch_type(out)
 
     # Default video.process_fps to min(30, source_fps) when unset. The
     # legacy default ("not set" -> "process every frame") was a foot-gun
@@ -111,6 +123,50 @@ def resolve_config(
         tc["min_track_frames"] = int(round(float(tc["min_track_seconds"]) * float(effective_fps)))
 
     return out
+
+
+def expand_pitch_type(config: dict[str, Any]) -> None:
+    """Public alias of ``_expand_pitch_type`` for callers that hand-load yaml.
+
+    Use this from any code path that reads a config dict but doesn't go
+    through ``resolve_config`` (e.g. ``web/__main__.py`` parsing a
+    --pitch-config argument, ``annotator.set_solver_config``).
+    """
+    _expand_pitch_type(config)
+
+
+def _expand_pitch_type(config: dict[str, Any]) -> None:
+    """Resolve ``pitch_type: <name>`` to a full ``pitch:`` block in-place.
+
+    Precedence (matches ``annotation.per_video_settings._expand_pitch_type``):
+
+    - ``pitch_type: foo`` alone      → ``pitch`` = pitch_types.resolve("foo")
+    - ``pitch_type`` + ``pitch:``    → pitch_types.resolve provides defaults,
+      inline ``pitch:`` keys override field-by-field.
+    - unknown ``pitch_type``         → logged and dropped, ``pitch`` (if any)
+      passes through unchanged.
+
+    After the call, ``pitch_type`` is removed so downstream consumers only
+    deal with a fully-expanded ``pitch:`` dict.
+    """
+    if "pitch_type" not in config:
+        return
+    name = config.pop("pitch_type")
+
+    # Lazy import to avoid pulling the annotation package into the
+    # config-resolution path for callers that don't need it (e.g.
+    # ``annotation`` itself uses ``per_video_settings._expand_pitch_type``
+    # — same job, narrower scope).
+    from ..annotation import pitch_types
+
+    try:
+        resolved = pitch_types.resolve(str(name))
+    except KeyError as exc:
+        logger.warning("Ignoring pitch_type: %s", exc)
+        return
+
+    inline = config.get("pitch") if isinstance(config.get("pitch"), dict) else {}
+    config["pitch"] = {**resolved, **inline}
 
 
 def _deep_copy_dict(d: dict[str, Any]) -> dict[str, Any]:

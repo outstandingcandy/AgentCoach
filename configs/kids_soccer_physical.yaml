@@ -1,46 +1,15 @@
+# kids_soccer_physical.yaml
+# Comments / rationale live in docs/config_notes.md (#kids_soccer_physical.yaml).
+
 video:
-  process_fps: 30            # 30 fps source = process every video frame (dense
-                             # tracking). Smaller per-frame displacements make
-                             # IoU/pitch gates much tighter, killing the
-                             # "two-same-team-players-close-together" ID
-                             # switches (e.g. orig 54 frame 249) that survived
-                             # at 10 fps. fps-sensitive tracker defaults
-                             # (max_age, pitch_gate_m, reid_pitch_max_m) auto-
-                             # scale by effective_fps/10, so physical meaning
-                             # is preserved.
-
-# Single source of truth for "compute every Nth video frame" used both
-# for the per-stage compute path and for the per-frame jpg/json vis
-# sink. Keeping these in sync means the vis sample lines up exactly
-# with what each stage actually processed — no missing-detection holes
-# (e.g. the old vis_frame_stride=10 falling on frame 10, which was
-# never sampled because process_fps gave step=3).
+  process_fps: 30
 sample:
-  stride: 1                  # process every video frame (matches process_fps=30 on 30fps source)
-
-# Long-focal sideline cam (fx=2448, hfov ≈ 43°). See kids_soccer.yaml.
+  stride: 1
 intrinsics:
   fx: 2448.68
-
-# Non-FIFA youth pitch — same dims as kids_soccer.yaml. The physical
-# backend reads pitch_length / pitch_width directly from the physical
-# block; the rest of the pitch.* table is consumed by pnlcalib_orig and
-# isn't used on this path, but kept for parity / future joint runs.
-pitch:
-  pitch_length: 66.28
-  pitch_width: 43.15
-  penalty_area_width: 21.84
-  penalty_area_length: 9.96
-  goal_area_width: 11.79
-  goal_area_length: 4.13
-  goal_line_to_penalty_mark: 8.0
-  center_circle_radius: 7.0
-  goal_height: 2.15
-  goal_length: 4.44
-
+pitch_type: kids_soccer
 field_registration:
   backend: "physical"
-
   physical:
     camera_profile: "kids_soccer_1080p"
     ransac_reproj_error: 30.0
@@ -48,115 +17,46 @@ field_registration:
     line_sample_points: 20
     max_reproj_error: 15.0
     use_line_model: true
-    focal_hfov_deg_bounds: [27.0, 45.3]   # wide upper for late-clip zoom-in;
-                                          # resolver converts to px focal at the
-                                          # source's actual width (1920 → [2300, 4000])
+    focal_hfov_deg_bounds: [27.0, 45.3]
     world_residual_weight: 0.0
-    joint_optimize: false             # camera zooms during clip — keep per-frame f
+    joint_optimize: false
     world_error_threshold: 5.0
-
-    # Camera position. Iterative refinement via Pass 2 lock-C:
-    #   measured prior:    (-4.000, -21.575, 2.000)
-    #   iter 1 converged:  (-5.116, -22.069, 2.844)
-    #   iter 2 converged:  (-5.557, -21.926, 2.820)  ← current (best stable point)
-    #   iter 3 converged:  (-5.906, -21.714, 2.765)  — x kept drifting -0.35m
-    # x didn't converge (left-half KPs over-represented in train set), so we
-    # stop at iter 2: y / z had stabilized, reproj already at 10.85 px median.
-    # Diff vs measured: x ≈ -1.6, y ≈ -0.35, z +0.82 (camera is taller).
     camera_position: [-5.557, -21.926, 2.820]
-    # SOFT prior — frames with only 3 (often near-collinear) keypoints can't
-    # all reproject to zero under hard-lock + 4-DOF (only rvec + focal free),
-    # they settle for a ~22 px three-point compromise. With soft, the LM is
-    # allowed to nudge tvec away from this prior to make the visible anchors
-    # fit while position_weight pulls it back.
     lock_camera_position: false
-    position_weight: 10.0             # pixels-equivalent; raise to keep tighter to prior
-
-    pitch_length: 66.28
-    pitch_width: 43.15
-
-    # Single sample stride for the whole pipeline lives at top-level
-    # `sample.stride`. calibration_skip=1 means physical runs PnP on
-    # every sampled frame (no second decimation on top of process_fps).
+    position_weight: 10.0
     calibration_skip: 1
-
-    # Per-frame vis JPG sink stride (sample-frame indices, not video).
-    # 1 = save a calibration JPG for every sampled frame.
     vis_interval: 1
-
-    # SIFT-based gap fill: replace linearly-interpolated frames with chained
-    # H propagation from high-quality anchors. Much more accurate when the
-    # camera is panning/zooming during a multi-second gap.
     gap_fill_chain:
       enabled: true
-      anchor_max_reproj_px: 30.0      # only frames with reproj<=30px become anchors
-      overwrite_above_reproj_px: 30.0 # don't overwrite frames already <=30px
+      anchor_max_reproj_px: 30.0
+      overwrite_above_reproj_px: 30.0
       method: improved
       smoothing_window: 5
       use_masking: false
       max_gap_frames: 60
-      max_anchor_distance_frames: 120  # extended further to cover the 192-frame gap between anchors 30 and 222
-      sift_top_skip_frac: 0.25        # mask top 25% (OSD + sky)
-
-  # Reuse the finetuned kids_soccer keypoint + line heads. The physical
-  # runner pulls model paths from this block.
+      max_anchor_distance_frames: 120
+      sift_top_skip_frac: 0.25
   pnlcalib:
-    # v2 KP best after full 100-epoch run on kids_soccer_v2 (clean manual
-    # annotations). 83.3% recall (30/36) / 0 phantoms, mean err 2.8 px on
-    # the v2 train set; baseline run_20260531_024941 was 71% / 3 phantoms.
-    # Left-goal z=-G_H channels (11 / 12 / 16) still don't activate above
-    # conf=0.05 — limitation of SV_kp pretrained head, not training data.
     keypoint_model_path: "data/finetuned_models/run_20260605_073045/models/best_model_final.pt"
     keypoint_weights: "SV_kp"
     keypoint_threshold: 0.15
     use_lines: true
-    # v2 line head from kids_soccer_v2 freeze_backbone training (200 ep).
     line_model_path: "data/finetuned_line_models/run_20260605_073744/models/best_model_final.pt"
     line_weights: "SV_lines"
     line_threshold: 0.10
-
 device: "cuda"
-
-# PRTReID is fine-tuned on SoccerNet (player-level), 256-dim with HRNet32.
-# Our same-jersey discrimination test on OSNet showed cross-player cosine
-# at 0.85 — too close to true-continuation cosine (0.85) for Hungarian to
-# pick correctly under team-uniform conditions. PRTReID's part-based
-# embedding (separate body parts) should give better same-jersey
-# discrimination on the kids clip.
 reid:
   backend: "prtreid"
-
-# 30fps tracking — both pitch_gate_m and reid_pitch_max_m auto-derive to
-# the values this clip was tuned at (4.0 * 10/30 = 1.33 m,
-# 1.5 * 10/30 = 0.5 m). No per-clip overrides needed.
-
-# Per-stage vis sinks. mp4 outputs are full-rate; the per-frame jpg/json
-# stride matches sample.stride (set at top-level) so vis frames line up
-# exactly with sampled frames — no overlay gaps from picking a frame the
-# stage never actually processed. Override per stage if you want a
-# different cadence.
-
 track_consolidation:
-  # 1 s at process_fps=30 ≈ 30 frames. Filters genuine 1–2 frame YOLO
-  # false positives while keeping fragmented player tids. Resolver
-  # converts seconds → frames at the effective process_fps.
   min_track_seconds: 1.0
-
-  # Phase-2 jersey OCR runs through the LLM (Bedrock). RapidOCR is
-  # fast but misses partial / occluded numbers (e.g. orig 11 all 51
-  # crops returned "no text detected"); the LLM still reads them
-  # via Phase-1 colour / partial-digit reasoning.
   jersey:
     ocr_backend: llm
-  # stride=10 keeps OCR cost bounded at ~60 LLM calls per long track.
-  # On Bedrock that's ~$0.05/track; the bottleneck is rate limiting.
   frame_stride: 10
-
 pipeline:
   stages:
-    - field_registration
-    - tracking
-    - track_consolidation
-    - event_detection
-    - player_profile
-    - highlights
+  - field_registration
+  - tracking
+  - track_consolidation
+  - event_detection
+  - player_profile
+  - highlights

@@ -10,6 +10,7 @@ Layout::
     workspace/
       videos/                   # uploaded / discovered source videos
       annotations/<video_stem>/ # AnchorAnnotator output (frame_*.json, ...)
+      configs/<video_stem>.yaml # per-video pipeline config authored from /library
       models/<run_ts>/          # train_finetune.py outputs (best_model.pt, ...)
       runs/<run_name>/          # pipeline run outputs
         field_registration/
@@ -51,6 +52,10 @@ class Workspace:
         return self.root / "runs"
 
     @property
+    def configs_dir(self) -> Path:
+        return self.root / "configs"
+
+    @property
     def jobs_file(self) -> Path:
         return self.root / "jobs.json"
 
@@ -61,10 +66,15 @@ class Workspace:
         """Per-video annotations directory, keyed by file stem."""
         return self.annotations_dir / Path(video_path).stem
 
+    def config_for(self, video_path: Path) -> Path:
+        """Per-video config yaml, keyed by file stem (may not exist)."""
+        return self.configs_dir / f"{Path(video_path).stem}.yaml"
+
     def ensure(self) -> None:
         for d in (
             self.videos_dir,
             self.annotations_dir,
+            self.configs_dir,
             self.models_dir,
             self.runs_dir,
         ):

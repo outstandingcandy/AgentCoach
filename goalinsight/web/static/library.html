@@ -134,6 +134,33 @@
                           cursor: pointer; padding: 0 4px; font-size: 16px;
                           margin-left: 4px; }
     #upload-card .close:hover { color: #fff; }
+
+    /* Edit-config modal */
+    #cfg-modal { position: fixed; inset: 0; display: none; align-items: center;
+                 justify-content: center; background: rgba(0,0,0,0.55); z-index: 50; }
+    #cfg-modal.show { display: flex; }
+    #cfg-modal .panel { background: #161b21; border: 1px solid #2a323c;
+                        border-radius: 10px; width: min(900px, 92vw);
+                        max-height: 88vh; display: flex; flex-direction: column;
+                        gap: 10px; padding: 16px; }
+    #cfg-modal .head { display: flex; gap: 10px; align-items: center; }
+    #cfg-modal .head .video-name { color: #cfe3ff; font-weight: 700; flex: 1;
+                                   word-break: break-all; }
+    #cfg-modal .head .close { background: transparent; color: #9aa3ad;
+                              padding: 0 6px; font-size: 20px; }
+    #cfg-modal .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    #cfg-modal .controls label { color: #9aa3ad; font-size: 12px; }
+    #cfg-modal .controls select { min-width: 220px; }
+    #cfg-modal textarea {
+      flex: 1; min-height: 320px; resize: vertical;
+      background: #0d1116; color: #e6e9ee; border: 1px solid #2a323c;
+      border-radius: 6px; padding: 10px; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 12px; line-height: 1.4; white-space: pre; overflow: auto;
+    }
+    #cfg-modal .actions { display: flex; gap: 8px; justify-content: flex-end;
+                          align-items: center; flex-wrap: wrap; }
+    #cfg-modal .actions .spacer { flex: 1; }
+    #cfg-modal .error { color: #fca5a5; font-size: 12px; min-height: 16px; }
   </style>
   <script defer src="/static/nav.js"></script>
 </head>
@@ -176,6 +203,37 @@
   </div>
 
   <div id="toast"></div>
+
+  <div id="cfg-modal" aria-hidden="true">
+    <div class="panel" role="dialog" aria-modal="true">
+      <div class="head">
+        <span class="video-name" id="cfg-video">video</span>
+        <button class="close" id="cfg-close" title="Close">&times;</button>
+      </div>
+      <div class="controls">
+        <label for="cfg-base">Seed from base config</label>
+        <select id="cfg-base"></select>
+        <button class="secondary" id="cfg-load-base"
+                title="Reload textarea from the selected base config">Load</button>
+        <span class="spacer" style="flex:1"></span>
+        <span id="cfg-saved-tag" style="color:#86efac;font-size:12px;display:none">
+          per-video config saved
+        </span>
+      </div>
+      <textarea id="cfg-text" spellcheck="false"
+                placeholder="pick a base config and click Load — or paste your own YAML here"></textarea>
+      <div class="error" id="cfg-error"></div>
+      <div class="actions">
+        <button class="danger" id="cfg-delete"
+                title="Delete the saved per-video config (run will fall back to the base config)">
+          Delete
+        </button>
+        <span class="spacer"></span>
+        <button class="secondary" id="cfg-cancel">Cancel</button>
+        <button id="cfg-save">Save</button>
+      </div>
+    </div>
+  </div>
 
   <script>
     const $ = (q) => document.querySelector(q);
@@ -296,6 +354,10 @@
       const wh = v.width ? `${v.width}×${v.height}` : '';
       const fps = v.fps ? `@${v.fps.toFixed(1)} fps` : '';
       const sizeMB = (v.size_bytes / 1024 / 1024).toFixed(1);
+      const savedTag = v.has_video_config
+        ? `<span class="badge done" title="A per-video config is saved for this video — used by default on new runs">cfg</span>`
+        : '';
+      const cfgBtnLabel = v.has_video_config ? 'Edit config' : 'New config';
       return `<div class="vcard">
         <div class="cover">
           <img src="${v.cover_url}" alt="${v.name}" loading="lazy"
@@ -303,12 +365,16 @@
           <div class="pill">${dur}</div>
         </div>
         <div class="body">
-          <div class="title">${v.name}</div>
+          <div class="title">${v.name} ${savedTag}</div>
           <div class="vmeta">${wh} ${fps} · ${sizeMB} MB</div>
           ${annotationBlock(v)}
           ${latestRunBlock(v)}
           <div class="actions" style="margin-top:auto">
             <button onclick="seedNewRun('${v.name}')">New run with this video</button>
+            <button class="secondary" onclick="openCfgModal('${v.name}')"
+                    title="Pick a base config, edit it, save it as the per-video config">
+              ${cfgBtnLabel}
+            </button>
           </div>
         </div>
       </div>`;
@@ -574,6 +640,123 @@
       };
       xhr.send(fd);
     }
+
+    // ---------------------- Per-video config editor ---------------------- //
+    // Opens a modal seeded from the saved per-video config (if any) or
+    // from a chosen base config under ./configs. Save writes to
+    // workspace/configs/<video_stem>.yaml; subsequent runs prefer that
+    // file over the dropdown selection (see library.create_run).
+
+    let cfgState = { videoName: null };
+
+    async function openCfgModal(videoName) {
+      cfgState.videoName = videoName;
+      const baseSel = $("#cfg-base");
+      const text = $("#cfg-text");
+      const savedTag = $("#cfg-saved-tag");
+      const errEl = $("#cfg-error");
+      errEl.textContent = '';
+      $("#cfg-video").textContent = videoName;
+
+      // Populate base-config dropdown from /api/library/configs.
+      if (!baseSel.options.length) {
+        const cfgs = await api('GET', '/api/library/configs');
+        baseSel.innerHTML = cfgs.map(c => {
+          const sel = c.name === 'default.yaml' ? ' selected' : '';
+          return `<option value="${c.name}"${sel}>${c.name}</option>`;
+        }).join('');
+      }
+
+      // Load saved per-video config first; fall through to base if absent.
+      try {
+        const saved = await api('GET', `/api/library/videos/${encodeURIComponent(videoName)}/config`);
+        if (saved.exists) {
+          text.value = saved.text;
+          savedTag.style.display = '';
+        } else {
+          savedTag.style.display = 'none';
+          await loadFromBase();
+        }
+      } catch (err) {
+        errEl.textContent = String(err.message || err);
+        return;
+      }
+
+      $("#cfg-modal").classList.add('show');
+      $("#cfg-modal").setAttribute('aria-hidden', 'false');
+    }
+
+    function closeCfgModal() {
+      $("#cfg-modal").classList.remove('show');
+      $("#cfg-modal").setAttribute('aria-hidden', 'true');
+      cfgState.videoName = null;
+    }
+
+    async function loadFromBase() {
+      const baseSel = $("#cfg-base");
+      const text = $("#cfg-text");
+      const errEl = $("#cfg-error");
+      const name = baseSel.value;
+      if (!name) return;
+      try {
+        const raw = await api('GET', `/api/library/configs/${encodeURIComponent(name)}/raw`);
+        text.value = raw.text || '';
+        errEl.textContent = '';
+      } catch (err) {
+        errEl.textContent = `Failed to load ${name}: ${err.message || err}`;
+      }
+    }
+
+    async function saveVideoConfig() {
+      const videoName = cfgState.videoName;
+      if (!videoName) return;
+      const text = $("#cfg-text").value;
+      const errEl = $("#cfg-error");
+      const btn = $("#cfg-save");
+      btn.disabled = true; btn.textContent = 'Saving…';
+      try {
+        await api('PUT', `/api/library/videos/${encodeURIComponent(videoName)}/config`,
+                  { text });
+        flash(`Saved config for ${videoName}`);
+        closeCfgModal();
+        refreshVideos();
+      } catch (err) {
+        errEl.textContent = String(err.message || err);
+      } finally {
+        btn.disabled = false; btn.textContent = 'Save';
+      }
+    }
+
+    async function deleteVideoConfig() {
+      const videoName = cfgState.videoName;
+      if (!videoName) return;
+      if (!confirm(`Delete the per-video config for ${videoName}? Runs will fall back to the base config picked in the dropdown.`)) return;
+      try {
+        await api('PUT', `/api/library/videos/${encodeURIComponent(videoName)}/config`,
+                  { text: '' });
+        flash(`Deleted config for ${videoName}`);
+        closeCfgModal();
+        refreshVideos();
+      } catch (err) {
+        $("#cfg-error").textContent = String(err.message || err);
+      }
+    }
+
+    $("#cfg-close").addEventListener('click', closeCfgModal);
+    $("#cfg-cancel").addEventListener('click', closeCfgModal);
+    $("#cfg-save").addEventListener('click', saveVideoConfig);
+    $("#cfg-delete").addEventListener('click', deleteVideoConfig);
+    $("#cfg-load-base").addEventListener('click', loadFromBase);
+    $("#cfg-modal").addEventListener('click', (e) => {
+      // Backdrop click closes the modal — clicks on the inner panel bubble
+      // through with a different target, so this only fires for backdrop.
+      if (e.target.id === 'cfg-modal') closeCfgModal();
+    });
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && $("#cfg-modal").classList.contains('show')) {
+        closeCfgModal();
+      }
+    });
 
     refreshVideos();
     refreshConfigs();

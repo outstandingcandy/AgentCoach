@@ -48,7 +48,10 @@ def main() -> int:
     if args.pitch_config:
         import yaml
         from ..annotation.pitch.geometry import SoccerPitch
+        from ..utils.config_resolver import expand_pitch_type
         cfg = yaml.safe_load(args.pitch_config.read_text()) or {}
+        # Honour ``pitch_type: <name>`` alongside an inline ``pitch:`` block.
+        expand_pitch_type(cfg)
         pitch_kw = cfg.get("pitch") or {}
         if pitch_kw:
             pitch = SoccerPitch(**pitch_kw)

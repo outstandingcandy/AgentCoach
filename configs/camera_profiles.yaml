@@ -1,73 +1,75 @@
-# Camera intrinsic profiles for physical calibration backend.
-# Each profile provides fixed K (intrinsic matrix) and dist_coeffs (distortion)
-# that are NEVER modified by the optimizer — only 6-DOF extrinsics are optimized.
-#
-# To add a new camera: measure or calibrate K and dist_coeffs offline,
-# then add a named entry below.
+# camera_profiles.yaml
+# Comments / rationale live in docs/config_notes.md (#camera_profiles.yaml).
 
 profiles:
-  # Original profile from factory calibration grid
   veo_1080p_factory:
     image_size: [1920, 1080]
     K:
-      - [1728.25, 0.0, 960.0]
-      - [0.0, 1728.25, 540.0]
-      - [0.0, 0.0, 1.0]
+    - [1728.25, 0.0, 960.0]
+    - [0.0, 1728.25, 540.0]
+    - [0.0, 0.0, 1.0]
     dist_coeffs: [-0.2375, 0.0167, 0.0, 0.0, 0.0]
-
-  # Refined via cross-frame joint optimization on football_sunday_output_000
   veo_1080p:
     image_size: [1920, 1080]
     K:
-      - [1724.3, 0.0, 960.4]
-      - [0.0, 1724.3, 534.7]
-      - [0.0, 0.0, 1.0]
+    - [1724.3, 0.0, 960.4]
+    - [0.0, 1724.3, 534.7]
+    - [0.0, 0.0, 1.0]
     dist_coeffs: [-0.376, 0.0572, 0.0, 0.0, 0.0]
-
-  # 4K (3840x2160) variant of veo_1080p. Veo's 4K stream is a 2x
-  # bilinear upsample of the same sensor crop, so fx/fy/cx/cy all
-  # double exactly. Distortion coefficients are unitless (operate in
-  # normalized image coordinates) so they're identical to the 1080p
-  # profile.
   veo_4k:
     image_size: [3840, 2160]
     K:
-      - [3448.6, 0.0, 1920.8]
-      - [0.0, 3448.6, 1069.4]
-      - [0.0, 0.0, 1.0]
+    - [3448.6, 0.0, 1920.8]
+    - [0.0, 3448.6, 1069.4]
+    - [0.0, 0.0, 1.0]
     dist_coeffs: [-0.376, 0.0572, 0.0, 0.0, 0.0]
-
-  # Generic 4K sideline profile for non-Veo cameras (phones, GoPros,
-  # consumer cams) where we don't have a lab-calibrated K. fx=6000 is
-  # the LM-converged value on sunday_cup_0050-0110 (~ 31° hfov) and
-  # works as a starting point for similar long-focal sideline rigs.
-  # Distortion zeroed — most phone footage is lens-corrected upstream.
-  # Pair with a wide focal_bounds and lock_camera_position=false so
-  # the LM can refine across rigs.
   generic_4k:
     image_size: [3840, 2160]
     K:
-      - [6000.0, 0.0, 1920.0]
-      - [0.0, 6000.0, 1080.0]
-      - [0.0, 0.0, 1.0]
+    - [6000.0, 0.0, 1920.0]
+    - [0.0, 6000.0, 1080.0]
+    - [0.0, 0.0, 1.0]
     dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
-
   broadcast_1080p:
     image_size: [1920, 1080]
     K:
-      - [1500.0, 0.0, 960.0]
-      - [0.0, 1500.0, 540.0]
-      - [0.0, 0.0, 1.0]
+    - [1500.0, 0.0, 960.0]
+    - [0.0, 1500.0, 540.0]
+    - [0.0, 0.0, 1.0]
     dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
-
-  # Long-focal sideline camera used for kids_soccer_match.mp4 / clips.
-  # fx=2448 (hfov ≈ 43°) recovered jointly with pitch dims via
-  # scripts/fit_pitch_dims.py --fit-fx (combined RMSE 5.82 px on 53 residuals).
-  # See configs/kids_soccer.yaml header for context.
   kids_soccer_1080p:
     image_size: [1920, 1080]
     K:
-      - [2448.68, 0.0, 960.0]
-      - [0.0, 2448.68, 540.0]
-      - [0.0, 0.0, 1.0]
+    - [2448.68, 0.0, 960.0]
+    - [0.0, 2448.68, 540.0]
+    - [0.0, 0.0, 1.0]
     dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+  # Working profile for the 0626_1_part_000 futsal-corner rig.
+  # Calibrated via cv2.calibrateCamera on 14 manual annotations
+  # (12 ground-plane + 2 goal-post tops at z!=0) with intrinsics fully
+  # free (fy=fx aspect lock + k3=0 to avoid 6th-order over-fit).
+  # Result: RMS=8.13 px across all 14 points, solver-recovered camera
+  # position (-23.5, -11.4, 5.3) — within 4 m of the field-measured
+  # rig position (-20, -10, 5).
+  # The notable values:
+  #   fx ≈ 946 → HFOV ≈ 91° (wide-angle lens, near-fisheye marketing)
+  #   cx=826, cy=620 → principal point offset ~134 px in x, ~80 px in y
+  #     (almost certainly because the recorded MP4 was cropped off-centre
+  #     from a higher-res capture; raw sensor optical axis is otherwise
+  #     near-centred)
+  #   k1≈+0.48, k2≈-0.39, p1, p2 small → mild pincushion, fairly typical
+  #     for a wide-angle phone/action-cam lens
+  # The pipeline picks this profile up via field_registration.physical's
+  # ``camera_profile: futsal_phone_1080p`` + ``free_intrinsics: true``
+  # (the second flag tells solve_camera_physical to run cv2.calibrateCamera
+  # at solve time instead of using PhysicalCalibrator's locked-cx/cy LM).
+  # Future videos shot with THIS SAME rig (lens + recording crop) can
+  # drop the ``free_intrinsics`` flag and rely on the K + dist here
+  # being fixed and physical.
+  futsal_phone_1080p:
+    image_size: [1920, 1080]
+    K:
+    - [946.25, 0.0, 825.94]
+    - [0.0, 946.25, 619.67]
+    - [0.0, 0.0, 1.0]
+    dist_coeffs: [0.4783, -0.3896, 0.0328, 0.0671, 0.0000]

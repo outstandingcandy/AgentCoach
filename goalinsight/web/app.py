@@ -118,6 +118,16 @@ def create_workspace_app(
     annotator = AnchorAnnotator(
         annotations_dir=str(ws.annotations_dir), pitch=pitch,
     )
+    app.state.annotator = annotator
+    register_annotation_routes(
+        app, annotator, ws.videos_dir,
+        configs_root=ws.configs_dir,
+        prefix="/api/annotate",
+    )
+    # Open the first discovered video AFTER routes are mounted so the
+    # open_video wrapper installed by register_annotation_routes (which
+    # applies the per-video workspace config) runs on the initial open
+    # too. Failing here doesn't kill the boot — uploads come later.
     initial = sorted(
         [p for ext in _ANNOT_VIDEO_EXTS for p in ws.videos_dir.glob(f"*{ext}")],
         key=lambda p: p.name,
@@ -127,10 +137,6 @@ def create_workspace_app(
             annotator.open_video(str(initial[0]), start_frame=0)
         except Exception as exc:  # noqa: BLE001
             logger.warning("annotator: could not auto-open %s: %s", initial[0], exc)
-    app.state.annotator = annotator
-    register_annotation_routes(
-        app, annotator, ws.videos_dir, prefix="/api/annotate",
-    )
 
     register_library_routes(app, ws)
 

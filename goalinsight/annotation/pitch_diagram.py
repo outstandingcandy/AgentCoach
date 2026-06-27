@@ -70,6 +70,7 @@ def draw_pitch_structure(
     pen = pitch.GOAL_LINE_TO_PENALTY_MARK
     pa_w, pa_d = pitch.PENALTY_AREA_WIDTH / 2.0, pitch.PENALTY_AREA_LENGTH
     ga_w, ga_d = pitch.GOAL_AREA_WIDTH / 2.0, pitch.GOAL_AREA_LENGTH
+    pa_shape = getattr(pitch, "PENALTY_AREA_SHAPE", "rect")
 
     pts = [to_px(-L, W), to_px(L, W), to_px(L, -W), to_px(-L, -W)]
     for i in range(4):
@@ -78,8 +79,39 @@ def draw_pitch_structure(
     cv2.line(img, to_px(0, W), to_px(0, -W), color, thickness)
     cv2.circle(img, to_px(0, 0), int(ccr * scale), color, thickness)
 
-    cv2.rectangle(img, to_px(-L, pa_w), to_px(-L + pa_d, -pa_w), color, thickness)
-    cv2.rectangle(img, to_px(L - pa_d, pa_w), to_px(L, -pa_w), color, thickness)
+    if pa_shape == "d":
+        # Futsal-style D area. Two quarter-arcs of radius pa_d centered
+        # on each post (at y = ±goal_length/2), plus a straight chord
+        # at x = ±(L - pa_d) between the two arc endpoints. The chord
+        # length equals the goal width (PA_WIDTH = goal_length here).
+        # OpenCV ellipse angles are y-down — for the y-up canvas above
+        # we *don't* re-flip, because (a) the renderer's to_px already
+        # flips y and (b) the arcs are symmetric around the x-axis.
+        # Concretely: a top-of-frame post arc sweeps from the goal line
+        # outward through +y; a bottom-of-frame post arc sweeps inward
+        # through -y.
+        g_w = pitch.GOAL_LENGTH / 2.0
+        r_px = int(pa_d * scale)
+        # Left side (x = -L): two posts at y = ±g_w. Each quarter-arc
+        # opens to +x.
+        cv2.ellipse(img, to_px(-L, +g_w), (r_px, r_px), 0,
+                    -90, 0, color, thickness)    # top post: 270°→360°
+        cv2.ellipse(img, to_px(-L, -g_w), (r_px, r_px), 0,
+                    0, 90, color, thickness)     # bot post: 0°→90°
+        # Right side (x = +L): arcs open to -x.
+        cv2.ellipse(img, to_px(+L, +g_w), (r_px, r_px), 0,
+                    180, 270, color, thickness)
+        cv2.ellipse(img, to_px(+L, -g_w), (r_px, r_px), 0,
+                    90, 180, color, thickness)
+        # Chord at the front of the D between the two arc apexes.
+        cv2.line(img, to_px(-L + pa_d, +g_w), to_px(-L + pa_d, -g_w),
+                 color, thickness)
+        cv2.line(img, to_px(+L - pa_d, +g_w), to_px(+L - pa_d, -g_w),
+                 color, thickness)
+    else:
+        cv2.rectangle(img, to_px(-L, pa_w), to_px(-L + pa_d, -pa_w), color, thickness)
+        cv2.rectangle(img, to_px(L - pa_d, pa_w), to_px(L, -pa_w), color, thickness)
+
     cv2.rectangle(img, to_px(-L, ga_w), to_px(-L + ga_d, -ga_w), color, thickness)
     cv2.rectangle(img, to_px(L - ga_d, ga_w), to_px(L, -ga_w), color, thickness)
 
@@ -88,13 +120,13 @@ def draw_pitch_structure(
         cv2.circle(img, to_px(-L + pen, 0), landmark_radius, color, -1)
         cv2.circle(img, to_px(L - pen, 0), landmark_radius, color, -1)
 
-    if draw_arcs:
-        # Penalty-arc visible-segment half-angle, from the geometry of the
-        # circle (centered on the penalty mark) intersecting the PA-front
-        # line. cos(theta) = (pa_d - pen) / ccr. Falls back to a full circle
-        # if the front line is inside the circle (non-FIFA pitches where
+    if draw_arcs and pa_shape != "d":
+        # 11-a-side: a penalty-mark-centered arc on the PA front line.
+        # cos(theta) = (pa_d - pen) / ccr. Falls back to a full circle if
+        # the front line is inside the circle (non-FIFA pitches where
         # ccr > pa_d - pen far enough that the arc wraps), and skips
         # entirely if the front line never reaches the circle.
+        # (D-shape PAs draw their arcs above; no separate penalty arc.)
         r = int(ccr * scale)
         dx = pa_d - pen
         ratio = dx / ccr if ccr > 0 else 1.0
@@ -236,6 +268,12 @@ def create_pitch_diagram(
             continue
         pt = hrnet_pitch_points[name]
         wx, wy = float(pt[0]), float(pt[1])
+        # Skip keypoints whose world coords are geometrically undefined
+        # for this pitch (NaN from circle-tangent constructions on
+        # small pitches where corners sit inside the relevant circle —
+        # e.g. futsal corners inside the penalty arc).
+        if not (math.isfinite(wx) and math.isfinite(wy)):
+            continue
         # Goal-post posts: nudge in screen-x to disambiguate crossbar
         # (z<0) from ground (z=0) ends that share (x, y).
         if 0 <= idx <= 3 or 24 <= idx <= 27:
@@ -444,6 +482,11 @@ def compute_pitch_layout() -> dict:
             continue
         pt = hrnet_pitch_points[name]
         wx, wy = float(pt[0]), float(pt[1])
+        # Same NaN guard as create_pitch_diagram: drop tangent-from-corner
+        # keypoints that don't exist for the active pitch (e.g. futsal
+        # corners that sit inside the center circle).
+        if not (math.isfinite(wx) and math.isfinite(wy)):
+            continue
         if 0 <= idx <= 3 or 24 <= idx <= 27:
             is_left = idx in _LEFT_GOAL_IDS
             is_crossbar = idx in _NOT_ON_PLANE_SET

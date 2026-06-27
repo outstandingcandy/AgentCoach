@@ -1,56 +1,38 @@
-# Configuration for clip_000 using BroadTrack-style calibration
-# BroadTrack: 8-param camera + Cauchy loss + joint keypoint/line curve constraints
+# clip_000_broadtrack.yaml
+# Comments / rationale live in docs/config_notes.md (#clip_000_broadtrack.yaml).
 
-# Video Processing
 video:
   process_fps: 0.1
-
-# Stage 1: Field Registration with BroadTrack algorithm
 field_registration:
   backend: "broadtrack"
-
   pnlcalib:
-    # Fine-tuned keypoint model
     keypoint_model_path: "data/finetuned_models/run_20260319_135637/models/best_model.pt"
     keypoint_weights: "SV_kp"
     keypoint_threshold: 0.25
-
-    # Line detection (always enabled for BroadTrack)
     line_weights: "SV_lines"
     line_threshold: 0.5
-
-    # RANSAC threshold for PnP initialization
     ransac_threshold: 30.0
-
   broadtrack:
-    cauchy_f_scale: 5.0          # Cauchy loss scale (pixels)
-    line_sample_points: 5        # Points sampled per detected line
-    line_weight: 1.0             # Line residual weight vs keypoints
+    cauchy_f_scale: 5.0
+    line_sample_points: 5
+    line_weight: 1.0
     focal_candidates: [600, 800, 1000, 1300, 1600, 2000]
-    max_nfev: 500                # Max optimizer iterations
-
-# Stage 2: Tracking (same as original)
+    max_nfev: 500
 detection:
   model: "yolov8x"
   confidence_threshold: 0.5
   iou_threshold: 0.45
   imgsz: 1280
-
 ball_detection:
   enabled: true
   confidence_threshold: 0.3
-
 tracking:
   algorithm: "strongsort"
   max_age: 50
-
 reid:
   backend: "osnet"
   model: "osnet_x1_0"
-
 team_classification:
   backend: "kmeans"
   position_weight: 0.1
-
-# Hardware
 device: "cuda"

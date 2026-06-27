@@ -35,8 +35,20 @@ def collect_pnp_points(
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float, float]]]:
     """Gather (pixel, world_xyz) pairs from manual + accepted-derived points.
 
-    Manual keypoints contribute their full 3D pitch coord (crossbars at z<0).
-    Accepted derived points are line intersections, always on the ground plane.
+    Manual keypoints contribute their full 3D pitch coord. Accepted
+    derived points are line intersections, always on the ground plane.
+
+    NOTE on z sign: ``pitch/geometry.py`` stores crossbar keypoints at
+    ``z = -GOAL_HEIGHT`` (legacy convention shared with pnlcalib_orig's
+    Zhang-style calibration, where +z points DOWN). The OpenCV
+    ``solvePnP`` family this annotator's physical backend goes through
+    expects +z UP — feeding it the legacy negative z makes the solver
+    flip the whole pose to compensate, and the solved camera ends up at
+    z>0 (underground in the legacy frame, but mathematically self-
+    consistent) while the projection of any other elevated keypoint
+    lands on the wrong side of the ground. We FLIP the sign here only
+    for the PnP input. The keypoint table itself stays negative-z so
+    pnlcalib_orig and the HRNet head don't break.
     """
     pixel_pts: list[tuple[float, float]] = []
     world_3d_pts: list[tuple[float, float, float]] = []
@@ -45,7 +57,7 @@ def collect_pnp_points(
         pixel_pts.append(state.clicked_points[i])
         pt_3d = _pk.PITCH_POINTS[name]
         world_3d_pts.append(
-            (float(pt_3d[0]), float(pt_3d[1]), float(pt_3d[2])),
+            (float(pt_3d[0]), float(pt_3d[1]), -float(pt_3d[2])),
         )
     for i, (pixel, world, _) in enumerate(state.derived_points):
         accepted = state.derived_accepted[i] if i < len(state.derived_accepted) else False
@@ -107,8 +119,9 @@ def compute_auto_projections(state: "AnchorAnnotator") -> None:
         if not np.all(np.isfinite(pt_3d)):
             continue
 
+        # Flip z to match collect_pnp_points (same legacy-sign reason).
         pixel = project_camera_point(
-            cam, (float(pt_3d[0]), float(pt_3d[1]), float(pt_3d[2])),
+            cam, (float(pt_3d[0]), float(pt_3d[1]), -float(pt_3d[2])),
         )
         if pixel is None:
             continue
@@ -188,6 +201,7 @@ def compute_homography(state: "AnchorAnnotator") -> str:
     if not math.isfinite(float(mean_error)):
         state.H0 = None
         state.reprojection_error = 0.0
+        state._solved_cam_position = None
         state.auto_projected_points = []
         state.auto_accepted = []
         return (
@@ -198,6 +212,35 @@ def compute_homography(state: "AnchorAnnotator") -> str:
 
     state.reprojection_error = float(mean_error)
     state.H0 = H
+    # Store the y-up world position recovered by the solver so the
+    # tactical view can draw it next to the configured prior. Both the
+    # pnlcalib path (homography._camera_from_upstream_result) and the
+    # physical path (solve_camera_physical) end up populating
+    # cam.position in y-up coords, so this is uniform across backends.
+    try:
+        cam_pos = np.asarray(cam.position, dtype=np.float64).reshape(3)
+        if np.all(np.isfinite(cam_pos)):
+            state._solved_cam_position = (
+                float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]),
+            )
+        else:
+            state._solved_cam_position = None
+    except (AttributeError, ValueError):
+        state._solved_cam_position = None
+    # Stash full (K, dist, rvec, tvec) so draw_pitch_projection can
+    # project the pitch lines through the distortion model instead of
+    # the planar H. The planar H is a pinhole-only approximation; with
+    # non-trivial dist_coeffs the K + dist + (rvec, tvec) path gives
+    # the overlay that actually matches what the camera sees.
+    try:
+        state._solved_camera = {
+            "K": np.asarray(cam.calibration, dtype=np.float64).copy(),
+            "rvec": np.asarray(cam._pnp_rvec, dtype=np.float64).reshape(3, 1),
+            "tvec": np.asarray(cam._pnp_tvec, dtype=np.float64).reshape(3, 1),
+            "dist": np.asarray(cam._pnp_dist, dtype=np.float64).ravel(),
+        }
+    except (AttributeError, ValueError):
+        state._solved_camera = None
     compute_auto_projections(state)
 
     warn = ""

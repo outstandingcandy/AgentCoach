@@ -27,6 +27,14 @@ FIFA_DEFAULTS: dict[str, float] = {
     "goal_length": 7.32,
 }
 
+# Penalty-area shape:
+#   "rect" — 11-a-side: a rectangle (penalty_area_length × penalty_area_width)
+#            with a penalty-mark-centered arc on the front line.
+#   "d"    — futsal: two quarter-arcs of radius ``penalty_area_length`` centered
+#            on the goal posts, joined by a straight chord at the front of the
+#            area. ``penalty_area_width`` is the chord width (= goal width).
+PENALTY_AREA_SHAPE_DEFAULT: str = "rect"
+
 
 class SoccerPitch:
     def __init__(
@@ -41,6 +49,7 @@ class SoccerPitch:
         center_circle_radius: float = FIFA_DEFAULTS["center_circle_radius"],
         goal_height: float = FIFA_DEFAULTS["goal_height"],
         goal_length: float = FIFA_DEFAULTS["goal_length"],
+        penalty_area_shape: str = PENALTY_AREA_SHAPE_DEFAULT,
     ):
         self.PITCH_LENGTH = pitch_length
         self.PITCH_WIDTH = pitch_width
@@ -52,6 +61,12 @@ class SoccerPitch:
         self.CENTER_CIRCLE_RADIUS = center_circle_radius
         self.GOAL_HEIGHT = goal_height
         self.GOAL_LENGTH = goal_length
+        # Authoritative shape for the penalty area. Downstream consumers
+        # that render or solve against the front line (currently only
+        # ``draw_pitch_structure`` for visualisation) branch on this.
+        # The HRNet 57-keypoint table is shape-agnostic — the four
+        # penalty-arc tangent points live on the same circle either way.
+        self.PENALTY_AREA_SHAPE = str(penalty_area_shape).lower()
 
         hL = pitch_length / 2.0
         hW = pitch_width / 2.0
@@ -89,14 +104,31 @@ class SoccerPitch:
         l_pen_mark = pt(-hL + self.GOAL_LINE_TO_PENALTY_MARK, 0)
         r_pen_mark = pt(hL - self.GOAL_LINE_TO_PENALTY_MARK, 0)
 
-        # Penalty areas (y-up: top = +pa_w, bottom = -pa_w)
-        l_pa_tl = pt(-hL, pa_w)
+        # Penalty areas (y-up: top = +pa_w, bottom = -pa_w).
+        # For D-shape pitches (``PENALTY_AREA_SHAPE = "d"``, e.g. futsal)
+        # the PA is a post-centered quarter-arc rather than a rectangle,
+        # so the "PA top/bottom corner on the goal line" semantically
+        # means the arc-touches-goal-line tangent point at y = ±(g_w + pa_d),
+        # not the rectangle corner at y = ±pa_w (= goal-post width on
+        # futsal). The TR/BR ("front-line corner") points retain their
+        # rect meaning (-L+pa_d, ±pa_w) — for D-PA that's the chord apex,
+        # i.e. the goal post at the front of the D. Renaming would break
+        # downstream keypoint indexing; instead we just shift the world
+        # coords so the click-to-pick targets are visually correct.
+        if self.PENALTY_AREA_SHAPE == "d":
+            pa_tangent_y = g_w + pa_d
+            l_pa_tl = pt(-hL, pa_tangent_y)
+            l_pa_bl = pt(-hL, -pa_tangent_y)
+            r_pa_tr = pt(hL, pa_tangent_y)
+            r_pa_br = pt(hL, -pa_tangent_y)
+        else:
+            l_pa_tl = pt(-hL, pa_w)
+            l_pa_bl = pt(-hL, -pa_w)
+            r_pa_tr = pt(hL, pa_w)
+            r_pa_br = pt(hL, -pa_w)
         l_pa_tr = pt(-hL + pa_d, pa_w)
-        l_pa_bl = pt(-hL, -pa_w)
         l_pa_br = pt(-hL + pa_d, -pa_w)
-        r_pa_tr = pt(hL, pa_w)
         r_pa_tl = pt(hL - pa_d, pa_w)
-        r_pa_br = pt(hL, -pa_w)
         r_pa_bl = pt(hL - pa_d, -pa_w)
 
         # Goal areas
@@ -173,4 +205,6 @@ class SoccerPitch:
         Unknown keys are ignored. Missing keys default to FIFA values.
         """
         kwargs = {k: data[k] for k in FIFA_DEFAULTS if k in data}
+        if "penalty_area_shape" in data:
+            kwargs["penalty_area_shape"] = data["penalty_area_shape"]
         return cls(**kwargs)
