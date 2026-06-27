@@ -351,8 +351,18 @@ def run_tracking(
     # tracking + ReID feature output.
     fr_config = config.get("field_registration", {})
     phys_config = fr_config.get("physical", {})
-    pitch_length = phys_config.get("pitch_length", 105.0)
-    pitch_width = phys_config.get("pitch_width", 68.0)
+    # Top-level ``pitch:`` block is the source of truth for non-FIFA pitches
+    # (set above via ``set_active_pitch``). ``field_registration.physical``
+    # only carries pitch dims for legacy configs — fall through to top-level
+    # so futsal / kids pitches don't silently render as 105×68.
+    pitch_length = (
+        phys_config.get("pitch_length")
+        or _pitch_dims.get("pitch_length", 105.0)
+    )
+    pitch_width = (
+        phys_config.get("pitch_width")
+        or _pitch_dims.get("pitch_width", 68.0)
+    )
 
     pitch_half_length = pitch_length / 2
     pitch_half_width = pitch_width / 2

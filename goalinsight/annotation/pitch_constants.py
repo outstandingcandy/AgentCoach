@@ -14,6 +14,8 @@ pitch_constants``) and read attributes at call time, not import them by value
 (``from .pitch_constants import PITCH_LINES`` captures a stale value).
 """
 
+import math
+
 from .pitch.geometry import SoccerPitch
 
 
@@ -75,3 +77,51 @@ def get_active_pitch() -> SoccerPitch:
 
 def get_all_line_names() -> list[str]:
     return list(PITCH_LINES.keys())
+
+
+def build_d_penalty_arcs(
+    pitch: SoccerPitch | None = None,
+    samples_per_arc: int = 48,
+) -> list[list[tuple[float, float]]]:
+    """Return D-shape penalty area as a list of world-space polylines.
+
+    Single source of truth for the futsal D-region geometry. Each arc is a
+    post-centered quarter-arc (radius = PENALTY_AREA_LENGTH); the two
+    chord segments connect arc apices at x = ±(L - pa_d) along ±g_w.
+
+    Output is a list of 6 polylines (4 arcs + 2 chords). Annotate-side
+    rendering (``annotation/viz.py``) and pipeline-side rendering
+    (``utils/pitch.py``) both consume this so the projected D shape is
+    identical on both pages.
+    """
+    pitch = pitch if pitch is not None else _active_pitch
+    L = pitch.PITCH_LENGTH / 2.0
+    pa_d = pitch.PENALTY_AREA_LENGTH
+    g_w = pitch.GOAL_LENGTH / 2.0
+
+    # (center_x, center_y, start_deg, end_deg). Standard math angles (CCW
+    # from +x) in the y-up world frame. The sweep direction matters: each
+    # quarter-arc must walk from the goal-line side (radius along ±x) to
+    # the chord-apex side, staying inside the pitch.
+    arc_specs = [
+        # Left side, top post & bottom post.
+        (-L, +g_w, 90.0, 0.0),
+        (-L, -g_w, 0.0, -90.0),
+        # Right side, top post & bottom post.
+        (+L, +g_w, 90.0, 180.0),
+        (+L, -g_w, 180.0, 270.0),
+    ]
+    polylines: list[list[tuple[float, float]]] = []
+    for cx, cy, a0, a1 in arc_specs:
+        arc: list[tuple[float, float]] = []
+        for k in range(samples_per_arc):
+            t = math.radians(a0) + (
+                math.radians(a1) - math.radians(a0)
+            ) * k / (samples_per_arc - 1)
+            arc.append((cx + pa_d * math.cos(t), cy + pa_d * math.sin(t)))
+        polylines.append(arc)
+    # Chord segments at x = ±(L - pa_d) connecting (-g_w) and (+g_w).
+    for sign in (-1.0, 1.0):
+        chord_x = sign * (L - pa_d)
+        polylines.append([(chord_x, -g_w), (chord_x, +g_w)])
+    return polylines

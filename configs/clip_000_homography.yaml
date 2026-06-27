@@ -1,19 +1,16 @@
-# Configuration for clip_000 using homography backend
-# Direct ground-plane homography estimation via DLT (no camera model)
+# clip_000_homography.yaml
+# Comments / rationale live in docs/config_notes.md (#clip_000_homography.yaml).
 
 video:
   process_fps: 0.5
-
 field_registration:
   backend: "homography"
-
   homography:
     ransac_reproj_error: 10.0
     max_reproj_error: 15.0
     world_error_threshold: 5.0
     pitch_length: 89.7
     pitch_width: 56.5
-
   pnlcalib:
     keypoint_model_path: "data/finetuned_models/run_20260319_135637/models/best_model.pt"
     keypoint_threshold: 0.3434

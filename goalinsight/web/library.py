@@ -229,6 +229,7 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
             for p in sorted(workspace.videos_dir.glob(f"*{ext}")):
                 meta = _probe_video_meta(p)
                 runs = runs_by_video.get(p.stem, [])
+                video_config_path = workspace.config_for(p)
                 out.append({
                     "name": p.name,
                     "stem": p.stem,
@@ -238,6 +239,7 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
                     "annotation": annotations.get(p.stem),
                     "runs": runs,
                     "latest_run": runs[0] if runs else None,
+                    "has_video_config": video_config_path.exists(),
                     **meta,
                 })
         return JSONResponse(out)
@@ -324,7 +326,20 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
             if not video_path.exists():
                 raise HTTPException(404, f"video not found: {video_name}")
 
-        config_path = CONFIGS_DIR / _safe_filename(str(config_name))
+        # Per-video saved config wins over the dropdown selection when
+        # present. Authored from the library Edit-Config modal; lives at
+        # workspace/configs/<stem>.yaml. Unless the request explicitly
+        # asks for a different base ("use_video_config": False), we
+        # prefer the saved file so a user who edited a config doesn't
+        # have to remember to re-pick it on every run.
+        use_video_cfg = bool(payload.get("use_video_config", True))
+        config_path: Path | None = None
+        if video_path is not None and use_video_cfg:
+            vc = workspace.config_for(video_path)
+            if vc.exists():
+                config_path = vc
+        if config_path is None:
+            config_path = CONFIGS_DIR / _safe_filename(str(config_name))
         if not config_path.exists():
             raise HTTPException(404, f"config not found: {config_name}")
 
@@ -384,3 +399,100 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
             stages = _read_pipeline_stages(p) or default_stages
             out.append({"name": p.name, "path": str(p), "stages": stages})
         return JSONResponse(out)
+
+    @app.get("/api/library/configs/{name}/raw")
+    def get_config_raw(name: str) -> JSONResponse:
+        """Return the raw YAML text of a base config under ./configs.
+
+        Used by the library Edit-Config modal to seed the textarea from
+        whichever base config the user picked. ``name`` is matched
+        against the file name (not the path) and sanitised against path
+        traversal.
+        """
+        safe = _safe_filename(name)
+        path = CONFIGS_DIR / safe
+        if not path.exists():
+            raise HTTPException(404, f"config not found: {name}")
+        try:
+            text = path.read_text()
+        except OSError as exc:
+            raise HTTPException(500, f"failed to read {name}: {exc}") from exc
+        return JSONResponse({"name": safe, "path": str(path), "text": text})
+
+    @app.get("/api/library/videos/{name}/config")
+    def get_video_config(name: str) -> JSONResponse:
+        """Return the saved per-video config for *name* (or empty meta).
+
+        Response shape: ``{stem, exists, path, text}``. ``exists=False`` +
+        empty ``text`` means the user hasn't saved a custom config for
+        this video yet — the UI uses that to know whether to pre-fill
+        from a base config when opening the modal.
+        """
+        safe = _safe_filename(name)
+        video_path = workspace.videos_dir / safe
+        if not video_path.exists():
+            raise HTTPException(404, f"video not found: {name}")
+        cfg_path = workspace.config_for(video_path)
+        exists = cfg_path.exists()
+        text = cfg_path.read_text() if exists else ""
+        return JSONResponse({
+            "stem": video_path.stem,
+            "exists": exists,
+            "path": str(cfg_path),
+            "text": text,
+        })
+
+    @app.put("/api/library/videos/{name}/config")
+    async def save_video_config(name: str, request: Request) -> JSONResponse:
+        """Persist a per-video pipeline config under workspace/configs/.
+
+        Body: ``{text: "<yaml>"}``. We validate that the body is parseable
+        YAML and that the top-level is a mapping (so a typo can't write a
+        file that crashes the pipeline runner later). Empty text deletes
+        the saved config — the run will fall back to the chosen base
+        config.
+        """
+        safe = _safe_filename(name)
+        video_path = workspace.videos_dir / safe
+        if not video_path.exists():
+            raise HTTPException(404, f"video not found: {name}")
+
+        payload = await request.json()
+        text = payload.get("text")
+        if text is None:
+            raise HTTPException(400, "missing 'text' field")
+        text = str(text)
+
+        cfg_path = workspace.config_for(video_path)
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if text.strip() == "":
+            # Empty text = "clear the per-video override".
+            if cfg_path.exists():
+                cfg_path.unlink()
+            return JSONResponse({
+                "stem": video_path.stem,
+                "exists": False,
+                "path": str(cfg_path),
+                "text": "",
+            })
+
+        try:
+            import yaml  # local import keeps cold-start fast
+            data = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            raise HTTPException(400, f"invalid YAML: {exc}") from exc
+        if data is not None and not isinstance(data, dict):
+            raise HTTPException(
+                400,
+                "config root must be a mapping (a YAML object), "
+                f"got {type(data).__name__}",
+            )
+
+        cfg_path.write_text(text)
+        return JSONResponse({
+            "stem": video_path.stem,
+            "exists": True,
+            "path": str(cfg_path),
+            "text": text,
+        })

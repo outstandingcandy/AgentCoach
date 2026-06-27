@@ -88,6 +88,19 @@ class AnchorAnnotator:
         self.current_frame: np.ndarray | None = None
         self.H0: np.ndarray | None = None
         self.reprojection_error = 0.0
+        # World-coord camera position recovered by the most recent solve.
+        # ``None`` until Compute is clicked; cleared whenever ``H0`` is
+        # invalidated. Used by the tactical view to draw a green marker
+        # next to the configured prior, so the user can see how far the
+        # LM drifted from their camera_position guess.
+        self._solved_cam_position: tuple[float, float, float] | None = None
+        # Full pnp result stashed for renderers that need the real
+        # (K, dist, rvec, tvec) instead of just the H planar
+        # homography — ``draw_pitch_projection`` uses this to project
+        # the pitch lines through the lens distortion model so the
+        # overlay matches the image even on heavy-distortion lenses.
+        # ``None`` until Compute is clicked.
+        self._solved_camera: dict | None = None
         self.show_projection = True
         # Non-blocking warning surfaced via state_dict when the active
         # pitch config disagrees with saved annotations. None when
@@ -122,6 +135,8 @@ class AnchorAnnotator:
         self.auto_accepted = []
         self.H0 = None
         self.reprojection_error = 0.0
+        self._solved_cam_position = None
+        self._solved_camera = None
         self.selected_manual_idx = None
         self.selected_line_idx = None
 
@@ -250,6 +265,8 @@ class AnchorAnnotator:
             # without a manual "Compute homography" click.
             self.H0 = None
             self.reprojection_error = 0.0
+            self._solved_cam_position = None
+            self._solved_camera = None
             if (len(self.keypoint_names) + len(self.derived_points)) >= MIN_POINTS_FOR_PNLCALIB:
                 self.compute_homography()
         elif self.H0 is not None:
@@ -261,7 +278,7 @@ class AnchorAnnotator:
         frame_rgb = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
         vis = visualize_annotations(self, frame_rgb)
         if self.H0 is not None:
-            vis = draw_pitch_projection(vis, self.H0)
+            vis = draw_pitch_projection(vis, self.H0, cam=self._solved_camera)
 
         # Persist all derived points plus their accepted flags so that
         # reload can restore the user's accept/reject decisions. (Auto
@@ -442,10 +459,14 @@ class AnchorAnnotator:
         import yaml
         from pathlib import Path as _Path
 
+        from ..utils.config_resolver import expand_pitch_type
+
         cp = _Path(config_path)
         if not cp.exists():
             return f"Config not found: {cp}"
         cfg = yaml.safe_load(cp.read_text()) or {}
+        # Honour ``pitch_type: <name>`` alongside any inline ``pitch:`` block.
+        expand_pitch_type(cfg)
         fr = cfg.get("field_registration", {}) or {}
         backend = (fr.get("backend") or "pnlcalib").lower()
 
@@ -458,7 +479,11 @@ class AnchorAnnotator:
             except (TypeError, ValueError) as exc:
                 return f"Bad pitch block in {cp.name}: {exc}"
 
-        if backend == "physical":
+        # ``fixed_camera`` is a pipeline-side backend that re-uses the same
+        # one-shot physical solve the annotator performs — so for the
+        # annotator's purposes it IS the physical path. Honour both names
+        # so the per-video yaml can use whichever the pipeline expects.
+        if backend in ("physical", "fixed_camera"):
             phys = fr.get("physical") or {}
             profile_path = phys.get("camera_profiles_path") or \
                 "configs/camera_profiles.yaml"
@@ -481,6 +506,8 @@ class AnchorAnnotator:
         # Invalidate H0 and re-derive against the new pitch / solver.
         self.H0 = None
         self.reprojection_error = 0.0
+        self._solved_cam_position = None
+        self._solved_camera = None
         self.auto_projected_points = []
         self.auto_accepted = []
         return (
@@ -669,6 +696,8 @@ class AnchorAnnotator:
             return
         self.H0 = None
         self.reprojection_error = 0.0
+        self._solved_cam_position = None
+        self._solved_camera = None
         self.auto_projected_points = []
         self.auto_accepted = []
 
@@ -736,7 +765,8 @@ class AnchorAnnotator:
         if with_overlay:
             vis = visualize_annotations(self, frame_rgb)
             if self.H0 is not None and self.show_projection:
-                vis = draw_pitch_projection(vis, self.H0)
+                vis = draw_pitch_projection(vis, self.H0,
+                                             cam=self._solved_camera)
         else:
             vis = frame_rgb
         return encode_jpeg(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))

@@ -105,6 +105,9 @@ class FieldRegistrationStage(Stage):
         elif backend == "physical":
             from ..field_registration.physical_runner import run_stage1_physical
             return run_stage1_physical(ctx.video_path, out, vis_dir, config, process_fps)
+        elif backend == "fixed_camera":
+            from ..field_registration.fixed_camera_runner import run_stage1_fixed_camera
+            return run_stage1_fixed_camera(ctx.video_path, out, vis_dir, config, process_fps)
         elif backend == "homography":
             from ..field_registration.homography_runner import run_stage1_homography
             return run_stage1_homography(ctx.video_path, out, vis_dir, config, process_fps)

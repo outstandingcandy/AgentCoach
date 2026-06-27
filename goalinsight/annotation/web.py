@@ -1,9 +1,9 @@
 """FastAPI backend for the pitch annotator UI.
 
-The frontend is a single static HTML page served from
-goalinsight/annotation/static/, and all interaction goes through JSON
-endpoints under ``{prefix}/...`` (default ``/api``) plus a few image
-endpoints that return JPEGs.
+All interaction goes through JSON endpoints under ``{prefix}/...``
+(workspace app mounts this at ``/api/annotate``) plus a few image
+endpoints that return JPEGs. The frontend that drives these routes is
+``goalinsight/web/static/annotate.html``.
 
 Public API: ``register_annotation_routes(app, annotator, *, prefix)``
 mounts the routes onto an existing FastAPI app — the unified workspace
@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import JSONResponse, Response
 
 from . import per_video_settings, pitch_constants
 from .pitch import keypoints as _pk
@@ -27,8 +27,6 @@ from .pitch.keypoints import (
 from .pitch_constants import get_all_line_names
 from .pitch_diagram import get_line_color
 from .ui import AnchorAnnotator
-
-STATIC_DIR = Path(__file__).parent / "static"
 
 VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi")
 
@@ -65,6 +63,7 @@ def register_annotation_routes(
     annotator: AnchorAnnotator,
     videos_root: Path,
     *,
+    configs_root: Path | None = None,
     prefix: str = "/api",
 ) -> None:
     """Mount annotator JSON + JPEG endpoints onto an existing FastAPI app.
@@ -73,26 +72,71 @@ def register_annotation_routes(
     for opening the initial video. *prefix* lets the unified app expose the
     annotator under ``/api/annotate/...`` to avoid colliding with the
     viewer's ``/api/*`` namespace.
+
+    *configs_root* is the workspace's per-video config directory
+    (``workspace/configs/``). When opening a video we look for
+    ``<configs_root>/<stem>.yaml`` and, if present, apply it the same
+    way the now-gone "Config" dropdown used to — backend selection,
+    physical params, pitch, etc. The library page is the canonical
+    place to author / edit these.
     """
     index = annotator.index
     videos_root_path = Path(videos_root)
+    configs_root_path = Path(configs_root) if configs_root else None
     p = prefix.rstrip("/")
 
-    # Auto-apply per-video pitch on every video open. Must run BEFORE
-    # _check_pitch_consistency in the annotator so the active pitch matches
-    # the saved coords. We wrap open_video at registration time; switch_video
-    # delegates to it, so one hook covers both.
+    def _apply_per_video_config(stem: str) -> bool:
+        """Re-read ``workspace/configs/<stem>.yaml`` and apply it.
+
+        Called from both the open-video hook and the compute endpoint so
+        edits the user makes to the per-video yaml (camera_position,
+        focal_hfov, pitch, etc.) take effect on the very next Compute
+        click — without forcing them to switch videos to refresh.
+
+        Returns True when a config was found and applied. Failures are
+        surfaced via ``annotator._pending_pitch_mismatch`` (rendered as
+        the next state response's ``status``) rather than raised, so a
+        bad edit doesn't take the page down.
+        """
+        if configs_root_path is None:
+            return False
+        cfg_path = configs_root_path / f"{stem}.yaml"
+        if not cfg_path.exists():
+            return False
+        try:
+            annotator.set_solver_config(str(cfg_path))
+            return True
+        except (FileNotFoundError, ValueError) as exc:
+            annotator._pending_pitch_mismatch = (
+                f"per-video config {cfg_path.name} failed to load: {exc}"
+            )
+            return False
+
+    # Auto-apply per-video config + pitch on every video open. Must run
+    # BEFORE _check_pitch_consistency in the annotator so the active
+    # pitch matches the saved coords. We wrap open_video at registration
+    # time; switch_video delegates to it, so one hook covers both.
     _orig_open_video = annotator.open_video
 
     def _open_video_with_settings(video_path: str, start_frame: int = 0) -> int:
         stem = Path(video_path).stem
-        pitch = per_video_settings.load_pitch(annotator.annotations_dir, stem)
-        if pitch:
-            try:
-                pitch_constants.set_active_pitch(SoccerPitch(**pitch))
-            except TypeError:
-                # Unknown keys in overrides.yaml — fall through.
-                pass
+
+        # Per-video pipeline config (the file the library page edits)
+        # wins. When the user hasn't authored one, fall back to the
+        # legacy workspace/annotations/<stem>/overrides.yaml that older
+        # builds wrote via the now-gone pitch_type dropdown.
+        applied_from_config = _apply_per_video_config(stem)
+
+        if not applied_from_config:
+            pitch = per_video_settings.load_pitch(
+                annotator.annotations_dir, stem,
+            )
+            if pitch:
+                try:
+                    pitch_constants.set_active_pitch(SoccerPitch(**pitch))
+                except TypeError:
+                    pass
+
         return _orig_open_video(video_path, start_frame=start_frame)
 
     annotator.open_video = _open_video_with_settings  # type: ignore[assignment]
@@ -103,15 +147,23 @@ def register_annotation_routes(
 
     @app.get(f"{p}/keypoints")
     def keypoints() -> JSONResponse:
+        import math as _math
         out = []
         for idx, name in INTERSECTON_TO_PITCH_POINTS.items():
             pt = _pk.PITCH_POINTS.get(name)
             if pt is None:
                 continue
+            wx, wy = float(pt[0]), float(pt[1])
+            # Some tangent-from-corner keypoints don't exist for small
+            # pitches (e.g. futsal where corners sit inside the center
+            # circle) — SoccerPitch emits NaN; drop them so the JSON
+            # serializer doesn't 500.
+            if not (_math.isfinite(wx) and _math.isfinite(wy)):
+                continue
             out.append({
                 "hrnet_index": idx,
                 "name": name,
-                "world": [float(pt[0]), float(pt[1])],
+                "world": [wx, wy],
                 "is_ground": idx not in NOT_ON_PLANE,
             })
         return JSONResponse(out)
@@ -302,6 +354,15 @@ def register_annotation_routes(
 
     @app.get(f"{p}/tactical.jpg")
     def tactical_jpg() -> Response:
+        # NB: we used to re-read the per-video config here on every
+        # GET, but ``set_solver_config`` invalidates H0 + the solved
+        # cam position as a side effect — so any periodic poll of this
+        # endpoint silently wiped a fresh solve. The config is now
+        # re-read in two narrower spots: on /api/annotate/jump (page
+        # load / video switch) and on /api/annotate/compute (the user
+        # clicked the button). Between solves the tactical view shows
+        # the prior the user just saved, which is what they want when
+        # iterating on camera_position.
         data = annotator.render_tactical_jpeg()
         return Response(content=data, media_type="image/jpeg",
                         headers={"Cache-Control": "no-store"})
@@ -356,6 +417,11 @@ def register_annotation_routes(
         target_frame = int(frame_idx) if frame_idx is not None else 0
         try:
             if video_name == annotator.video_name:
+                # Same video → no open_video, so no auto-apply hook
+                # fires. Re-read the per-video config here so a user
+                # who edited workspace/configs/<stem>.yaml and reloaded
+                # the page still gets the latest pitch / backend.
+                _apply_per_video_config(video_name)
                 if not annotator.goto_frame(target_frame):
                     raise HTTPException(400, f"Invalid frame_idx: {target_frame}")
             else:
@@ -402,6 +468,13 @@ def register_annotation_routes(
 
     @app.post(f"{p}/compute")
     async def compute() -> JSONResponse:
+        # Re-read the per-video config on every Compute click so users
+        # who tweak camera_position / focal_hfov / pitch in their
+        # workspace/configs/<stem>.yaml see the result without having to
+        # re-open the video. Cheap (yaml parse + dict diff); the active
+        # pitch and solver backend stay in sync with disk.
+        if annotator.video_name:
+            _apply_per_video_config(annotator.video_name)
         return _ok(annotator.compute_homography())
 
     @app.post(f"{p}/save")
@@ -435,47 +508,6 @@ def register_annotation_routes(
     @app.post(f"{p}/auto/reject_all")
     async def auto_reject_all() -> JSONResponse:
         return _ok(annotator.reject_all_auto())
-
-    @app.get(f"{p}/configs")
-    async def list_configs() -> JSONResponse:
-        """List config yamls under ./configs that include a
-        ``field_registration`` block — these are the ones that make
-        sense to bind as the active solver/pitch source."""
-        from pathlib import Path as _P
-        import yaml as _yaml
-        out = []
-        for cp in sorted(_P("configs").glob("*.yaml")):
-            try:
-                doc = _yaml.safe_load(cp.read_text()) or {}
-            except (OSError, _yaml.YAMLError):
-                continue
-            fr = doc.get("field_registration") or {}
-            if not isinstance(fr, dict) or not fr.get("backend"):
-                # Skip non-pipeline configs (e.g. camera_profiles.yaml,
-                # standalone helper docs that don't drive a backend).
-                continue
-            backend = fr["backend"].lower()
-            pitch = doc.get("pitch") or {}
-            out.append({
-                "path": str(cp),
-                "name": cp.name,
-                "backend": backend,
-                "pitch_length": pitch.get("pitch_length"),
-                "pitch_width": pitch.get("pitch_width"),
-                "active": (
-                    cp.name == getattr(annotator, "_active_config_name", None)
-                ),
-            })
-        return JSONResponse(out)
-
-    @app.post(f"{p}/set_config")
-    async def set_config(request: Request) -> JSONResponse:
-        payload = await request.json()
-        cfg = payload.get("config_path") or payload.get("path")
-        if not cfg:
-            raise HTTPException(400, "config_path is required")
-        msg = annotator.set_solver_config(cfg)
-        return _ok(msg)
 
     @app.post(f"{p}/manual/select")
     async def manual_select(request: Request) -> JSONResponse:

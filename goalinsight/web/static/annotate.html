@@ -127,14 +127,6 @@
   <span class="badge" id="hdr-h0">no homography</span>
   <span class="badge" id="hdr-counts">0 pts</span>
   <label style="margin-left: auto; display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted);">
-    config:
-    <select id="cfg-select" style="background:#15171a; color:#cfe0ff;
-            border:1px solid #2a2c30; border-radius:4px; padding:2px 6px;
-            font-family:ui-monospace,monospace; font-size:11px;">
-      <option value="">(loading…)</option>
-    </select>
-  </label>
-  <label style="display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted);">
     <input type="checkbox" id="toggle-projection" checked /> Projection
   </label>
 </header>
@@ -316,7 +308,18 @@ function refreshTactical() {
 }
 
 function applyState(state) {
+  // Each video may carry its own per-video config (authored on the
+  // /library page) which the server auto-applies on open — when that
+  // happens the active pitch + line endpoints change under us, so
+  // refetch the keypoint/line metadata + reference images on every
+  // video switch.
+  const prevVideo = lastState ? lastState.video_name : null;
   lastState = state;
+  if (state.video_name && prevVideo && state.video_name !== prevVideo) {
+    reloadPitchGeometry().catch(err => {
+      console.error("pitch refresh on video switch failed", err);
+    });
+  }
   $("#hdr-video").textContent = state.video_name || "(no video)";
   $("#hdr-frame").textContent = `frame ${state.frame_idx} / ${state.total_frames - 1}`;
   $("#hdr-h0").textContent = state.homography_computed
@@ -430,30 +433,42 @@ function applyState(state) {
   refreshVideosAndFrames();
 }
 
-async function refreshConfigs() {
-  try {
-    const cfgs = await api("GET", "/api/annotate/configs");
-    const sel = $("#cfg-select");
-    const prev = sel.value;
-    sel.innerHTML = "";
-    if (!cfgs.length) {
-      sel.innerHTML = "<option value=''>(no configs)</option>";
-      return;
-    }
-    for (const c of cfgs) {
-      const opt = document.createElement("option");
-      opt.value = c.path;
-      const dim = c.pitch_length && c.pitch_width
-        ? ` (${c.pitch_length}×${c.pitch_width})` : "";
-      opt.textContent = `${c.name} [${c.backend}]${dim}`;
-      if (c.active) opt.selected = true;
-      sel.appendChild(opt);
-    }
-    // Preserve user choice across re-renders if no server-side active.
-    if (!sel.value && prev) sel.value = prev;
-  } catch (err) {
-    console.error("config refresh failed", err);
+// Pitch geometry depends on the active pitch type. Keypoint/line lists,
+// the pitch-layout hit-test, and the rendered reference images all need
+// to be rebuilt when the user picks a different pitch from the header
+// dropdown.
+async function reloadPitchGeometry() {
+  keypoints = await api("GET", "/api/annotate/keypoints");
+  lines = await api("GET", "/api/annotate/lines");
+  pitchLayout = await api("GET", "/api/annotate/pitch_layout");
+
+  const kpSel = $("#kp-select");
+  const prevKp = kpSel.value;
+  kpSel.innerHTML = "";
+  for (const kp of keypoints) {
+    const opt = document.createElement("option");
+    opt.value = kp.name;
+    const ground = kp.is_ground ? "" : " ⌃";
+    opt.textContent = `[${kp.hrnet_index}] ${kp.name}${ground}`;
+    kpSel.appendChild(opt);
   }
+  if (prevKp && keypoints.some(kp => kp.name === prevKp)) kpSel.value = prevKp;
+
+  const lineSel = $("#line-select");
+  const prevLine = lineSel.value;
+  lineSel.innerHTML = "";
+  for (const ln of lines) {
+    const opt = document.createElement("option");
+    opt.value = ln.name; opt.textContent = ln.name;
+    if (ln.color) {
+      opt.style.background = ln.color;
+      opt.style.color = "#000";
+    }
+    lineSel.appendChild(opt);
+  }
+  if (prevLine && lines.some(ln => ln.name === prevLine)) lineSel.value = prevLine;
+
+  refreshPitch();
 }
 
 async function refreshVideosAndFrames() {
@@ -623,42 +638,15 @@ function nearestLine(px, py) {
 async function init() {
   info = await api("GET", "/api/annotate/info");
 
-  keypoints = await api("GET", "/api/annotate/keypoints");
-  lines = await api("GET", "/api/annotate/lines");
-  pitchLayout = await api("GET", "/api/annotate/pitch_layout");
-
-  // Config selector — populated from /api/annotate/configs.
-  await refreshConfigs();
-  $("#cfg-select").addEventListener("change", async (e) => {
-    const path = e.target.value;
-    if (!path) return;
-    const state = await api("POST", "/api/annotate/set_config",
-                            { config_path: path });
-    applyState(state);
-    refreshFrame();
-    await refreshConfigs();
-  });
+  // Pitch geometry is driven by the per-video config the library page
+  // saves under workspace/configs/<stem>.yaml; the server auto-applies
+  // it on every video open. We just refetch keypoints/lines/layout
+  // here and again on each video switch (see applyState below).
+  await reloadPitchGeometry();
 
   const kpSel = $("#kp-select");
-  for (const kp of keypoints) {
-    const opt = document.createElement("option");
-    opt.value = kp.name;
-    const ground = kp.is_ground ? "" : " ⌃";
-    opt.textContent = `[${kp.hrnet_index}] ${kp.name}${ground}`;
-    kpSel.appendChild(opt);
-  }
   kpSel.addEventListener("change", () => refreshPitch({ highlight_keypoint: kpSel.value }));
-
   const lineSel = $("#line-select");
-  for (const ln of lines) {
-    const opt = document.createElement("option");
-    opt.value = ln.name; opt.textContent = ln.name;
-    if (ln.color) {
-      opt.style.background = ln.color;
-      opt.style.color = "#000";
-    }
-    lineSel.appendChild(opt);
-  }
   lineSel.addEventListener("change", () => refreshPitch({ highlight_line: lineSel.value }));
 
   // Click on the keypoints reference image → pick nearest keypoint into
@@ -917,6 +905,17 @@ async function init() {
     else if (e.key === "h") $("#btn-compute").click();
     else if (e.key === "s" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("#btn-save").click(); }
   });
+
+  // If the page was deep-linked with ?video=<name>, jump to that video
+  // before pulling state so the per-video config + pitch get applied
+  // by the server-side open hook. The library page links here with the
+  // raw filename (e.g. ``0626_1_part_000.mov``); /api/annotate/jump
+  // keys by stem, so strip the extension.
+  const qVideo = new URLSearchParams(window.location.search).get("video");
+  if (qVideo) {
+    const stem = qVideo.replace(/\.(mp4|mov|mkv|avi)$/i, "");
+    await jumpTo(stem, 0);
+  }
 
   // Initial state
   const state = await api("GET", "/api/annotate/state");

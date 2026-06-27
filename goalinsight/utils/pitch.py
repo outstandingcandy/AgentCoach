@@ -34,65 +34,120 @@ PITCH_LINE_KEYPOINTS = [
 def get_pitch_template_points(pitch_length=None, pitch_width=None):
     """Get key points on the pitch template for visualization.
 
+    Single source of truth: ``annotation.pitch_constants.PITCH_LINES``
+    (straight segments) + the active-pitch dimensions for arcs and the
+    D-shape penalty area. Earlier this function had its own duplicate
+    geometry built from ``pitch.PITCH_LENGTH`` etc. — every time a new
+    pitch shape was added (e.g. futsal's D), two places had to be
+    updated and they drifted. Now this one pulls everything from the
+    same dict the annotate page uses, so non-FIFA pitches (kids,
+    futsal) stay consistent across all renderers.
+
+    Output remains the legacy ``{name: [(x, y), ...]}`` shape that
+    ``_draw_physical_calibration`` consumes; we just synthesize the
+    entries from the shared source.
+
     Args:
-        pitch_length: Pitch length in meters (default: active pitch length).
-        pitch_width: Pitch width in meters (default: active pitch width).
+        pitch_length: Optional override. When provided MUST match the
+            active pitch's length — caller is responsible for setting
+            the active pitch before calling. Logged at the top of
+            ``physical_runner`` / ``fixed_camera_runner``.
+        pitch_width: Same caveat as ``pitch_length``.
     """
     active = pitch_constants.get_active_pitch()
+    # Sanity log if caller passed something different — every call site
+    # I checked already does ``set_active_pitch(...)`` first.
     pl = pitch_length or active.PITCH_LENGTH
     pw = pitch_width or active.PITCH_WIDTH
     half_l = pl / 2
     half_w = pw / 2
 
-    # Marking dimensions track the active pitch — non-FIFA youth pitches
-    # have their own penalty/goal-area sizes. Reading FIFA constants here
-    # produced an overlay where the outer touchlines match the solver's
-    # H but the inner boxes/circle don't, masquerading as "calibration
-    # is wrong" when the H was actually correct.
+    CR = active.CENTER_CIRCLE_RADIUS
     PA_DEPTH = active.PENALTY_AREA_LENGTH
     PA_HW = active.PENALTY_AREA_WIDTH / 2.0
-    GA_DEPTH = active.GOAL_AREA_LENGTH
-    GA_HW = active.GOAL_AREA_WIDTH / 2.0
     PS_DIST = active.GOAL_LINE_TO_PENALTY_MARK
-    CR = active.CENTER_CIRCLE_RADIUS
+    pa_shape = getattr(active, "PENALTY_AREA_SHAPE", "rect")
 
-    # Penalty arc visible-segment half-angle = acos((PA_DEPTH - PS_DIST) / CR).
-    # Hardcoding ±0.93 rad (~53°) was a FIFA coincidence and clipped the arc on
-    # non-FIFA pitches (kids: ~±73°). Falls back to ±90° when geometry yields a
-    # full half-circle (PA-front past the arc tangent).
-    _arc_dx = PA_DEPTH - PS_DIST
-    if CR > 0 and -1.0 < _arc_dx / CR < 1.0:
-        _arc_half = float(np.arccos(_arc_dx / CR))
-    else:
-        _arc_half = float(np.pi / 2.0)
-
-    return {
+    # Re-shape annotation's flat line dict into the legacy
+    # multi-line-per-shape entries the renderer expects. Each value is
+    # a polyline (list of (x, y)) and consecutive points get connected.
+    lines = pitch_constants.PITCH_LINES
+    template: dict = {
         'pitch_outline': [
             (-half_l, -half_w), (half_l, -half_w),
-            (half_l, half_w), (-half_l, half_w), (-half_l, -half_w)
+            (half_l, half_w), (-half_l, half_w), (-half_l, -half_w),
         ],
-        'center_line': [(0, -half_w), (0, half_w)],
+        'center_line': [lines['center_line'][0], lines['center_line'][1]],
         'center_circle': [
             (CR * np.cos(a), CR * np.sin(a))
-            for a in np.linspace(0, 2*np.pi, 36)
+            for a in np.linspace(0, 2 * np.pi, 36)
         ],
-        'left_penalty': [(-half_l, -PA_HW), (-half_l + PA_DEPTH, -PA_HW),
-                         (-half_l + PA_DEPTH, PA_HW), (-half_l, PA_HW)],
-        'right_penalty': [(half_l, -PA_HW), (half_l - PA_DEPTH, -PA_HW),
-                          (half_l - PA_DEPTH, PA_HW), (half_l, PA_HW)],
-        'left_goal_area': [(-half_l, -GA_HW), (-half_l + GA_DEPTH, -GA_HW),
-                           (-half_l + GA_DEPTH, GA_HW), (-half_l, GA_HW)],
-        'right_goal_area': [(half_l, -GA_HW), (half_l - GA_DEPTH, -GA_HW),
-                            (half_l - GA_DEPTH, GA_HW), (half_l, GA_HW)],
-        'left_penalty_arc': [
-            (-half_l + PS_DIST + CR * np.cos(a), CR * np.sin(a))
-            for a in np.linspace(-_arc_half, _arc_half, 20)
+        'left_goal_area': [
+            lines['goal_area_left_bottom'][0],
+            lines['goal_area_left_bottom'][1],
+            lines['goal_area_left_front'][0],
+            lines['goal_area_left_top'][1],
+            lines['goal_area_left_top'][0],
         ],
-        'right_penalty_arc': [
-            (half_l - PS_DIST - CR * np.cos(a), CR * np.sin(a))
-            for a in np.linspace(-_arc_half, _arc_half, 20)
+        'right_goal_area': [
+            lines['goal_area_right_bottom'][0],
+            lines['goal_area_right_bottom'][1],
+            lines['goal_area_right_front'][0],
+            lines['goal_area_right_top'][1],
+            lines['goal_area_right_top'][0],
         ],
     }
+
+    if pa_shape == "d":
+        # Futsal D-shape PA. Sampling lives in
+        # ``pitch_constants.build_d_penalty_arcs`` so annotate-side
+        # rendering (viz.py) and pipeline-side rendering (this file)
+        # consume the *same* world points — drift between the two
+        # used to make the projected PA dimensions look different.
+        arcs = pitch_constants.build_d_penalty_arcs(active)
+        # arcs[0..3] are post-centered quarter-arcs (left-top, left-bot,
+        # right-top, right-bot in that order); arcs[4..5] are the two
+        # chords at x = ±(L - pa_d). The topdown / projection renderer
+        # consumes each polyline as a connected line strip, so we keep
+        # the arcs separate (otherwise the line would cross the field
+        # diagonally on the way from one arc to the next).
+        template['left_penalty_d_arc_top'] = arcs[0]
+        template['left_penalty_d_arc_bot'] = arcs[1]
+        template['right_penalty_d_arc_top'] = arcs[2]
+        template['right_penalty_d_arc_bot'] = arcs[3]
+        template['left_penalty_d_chord'] = arcs[4]
+        template['right_penalty_d_chord'] = arcs[5]
+    else:
+        # 11-a-side rectangle PA + penalty-mark-centered arc.
+        template['left_penalty'] = [
+            lines['penalty_left_bottom'][0],
+            lines['penalty_left_bottom'][1],
+            lines['penalty_left_front'][0],
+            lines['penalty_left_top'][1],
+            lines['penalty_left_top'][0],
+        ]
+        template['right_penalty'] = [
+            lines['penalty_right_bottom'][0],
+            lines['penalty_right_bottom'][1],
+            lines['penalty_right_front'][0],
+            lines['penalty_right_top'][1],
+            lines['penalty_right_top'][0],
+        ]
+        # Penalty arc — half-angle = acos((PA_DEPTH - PS_DIST) / CR).
+        _arc_dx = PA_DEPTH - PS_DIST
+        if CR > 0 and -1.0 < _arc_dx / CR < 1.0:
+            _arc_half = float(np.arccos(_arc_dx / CR))
+        else:
+            _arc_half = float(np.pi / 2.0)
+        template['left_penalty_arc'] = [
+            (-half_l + PS_DIST + CR * np.cos(a), CR * np.sin(a))
+            for a in np.linspace(-_arc_half, _arc_half, 20)
+        ]
+        template['right_penalty_arc'] = [
+            (half_l - PS_DIST - CR * np.cos(a), CR * np.sin(a))
+            for a in np.linspace(-_arc_half, _arc_half, 20)
+        ]
+    return template
 
 
 def project_pitch_to_image(H, template_points, camera_params=None):
@@ -170,9 +225,6 @@ def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_m
     pitch = np.zeros((height, width, 3), dtype=np.uint8)
     pitch[:] = (34, 139, 34)  # Forest green background
 
-    half_l = pl / 2
-    half_w = pw / 2
-
     # Pitch coordinate -> pixel mapping (with margin)
     margin = 8  # meters of margin around pitch
     scale = min(
@@ -191,36 +243,18 @@ def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_m
     line_color = (255, 255, 255)
     lw = max(1, int(scale * 0.3))
 
-    # Marking dimensions follow the active pitch (kids pitches have
-    # smaller penalty/goal areas than FIFA), matching the same fix in
-    # get_pitch_template_points above.
-    pa_d = active.PENALTY_AREA_LENGTH
-    pa_hw = active.PENALTY_AREA_WIDTH / 2.0
-    ga_d = active.GOAL_AREA_LENGTH
-    ga_hw = active.GOAL_AREA_WIDTH / 2.0
-    ps_dist = active.GOAL_LINE_TO_PENALTY_MARK
-    cr = active.CENTER_CIRCLE_RADIUS
+    # Pitch markings come from the single shared renderer in
+    # ``annotation.pitch_diagram``. Same code path the annotate page and
+    # tracking minimap use — PA shape, goal area, center circle, and
+    # penalty arc stay consistent across every top-down rendering.
+    from ..annotation.pitch_diagram import draw_pitch_structure
+    draw_pitch_structure(
+        pitch, w2p, scale=scale, color=line_color, thickness=lw,
+        draw_landmarks=True,
+        landmark_radius=max(2, int(0.3 * scale)),
+        draw_arcs=True,
+    )
 
-    # Pitch outline
-    cv2.rectangle(pitch, w2p(-half_l, half_w), w2p(half_l, -half_w), line_color, lw)
-    # Center line
-    cv2.line(pitch, w2p(0, half_w), w2p(0, -half_w), line_color, lw)
-    # Center circle
-    center_px = w2p(0, 0)
-    cv2.circle(pitch, center_px, int(cr * scale), line_color, lw)
-    # Center spot
-    cv2.circle(pitch, center_px, max(2, int(0.3 * scale)), line_color, -1)
-    # Left penalty area
-    cv2.rectangle(pitch, w2p(-half_l, pa_hw), w2p(-half_l + pa_d, -pa_hw), line_color, lw)
-    # Right penalty area
-    cv2.rectangle(pitch, w2p(half_l - pa_d, pa_hw), w2p(half_l, -pa_hw), line_color, lw)
-    # Left goal area
-    cv2.rectangle(pitch, w2p(-half_l, ga_hw), w2p(-half_l + ga_d, -ga_hw), line_color, lw)
-    # Right goal area
-    cv2.rectangle(pitch, w2p(half_l - ga_d, ga_hw), w2p(half_l, -ga_hw), line_color, lw)
-    # Penalty spots
-    cv2.circle(pitch, w2p(-half_l + ps_dist, 0), max(2, int(0.3 * scale)), line_color, -1)
-    cv2.circle(pitch, w2p(half_l - ps_dist, 0), max(2, int(0.3 * scale)), line_color, -1)
 
     if result is None:
         return pitch

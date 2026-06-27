@@ -92,6 +92,76 @@ def _draw_lines_pixel(
 # Tactical (world-coord) view
 # ---------------------------------------------------------------------------
 
+def _draw_cam_marker(
+    img: np.ndarray,
+    to_px,
+    cam_pos: tuple,
+    color: tuple[int, int, int],
+    label_prefix: str,
+    center_px: tuple[int, int],
+    legend_slot: int = 0,
+) -> None:
+    """Draw a single camera marker on the tactical canvas.
+
+    Plots a filled triangle (pointing toward the pitch centre) + a small
+    crosshair dot at ``cam_pos`` (clipped to the canvas if it's outside)
+    and writes ``"<prefix> (x, y, z)"`` into a fixed top-right legend
+    column. ``legend_slot`` stacks subsequent labels (0 = top row).
+
+    Coordinates of ``cam_pos`` are world-meters in the y-up frame; the
+    z component is shown in the label but not used to position the
+    marker. ``color`` is BGR.
+    """
+    cx, cy = float(cam_pos[0]), float(cam_pos[1])
+    cz = float(cam_pos[2]) if len(cam_pos) >= 3 else None
+
+    h, w = img.shape[:2]
+    tx, ty = to_px(cx, cy)
+    clipped = tx < 0 or tx >= w or ty < 0 or ty >= h
+    tx_c = max(8, min(w - 8, tx))
+    ty_c = max(8, min(h - 8, ty))
+
+    cx_px, cy_px = center_px
+    vx, vy = cx_px - tx_c, cy_px - ty_c
+    vlen = max((vx * vx + vy * vy) ** 0.5, 1e-6)
+    ux, uy = vx / vlen, vy / vlen
+    perp_x, perp_y = -uy, ux
+
+    tip = (int(tx_c + ux * 14), int(ty_c + uy * 14))
+    base_l = (int(tx_c - ux * 4 + perp_x * 8),
+              int(ty_c - uy * 4 + perp_y * 8))
+    base_r = (int(tx_c - ux * 4 - perp_x * 8),
+              int(ty_c - uy * 4 - perp_y * 8))
+    tri = np.array([tip, base_l, base_r], dtype=np.int32)
+    cv2.fillPoly(img, [tri], color)
+    cv2.polylines(img, [tri], True, (0, 0, 0), 1)
+    cv2.circle(img, (tx_c, ty_c), 3, (0, 0, 0), -1)
+    cv2.circle(img, (tx_c, ty_c), 2, color, -1)
+
+    # Fixed legend column in the top-right: each marker gets its own row,
+    # so prior + solved can both be read at a glance even when the
+    # triangles overlap or are clipped to the same edge.
+    label = (
+        f"{label_prefix} ({cx:.1f}, {cy:.1f}, {cz:.1f})"
+        if cz is not None
+        else f"{label_prefix} ({cx:.1f}, {cy:.1f})"
+    )
+    if clipped:
+        label += " ↓"
+    font_scale = 0.42
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+    row_h = th + 8
+    lx = w - tw - 12
+    ly = 18 + legend_slot * row_h
+    # Color chip + label background.
+    cv2.rectangle(img, (lx - 18, ly - th - 3), (lx + tw + 3, ly + 4),
+                  (0, 0, 0), -1)
+    cv2.rectangle(img, (lx - 14, ly - th + 1), (lx - 6, ly - 1),
+                  color, -1)
+    cv2.putText(img, label, (lx, ly),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1)
+
+
 def render_tactical_view(state: "AnchorAnnotator") -> np.ndarray:
     """Render a tactical-style view of all annotations (y-up world)."""
     scale = 7  # match create_pitch_diagram / create_lines_diagram for visual parity
@@ -133,6 +203,38 @@ def render_tactical_view(state: "AnchorAnnotator") -> np.ndarray:
         fill = -1 if accepted else 1
         cv2.circle(img, (tx, ty), 5, color, fill)
         cv2.circle(img, (tx, ty), 5, (255, 255, 255), 1)
+
+    # Camera markers — yellow triangle = configured prior from the
+    # per-video yaml; green triangle = position the solver actually
+    # converged to (only present after Compute). Comparing the two is
+    # the fastest way to see whether the LM honoured your prior or
+    # drifted away (e.g. low position_weight + wide bounds = drift).
+    h_img, w_img = img.shape[:2]
+    cx_px, cy_px = to_px(0.0, 0.0)
+    label_offset_y = 0  # tracks already-placed labels so they don't overlap
+
+    cam_pos_prior = None
+    phys_cfg = getattr(state, "_physical_cfg", None)
+    if isinstance(phys_cfg, dict):
+        cam_pos_prior = phys_cfg.get("camera_position")
+    solved = getattr(state, "_solved_cam_position", None)
+
+    # Both markers go to the legend column at the bottom-right so they
+    # don't fight with the prior-marker label and so users can read both
+    # values even when prior and solved end up close to each other (or
+    # both clipped to the same canvas edge).
+    if cam_pos_prior and len(cam_pos_prior) >= 2:
+        _draw_cam_marker(
+            img, to_px, cam_pos_prior, (0, 220, 220),
+            label_prefix="prior", center_px=(cx_px, cy_px),
+            legend_slot=0,
+        )
+    if solved is not None and len(solved) >= 2:
+        _draw_cam_marker(
+            img, to_px, solved, (0, 255, 80),
+            label_prefix="solved", center_px=(cx_px, cy_px),
+            legend_slot=1,
+        )
 
     total = len(state.keypoint_names) + len(state.derived_points)
     status = (
@@ -210,6 +312,54 @@ def visualize_annotations(state: "AnchorAnnotator", frame_rgb: np.ndarray) -> np
         cv2.putText(vis, label, (int(px) + 15, int(py) + 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
+    # Per-keypoint reprojection markers — shown only when a solve is on
+    # file. For each manual annotation we run its world coord through
+    # the same (K, dist, rvec, tvec) the PnP solver landed on, then
+    # draw a small open circle at the projected pixel + a thin line to
+    # the user's click. The visible gap between the two is the
+    # per-point reprojection residual at solve time. Drawn LAST so the
+    # markers sit on top of the green manual circles — otherwise a
+    # near-zero residual would hide the cyan ring inside the green
+    # blob and the user couldn't tell the solver fit each point.
+    # Crossbar keypoints carry the legacy z = -GOAL_HEIGHT convention
+    # from geometry.py; we mirror that here so the marker lands on the
+    # same physical post-top the solver fit.
+    cam = getattr(state, "_solved_camera", None)
+    if cam is not None:
+        from .pitch import keypoints as _pk
+        K = np.asarray(cam["K"], dtype=np.float64)
+        dist = np.asarray(cam["dist"], dtype=np.float64).ravel()
+        rvec = np.asarray(cam["rvec"], dtype=np.float64).reshape(3, 1)
+        tvec = np.asarray(cam["tvec"], dtype=np.float64).reshape(3, 1)
+        for i, (px, py) in enumerate(state.clicked_points):
+            if i >= len(state.keypoint_names):
+                continue
+            name = state.keypoint_names[i]
+            pt_3d = _pk.PITCH_POINTS.get(name)
+            if pt_3d is None:
+                continue
+            wx, wy = float(pt_3d[0]), float(pt_3d[1])
+            # Flip z sign — see collect_pnp_points for the rationale.
+            wz = -float(pt_3d[2]) if len(pt_3d) >= 3 else 0.0
+            world = np.array([[wx, wy, wz]], dtype=np.float64)
+            try:
+                proj, _ = cv2.projectPoints(world, rvec, tvec, K, dist)
+            except cv2.error:
+                continue
+            qx, qy = proj.reshape(2)
+            if not (np.isfinite(qx) and np.isfinite(qy)):
+                continue
+            # Black outline first (so the cyan reads against bright
+            # green / yellow / grass), then the cyan ring, then a thin
+            # white connector to the click position. The connector
+            # length IS the per-point residual; users can eyeball
+            # which annotation the solver disagreed with most.
+            qi = (int(qx), int(qy))
+            cv2.line(vis, (int(px), int(py)), qi, (255, 255, 255), 1)
+            cv2.circle(vis, qi, 7, (0, 0, 0), 3)         # black halo
+            cv2.circle(vis, qi, 7, (0, 255, 255), 2)     # cyan ring (RGB)
+            cv2.circle(vis, qi, 1, (0, 255, 255), -1)    # tiny dot at exact pixel
+
     confirmed = len(state.keypoint_names)
     derived = len(state.derived_points)
     total_pts = confirmed + derived
@@ -224,9 +374,24 @@ def visualize_annotations(state: "AnchorAnnotator", frame_rgb: np.ndarray) -> np
     return vis
 
 
-def draw_pitch_projection(frame_rgb: np.ndarray, H: np.ndarray) -> np.ndarray:
+def draw_pitch_projection(
+    frame_rgb: np.ndarray,
+    H: np.ndarray,
+    cam: dict | None = None,
+) -> np.ndarray:
+    """Overlay the yellow pitch lines onto a frame.
+
+    When *cam* (``{K, dist, rvec, tvec}`` from the most recent PnP solve)
+    is provided, projection runs through ``cv2.projectPoints`` with the
+    full distortion model — this matches what the camera actually
+    captured on heavy-distortion lenses (k1 > 0.3-ish). Falls back to
+    the planar H path (image↔world homography, pinhole-only) when
+    ``cam`` is None, so callers without a stashed solve still work.
+    """
     frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-    result = render_pitch_projection(frame_bgr, H, color=(0, 255, 255), thickness=2)
+    result = render_pitch_projection(
+        frame_bgr, H, color=(0, 255, 255), thickness=2, cam=cam,
+    )
     return cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
 
 

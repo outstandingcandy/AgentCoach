@@ -1,53 +1,34 @@
-# Configuration for clip_000 using fine-tuned PnLCalib model
-# Fine-tuned on clip_000 annotations: Recall 43.8% -> 84.4%, error 40px -> 2px
+# clip_000_finetuned.yaml
+# Comments / rationale live in docs/config_notes.md (#clip_000_finetuned.yaml).
 
-# Video Processing
 video:
-  process_fps: 10          # Process 10 fps
-
-# Stage 1: Field Registration with fine-tuned model
+  process_fps: 10
 field_registration:
   backend: "pnlcalib"
-
   pnlcalib:
-    # Fine-tuned keypoint model (trained on clip_000 annotations)
     keypoint_model_path: "data/finetuned_models/run_20260319_135637/models/best_model.pt"
-    keypoint_weights: "SV_kp"          # Base weights (ignored when model_path is set)
-    keypoint_threshold: 0.25           # Lower threshold for fine-tuned model (higher recall)
-
-    # Line detection (using standard weights)
+    keypoint_weights: "SV_kp"
+    keypoint_threshold: 0.25
     line_weights: "SV_lines"
     line_threshold: 0.5
-
-    # Calibration method: "iterative_pnp" or "h_decompose"
     calibration_method: "iterative_pnp"
-
-    # PnL optimization
     pnl_refine: true
     line_weight: 1.0
-
-# Stage 2: Tracking
 detection:
   model: "yolov8x"
   confidence_threshold: 0.5
   iou_threshold: 0.45
   imgsz: 1280
-
 ball_detection:
   enabled: true
   confidence_threshold: 0.3
-
 tracking:
   algorithm: "strongsort"
   max_age: 50
-
 reid:
   backend: "osnet"
   model: "osnet_x1_0"
-
 team_classification:
   backend: "kmeans"
   position_weight: 0.1
-
-# Hardware
 device: "cuda"

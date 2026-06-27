@@ -181,7 +181,12 @@ class _BallBYTETracker(BYTETracker):
     """
 
     def __init__(self, args, frame_rate: int = 30, max_distance: float = 200.0):
-        super().__init__(args, frame_rate=frame_rate)
+        # Older ultralytics (<= 8.3) accepted ``frame_rate`` as a kwarg;
+        # newer releases (>= 8.4) only take ``args``. Probe at call time.
+        try:
+            super().__init__(args, frame_rate=frame_rate)
+        except TypeError:
+            super().__init__(args)
         self.max_distance = max_distance
 
     def get_dists(self, tracks: list[STrack], detections: list[STrack]) -> np.ndarray:
@@ -216,7 +221,12 @@ class _BallBOTSORTTracker(BOTSORT):
     """
 
     def __init__(self, args, frame_rate: int = 30, max_distance: float = 200.0):
-        super().__init__(args, frame_rate=frame_rate)
+        # Older ultralytics (<= 8.3) accepted ``frame_rate`` as a kwarg;
+        # newer releases (>= 8.4) only take ``args``. Probe at call time.
+        try:
+            super().__init__(args, frame_rate=frame_rate)
+        except TypeError:
+            super().__init__(args)
         self.max_distance = max_distance
 
     def get_dists(self, tracks: list[BOTrack], detections: list[BOTrack]) -> np.ndarray:

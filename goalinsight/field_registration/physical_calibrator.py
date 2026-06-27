@@ -117,12 +117,18 @@ class PhysicalCalibrator:
         pitch_length: float = 105.0,
         pitch_width: float = 68.0,
         pitch_dims: dict | None = None,
+        dist_coeffs: np.ndarray | list | tuple | None = None,
     ):
         """Initialize with image size and focal length guess.
 
         Args:
-            K: 3x3 intrinsic matrix (only f=K[0,0] is used as initial guess;
-               cx/cy are overridden to image center).
+            K: 3x3 intrinsic matrix. ``K[0, 0]`` is the initial focal
+               length guess (LM optimises within ``focal_bounds``); ``K[0, 2]``
+               / ``K[1, 2]`` are honoured as the principal point and ``K[1, 1]``
+               as fy (defaults to fx if zero). Earlier versions forced the
+               principal point to the image centre and fy = fx; that's a
+               bad assumption for cameras with off-centre sensors or
+               anamorphic crops — pass a real K from your camera profile.
             image_size: (width, height) of video frames.
             ransac_reproj_error: PnP RANSAC reprojection threshold in pixels.
             line_weight: Weight alpha for line residuals vs point residuals.
@@ -158,15 +164,37 @@ class PhysicalCalibrator:
                 present fall back to FIFA defaults. When given, overrides
                 ``pitch_length``/``pitch_width`` if those are in the dict.
                 Required for non-FIFA pitches (e.g. youth fields).
+            dist_coeffs: Brown-Conrady distortion coefficients ``[k1, k2,
+                p1, p2, k3]``. Used by every ``cv2.projectPoints`` /
+                ``cv2.solvePnP`` call inside the calibrator, so the
+                solver "sees through" the lens. Pass ``None`` (default)
+                or all-zeros for a pinhole-only model. Coefficients
+                short of 5 entries are right-padded with zeros.
         """
         self.width, self.height = image_size
-        # Fix principal point at image geometric center, zero distortion
+        # Honour the supplied K verbatim. Earlier the principal point
+        # was forced to (W/2, H/2) and fy = fx — that's only right for
+        # ideal sensors, and a Brown-Conrady fit (cv2.calibrateCamera)
+        # on real footage typically lands cx / cy offset 50-150 px and
+        # fy slightly different from fx. Pass a real profile K and the
+        # solver actually uses it.
+        fx = float(K[0, 0])
+        fy = float(K[1, 1]) if K[1, 1] else fx
+        cx = float(K[0, 2]) if K[0, 2] else self.width / 2.0
+        cy = float(K[1, 2]) if K[1, 2] else self.height / 2.0
         self.K = np.array([
-            [K[0, 0], 0, self.width / 2.0],
-            [0, K[0, 0], self.height / 2.0],
-            [0, 0, 1],
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
         ], dtype=np.float64)
-        self.dist_coeffs = np.zeros(5, dtype=np.float64)
+        # Distortion: take what the caller gave us, normalise to 5 entries.
+        if dist_coeffs is None:
+            self.dist_coeffs = np.zeros(5, dtype=np.float64)
+        else:
+            arr = np.asarray(dist_coeffs, dtype=np.float64).ravel()
+            padded = np.zeros(5, dtype=np.float64)
+            padded[: min(5, arr.size)] = arr[: min(5, arr.size)]
+            self.dist_coeffs = padded
         self.ransac_reproj_error = ransac_reproj_error
         self.line_weight = line_weight
         self.line_sample_points = line_sample_points
@@ -847,6 +875,25 @@ class PhysicalCalibrator:
         self.K[0, 0] = best_f
         self.K[1, 1] = best_f
 
+        # Refine the EPNP/SQPNP solution with LM under the full distortion
+        # model BEFORE handing it to the 7-DOF joint refinement. EPNP/SQPNP
+        # both assume pinhole and produce a noticeably off pose under heavy
+        # radial distortion (k1 > 1 lenses can leave 70+ px residual that
+        # the downstream 7-DOF LM can't undo because its loss is dominated
+        # by position-prior and line residuals, not point residuals).
+        # cv2.solvePnPRefineLM minimises pure point reprojection with the
+        # given dist, so it brings the initial pose to the true local min.
+        inlier_idx = inliers.ravel()
+        if inlier_idx.size >= 4:
+            try:
+                rvec, tvec = cv2.solvePnPRefineLM(
+                    world_pts[inlier_idx].reshape(-1, 1, 3),
+                    img_pts[inlier_idx].reshape(-1, 1, 2),
+                    K_best, dist, rvec, tvec,
+                )
+            except cv2.error as exc:
+                logger.debug("solvePnPRefineLM failed: %s", exc)
+
         # Compute per-point reprojection errors for RANSAC result
         projected = project_points_2d(world_pts, rvec, tvec, K_best, dist)
         per_point_errors = np.linalg.norm(projected - img_pts, axis=1)
@@ -1059,7 +1106,12 @@ class PhysicalCalibrator:
         f_init = self.K[0, 0]
         cx_fixed = self.K[0, 2]
         cy_fixed = self.K[1, 2]
-        dist_zero = np.zeros(5, dtype=np.float64)
+        # Use the calibrator-wide distortion. Earlier code locally zeroed
+        # dist inside the 7-DOF refinement; that silently undid any
+        # dist_coeffs the caller passed at construction time and made
+        # heavy-distortion lenses (k1 > 0.5) solve to a hopelessly off
+        # pose.
+        dist_zero = self.dist_coeffs
 
         # Defensive: clamp f_init into focal_bounds. The few-point P3P
         # path (``_solve_few_pts_p3p``) walks ``np.arange(f_min, f_max +
@@ -1380,7 +1432,12 @@ class PhysicalCalibrator:
         f_init = self.K[0, 0]
         cx_fixed = self.K[0, 2]
         cy_fixed = self.K[1, 2]
-        dist_zero = np.zeros(5, dtype=np.float64)
+        # Use the calibrator-wide distortion. Earlier code locally zeroed
+        # dist inside the 7-DOF refinement; that silently undid any
+        # dist_coeffs the caller passed at construction time and made
+        # heavy-distortion lenses (k1 > 0.5) solve to a hopelessly off
+        # pose.
+        dist_zero = self.dist_coeffs
 
         locked = self.lock_camera_position
         pos_target_arr = (
