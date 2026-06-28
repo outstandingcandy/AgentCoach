@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse
 
 from ..highlights._context import MatchContext
 from ..highlights._temporal import find_buildup_start, find_celebration_end
+from ._pitch import resolve_pitch_for_run
 from ._runs import RunHandle, RunRegistry
 from .match_tools import _frame_to_time
 
@@ -70,7 +71,7 @@ def register_match_detail_routes(app: FastAPI, runs: RunRegistry) -> None:
                     "missing_recommended": exc.missing_recommended,
                 },
             ) from exc
-        return JSONResponse(_build_payload(handle))
+        return JSONResponse(_build_payload(handle, runs.workspace))
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +79,7 @@ def register_match_detail_routes(app: FastAPI, runs: RunRegistry) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_payload(handle: RunHandle) -> dict[str, Any]:
+def _build_payload(handle: RunHandle, workspace: Any) -> dict[str, Any]:
     """Build the match-detail payload fresh on each request.
 
     Previously this was cached on the RunHandle, but that meant
@@ -106,7 +107,7 @@ def _build_payload(handle: RunHandle) -> dict[str, Any]:
         "height": ctx.height,
         "pitch_length": ctx.pitch_length,
         "pitch_width": ctx.pitch_width,
-        "pitch": _pitch_geometry(ctx),
+        "pitch": _pitch_geometry(ctx, handle.video_path, workspace),
         "tracks_url": (
             f"/runs_static/{handle.run_name}/track_consolidation/tracks.json"
         ),
@@ -121,31 +122,97 @@ def _build_payload(handle: RunHandle) -> dict[str, Any]:
     return payload
 
 
-def _pitch_geometry(ctx: MatchContext) -> dict[str, float]:
-    """Active pitch dimensions for drawing the top-down panel client-side.
+def _pitch_geometry(
+    ctx: MatchContext,
+    video_path: Any = None,
+    workspace: Any = None,
+) -> dict[str, Any]:
+    """Active pitch dimensions + 2D top-down polylines for the match panel.
 
-    Falls back to FIFA defaults scaled by the context's pitch dims when
-    the active SoccerPitch hasn't been overridden (e.g. workspace
-    booted without a ``--pitch-config`` flag).
+    Builds world-space polylines (from ``pitch_constants.PITCH_LINES`` +
+    ``build_d_penalty_arcs``) so the client just maps world (x, y) →
+    pixel and strokes line strips. Same source as the annotate page,
+    field-registration vis, and tracking minimap — single source of
+    truth across every top-down panel.
+
+    Pitch resolution reads ``workspace/configs/<video>.yaml`` directly
+    (see :func:`web._pitch.resolve_pitch_for_run`) so per-run pitch
+    survives the process-global active-pitch racing across runs.
     """
+    import math
     from ..annotation import pitch_constants
-    p = pitch_constants.get_active_pitch()
-    # Prefer the per-run dimensions stored in MatchContext (calibration
-    # metadata) over the process-global active pitch when they disagree;
-    # the active pitch is shared across runs but a ctx may legitimately
-    # describe a different size.
-    L = ctx.pitch_length or p.PITCH_LENGTH
-    W = ctx.pitch_width or p.PITCH_WIDTH
-    sx = L / p.PITCH_LENGTH if p.PITCH_LENGTH else 1.0
-    sy = W / p.PITCH_WIDTH if p.PITCH_WIDTH else 1.0
+
+    p = resolve_pitch_for_run(ctx, video_path, workspace)
+    L = p.PITCH_LENGTH
+    W = p.PITCH_WIDTH
+
+    pa_shape = getattr(p, "PENALTY_AREA_SHAPE", "rect")
+
+    # World-space polylines that paint the pitch. Each entry is a list
+    # of (x, y) world coords (metres, centre-origin, y-up). The client
+    # draws each as a connected line strip.
+    polylines: list[list[list[float]]] = []
+
+    # Rebuild PITCH_LINES against this run's pitch (don't trust the
+    # process-global state).
+    line_dict = pitch_constants._build_lines_for_pitch(p)
+    pa_rect_names = {
+        "penalty_left_top", "penalty_left_bottom", "penalty_left_front",
+        "penalty_right_top", "penalty_right_bottom", "penalty_right_front",
+    }
+    for name, ((wx1, wy1), (wx2, wy2)) in line_dict.items():
+        if pa_shape == "d" and name in pa_rect_names:
+            continue
+        polylines.append([[wx1, wy1], [wx2, wy2]])
+
+    # Centre circle.
+    ccr = p.CENTER_CIRCLE_RADIUS
+    n = 96
+    polylines.append([
+        [ccr * math.cos(2 * math.pi * i / n),
+         ccr * math.sin(2 * math.pi * i / n)]
+        for i in range(n + 1)
+    ])
+
+    if pa_shape == "d":
+        for poly in pitch_constants.build_d_penalty_arcs(p):
+            polylines.append([[x, y] for x, y in poly])
+    else:
+        # 11-a-side penalty arc.
+        pa_d = p.PENALTY_AREA_LENGTH
+        pen = p.GOAL_LINE_TO_PENALTY_MARK
+        dx = pa_d - pen
+        ratio = dx / ccr if ccr > 0 else 1.0
+        if -1.0 < ratio < 1.0:
+            half = math.acos(ratio)
+            for sign in (-1.0, 1.0):
+                cx = sign * (p.PITCH_LENGTH / 2 - pen)
+                if sign < 0:
+                    ts = [-half + (2 * half) * i / 39 for i in range(40)]
+                else:
+                    ts = [math.pi - half + (2 * half) * i / 39 for i in range(40)]
+                polylines.append([
+                    [cx + ccr * math.cos(t), ccr * math.sin(t)] for t in ts
+                ])
+
+    pen = p.GOAL_LINE_TO_PENALTY_MARK
+    landmarks = [
+        [0.0, 0.0],
+        [-p.PITCH_LENGTH / 2 + pen, 0.0],
+        [p.PITCH_LENGTH / 2 - pen, 0.0],
+    ]
+
     return {
         "length": L,
         "width": W,
-        "penalty_area_length": p.PENALTY_AREA_LENGTH * sx,
-        "penalty_area_width": p.PENALTY_AREA_WIDTH * sy,
-        "goal_area_length": p.GOAL_AREA_LENGTH * sx,
-        "goal_area_width": p.GOAL_AREA_WIDTH * sy,
-        "center_circle_radius": p.CENTER_CIRCLE_RADIUS * min(sx, sy),
+        "penalty_area_length": p.PENALTY_AREA_LENGTH,
+        "penalty_area_width": p.PENALTY_AREA_WIDTH,
+        "goal_area_length": p.GOAL_AREA_LENGTH,
+        "goal_area_width": p.GOAL_AREA_WIDTH,
+        "center_circle_radius": p.CENTER_CIRCLE_RADIUS,
+        "penalty_area_shape": pa_shape,
+        "polylines_2d": polylines,
+        "landmarks_2d": landmarks,
     }
 
 
@@ -245,14 +312,17 @@ def _abs_url(base: str, rel: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-# Image-edge sampling: 8 points per side gives a smooth polygon on the
-# ground without ballooning the payload. With ~200 keyed frames per
-# kids run that's 200 × 32 × 2 floats ≈ ~12 kB after gzip.
-_FOV_POINTS_PER_SIDE = 8
+# Image-edge sampling. Matches the 30 points/side that FR's topdown
+# vis uses (utils/pitch.py:_draw_topdown_pitch) so the match minimap
+# FOV polygon is bit-identical to the FR vis FOV. Payload is
+# (4 × 30 × 2) × 4 B ≈ ~1 kB per frame after gzip — affordable.
+_FOV_POINTS_PER_SIDE = 30
 # Drop ground hits more than this many metres outside the pitch — the
-# unprojection of points near the horizon line goes to enormous values
-# and would distort the auto-zoom on the top-down panel.
-_FOV_GROUND_CLAMP_M = 60.0
+# unprojection of points near the horizon line goes to enormous values.
+# Matches the ``max_range`` FR's ``utils/pitch._img_to_world`` uses
+# (default 80 m) so the match-page FOV polygon and the FR stage-1
+# topdown FOV polygon are bit-identical for the same pose.
+_FOV_GROUND_CLAMP_M = 80.0
 
 
 def _camera_fov_polygons(ctx: MatchContext) -> dict[str, Any]:
@@ -290,9 +360,49 @@ def _camera_fov_polygons(ctx: MatchContext) -> dict[str, Any]:
         poly = _project_image_boundary_to_ground(pose, boundary)
         if poly is None or len(poly) < 3:
             continue
-        out.append({"frame": frame, "polygon": poly})
+        entry: dict[str, Any] = {"frame": frame, "polygon": poly}
+        # Camera position (world coords) — annotate-page-style marker on
+        # the minimap. Computed from R, t so we don't depend on the
+        # pose dict carrying a ``camera_position`` sub-dict (some
+        # backends omit it).
+        cam_xyz = _camera_position_from_pose(pose)
+        if cam_xyz is not None:
+            entry["camera"] = [
+                round(cam_xyz[0], 3),
+                round(cam_xyz[1], 3),
+                round(cam_xyz[2], 3),
+            ]
+        out.append(entry)
     out.sort(key=lambda x: x["frame"])
     return {"frames": out}
+
+
+def _camera_position_from_pose(pose: dict[str, Any]) -> tuple[float, float, float] | None:
+    """Return world-coord (x, y, z) of the camera from a pose dict.
+
+    Prefers an explicit ``camera_position`` sub-dict when present (the
+    fixed-camera and physical backends both write one), falls back to
+    ``-R.T @ tvec`` otherwise.
+    """
+    explicit = pose.get("camera_position")
+    if isinstance(explicit, dict) and all(k in explicit for k in ("x", "y", "z")):
+        try:
+            return (float(explicit["x"]),
+                    float(explicit["y"]),
+                    float(explicit["z"]))
+        except (TypeError, ValueError):
+            pass
+
+    rvec = pose.get("rvec")
+    tvec = pose.get("tvec")
+    if rvec is None or tvec is None:
+        return None
+    import cv2 as _cv2
+    import numpy as _np
+    R, _ = _cv2.Rodrigues(_np.asarray(rvec, dtype=_np.float64).reshape(3, 1))
+    t = _np.asarray(tvec, dtype=_np.float64).reshape(3)
+    pos = (-R.T @ t).ravel()
+    return (float(pos[0]), float(pos[1]), float(pos[2]))
 
 
 def _project_image_boundary_to_ground(
@@ -300,11 +410,16 @@ def _project_image_boundary_to_ground(
 ) -> list[list[float]] | None:
     """Back-project each image-boundary point to the z=0 ground plane.
 
-    Mirrors ``utils/pitch.py:_img_to_world`` but in pure Python (no
-    OpenCV dep here — distortion coefficients are zero for the physical
-    backend kids configs use, so undistortPoints reduces to the linear
-    pinhole model and we can do the math inline).
+    Uses the same math as ``utils/pitch.py:_img_to_world`` — applies the
+    Brown-Conrady distortion via ``cv2.undistortPoints`` so wide-angle
+    / fisheye lenses (futsal phone profile carries k1≈0.48) produce the
+    same FOV polygon on the match minimap as the field-registration
+    visualisation. Without distortion the polygon shape diverges at the
+    edges where radial distortion is strongest.
     """
+    import cv2 as _cv2
+    import numpy as _np
+
     K = pose.get("K")
     if K is None:
         return None
@@ -313,73 +428,39 @@ def _project_image_boundary_to_ground(
     if rvec is None or tvec is None:
         return None
 
-    fx = float(K[0][0])
-    fy = float(K[1][1])
-    cx = float(K[0][2])
-    cy = float(K[1][2])
+    K_arr = _np.asarray(K, dtype=_np.float64)
+    rvec_arr = _np.asarray(rvec, dtype=_np.float64).reshape(3, 1)
+    tvec_arr = _np.asarray(tvec, dtype=_np.float64).reshape(3)
+    dist_arr = _np.asarray(
+        pose.get("dist_coeffs") or [0.0, 0.0, 0.0, 0.0, 0.0],
+        dtype=_np.float64,
+    ).ravel()
 
-    # rvec → R via Rodrigues. Pure-Python implementation; rvec is small
-    # so accuracy is fine. Skip OpenCV to keep this module light.
-    R = _rodrigues(rvec)
-    Rt = _transpose3(R)
-    tv = [float(tvec[0]), float(tvec[1]), float(tvec[2])]
-    cam_center = _mat_vec(Rt, [-tv[0], -tv[1], -tv[2]])
+    R, _ = _cv2.Rodrigues(rvec_arr)
+    cam_center = -R.T @ tvec_arr
 
-    # Distortion coefficients aren't applied — physical backend uses
-    # zero distortion, and pnlcalib's residual is small enough that the
-    # polygon shape is dominated by R/t. If a future backend ships
-    # non-zero distortion this is the place to plug it in.
+    pts = _np.asarray(boundary_img, dtype=_np.float64).reshape(-1, 1, 2)
+    pts_norm = _cv2.undistortPoints(pts, K_arr, dist_arr).reshape(-1, 2)
 
     poly: list[list[float]] = []
-    for ix, iy in boundary_img:
-        xn = (ix - cx) / fx
-        yn = (iy - cy) / fy
-        ray_world = _mat_vec(Rt, [xn, yn, 1.0])
+    for xn, yn in pts_norm:
+        ray_world = R.T @ _np.array([xn, yn, 1.0], dtype=_np.float64)
         if abs(ray_world[2]) < 1e-9:
             continue
         t = -cam_center[2] / ray_world[2]
         if t < 0:
             continue
-        wx = cam_center[0] + t * ray_world[0]
-        wy = cam_center[1] + t * ray_world[1]
+        wx = float(cam_center[0] + t * ray_world[0])
+        wy = float(cam_center[1] + t * ray_world[1])
+        # Mirror FR's behaviour (utils/pitch._img_to_world): drop
+        # near-horizon rays that back-project far outside the pitch
+        # instead of clamping. The resulting polygon may be open at the
+        # sky-end, but the client fills it the same way FR fills its
+        # pitch.copy() overlay, so both panels look identical.
         if abs(wx) > _FOV_GROUND_CLAMP_M or abs(wy) > _FOV_GROUND_CLAMP_M:
-            # Image points near the horizon back-project to enormous
-            # ground coordinates. Clamp the ray to the boundary ring at
-            # the configured radius so the polygon stays closed.
-            r = _FOV_GROUND_CLAMP_M / max(abs(wx), abs(wy))
-            wx *= r
-            wy *= r
+            continue
         poly.append([round(wx, 3), round(wy, 3)])
     return poly
-
-
-def _rodrigues(rvec: list[float]) -> list[list[float]]:
-    """Rotation matrix from a 3-vector axis-angle (Rodrigues' formula)."""
-    rx, ry, rz = float(rvec[0]), float(rvec[1]), float(rvec[2])
-    theta = math.sqrt(rx * rx + ry * ry + rz * rz)
-    if theta < 1e-12:
-        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-    kx, ky, kz = rx / theta, ry / theta, rz / theta
-    c = math.cos(theta)
-    s = math.sin(theta)
-    C = 1.0 - c
-    return [
-        [c + kx * kx * C,        kx * ky * C - kz * s, kx * kz * C + ky * s],
-        [ky * kx * C + kz * s,   c + ky * ky * C,      ky * kz * C - kx * s],
-        [kz * kx * C - ky * s,   kz * ky * C + kx * s, c + kz * kz * C],
-    ]
-
-
-def _transpose3(M: list[list[float]]) -> list[list[float]]:
-    return [[M[j][i] for j in range(3)] for i in range(3)]
-
-
-def _mat_vec(M: list[list[float]], v: list[float]) -> list[float]:
-    return [
-        M[0][0] * v[0] + M[0][1] * v[1] + M[0][2] * v[2],
-        M[1][0] * v[0] + M[1][1] * v[1] + M[1][2] * v[2],
-        M[2][0] * v[0] + M[2][1] * v[1] + M[2][2] * v[2],
-    ]
 
 
 def _events(ctx: MatchContext) -> list[dict[str, Any]]:

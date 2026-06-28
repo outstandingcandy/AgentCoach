@@ -339,6 +339,47 @@ def _draw_topdown_pitch(height, width, result, keypoints, calibrator, keypoint_m
             cv2.addWeighted(overlay, 0.3, pitch, 0.7, 0, pitch)
             cv2.polylines(pitch, [np.array(fov_px, dtype=np.int32)], True, (100, 255, 100), 1)
 
+        # Camera position marker — yellow triangle pointing toward pitch
+        # centre + crosshair, identical idiom to the annotate page's
+        # tactical view and the match-page minimap so all three top-down
+        # renderings show the same cam marker.
+        cam_world = (-R_cam.T @ tvec_cam).ravel()
+        cpx, cpy = w2p(float(cam_world[0]), float(cam_world[1]))
+        clipped_cam = not (0 <= cpx < width and 0 <= cpy < height)
+        cpx = max(8, min(width - 8, cpx))
+        cpy = max(8, min(height - 8, cpy))
+        center_px = w2p(0.0, 0.0)
+        vx_c, vy_c = center_px[0] - cpx, center_px[1] - cpy
+        vlen_c = max((vx_c * vx_c + vy_c * vy_c) ** 0.5, 1e-6)
+        ux_c, uy_c = vx_c / vlen_c, vy_c / vlen_c
+        perp_x, perp_y = -uy_c, ux_c
+        tri = np.array([
+            [int(cpx + ux_c * 14), int(cpy + uy_c * 14)],
+            [int(cpx - ux_c * 4 + perp_x * 8),
+             int(cpy - uy_c * 4 + perp_y * 8)],
+            [int(cpx - ux_c * 4 - perp_x * 8),
+             int(cpy - uy_c * 4 - perp_y * 8)],
+        ], dtype=np.int32)
+        cv2.fillPoly(pitch, [tri], (102, 215, 255))   # yellow in BGR
+        cv2.polylines(pitch, [tri], True, (0, 0, 0), 1)
+        cv2.circle(pitch, (int(cpx), int(cpy)), 3, (0, 0, 0), -1)
+        cv2.circle(pitch, (int(cpx), int(cpy)), 2, (102, 215, 255), -1)
+        cam_label = (
+            f"cam ({float(cam_world[0]):.1f}, {float(cam_world[1]):.1f}, "
+            f"{float(cam_world[2]):.1f})"
+        )
+        if clipped_cam:
+            cam_label += " v"
+        (tw, th), _ = cv2.getTextSize(
+            cam_label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1,
+        )
+        lx = width - tw - 12
+        ly = 18
+        cv2.rectangle(pitch, (lx - 4, ly - th - 3), (lx + tw + 4, ly + 4),
+                      (0, 0, 0), -1)
+        cv2.putText(pitch, cam_label, (lx, ly),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (102, 215, 255), 1, cv2.LINE_AA)
 
         # --- Keypoints on top-down view ---
         # Back-project detected IMAGE pixel to world. Displacement from white

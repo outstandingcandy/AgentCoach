@@ -96,12 +96,6 @@ class StrongSORTTracker:
         self.lifecycle = TrackLifecycle(
             max_age=config.get("max_age", 30),
             n_init=self.n_init,
-            stationary_window=int(config.get("stationary_window", 30)),
-            stationary_max_pixels=float(
-                config.get("stationary_max_pixels", 5.0)),
-            stationary_zone_radius=float(
-                config.get("stationary_zone_radius", 25.0)),
-            stationary_zone_ttl=int(config.get("stationary_zone_ttl", 300)),
         )
 
         frame_interval = config.get("frame_interval", 1.0)
@@ -215,7 +209,6 @@ class StrongSORTTracker:
         track.confidence = det.get("confidence", 1.0)
         track.hits += 1
         track.time_since_update = 0
-        self._record_center(track)
         if det.get("pitch_pos") is not None:
             track.pitch_pos = tuple(det["pitch_pos"])
         emb = det.get("embedding")
@@ -237,7 +230,6 @@ class StrongSORTTracker:
             class_id=det.get("class", 0),
         )
         track.kalman_state = self.kalman.initiate(det["bbox"])
-        self._record_center(track)
         if det.get("pitch_pos") is not None:
             track.pitch_pos = tuple(det["pitch_pos"])
         emb = det.get("embedding")
@@ -319,18 +311,8 @@ class StrongSORTTracker:
             updated_this_frame.add(track.track_id)
 
         # ---- Spawn new tracks for unmatched detections --------------
-        # Suppress any detection landing inside a kill-zone left behind
-        # by the stationary-track killer (a persistent YOLO false-
-        # positive can't immediately respawn the ghost as a fresh
-        # track).
         for i in sorted(unmatched_det_idx):
-            det = detections[i]
-            x1, y1, x2, y2 = det["bbox"]
-            dcx = (x1 + x2) / 2.0
-            dcy = (y1 + y2) / 2.0
-            if self._in_kill_zone(dcx, dcy):
-                continue
-            track = self._spawn_track(det)
+            track = self._spawn_track(detections[i])
             updated_this_frame.add(track.track_id)
 
         # ---- Tick + cleanup -----------------------------------------
@@ -363,12 +345,6 @@ class StrongSORTTracker:
                 "confirmed": t.status == TrackStatus.CONFIRMED,
             })
         return result
-
-    def _in_kill_zone(self, cx: float, cy: float) -> bool:
-        return self.lifecycle.in_kill_zone(cx, cy)
-
-    def _record_center(self, track: Track) -> None:
-        self.lifecycle.record_center(track)
 
     def get_track_features(self) -> dict[int, np.ndarray]:
         """Get mean features for all confirmed tracks."""

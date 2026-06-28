@@ -35,6 +35,7 @@ from ..annotation.pitch_diagram import (  # noqa: E402
     make_pitch_canvas,
 )
 from ..highlights._context import MatchContext  # noqa: E402
+from ._pitch import resolve_pitch_for_run  # noqa: E402
 from ._runs import RunRegistry  # noqa: E402
 
 PITCH_SCALE = 12      # px per metre
@@ -42,10 +43,16 @@ PITCH_MARGIN = 30     # px around the pitch
 
 
 def register_analytics_routes(app: FastAPI, runs: RunRegistry) -> None:
-    def _get_ctx(run_name: str) -> MatchContext:
+    def _get_handle(run_name: str):
+        """Return the warm RunHandle for *run_name* (lazy-loads).
+
+        Wrapped in a helper so each endpoint can pull both ``ctx`` and
+        ``video_path`` from the same lookup without paying the registry
+        lookup twice.
+        """
         from ._runs import IncompleteRunError
         try:
-            return runs.get(run_name).ctx
+            return runs.get(run_name)
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc))
         except IncompleteRunError as exc:
@@ -60,6 +67,19 @@ def register_analytics_routes(app: FastAPI, runs: RunRegistry) -> None:
                     "missing_recommended": exc.missing_recommended,
                 },
             ) from exc
+
+    def _get_ctx(run_name: str) -> MatchContext:
+        return _get_handle(run_name).ctx
+
+    def _get_pitch(run_name: str):
+        """Resolve the SoccerPitch for *run_name* from its per-video yaml.
+
+        Reads ``workspace/configs/<video_stem>.yaml`` (same source as the
+        annotate page + match panel) so analytics PNGs don't accidentally
+        pick up a different run's pitch from process-global state.
+        """
+        h = _get_handle(run_name)
+        return resolve_pitch_for_run(h.ctx, h.video_path, runs.workspace)
 
     # ---- JSON ------------------------------------------------------------
 
@@ -115,7 +135,8 @@ def register_analytics_routes(app: FastAPI, runs: RunRegistry) -> None:
         if not positions:
             raise HTTPException(404, "no pitch positions for that filter")
         png = _render_heatmap(positions, bins=bins,
-                              title=_filter_title(player_id, team_id))
+                              title=_filter_title(player_id, team_id),
+                              pitch=_get_pitch(run_name))
         return Response(content=png, media_type="image/png",
                         headers={"Cache-Control": "no-store"})
 
@@ -125,7 +146,8 @@ def register_analytics_routes(app: FastAPI, runs: RunRegistry) -> None:
         shots = _collect_shots(ctx, team_id=team_id)
         if not shots:
             raise HTTPException(404, "no shot events for that filter")
-        png = _render_shot_map(shots, title=_filter_title(None, team_id))
+        png = _render_shot_map(shots, title=_filter_title(None, team_id),
+                               pitch=_get_pitch(run_name))
         return Response(content=png, media_type="image/png",
                         headers={"Cache-Control": "no-store"})
 
@@ -138,7 +160,8 @@ def register_analytics_routes(app: FastAPI, runs: RunRegistry) -> None:
         if not edges:
             raise HTTPException(404, "no pass events for that filter")
         png = _render_pass_network(nodes, edges,
-                                   title=_filter_title(None, team_id))
+                                   title=_filter_title(None, team_id),
+                                   pitch=_get_pitch(run_name))
         return Response(content=png, media_type="image/png",
                         headers={"Cache-Control": "no-store"})
 
@@ -243,9 +266,16 @@ def _collect_pass_network(
     return nodes, edges
 
 
-def _pitch_axes(title: str) -> tuple[plt.Figure, plt.Axes, "callable", int, int]:
-    img, to_px, w, h = make_pitch_canvas(PITCH_SCALE, PITCH_MARGIN)
-    draw_pitch_structure(img, to_px, PITCH_SCALE, color=(255, 255, 255), thickness=2)
+def _pitch_axes(
+    title: str, *, pitch=None,
+) -> tuple[plt.Figure, plt.Axes, "callable", int, int]:
+    img, to_px, w, h = make_pitch_canvas(
+        PITCH_SCALE, PITCH_MARGIN, pitch=pitch,
+    )
+    draw_pitch_structure(
+        img, to_px, PITCH_SCALE,
+        color=(255, 255, 255), thickness=2, pitch=pitch,
+    )
     fig, ax = plt.subplots(figsize=(w / 100, h / 100), dpi=100)
     ax.imshow(img[:, :, ::-1])  # BGR canvas → RGB
     ax.set_xlim(0, w)
@@ -263,10 +293,12 @@ def _save_png(fig: plt.Figure) -> bytes:
 
 
 def _render_heatmap(
-    positions: list[tuple[float, float]], *, bins: int, title: str,
+    positions: list[tuple[float, float]], *,
+    bins: int, title: str, pitch=None,
 ) -> bytes:
-    fig, ax, to_px, w, h = _pitch_axes(f"Heatmap — {title}")
-    pitch = pitch_constants.get_active_pitch()
+    fig, ax, to_px, w, h = _pitch_axes(f"Heatmap — {title}", pitch=pitch)
+    if pitch is None:
+        pitch = pitch_constants.get_active_pitch()
     L = pitch.PITCH_LENGTH / 2.0
     W = pitch.PITCH_WIDTH / 2.0
     xs = np.array([p[0] for p in positions])
@@ -296,8 +328,10 @@ _OUTCOME_COLORS = {
 }
 
 
-def _render_shot_map(shots: list[dict[str, Any]], *, title: str) -> bytes:
-    fig, ax, to_px, w, h = _pitch_axes(f"Shot map — {title}")
+def _render_shot_map(
+    shots: list[dict[str, Any]], *, title: str, pitch=None,
+) -> bytes:
+    fig, ax, to_px, w, h = _pitch_axes(f"Shot map — {title}", pitch=pitch)
     seen_outcomes: set[str] = set()
     for s in shots:
         px, py = to_px(s["x"], s["y"])
@@ -317,8 +351,9 @@ def _render_pass_network(
     edges: list[tuple[str, str, int, tuple[float, float], tuple[float, float]]],
     *,
     title: str,
+    pitch=None,
 ) -> bytes:
-    fig, ax, to_px, w, h = _pitch_axes(f"Pass network — {title}")
+    fig, ax, to_px, w, h = _pitch_axes(f"Pass network — {title}", pitch=pitch)
     if not edges:
         return _save_png(fig)
     max_w = max(n for _, _, n, _, _ in edges)

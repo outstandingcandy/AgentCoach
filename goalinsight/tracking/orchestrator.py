@@ -330,12 +330,6 @@ def run_tracking(
             "reid_iou_min": tracking_cfg.get("reid_iou_min", 0.1),
             "reid_pitch_max_m": tracking_cfg.get(
                 "reid_pitch_max_m", 1.5 * _inv_fps_scale),
-            "stationary_window": tracking_cfg.get(
-                "stationary_window", int(round(30 * _fps_scale))),
-            "stationary_max_pixels": tracking_cfg.get(
-                "stationary_max_pixels", 5.0),
-            "stationary_zone_ttl": tracking_cfg.get(
-                "stationary_zone_ttl", int(round(300 * _fps_scale))),
         })
     tracker.img_w = width
     tracker.img_h = height
