@@ -4,8 +4,10 @@ World convention is y-up (top = +W/2); the rendering flips y so that points
 with y > 0 appear at the top of the image.
 """
 
+from __future__ import annotations
+
 import math
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -19,6 +21,9 @@ from .pitch.keypoints import (
     pitch_name_to_pnlcalib_id,
 )
 
+if TYPE_CHECKING:
+    from .pitch.geometry import SoccerPitch
+
 ToPx = Callable[[float, float], tuple[int, int]]
 
 
@@ -26,13 +31,21 @@ def make_pitch_canvas(
     scale: int,
     margin: int,
     bg: tuple[int, int, int] = (34, 139, 34),
+    *,
+    pitch: "SoccerPitch | None" = None,
 ) -> tuple[np.ndarray, ToPx, int, int]:
-    """Allocate a canvas sized to the active pitch + margin and return the y-up→pixel map.
+    """Allocate a canvas sized to ``pitch`` + margin and return the y-up→pixel map.
 
     Returns ``(img, to_px, width, height)``. ``to_px(world_x, world_y)`` flips
     ``y`` around the pitch center so y-up world coords land y-down on screen.
+
+    If ``pitch`` is None, falls back to ``pitch_constants.get_active_pitch()``.
+    Pass an explicit pitch when the caller knows which run/video the canvas
+    belongs to — that avoids the process-global active-pitch racing across
+    runs in a multi-run web process.
     """
-    pitch = pitch_constants.get_active_pitch()
+    if pitch is None:
+        pitch = pitch_constants.get_active_pitch()
     L = pitch.PITCH_LENGTH / 2.0
     W = pitch.PITCH_WIDTH / 2.0
     width = int(pitch.PITCH_LENGTH * scale + 2 * margin)
@@ -57,14 +70,21 @@ def draw_pitch_structure(
     draw_landmarks: bool = True,
     landmark_radius: int = 4,
     draw_arcs: bool = True,
+    pitch: "SoccerPitch | None" = None,
 ) -> None:
     """Draw outline + halfway line + circles + penalty/goal areas + (optionally) arcs.
 
-    Geometry comes from ``pitch_constants.get_active_pitch()``. Used by all
-    schematic pitch renderers (``render_tactical_view``, ``create_pitch_diagram``,
-    ``create_lines_diagram``) so they stay visually consistent.
+    Geometry comes from ``pitch`` (or, if None, ``pitch_constants.get_active_pitch()``).
+    Used by every schematic pitch renderer (annotate's render_tactical_view,
+    create_pitch_diagram, the FR-vis topdown panel, tracking minimap,
+    analytics heatmaps) so they stay visually consistent.
+
+    Pass an explicit ``pitch`` from web endpoints that resolve their pitch
+    from a per-run config file — that's safer than depending on
+    process-global active-pitch state in a long-running multi-run process.
     """
-    pitch = pitch_constants.get_active_pitch()
+    if pitch is None:
+        pitch = pitch_constants.get_active_pitch()
     L, W = pitch.PITCH_LENGTH / 2.0, pitch.PITCH_WIDTH / 2.0
     ccr = pitch.CENTER_CIRCLE_RADIUS
     pen = pitch.GOAL_LINE_TO_PENALTY_MARK

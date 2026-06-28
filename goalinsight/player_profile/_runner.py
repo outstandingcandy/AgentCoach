@@ -297,12 +297,12 @@ def _render_heatmap_png(
 ) -> bytes | None:
     """Render a heatmap PNG over a schematic top-down pitch.
 
-    Self-contained matplotlib rendering: outline + halfway line +
-    center circle + both penalty / goal areas, then the histogram-based
-    heatmap on top. Stays decoupled from the global
-    ``pitch_constants.get_active_pitch()`` state so a kids-pitch run
-    renders against the kids pitch even when the host process was
-    booted with FIFA defaults.
+    Reads geometry from the *active* SoccerPitch (set by the pipeline's
+    stage 1 from the per-video config) so PA shape, goal-area
+    dimensions, center-circle radius, etc. match the run's pitch type
+    (futsal D, kids-soccer, FIFA, ...). Uses the shared
+    ``make_pitch_canvas`` + ``draw_pitch_structure`` helpers so the
+    schematic matches every other top-down panel exactly.
     """
     if not positions:
         return None
@@ -312,55 +312,69 @@ def _render_heatmap_png(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    from ..annotation import pitch_constants
+    from ..annotation.pitch.geometry import SoccerPitch
+    from ..annotation.pitch_diagram import (
+        draw_pitch_structure, make_pitch_canvas,
+    )
+
+    # Prefer the process-global active pitch when its outer dims match
+    # the run's pitch_length/width — that's the path the pipeline takes
+    # (stage 1 sets active pitch from the per-video config). When they
+    # diverge, fall back to a scaled FIFA so the schematic still tracks
+    # the run's outer dimensions.
+    active = pitch_constants.get_active_pitch()
+    if (abs(active.PITCH_LENGTH - pitch_length) < 1e-3
+            and abs(active.PITCH_WIDTH - pitch_width) < 1e-3):
+        pitch = active
+    else:
+        base = SoccerPitch()
+        sx = pitch_length / base.PITCH_LENGTH
+        sy = pitch_width / base.PITCH_WIDTH
+        pitch = SoccerPitch(
+            pitch_length=pitch_length,
+            pitch_width=pitch_width,
+            penalty_area_length=base.PENALTY_AREA_LENGTH * sx,
+            penalty_area_width=base.PENALTY_AREA_WIDTH * sy,
+            goal_area_length=base.GOAL_AREA_LENGTH * sx,
+            goal_area_width=base.GOAL_AREA_WIDTH * sy,
+            goal_line_to_penalty_mark=base.GOAL_LINE_TO_PENALTY_MARK * sx,
+            center_circle_radius=base.CENTER_CIRCLE_RADIUS * min(sx, sy),
+        )
+
     L = pitch_length / 2.0
     W = pitch_width / 2.0
-    # Standard-pitch ratios scaled to whatever pitch we're on. Same
-    # ratios the SoccerPitch dataclass uses for its defaults; keeps the
-    # schematic recognisable on non-FIFA dims.
-    pa_l = pitch_length * (16.5 / 105.0)
-    pa_w = pitch_width * (40.32 / 68.0) / 2.0
-    ga_l = pitch_length * (5.5 / 105.0)
-    ga_w = pitch_width * (18.32 / 68.0) / 2.0
-    ccr = min(pitch_length, pitch_width) * (9.15 / 68.0)
 
-    fig, ax = plt.subplots(figsize=(6.0, 6.0 * pitch_width / pitch_length),
-                           dpi=100)
-    ax.set_facecolor("#1a3a1a")
-    line = "#cfe3ff"
+    # Build the schematic with the shared helpers (handles D-shape PA,
+    # penalty arcs, landmarks). Convert to RGB for matplotlib.
+    scale_px = 12  # px per metre — matches analytics' PITCH_SCALE
+    margin_px = 30
+    img, to_px, w_px, h_px = make_pitch_canvas(
+        scale_px, margin_px, bg=(34, 100, 34), pitch=pitch,
+    )
+    draw_pitch_structure(
+        img, to_px, scale_px,
+        color=(207, 227, 255), thickness=2, pitch=pitch,
+    )
 
-    # Outline + halfway line + center circle.
-    ax.plot([-L, L, L, -L, -L], [W, W, -W, -W, W], color=line, lw=1.5)
-    ax.plot([0, 0], [W, -W], color=line, lw=1.5)
-    theta = np.linspace(0, 2 * np.pi, 100)
-    ax.plot(ccr * np.cos(theta), ccr * np.sin(theta), color=line, lw=1.2)
+    fig, ax = plt.subplots(figsize=(w_px / 100, h_px / 100), dpi=100)
+    ax.imshow(img[:, :, ::-1])  # BGR → RGB
+    ax.set_xlim(0, w_px)
+    ax.set_ylim(h_px, 0)
+    ax.set_axis_off()
 
-    # Penalty + goal areas, both ends.
-    for sign in (-1, 1):
-        x_goal = sign * L
-        x_pa = sign * (L - pa_l)
-        x_ga = sign * (L - ga_l)
-        ax.plot([x_goal, x_pa, x_pa, x_goal],
-                [pa_w, pa_w, -pa_w, -pa_w], color=line, lw=1.2)
-        ax.plot([x_goal, x_ga, x_ga, x_goal],
-                [ga_w, ga_w, -ga_w, -ga_w], color=line, lw=1.2)
-
-    # Histogram-based heatmap, drawn last so it overlays the lines.
+    # Histogram-based heatmap, projected into the pitch canvas pixel grid.
     xs = np.array([p[0] for p in positions])
     ys = np.array([p[1] for p in positions])
     H, xedges, yedges = np.histogram2d(
         xs, ys, bins=bins, range=[[-L, L], [-W, W]],
     )
-    ax.pcolormesh(xedges, yedges, H.T, alpha=0.65,
-                  shading="auto", cmap="hot")
-
-    margin = max(pitch_length, pitch_width) * 0.04
-    ax.set_xlim(-L - margin, L + margin)
-    ax.set_ylim(-W - margin, W + margin)
-    ax.set_aspect("equal")
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_visible(False)
+    xc = 0.5 * (xedges[:-1] + xedges[1:])
+    yc = 0.5 * (yedges[:-1] + yedges[1:])
+    xx, yy = np.meshgrid(xc, yc, indexing="ij")
+    pxs = (xx + L) * scale_px + margin_px
+    pys = (W - yy) * scale_px + margin_px
+    ax.pcolormesh(pxs, pys, H, alpha=0.6, shading="auto", cmap="hot")
     ax.set_title(title, fontsize=11, color="#222")
 
     buf = io.BytesIO()

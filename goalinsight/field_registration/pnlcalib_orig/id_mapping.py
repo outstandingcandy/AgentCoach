@@ -128,12 +128,27 @@ class PnLCalibIdMap:
         self._verify_consistency(pitch_points)
 
     def _verify_consistency(self, pitch_points: dict[str, np.ndarray]) -> None:
-        """Cross-check name → world via two paths agrees within tol."""
+        """Cross-check name → world via two paths agrees within tol.
+
+        D-shape penalty areas (futsal) extend ``L/R_PENALTY_AREA_TL/BL/
+        TR/BR_CORNER`` to mean the arc-tangent-on-goal-line points
+        (±(g_w + pa_d)) instead of the rect corners at ±pa_w — the
+        upstream table doesn't model arc tangents, so these 4 names
+        intentionally disagree. Skip them on D-PA pitches; everything
+        else still has to round-trip.
+        """
         from goalinsight.annotation.pitch.keypoints import (
             PITCH_POINT_TO_PNLCALIB_ID,
         )
+        pa_shape = getattr(self.pitch, "PENALTY_AREA_SHAPE", "rect")
+        d_pa_overrides = {
+            "L_PENALTY_AREA_TL_CORNER", "L_PENALTY_AREA_BL_CORNER",
+            "R_PENALTY_AREA_TR_CORNER", "R_PENALTY_AREA_BR_CORNER",
+        } if pa_shape == "d" else set()
         bad: list[str] = []
         for name, proj_id in PITCH_POINT_TO_PNLCALIB_ID.items():
+            if name in d_pa_overrides:
+                continue
             up_id = project_kp_to_upstream(proj_id)
             if up_id < 1 or up_id > len(self._kp_table):
                 bad.append(f"{name}: upstream id {up_id} out of range")

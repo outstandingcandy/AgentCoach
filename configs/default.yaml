@@ -136,8 +136,6 @@ tracking:
   reid_iou_min: 0.1
   reid_pitch_max_m: 1.5
   dump_yolo_raw: true
-  stationary_window: 30
-  stationary_max_pixels: 5.0
 reid:
   backend: "osnet"
   model: "osnet_x1_0"

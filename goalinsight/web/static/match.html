@@ -377,6 +377,10 @@
     let payload = null;       // /api/runs/{run}/match/data
     let tracksByFrame = {};   // frame_str -> [track,...]
     let ballByFrame = {};     // frame_str -> ball
+    // Per-player pitch trails: pid -> [{frame, x, y, team}]. Built once
+    // from tracksByFrame after the tracks payload loads. Used by the
+    // "All trails" minimap overlay.
+    let trailsByPid = new Map();
 
     // Defaults: keep the broadcast clean — only an ellipse under each
     // player's feet plus their jersey number. Everything else is opt-in
@@ -389,6 +393,7 @@
       ball_trail: false,
       pass_arrows: false,
       possession: false,
+      trails: false,
     };
 
     let selectedPlayer = null;
@@ -411,6 +416,7 @@
         ['ball_trail', 'Ball trail'],
         ['pass_arrows', 'Pass arrows'],
         ['possession', 'Possession'],
+        ['trails', 'All trails'],
       ];
       // Player-controls (separate state — these wire straight onto
       // <video> properties rather than into ``overlays``). Rendered
@@ -753,77 +759,94 @@
       return Math.abs(a.frame - frame) <= Math.abs(b.frame - frame) ? a : b;
     }
 
+    // ---------- Per-player trails (built once after load) ----------
+    function buildTrailsByPid(tbf) {
+      const out = new Map();
+      const frames = Object.keys(tbf).map(Number).sort((a, b) => a - b);
+      for (const f of frames) {
+        for (const t of tbf[f] || []) {
+          const pp = t.pitch_position;
+          if (!pp || pp[0] == null) continue;
+          const pid = t.player_id != null ? String(t.player_id) :
+                      (t.track_id != null ? String(t.track_id) : null);
+          if (!pid) continue;
+          if (!out.has(pid)) {
+            out.set(pid, {points: [], team: t.team || 'unknown'});
+          }
+          const entry = out.get(pid);
+          entry.points.push([f, pp[0], pp[1]]);
+        }
+      }
+      return out;
+    }
+
     function drawMiniPitch(tracks, ball) {
       const W = mini.width, H = mini.height;
       const geom = (payload && payload.pitch) || {
         length: (payload && payload.pitch_length) || 105,
         width: (payload && payload.pitch_width) || 68,
-        penalty_area_length: 16.5,
-        penalty_area_width: 40.32,
-        goal_area_length: 5.5,
-        goal_area_width: 18.32,
         center_circle_radius: 9.15,
+        polylines_2d: [],
+        landmarks_2d: [],
       };
       const PL = geom.length, PW = geom.width;
-      const pad = 12;
-      const sx = (W - 2 * pad) / PL;
-      const sy = (H - 2 * pad) / PW;
+      // Pitch occupies ~75% of the canvas (annotate-tactical style):
+      // leaves room for off-pitch camera markers / labels without
+      // overlapping the field. ``WORLD_MARGIN_M`` is the breathing
+      // room in world metres around the pitch outline; both axes use
+      // the same scale so the aspect ratio doesn't squash.
+      const WORLD_MARGIN_M = Math.max(PL, PW) * 0.18;
+      const scale = Math.min(
+        W / (PL + 2 * WORLD_MARGIN_M),
+        H / (PW + 2 * WORLD_MARGIN_M),
+      );
+      // Origin (world centre) at canvas centre — keeps the cam-pos
+      // triangle visible whichever side of the pitch the camera is on.
+      const ox = W / 2;
+      const oy = H / 2;
 
       // Grass background.
       miniCtx.fillStyle = '#0d1f0d';
       miniCtx.fillRect(0, 0, W, H);
 
       const w2p = (wx, wy) => [
-        pad + (wx + PL / 2) * sx,
-        pad + (PW / 2 - wy) * sy,
+        ox + wx * scale,
+        oy - wy * scale,   // y-up world → y-down screen
       ];
 
       const lineColor = '#cfe3ff';
       miniCtx.strokeStyle = lineColor;
       miniCtx.lineWidth = 1.5;
 
-      // Touchlines + goal lines (outline).
-      const tl = w2p(-PL / 2,  PW / 2);
-      const br = w2p( PL / 2, -PW / 2);
-      miniCtx.strokeRect(tl[0], tl[1], br[0] - tl[0], br[1] - tl[1]);
+      // Pitch lines come pre-built from the server (the same
+      // pitch_constants + build_d_penalty_arcs source the annotate page
+      // and field-registration vis use). Each entry is a world-space
+      // (x, y) polyline; we just project and stroke.
+      const lines = geom.polylines_2d || [];
+      for (const poly of lines) {
+        if (!poly || poly.length < 2) continue;
+        miniCtx.beginPath();
+        for (let i = 0; i < poly.length; i++) {
+          const [px, py] = w2p(poly[i][0], poly[i][1]);
+          if (i === 0) miniCtx.moveTo(px, py); else miniCtx.lineTo(px, py);
+        }
+        miniCtx.stroke();
+      }
 
-      // Halfway line.
-      miniCtx.beginPath();
-      const ht = w2p(0,  PW / 2);
-      const hb = w2p(0, -PW / 2);
-      miniCtx.moveTo(ht[0], ht[1]); miniCtx.lineTo(hb[0], hb[1]);
-      miniCtx.stroke();
-
-      // Center circle + spot.
-      const ccr = geom.center_circle_radius * Math.min(sx, sy);
-      const c0 = w2p(0, 0);
-      miniCtx.beginPath();
-      miniCtx.arc(c0[0], c0[1], ccr, 0, Math.PI * 2);
-      miniCtx.stroke();
-      miniCtx.beginPath();
-      miniCtx.arc(c0[0], c0[1], 2, 0, Math.PI * 2);
+      // Landmarks (centre spot + penalty marks).
       miniCtx.fillStyle = lineColor;
-      miniCtx.fill();
+      for (const lm of (geom.landmarks_2d || [])) {
+        const [px, py] = w2p(lm[0], lm[1]);
+        miniCtx.beginPath();
+        miniCtx.arc(px, py, 2, 0, Math.PI * 2);
+        miniCtx.fill();
+      }
 
-      // Penalty + goal areas, both ends.
-      const paW = geom.penalty_area_width / 2;
-      const paL = geom.penalty_area_length;
-      const gaW = geom.goal_area_width / 2;
-      const gaL = geom.goal_area_length;
-      const drawBox = (x1w, y1w, x2w, y2w) => {
-        const [a, b] = w2p(x1w, y1w);
-        const [c, d] = w2p(x2w, y2w);
-        miniCtx.strokeRect(a, b, c - a, d - b);
-      };
-      // Left side
-      drawBox(-PL / 2,  paW, -PL / 2 + paL, -paW);
-      drawBox(-PL / 2,  gaW, -PL / 2 + gaL, -gaW);
-      // Right side
-      drawBox( PL / 2,  paW,  PL / 2 - paL, -paW);
-      drawBox( PL / 2,  gaW,  PL / 2 - gaL, -gaW);
-
-      // Camera FOV polygon (where the broadcast camera is currently
-      // looking) — drawn before the players so the dots stay on top.
+      // Camera FOV polygon + camera-position marker (where the
+      // broadcast camera is, and where it's looking) — drawn before
+      // the players so the dots stay on top. Mirrors annotate's
+      // tactical view: a yellow triangle at the cam pos pointing into
+      // the FOV.
       const fov = nearestFov(frameAtPlayhead());
       if (fov && fov.polygon && fov.polygon.length >= 3) {
         miniCtx.beginPath();
@@ -837,6 +860,92 @@
         miniCtx.lineWidth = 1.5;
         miniCtx.strokeStyle = 'rgba(255, 215, 102, 0.95)';
         miniCtx.stroke();
+
+        if (fov.camera && fov.camera.length >= 2) {
+          const [cwx, cwy] = [fov.camera[0], fov.camera[1]];
+          const cwz = fov.camera.length >= 3 ? fov.camera[2] : null;
+          let [cpx, cpy] = w2p(cwx, cwy);
+          // Clip the marker to the canvas so a camera placed off-pitch
+          // (typical: behind the goal at world y < -PW/2) is still visible
+          // at the canvas edge instead of disappearing entirely.
+          const clipped = cpx < 0 || cpx >= W || cpy < 0 || cpy >= H;
+          cpx = Math.max(8, Math.min(W - 8, cpx));
+          cpy = Math.max(8, Math.min(H - 8, cpy));
+          // Triangle points toward the pitch centre (0,0) — same idiom
+          // the annotate-page tactical canvas uses.
+          const [ccx, ccy] = w2p(0, 0);
+          const vx = ccx - cpx, vy = ccy - cpy;
+          const vlen = Math.max(Math.hypot(vx, vy), 1e-6);
+          const ux = vx / vlen, uy = vy / vlen;
+          const perpX = -uy, perpY = ux;
+          const tipX = cpx + ux * 14, tipY = cpy + uy * 14;
+          const baseLX = cpx - ux * 4 + perpX * 8,
+                baseLY = cpy - uy * 4 + perpY * 8;
+          const baseRX = cpx - ux * 4 - perpX * 8,
+                baseRY = cpy - uy * 4 - perpY * 8;
+          miniCtx.beginPath();
+          miniCtx.moveTo(tipX, tipY);
+          miniCtx.lineTo(baseLX, baseLY);
+          miniCtx.lineTo(baseRX, baseRY);
+          miniCtx.closePath();
+          miniCtx.fillStyle = 'rgba(255, 215, 102, 0.95)';
+          miniCtx.fill();
+          miniCtx.lineWidth = 1;
+          miniCtx.strokeStyle = '#000';
+          miniCtx.stroke();
+          // Crosshair at the exact cam position.
+          miniCtx.beginPath();
+          miniCtx.arc(cpx, cpy, 3, 0, Math.PI * 2);
+          miniCtx.fillStyle = '#000';
+          miniCtx.fill();
+          miniCtx.beginPath();
+          miniCtx.arc(cpx, cpy, 2, 0, Math.PI * 2);
+          miniCtx.fillStyle = 'rgba(255, 215, 102, 1)';
+          miniCtx.fill();
+          // Coordinate label.
+          const label = cwz != null
+            ? `cam (${cwx.toFixed(1)}, ${cwy.toFixed(1)}, ${cwz.toFixed(1)})`
+            : `cam (${cwx.toFixed(1)}, ${cwy.toFixed(1)})`
+            + (clipped ? ' ↓' : '');
+          miniCtx.font = '11px system-ui, sans-serif';
+          const tm = miniCtx.measureText(label);
+          const lx = W - tm.width - 8;
+          const ly = 16;
+          miniCtx.fillStyle = 'rgba(0,0,0,0.6)';
+          miniCtx.fillRect(lx - 4, ly - 12, tm.width + 8, 16);
+          miniCtx.fillStyle = 'rgba(255, 215, 102, 1)';
+          miniCtx.fillText(label, lx, ly);
+        }
+      }
+
+      // All-trails overlay: one polyline per player, painted under the
+      // dots so the current-frame positions stay readable. Trails fade
+      // older-to-newer; team_A red, team_B blue, others grey, matching
+      // the player-dot palette.
+      if (overlays.trails && trailsByPid.size) {
+        const TEAM_RGB = {
+          team_A: [255, 80, 80],
+          team_B: [80, 140, 255],
+          referee: [255, 220, 60],
+          unknown: [180, 180, 180],
+        };
+        for (const [pid, entry] of trailsByPid) {
+          // Skip "unmapped-*" / "*-unk-*" by default — they're noise
+          // (consolidator-rejected fragments). Show only resolved
+          // players + referees so the panel doesn't blur.
+          if (typeof pid === 'string' && pid.startsWith('unmapped-')) continue;
+          const pts = entry.points;
+          if (pts.length < 2) continue;
+          const rgb = TEAM_RGB[entry.team] || TEAM_RGB.unknown;
+          miniCtx.lineWidth = 1.2;
+          miniCtx.strokeStyle = `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, 0.55)`;
+          miniCtx.beginPath();
+          for (let i = 0; i < pts.length; i++) {
+            const [px, py] = w2p(pts[i][1], pts[i][2]);
+            if (i === 0) miniCtx.moveTo(px, py); else miniCtx.lineTo(px, py);
+          }
+          miniCtx.stroke();
+        }
       }
 
       // On-field identified players + referees only. ``tracks`` already
@@ -1101,13 +1210,21 @@
     // ---------- Player filter ----------
     function buildPlayerGrid() {
       const grid = document.getElementById('player-grid');
-      // Hide tracks the consolidator never resolved into a numbered
-      // player (jersey OCR + role both unknown). They're the long tail
-      // of fragmented detections; surfacing them just clutters the
-      // roster.
-      const players = (payload.players || []).filter(isIdentifiedPlayer);
-      players.sort((a, b) => (a.team_id || '').localeCompare(b.team_id || '')
-        || -(a.frames_observed - b.frames_observed));
+      // Show every consolidated player — including unknown-jersey ones
+      // (``*-unk-NN``). Sorted: identified players (jersey/role known)
+      // first, then unknown-jersey players, with each group ordered by
+      // team and frames-observed. This way the most-seen identified
+      // players stay at the top while the long tail is still visible
+      // for inspection.
+      const allPlayers = (payload.players || []).slice();
+      const teamRank = (a, b) => (a.team_id || '').localeCompare(b.team_id || '');
+      const seenRank = (a, b) => -(a.frames_observed - b.frames_observed);
+      allPlayers.sort((a, b) => {
+        const aIdent = isIdentifiedPlayer(a) ? 0 : 1;
+        const bIdent = isIdentifiedPlayer(b) ? 0 : 1;
+        return (aIdent - bIdent) || teamRank(a, b) || seenRank(a, b);
+      });
+      const players = allPlayers;
       grid.innerHTML = players.map(p => {
         const jersey = p.jersey_number != null ? `#${p.jersey_number}` : '';
         const role = p.role && p.role !== 'player' ? ` · ${p.role}` : '';
@@ -1401,6 +1518,9 @@
         for (const k of Object.keys(tj || {})) tracksByFrame[parseInt(k, 10)] = tj[k];
         ballByFrame = {};
         for (const k of Object.keys(bj || {})) ballByFrame[parseInt(k, 10)] = bj[k];
+        // Build per-player pitch trails for the "All trails" overlay.
+        // Done once; cheap (single linear pass over frames).
+        trailsByPid = buildTrailsByPid(tracksByFrame);
       });
     })();
   </script>

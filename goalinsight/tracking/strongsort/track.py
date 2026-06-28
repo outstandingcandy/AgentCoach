@@ -42,12 +42,6 @@ class Track:
     confidence: float = 0.0
     class_id: int = 0
 
-    # Recent bbox-center history for stationary-detection. Stores at
-    # most ``stationary_window`` (cx, cy) tuples so the lifecycle
-    # cleanup pass can detect ghost tracks where YOLO keeps
-    # re-detecting the same static background object.
-    center_history: list = field(default_factory=list)
-
     # Last successful projection of the bbox foot-point onto the pitch
     # in world coordinates (metres). Refreshed whenever the orchestrator
     # passes a calibration-derived ``pitch_pos`` on the matched

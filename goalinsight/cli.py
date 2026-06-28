@@ -151,6 +151,21 @@ def main():
         n_frames = fps = width = height = None
     config = resolve_config(config, width, height, fps)
 
+    # Push the resolved pitch into the global active-pitch state once at
+    # the top of the run, so stages that don't have their own
+    # ``set_active_pitch`` call (player_profile, annotated_video) still
+    # render against the right pitch when invoked with ``--stages X``
+    # standalone — without this, only stages that set it themselves
+    # (field_registration, tracking) would see the correct pitch.
+    pitch_cfg = config.get("pitch") or {}
+    if pitch_cfg:
+        try:
+            from goalinsight.annotation.pitch.geometry import SoccerPitch
+            from goalinsight.annotation import pitch_constants
+            pitch_constants.set_active_pitch(SoccerPitch.from_dict(pitch_cfg))
+        except (TypeError, ValueError):
+            pass
+
     # Build and run pipeline
     if args.stages:
         stage_names = [s.strip() for s in args.stages.split(",")]
