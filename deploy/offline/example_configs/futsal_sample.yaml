@@ -1,0 +1,75 @@
+# Futsal sample config — runs end-to-end against the bundled
+# example_video.mp4 + annotations/example_video/.
+#
+# Defaults to local-only inference (no AWS / no Google API keys
+# required). To swap to Bedrock Claude jersey OCR:
+#   1. set ``track_consolidation.jersey.backend: claude`` below, and
+#   2. pass AWS creds at ``docker run`` time via
+#      ``-e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... \
+#       -e AWS_DEFAULT_REGION=us-east-1``.
+
+video:
+  process_fps: 30
+sample:
+  stride: 1
+pitch_type: futsal
+
+field_registration:
+  backend: fixed_camera
+  process_fps: 10
+  physical:
+    camera_profile: futsal_phone_1080p
+    free_intrinsics: true
+    focal_hfov_deg_bounds: [70, 90]
+    camera_position: [-20.0, -10.0, 5.0]
+    position_bounds_m: [8.0, 8.0, 3.0]
+    vis_interval: 30
+
+device: cuda
+
+unified_detection:
+  imgsz: 0
+  iou_threshold: 0.55
+
+reid:
+  # CLIP-ReID gives the best player separation on this clip. Weights
+  # are pre-baked into the image at /opt/goalinsight/models/clip_reid/
+  # by build.sh. Drop to ``backend: osnet`` (no weights_path needed)
+  # if you want a faster smoke test.
+  backend: clip_reid
+  clip_reid:
+    backbone: ViT-L-14
+    weights_path: /opt/goalinsight/models/clip_reid/ViT-L-14_openai/Paper/weights_e4.pth
+    remove_proj: true
+    batch_size: 16
+
+tracking:
+  reid_pitch_max_m: 0.8
+  # Calibrated for clip_reid's tight cosine distribution. If you flip
+  # ``reid.backend`` back to osnet/prtreid, change this to 0.2.
+  max_cosine_distance: 0.012
+  vis_frames_enabled: false
+  dump_yolo_raw: false
+  dump_ball_diag: false
+
+# Jersey number recognition — local mmocr by default so no cloud
+# creds are needed. Swap to ``backend: claude`` + set Bedrock creds
+# for higher accuracy.
+jersey_recognition:
+  enabled: true
+  backend: mmocr
+
+track_consolidation:
+  min_track_seconds: 1.0
+  jersey:
+    backend: mmocr
+    ocr_backend: rapidocr      # secondary OCR for per-crop number
+  frame_stride: 8
+
+pipeline:
+  stages:
+    - field_registration
+    - tracking
+    - track_consolidation
+    - event_detection
+    - player_profile

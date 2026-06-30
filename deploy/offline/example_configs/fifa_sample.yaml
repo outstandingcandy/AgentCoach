@@ -1,0 +1,55 @@
+# Standard 11-a-side FIFA pitch (105×68m) config. Use as starter for
+# broadcast / drone / pole-cam footage. You'll likely need to set
+# field_registration.physical.camera_profile to one that matches
+# your camera (see configs/camera_profiles.yaml), or switch to the
+# pnlcalib backend which uses HRNet keypoints + lines.
+
+video:
+  process_fps: 30
+sample:
+  stride: 1
+pitch_type: fifa
+
+field_registration:
+  # pnlcalib uses HRNet to detect keypoints + lines per frame — no
+  # annotation required, but slower than fixed_camera (which assumes
+  # a static rig). SV_kp + SV_lines weights are pre-baked.
+  backend: pnlcalib
+  pnlcalib:
+    keypoint_weights: SV_kp
+    line_weights: SV_lines
+    keypoint_threshold: 0.15
+
+device: cuda
+
+unified_detection:
+  imgsz: 0
+  iou_threshold: 0.55
+
+reid:
+  backend: osnet     # cheap + fast; flip to clip_reid for harder cases
+
+tracking:
+  max_cosine_distance: 0.2
+  vis_frames_enabled: false
+  dump_yolo_raw: false
+  dump_ball_diag: false
+
+jersey_recognition:
+  enabled: true
+  backend: mmocr
+
+track_consolidation:
+  min_track_seconds: 1.0
+  jersey:
+    backend: mmocr
+    ocr_backend: rapidocr
+  frame_stride: 8
+
+pipeline:
+  stages:
+    - field_registration
+    - tracking
+    - track_consolidation
+    - event_detection
+    - player_profile
