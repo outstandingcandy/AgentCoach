@@ -92,3 +92,8 @@ secrets.yml
 *.pptx
 *.pptx_files/
 【上屏PPT模板】*
+
+# Docker build staging — populated by deploy/offline/build.sh from the
+# user's local workspace. Contains the CLIP-ReID fine-tuned weights
+# (~1.2 GB) and a trimmed demo video, neither of which belong in git.
+deploy/offline/_build_assets/

@@ -175,16 +175,22 @@ class ClipReIDExtractor(BaseReIDExtractor):
                 pass
 
         # Apply the fine-tuned checkpoint. Upstream's training saves
-        # just the ``OpenClipModel`` wrapper state, which boils down
-        # to the same keys as a raw open_clip model. ``strict=False``
-        # tolerates remove_proj mismatches and any auxiliary heads
-        # the upstream wrapper might add.
+        # the wrapper ``OpenClipModel`` state, so every key is
+        # prefixed with ``model.`` (e.g. ``model.visual.class_embedding``).
+        # open_clip's bare model expects unprefixed keys, so strip the
+        # prefix before load — otherwise strict=False silently lets
+        # every key fail to match and the model stays at its randomly-
+        # initialized weights, which feels like "loaded OK" but isn't.
         state = torch.load(
             weights_path, map_location=self.device, weights_only=False,
         )
         if isinstance(state, dict) and "model" in state and "epoch" in state:
-            # Common training-loop wrapper: {"model": <state>, ...}.
+            # Training-loop wrapper: {"model": <state>, "epoch": N, ...}.
             state = state["model"]
+        # Strip a uniform ``model.`` prefix if the whole checkpoint
+        # has one — upstream's OpenClipModel is one such wrapper.
+        if state and all(k.startswith("model.") for k in state.keys()):
+            state = {k[len("model."):]: v for k, v in state.items()}
         missing, unexpected = model.load_state_dict(state, strict=False)
         # Trim a known-good amount of slack; surface unusual mismatches
         # so a wrong checkpoint doesn't silently load with mostly-zero

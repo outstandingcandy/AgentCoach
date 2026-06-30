@@ -1,0 +1,48 @@
+# Kids / youth soccer pitch (smaller than FIFA; dims in
+# configs/pitches/kids_soccer.yaml).
+
+video:
+  process_fps: 30
+sample:
+  stride: 1
+pitch_type: kids_soccer
+
+field_registration:
+  backend: pnlcalib
+  pnlcalib:
+    keypoint_weights: SV_kp
+    line_weights: SV_lines
+
+device: cuda
+
+unified_detection:
+  imgsz: 0
+  iou_threshold: 0.55
+
+reid:
+  backend: osnet
+
+tracking:
+  max_cosine_distance: 0.2
+  vis_frames_enabled: false
+  dump_yolo_raw: false
+  dump_ball_diag: false
+
+jersey_recognition:
+  enabled: true
+  backend: mmocr
+
+track_consolidation:
+  min_track_seconds: 1.0
+  jersey:
+    backend: mmocr
+    ocr_backend: rapidocr
+  frame_stride: 8
+
+pipeline:
+  stages:
+    - field_registration
+    - tracking
+    - track_consolidation
+    - event_detection
+    - player_profile

@@ -1,0 +1,68 @@
+# Keep the docker build context lean.
+#
+# This file is shared between deploy/offline/Dockerfile and
+# sagemaker/docker/Dockerfile. If you need anything below in the
+# image, COPY it explicitly.
+
+# --- VCS + scratch ---
+.git
+.github
+.gitignore
+
+# --- Python build artefacts ---
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+.venv
+venv
+build
+dist
+
+# --- IDEs / editor ---
+.vscode
+.idea
+*.swp
+
+# --- Big runtime data ---
+# Anything the offline image needs explicitly is staged into
+# deploy/offline/_build_assets/ by build.sh; we don't want the rest
+# of workspace/ shipped in the build context (would push it past
+# 50 GB on a developer machine with several runs cached).
+workspace/runs
+workspace/videos
+workspace/annotations
+workspace/models
+workspace/jobs
+workspace/.tmp
+workspace/configs
+data
+output
+
+# --- Web-app artefacts (offline image is CLI-only) ---
+goalinsight/web/static/.cache
+goalinsight/annotation/static/.cache
+
+# --- Deploy artefacts that don't belong in the image ---
+deploy/agentcore_runtime
+deploy/cloudfront
+deploy/alb-cognito.yaml
+deploy/bootstrap.sh
+deploy/start_web.sh
+
+# Don't recursively include the build-context staging dir under
+# deploy/offline (it'd be self-referential and inflate the context).
+# We DO want _build_assets/ — that's the whole point — but exclude
+# anything else under deploy/offline that pip would otherwise pull
+# in by accident.
+deploy/offline/*.log
+
+# --- Misc top-level reference files we don't need in the image ---
+docs
+goalinsight-aws-architecture.0623.drawio
+goalinsight-aws-architecture.0623.png
+README.md
+CLAUDE.md
