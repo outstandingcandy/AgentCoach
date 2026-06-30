@@ -1299,15 +1299,21 @@ def run_tracking(
             },
         )
     # Vis layering for the tracking stage:
-    #   * Per-frame jpg overlays (frames/) — ALWAYS rendered. The
-    #     /pipeline web page reads them and is the main way humans
-    #     inspect tracker output. Skipping them leaves the page blank.
+    #   * Per-frame jpg overlays (frames/) — ON by default. The
+    #     /pipeline web page reads them. Can be disabled per-run via
+    #     ``tracking.vis_frames_enabled: false`` when the run is purely
+    #     for downstream consumers (events, profile, match page) and
+    #     the per-frame debug grid isn't needed — on a 6-min 1080p clip
+    #     this rendering loop was 55% of stage 2 wall time.
     #   * Encoded mp4 (tracking.mp4) — opt-in via output.write_videos.
     #   * yolo_raw/ + ball_detection_diag/ — heavy diagnostic dumps,
     #     gated on output.save_visualizations (skipped by --no-viz).
     out_cfg = config.get("output", {}) or {}
     save_vis = out_cfg.get("save_visualizations", True)
     write_mp4 = out_cfg.get("write_videos", False)
+    vis_frames_enabled = bool(
+        config.get("tracking", {}).get("vis_frames_enabled", True)
+    )
 
     if save_vis:
         render_yolo_raw_diag(
@@ -1320,30 +1326,36 @@ def run_tracking(
     # Team / role / jersey classification and off-field filtering have
     # all moved to the track_consolidation stage.
 
-    # Always render per-frame jpgs — the web page needs them. mp4 +
-    # heavy debug renders gated separately.
-    _render_tracking_video(
-        video_path=video_path,
-        output_dir=output_dir,
-        sampler=sampler,
-        all_tracks=all_tracks,
-        all_ball_tracks=all_ball_tracks,
-        ball_debug_log=ball_debug_log,
-        ball_enabled=ball_enabled,
-        out=out,
-        fps=fps,
-        height=height,
-        pitch_length=pitch_length,
-        pitch_width=pitch_width,
-        camera_poses=camera_poses,
-        vis_frame_stride=int(
-            config.get("tracking", {}).get(
-                "vis_frame_stride",
-                (config.get("sample") or {}).get("stride", 1),
-            )
-        ),
-        write_mp4=write_mp4,
-    )
+    # Per-frame jpgs + (optional) mp4. Skip the entire render pass when
+    # neither output is wanted — saves 50%+ of stage 2 wall-time on
+    # full-match clips where the user only cares about downstream
+    # outputs.
+    if vis_frames_enabled or write_mp4:
+        _render_tracking_video(
+            video_path=video_path,
+            output_dir=output_dir,
+            sampler=sampler,
+            all_tracks=all_tracks,
+            all_ball_tracks=all_ball_tracks,
+            ball_debug_log=ball_debug_log,
+            ball_enabled=ball_enabled,
+            out=out,
+            fps=fps,
+            height=height,
+            pitch_length=pitch_length,
+            pitch_width=pitch_width,
+            camera_poses=camera_poses,
+            vis_frame_stride=int(
+                config.get("tracking", {}).get(
+                    "vis_frame_stride",
+                    (config.get("sample") or {}).get("stride", 1),
+                )
+            ),
+            write_mp4=write_mp4,
+            vis_frames_enabled=vis_frames_enabled,
+        )
+    else:
+        logger.info("Stage 2: skipping vis render (tracking.vis_frames_enabled=false, write_videos=false)")
     # _render_tracking_video releases ``out`` only when write_mp4=True.
     # Without mp4 we still hold the writer; release + delete the empty
     # 0-byte stub so /pipeline doesn't list a useless tracking.mp4.
@@ -1390,6 +1402,7 @@ def _render_tracking_video(
     camera_poses: dict | None = None,
     vis_frame_stride: int = 10,
     write_mp4: bool = False,
+    vis_frames_enabled: bool = True,
 ) -> None:
     """Render the tracking visualization video with ball + raw-track overlays.
 
@@ -1439,6 +1452,18 @@ def _render_tracking_video(
     _writer.start()
 
     for idx, frame_idx in enumerate(tqdm(list(sampler), desc="Stage 2: Rendering")):
+        # Skip everything for frames we won't emit. The vis loop used to
+        # decode + draw + project + topdown + hstack EVERY frame and only
+        # gate the disk-write at the bottom — that made vis the slowest
+        # part of stage 2 (>20 min on a 6-min 1080p clip). When
+        # ``write_mp4`` is off and the frame isn't on the stride grid,
+        # there's nothing to draw, so jump ahead.
+        want_image = vis_frames_enabled and (
+            vis_frame_stride <= 1 or frame_idx % vis_frame_stride == 0
+        )
+        if not write_mp4 and not want_image:
+            continue
+
         frame = render_prefetcher.get(frame_idx)
         if frame is None:
             break
@@ -1532,7 +1557,7 @@ def _render_tracking_video(
         fname = f"frame_{frame_idx:05d}"
         if write_mp4:
             _write_queue.put(("video", combined))
-        if vis_frame_stride <= 1 or frame_idx % vis_frame_stride == 0:
+        if want_image:
             _write_queue.put(("image", str(vis_frames_dir / f"{fname}.jpg"), combined))
             _write_queue.put(("json", str(vis_frames_dir / f"{fname}.json"), {
                 "frame_idx": int(frame_idx),

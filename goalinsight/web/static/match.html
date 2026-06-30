@@ -953,10 +953,21 @@
       // have no pitch_position (i.e. couldn't be projected onto the
       // field) or no jersey/role.
       const PLAYER_R = Math.max(5, Math.min(W, H) / 50);
+      // Index the roster by player_id so the minimap dots include every
+      // consolidated player listed in the Player Status grid — even
+      // unknown-jersey ones. The grid + minimap now show the same
+      // population.
+      const rosterIds = new Set(
+        (payload.players || []).map(p => String(p.player_id))
+      );
       for (const t of tracks || []) {
         const pp = t.pitch_position;
         if (!pp || pp[0] == null) continue;
-        if (!isIdentifiedTrack(t)) continue;
+        const tid = String(t.track_id);
+        // Show the dot iff this track resolved to a roster entry —
+        // matches the Player Status grid. ``unmapped-*`` fragments
+        // (consolidator-rejected) are excluded.
+        if (!rosterIds.has(tid)) continue;
         // Skip detections that landed outside the field rectangle by
         // more than a margin — these are invariably calibration
         // misprojections (sideline staff, photographers, etc.) and
@@ -965,7 +976,6 @@
         if (Math.abs(pp[0]) > PL / 2 + margin) continue;
         if (Math.abs(pp[1]) > PW / 2 + margin) continue;
 
-        const tid = String(t.track_id);
         const playerInfo = payload.players.find(p => p.player_id === tid) || {};
         const team = t.team || playerInfo.team_id || 'unknown';
         const role = t.role || playerInfo.role || 'player';

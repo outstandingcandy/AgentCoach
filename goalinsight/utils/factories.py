@@ -60,9 +60,10 @@ def get_reid_extractor(config: dict[str, Any] | None = None) -> "BaseReIDExtract
     Args:
         config: Configuration dict with 'reid' section.
             Expected keys:
-            - backend: "osnet" or "prtreid"
+            - backend: "osnet" | "prtreid" | "clip_reid"
             - osnet: {...} backend-specific config
             - prtreid: {...} backend-specific config
+            - clip_reid: {...} backend-specific config (weights_path required)
 
     Returns:
         ReID extractor instance implementing BaseReIDExtractor.
@@ -79,6 +80,15 @@ def get_reid_extractor(config: dict[str, Any] | None = None) -> "BaseReIDExtract
         backend_config = reid_config.get("prtreid", {})
         backend_config["device"] = config.get("device", "cuda")
         return PRTReIDExtractor(backend_config)
+    elif backend == "clip_reid":
+        # CLIP-ReID — fine-tuned OpenCLIP ViT-L/14 for player re-id.
+        # Weights aren't auto-downloaded; the user supplies the path
+        # via ``reid.clip_reid.weights_path``. See the extractor
+        # module docstring for the source.
+        from ..tracking.reid import ClipReIDExtractor
+        backend_config = dict(reid_config.get("clip_reid", {}))
+        backend_config["device"] = config.get("device", "cuda")
+        return ClipReIDExtractor(backend_config)
     else:
         # Default: OSNet
         from ..tracking.reid import OSNetExtractor

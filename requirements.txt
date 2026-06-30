@@ -10,6 +10,7 @@ deep-sort-realtime>=1.3,<2  # Multi-object tracking (StrongSORT compatible)
 
 # ReID
 torchreid>=0.2.5,<0.3     # Person re-identification
+open_clip_torch>=2.0.2    # CLIP-ReID backend (reid.backend: clip_reid)
 
 # Segmentation
 sam2>=1.0,<2              # SAM2
