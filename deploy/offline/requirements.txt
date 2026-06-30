@@ -1,58 +1,67 @@
 # Offline GoalInsight pipeline — full dependency set for a self-
-# contained Docker image. Lives separately from the top-level
-# requirements.txt because:
-#   * we drop the web app (fastapi/uvicorn/python-multipart) — the
-#     image is CLI-only, no /pipeline /match /annotate UIs.
-#   * we drop test deps (pytest) — image is for end-users, not the
-#     CI runner.
-#   * we keep the heavy ones (mmocr family, sam2, open_clip,
-#     transformers, qwen-vl-utils) so any jersey-OCR backend works
-#     out of the box without a second install pass.
+# contained Docker image. Versions mirror the dev venv at the repo
+# root (the one in `.venv/`) — they're known-good against the
+# repo's source tree as of the latest tested run.
 #
-# Pinned PyTorch family lives in the base image (pytorch:2.4.1-
-# cuda12.1-cudnn9-runtime); do NOT re-pin here or pip will re-resolve
-# and break CUDA wheels.
+# Drops vs repo's top-level requirements.txt:
+#   * fastapi / uvicorn / python-multipart — image is CLI-only
+#   * pytest — image is for end users, not CI
+#   * sam2 — declared in the repo's top-level requirements for future
+#     segmentation work but not imported by any current pipeline stage,
+#     and sam2>=1.1 demands torch>=2.5 which pip resolves into a wider
+#     torch upgrade than we want at build time
+#   * mmocr family — needs a from-source mmcv compile against torch
+#     headers (C++17, ~15 min build time, ~1 GB image bloat). Users
+#     who want OCR-based jersey reading should set
+#     ``track_consolidation.jersey.backend`` to claude / gemini /
+#     qwen and pass the matching API key at ``docker run`` time.
 
 # Detection & Tracking
-ultralytics>=8.3,<9       # YOLOv8 — pinned-major after the Dec-2024 PyPI hijack
-sahi>=0.11.0              # Sliced Aided Hyper Inference for small object detection
-deep-sort-realtime>=1.3,<2
+ultralytics==8.4.60
+sahi==0.12.0
+deep-sort-realtime==1.3.2
 
 # ReID
-torchreid>=0.2.5,<0.3
-open_clip_torch>=2.0.2
+# torchreid 0.2.5 (the PyPI fork) imports gdown + tensorboard at
+# package init via torchreid.reid.engine — but doesn't declare them
+# in its setup.py. Listing them explicitly here so `import torchreid`
+# works in a fresh image (otherwise OSNetExtractor silently treats
+# torchreid as missing and the build fails at the weight pre-bake step).
+gdown==6.1.0
+tensorboard==2.20.0
+torchreid==0.2.5
+open_clip_torch==3.3.0
 
-# Segmentation
-sam2>=1.0,<2
-
-# VLM for jersey number recognition (any one of these can be active
-# via track_consolidation.jersey.backend; ship all so users can swap
-# without rebuilding).
-transformers>=4.40.0
-qwen-vl-utils>=0.0.8,<0.1
-mmocr==1.0.1
-mmengine>=0.8.0,<0.9.0
-mmdet>=3.0.0rc5,<3.2.0
-mmcv>=2.0.0rc4,<2.1.0
+# VLM for jersey number recognition (transformers + qwen-vl-utils
+# enable the local Qwen-VL backend; transformers also gates other
+# HF-based loaders we may use).
+transformers==5.10.1
 
 # Computer vision
-opencv-python>=4.8.0
-scipy>=1.10.0
-scikit-learn>=1.3.0
-timm>=0.9.0
-Pillow>=10.0.0
+opencv-python==4.13.0.92
+scipy==1.17.1
+scikit-learn==1.9.0
+timm==1.0.27
+Pillow==12.2.0
 
 # Utilities
-pyyaml>=6.0
-tqdm>=4.65.0
-numpy>=1.24.0,<2
-yacs>=0.1.8
-einops>=0.6.0
-httpx>=0.24.0
+pyyaml==6.0.3
+tqdm==4.67.3
+yacs==0.1.8
+httpx==0.28.1
 
-# Optional cloud jersey backends — installed for the env-var opt-in,
-# but the image's default config uses local mmocr so users with no
-# cloud creds still get a working pipeline.
-boto3>=1.28
-google-genai>=1.0
-openai>=1.0.0
+# Optional cloud jersey backends — boto3 enables the Bedrock Claude
+# path, openai is for OpenAI-hosted models. The image's default
+# config doesn't call any of them, so users without credentials are
+# unaffected.
+boto3==1.43.22
+openai==2.41.0
+
+# Web server — FastAPI app exposed at port 8000 by the default
+# entrypoint. ``python-multipart`` is needed for the video-upload
+# form on /library. Chat-related endpoints are gated behind
+# ``GOALINSIGHT_DISABLE_CHAT`` (set to 1 in the Dockerfile) so this
+# stack runs without AWS / Google / OpenAI credentials.
+fastapi==0.136.3
+uvicorn==0.49.0
+python-multipart==0.0.32

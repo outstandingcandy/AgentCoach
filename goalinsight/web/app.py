@@ -11,11 +11,26 @@ own modules so this file stays a thin assembler.
 from __future__ import annotations
 
 import logging
+import os
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import json
+
+
+def _chat_enabled() -> bool:
+    """Read the GOALINSIGHT_DISABLE_CHAT env flag.
+
+    Defaults to chat-enabled (legacy behaviour). The offline Docker
+    image sets ``GOALINSIGHT_DISABLE_CHAT=1`` so the same code base can
+    ship as either a credentials-free viewer or the full chat surface
+    depending on deployment.
+    """
+    val = os.getenv("GOALINSIGHT_DISABLE_CHAT", "").strip().lower()
+    # Treat any truthy value as "disabled"; empty / "0" / "false" keep
+    # chat on.
+    return val in ("", "0", "false", "no", "off")
 
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -178,28 +193,33 @@ def create_workspace_app(
             raise HTTPException(503, "pipeline.html not yet installed")
         return FileResponse(path, headers=no_cache)
 
-    @app.get("/insights")
-    @app.get("/insights/")
-    def insights_index_page() -> FileResponse:
-        # Run picker — same pattern as /match/ / /library: lists every
-        # run with a tracking + annotated_video output and lets the user
-        # click into one. Matches the nav-tab convention so Insights
-        # is always reachable, even when no run is in the URL yet.
-        path = STATIC_DIR / "insights_index.html"
-        if not path.exists():
-            raise HTTPException(503, "insights_index.html not yet installed")
-        return FileResponse(path, headers=no_cache)
+    # The /insights/* routes are the LLM chat surface. Gated behind
+    # GOALINSIGHT_DISABLE_CHAT so the offline / credentials-free
+    # deployment doesn't serve a half-broken page that 500s on every
+    # chat call.
+    if _chat_enabled():
+        @app.get("/insights")
+        @app.get("/insights/")
+        def insights_index_page() -> FileResponse:
+            # Run picker — same pattern as /match/ / /library: lists every
+            # run with a tracking + annotated_video output and lets the user
+            # click into one. Matches the nav-tab convention so Insights
+            # is always reachable, even when no run is in the URL yet.
+            path = STATIC_DIR / "insights_index.html"
+            if not path.exists():
+                raise HTTPException(503, "insights_index.html not yet installed")
+            return FileResponse(path, headers=no_cache)
 
-    @app.get("/insights/{run_name}")
-    def viewer_page(run_name: str) -> FileResponse:
-        # Path is just the entry point; client uses run_name to call
-        # /api/runs/{run_name}/* endpoints (added by task 3).
-        path = STATIC_DIR / "viewer.html"
-        if not path.exists():
-            # Until we rename index.html → viewer.html we still want a usable
-            # fallback so the workspace app boots end-to-end.
-            path = STATIC_DIR / "index.html"
-        return FileResponse(path, headers=no_cache)
+        @app.get("/insights/{run_name}")
+        def viewer_page(run_name: str) -> FileResponse:
+            # Path is just the entry point; client uses run_name to call
+            # /api/runs/{run_name}/* endpoints (added by task 3).
+            path = STATIC_DIR / "viewer.html"
+            if not path.exists():
+                # Until we rename index.html → viewer.html we still want a usable
+                # fallback so the workspace app boots end-to-end.
+                path = STATIC_DIR / "index.html"
+            return FileResponse(path, headers=no_cache)
 
     @app.get("/tracking/{run_name}")
     def tracking_diag_page(run_name: str) -> FileResponse:
@@ -268,6 +288,16 @@ def create_workspace_app(
                     "missing_recommended": exc.missing_recommended,
                 },
             ) from exc
+
+    @app.get("/api/features")
+    def features() -> dict[str, bool]:
+        """Feature-flag probe consumed by shell.html nav.
+
+        ``chat_enabled`` reflects ``GOALINSIGHT_DISABLE_CHAT`` and lets
+        the static shell hide the Insights tab without baking a
+        deployment-specific HTML variant into the image.
+        """
+        return {"chat_enabled": _chat_enabled()}
 
     @app.get("/api/runs/{run_name}/meta")
     def run_meta(run_name: str) -> JSONResponse:
@@ -338,8 +368,18 @@ def create_workspace_app(
                         return RedirectResponse(url, status_code=302)
         return FileResponse(handle.video_path, media_type="video/mp4")
 
+    # ------------------------------------------------------------------
+    # Chat API surface — gated behind GOALINSIGHT_DISABLE_CHAT so the
+    # offline image doesn't expose endpoints that 500 without AWS creds.
+    # The chat-disabled deployment also skips the ``/chat_artifacts``
+    # static mount further down (see "Mount the workspace-wide chat
+    # artifact root" below).
+    # ------------------------------------------------------------------
+
     @app.post("/api/runs/{run_name}/chat")
     def run_chat(run_name: str, req: ChatRequest) -> dict[str, Any]:
+        if not _chat_enabled():
+            raise HTTPException(404, "chat disabled")
         handle = _get_run_or_http(run_name)
         try:
             text = handle.engine.respond(
@@ -360,6 +400,8 @@ def create_workspace_app(
         immediately emits ``ready``. Front-end uses this to gate the
         chat input until preparation finishes.
         """
+        if not _chat_enabled():
+            raise HTTPException(404, "chat disabled")
         handle = _get_run_or_http(run_name)
 
         from .chat_prepare import stream_prepare
@@ -380,6 +422,8 @@ def create_workspace_app(
 
     @app.post("/api/runs/{run_name}/chat/stream")
     def run_chat_stream(run_name: str, req: ChatRequest) -> StreamingResponse:
+        if not _chat_enabled():
+            raise HTTPException(404, "chat disabled")
         handle = _get_run_or_http(run_name)
         messages = [m.model_dump() for m in req.messages]
         current_time = req.current_time
@@ -419,6 +463,8 @@ def create_workspace_app(
 
     @app.get("/api/runs/{run_name}/chat/sessions")
     def list_sessions(run_name: str) -> dict[str, Any]:
+        if not _chat_enabled():
+            raise HTTPException(404, "chat disabled")
         handle = _get_run_or_http(run_name)
         sessions = [m.to_json() for m in _store(handle).list()]
         return {"sessions": sessions}
@@ -427,12 +473,16 @@ def create_workspace_app(
     def create_session(
         run_name: str, req: SessionCreateRequest,
     ) -> dict[str, Any]:
+        if not _chat_enabled():
+            raise HTTPException(404, "chat disabled")
         handle = _get_run_or_http(run_name)
         meta = _store(handle).create(title=req.title)
         return meta.to_json()
 
     @app.get("/api/runs/{run_name}/chat/sessions/{sid}")
     def get_session(run_name: str, sid: str) -> dict[str, Any]:
+        if not _chat_enabled():
+            raise HTTPException(404, "chat disabled")
         handle = _get_run_or_http(run_name)
         store = _store(handle)
         try:
@@ -448,6 +498,8 @@ def create_workspace_app(
     def update_session(
         run_name: str, sid: str, req: SessionUpdateRequest,
     ) -> dict[str, Any]:
+        if not _chat_enabled():
+            raise HTTPException(404, "chat disabled")
         handle = _get_run_or_http(run_name)
         store = _store(handle)
         try:
@@ -458,6 +510,8 @@ def create_workspace_app(
 
     @app.delete("/api/runs/{run_name}/chat/sessions/{sid}")
     def delete_session(run_name: str, sid: str) -> dict[str, Any]:
+        if not _chat_enabled():
+            raise HTTPException(404, "chat disabled")
         handle = _get_run_or_http(run_name)
         _store(handle).delete(sid)
         return {"ok": True, "session_id": sid}
@@ -473,6 +527,8 @@ def create_workspace_app(
         success. Either way the next chat turn lands on a warm
         sandbox.
         """
+        if not _chat_enabled():
+            raise HTTPException(404, "chat disabled")
         handle = _get_run_or_http(run_name)
         store = _store(handle)
         try:
@@ -495,6 +551,8 @@ def create_workspace_app(
     def session_chat_stream(
         run_name: str, sid: str, req: SessionChatRequest,
     ) -> StreamingResponse:
+        if not _chat_enabled():
+            raise HTTPException(404, "chat disabled")
         handle = _get_run_or_http(run_name)
         store = _store(handle)
         try:
@@ -590,11 +648,14 @@ def create_workspace_app(
     # Mount the workspace-wide chat artifact root at /chat_artifacts so the
     # existing IMG_RE in viewer.html ('/chat_artifacts/...') still matches.
     # ChatEngine writes per-run files under <root>/<run_name>/.
-    app.mount(
-        RUNS_ARTIFACTS_URL,
-        StaticFiles(directory=runs.artifacts_root),
-        name="chat_artifacts",
-    )
+    # Skipped when chat is disabled — there's nothing under that path
+    # without an LLM writing into it.
+    if _chat_enabled():
+        app.mount(
+            RUNS_ARTIFACTS_URL,
+            StaticFiles(directory=runs.artifacts_root),
+            name="chat_artifacts",
+        )
     # Read-only direct access to every file inside a run dir, used by the
     # /pipeline page to display per-stage vis JPGs / mp4s. Path layout
     # mirrors the on-disk one: /runs_static/<run>/<stage>/...
