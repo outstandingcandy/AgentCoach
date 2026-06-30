@@ -357,6 +357,52 @@ def _build_track_consolidation(run_dir: Path, pipeline_stats: dict) -> StageMani
         # Keys on disk are stringified ints; keep them strings (filenames
         # use zero-padded ints anyway, conversion happens in JS).
         manifest.stats = {**manifest.stats, "_player_map": pmap}
+
+    # Per-player frame coverage (outer) + per-orig-tid coverage (inner).
+    # Both come from tracks.json: the consolidator writes the
+    # consolidated player_id into ``track_id`` and keeps the original
+    # tracker tid under ``orig_track_id``, so one pass yields both
+    # mappings without re-reading tracking/tracks.json.
+    player_lifetimes: dict[str, dict[str, Any]] = {}
+    orig_lifetimes: dict[str, dict[str, Any]] = {}
+    cons_tracks = _read_json(stage_dir / "tracks.json")
+    if isinstance(cons_tracks, dict):
+        per_pid_frames: dict[str, list[int]] = {}
+        per_orig_frames: dict[str, list[int]] = {}
+        for frame_key, dets in cons_tracks.items():
+            try:
+                fidx = int(frame_key)
+            except (TypeError, ValueError):
+                continue
+            for det in dets or []:
+                pid = det.get("track_id") or det.get("player_id")
+                if isinstance(pid, str) and not pid.startswith("unmapped-"):
+                    per_pid_frames.setdefault(pid, []).append(fidx)
+                orig = det.get("orig_track_id")
+                if isinstance(orig, int):
+                    per_orig_frames.setdefault(str(orig), []).append(fidx)
+        for pid, frames in per_pid_frames.items():
+            frames.sort()
+            player_lifetimes[pid] = {
+                "tid": pid,
+                "first_frame": frames[0],
+                "last_frame": frames[-1],
+                "n_frames": len(frames),
+                "frames": frames,
+            }
+        for orig, frames in per_orig_frames.items():
+            frames.sort()
+            orig_lifetimes[orig] = {
+                "tid": orig,
+                "first_frame": frames[0],
+                "last_frame": frames[-1],
+                "n_frames": len(frames),
+                "frames": frames,
+            }
+    if player_lifetimes:
+        manifest.stats = {**manifest.stats, "_track_lifetimes": player_lifetimes}
+    if orig_lifetimes:
+        manifest.stats = {**manifest.stats, "_orig_track_lifetimes": orig_lifetimes}
     return manifest
 
 
@@ -425,11 +471,36 @@ def _build_highlights(run_dir: Path, pipeline_stats: dict) -> StageManifest:
     )
 
 
+def _build_player_profile(run_dir: Path, pipeline_stats: dict) -> StageManifest:
+    """player_profile stage: list per-player crops, heatmaps, spotlights."""
+    stage_dir = run_dir / "player_profile"
+    if not stage_dir.is_dir():
+        return StageManifest(stage="player_profile", exists=False)
+    files = []
+    summary = stage_dir / "players_profile.json"
+    if summary.exists():
+        files.append(_file_entry(summary, run_dir))
+    for sub in ("crops", "heatmaps", "spotlights"):
+        sub_dir = stage_dir / sub
+        if not sub_dir.is_dir():
+            continue
+        for p in sorted(sub_dir.iterdir()):
+            if p.suffix in (".jpg", ".png", ".mp4", ".json"):
+                files.append(_file_entry(p, run_dir))
+    return StageManifest(
+        stage="player_profile",
+        exists=True,
+        stats=pipeline_stats.get("player_profile", {}),
+        files=files,
+    )
+
+
 _BUILDERS = {
     "field_registration": _build_field_registration,
     "tracking": _build_tracking,
     "track_consolidation": _build_track_consolidation,
     "event_detection": _build_event_detection,
+    "player_profile": _build_player_profile,
     "annotated_video": _build_annotated_video,
     "highlights": _build_highlights,
 }

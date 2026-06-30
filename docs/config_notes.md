@@ -620,7 +620,7 @@ Auto-extracted from `configs/*.yaml` by `scripts/extract_config_comments.py`. Co
 
 ### `reid.backend`
 
-- "osnet" (default) or "prtreid"
+- "osnet" (default), "prtreid", or "clip_reid"
 
 ### `reid.model`
 
@@ -641,6 +641,39 @@ Auto-extracted from `configs/*.yaml` by `scripts/extract_config_comments.py`. Co
 ### `reid.prtreid.weights_path`
 
 - Path to weights (null = auto-download)
+
+### `reid.clip_reid.backbone`
+
+- OpenCLIP model name; "ViT-L-14" (default) or "ViT-B-16" (lighter).
+- Embedding dim depends on `remove_proj`:
+  - `remove_proj: true` (default, matches CLIP-ReID): ViT-L-14 → 1024-dim,
+    ViT-B-16 → 768-dim.
+  - `remove_proj: false`: ViT-L-14 → 768-dim, ViT-B-16 → 512-dim.
+
+### `reid.clip_reid.pretrained`
+
+- OpenCLIP pretrained tag used as the BASE before applying the
+  fine-tuned checkpoint. Default "openai".
+
+### `reid.clip_reid.weights_path`
+
+- REQUIRED. Path to the fine-tuned CLIP-ReID checkpoint (e.g.
+  `workspace/models/clip_reid/ViT-L-14_openai/weights_e4.pth`).
+  Download manually from the Google Drive link in
+  https://github.com/KonradHabel/clip_reid — the upstream repo
+  doesn't expose a permanent HTTP URL so there's no auto-download.
+
+### `reid.clip_reid.remove_proj`
+
+- Mirrors upstream `OpenClipModel(remove_proj=True)`. When true the
+  image encoder's joint image/text projection is dropped, so the
+  embedding is the pre-projection visual feature. Default true —
+  matches CLIP-ReID's published evaluation.
+
+### `reid.clip_reid.batch_size`
+
+- Inference batch (default 32). ViT-L-14 at 336×336 uses ~4 GB GPU
+  per batch-32. Halve if you OOM.
 - Team classification — consumed by the track_consolidation stage
 - (tracker itself no longer does team/role assignment).
 

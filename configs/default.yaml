@@ -149,6 +149,12 @@ reid:
     referee_confidence_threshold: 0.85
     goalkeeper_confidence_threshold: 0.7
     weights_path:
+  clip_reid:
+    backbone: "ViT-L-14"
+    pretrained: "openai"
+    weights_path:
+    remove_proj: true
+    batch_size: 32
 team_classification:
   backend: "kmeans"
   position_weight: 0.1

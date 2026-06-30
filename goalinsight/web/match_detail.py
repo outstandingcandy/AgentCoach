@@ -237,6 +237,14 @@ def _players(
             if tid is None:
                 continue
             tid = str(tid)
+            # Skip the consolidator's synthetic ``unmapped-<orig_tid>``
+            # tracks — these are short / off-field / LLM-rejected
+            # fragments the consolidator preserved in tracks.json only
+            # so the per-frame renderer can paint a neutral box rather
+            # than a hole. They are NOT players and shouldn't pollute
+            # the match roster or the right-side minimap dots.
+            if tid.startswith("unmapped-"):
+                continue
             counts[tid] += 1
             if tid not in jerseys and t.get("jersey_number") is not None:
                 jerseys[tid] = t.get("jersey_number")

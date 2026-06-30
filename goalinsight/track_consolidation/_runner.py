@@ -736,6 +736,22 @@ def run_track_consolidation(
         "players_map": str(output_dir / "player_map.json"),
         "players_detail": str(output_dir / "players.json"),
     }
+    # Surface per-run jersey-recognizer Bedrock token spend so the
+    # pipeline summary captures the real LLM cost of this stage.
+    if hasattr(recognizer, "usage_stats"):
+        try:
+            usage = recognizer.usage_stats()
+        except Exception:
+            usage = None
+        if usage:
+            stats["jersey_recognizer_usage"] = usage
+            logger.info(
+                "Jersey recognizer (%s): %d calls, %d in tok, %d out tok",
+                usage.get("model_id", "?"),
+                usage.get("calls", 0),
+                usage.get("input_tokens", 0),
+                usage.get("output_tokens", 0),
+            )
     with open(output_dir / "stats.json", "w") as f:
         json.dump(stats, f, indent=2)
     return stats

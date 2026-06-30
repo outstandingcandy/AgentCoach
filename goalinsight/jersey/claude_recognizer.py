@@ -52,6 +52,13 @@ class ClaudeJerseyRecognizer(BaseVLMRecognizer):
         self._client = boto3.client(
             "bedrock-runtime", region_name=self.region, config=boto_cfg,
         )
+        # Token accounting: surfaces actual Bedrock spend per
+        # consolidation run so the per-video cost is reportable.
+        # Thread-safe — only mutated under the GIL via successful
+        # invoke_model returns; no concurrency primitives needed.
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+        self._total_calls = 0
 
     # ------------------------------------------------------------------
     # BaseVLMRecognizer hook
@@ -131,6 +138,12 @@ class ClaudeJerseyRecognizer(BaseVLMRecognizer):
                     contentType="application/json",
                 )
                 payload = json.loads(resp["body"].read())
+                # Tally per-call token usage so the runner can surface
+                # the total Bedrock cost for the consolidation pass.
+                usage = payload.get("usage") or {}
+                self._total_input_tokens += int(usage.get("input_tokens", 0))
+                self._total_output_tokens += int(usage.get("output_tokens", 0))
+                self._total_calls += 1
                 for p in payload.get("content", []):
                     if p.get("type") == "text":
                         return p["text"]
@@ -145,3 +158,16 @@ class ClaudeJerseyRecognizer(BaseVLMRecognizer):
                 time.sleep(wait)
         logger.error("Bedrock invoke permanently failed: %s", last_err)
         return None
+
+    def usage_stats(self) -> dict[str, int]:
+        """Return per-recognizer Bedrock token tally.
+
+        Reported by the track_consolidation runner at end-of-stage so
+        each run logs how much Sonnet/Opus it spent.
+        """
+        return {
+            "model_id": self.model_id,
+            "calls": int(self._total_calls),
+            "input_tokens": int(self._total_input_tokens),
+            "output_tokens": int(self._total_output_tokens),
+        }

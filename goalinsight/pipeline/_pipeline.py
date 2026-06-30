@@ -88,8 +88,10 @@ class Pipeline:
             frame_count=n_frames,
         )
 
+        import time as _time
         completed: list[str] = []
         cancelled = False
+        stage_durations: dict[str, float] = {}
         for stage in self._stages:
             # Always register the stage dir so later stages can find it
             ctx.stage_dir(stage.name)
@@ -112,9 +114,15 @@ class Pipeline:
             print(stage.description)
             print("=" * 60)
 
+            t0 = _time.time()
             stats = stage.run(ctx)
+            dt = _time.time() - t0
+            stage_durations[stage.name] = round(dt, 2)
+            if isinstance(stats, dict):
+                stats = {**stats, "elapsed_seconds": round(dt, 2)}
             ctx.stage_stats[stage.name] = stats
             completed.append(stage.name)
+            print(f"  [{stage.name}] elapsed: {dt:.1f}s")
             print()
 
         run_metadata = {
@@ -124,6 +132,8 @@ class Pipeline:
             "stages_run": completed,
             "cancelled": cancelled,
             "stats": ctx.stage_stats,
+            "stage_durations_seconds": stage_durations,
+            "total_elapsed_seconds": round(sum(stage_durations.values()), 2),
         }
         with open(output_dir / "pipeline_stats.json", "w") as f:
             json.dump(run_metadata, f, indent=2)

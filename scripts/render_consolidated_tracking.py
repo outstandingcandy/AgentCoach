@@ -253,47 +253,97 @@ def render_consolidated_video(
         tracks_now = all_tracks.get(str(frame_idx), [])
         visible_ids: set[str] = set()
         for t in tracks_now:
-            tid = str(t["track_id"])
-            visible_ids.add(tid)
-            player = player_by_id.get(tid)
-            color = _player_color(player, t)
-            orig_tid = t.get("orig_track_id")
-            label = _player_label(tid, player, orig_tid=orig_tid)
-            x1, y1, x2, y2 = (int(v) for v in t["bbox"])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, rect_thick)
-            (tw, th), _ = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_thick,
-            )
-            cv2.rectangle(
-                frame, (x1, y1 - th - 8), (x1 + tw + 8, y1), color, -1,
-            )
-            cv2.putText(
-                frame, label, (x1 + 4, y1 - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, font_scale,
-                (255, 255, 255), text_thick, cv2.LINE_AA,
-            )
+            visible_ids.add(str(t["track_id"]))
 
-        cv2.putText(
-            frame, f"frame {frame_idx}  |  visible: {len(visible_ids)}",
-            (10, int(40 * font_scale + 10)),
-            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0),
-            text_thick + 1, cv2.LINE_AA,
+        want_jpg = (
+            vis_frame_stride > 0
+            and frame_idx % vis_frame_stride == 0
+            and bool(tracks_now)
         )
 
-        if show_panel:
-            frame = _draw_side_panel(frame, players, visible_ids)
+        # Per-frame JSON sidecar: ships everything the client needs to
+        # draw bbox + label overlays from JS — bbox, player_id, jersey,
+        # team, role, plus the orig_track_id for the per-track drill-in
+        # widget. Written alongside the JPG so the frame slider can
+        # fetch them as a pair.
+        if want_jpg:
+            sidecar_tracks = []
+            for t in tracks_now:
+                tid = str(t["track_id"])
+                player = player_by_id.get(tid) or {}
+                bbox = t.get("bbox") or [0, 0, 0, 0]
+                sidecar_tracks.append({
+                    "player_id": tid,
+                    "orig_track_id": t.get("orig_track_id"),
+                    "bbox": [float(v) for v in bbox],
+                    "jersey_number": (
+                        t.get("jersey_number")
+                        or player.get("jersey_number")
+                    ),
+                    "team": t.get("team") or player.get("team"),
+                    "role": t.get("role") or player.get("role"),
+                    "color_bgr": list(_player_color(player, t)),
+                })
+            with open(frames_dir / f"frame_{frame_idx:05d}.json", "w") as jf:
+                json.dump({
+                    "frame_idx": int(frame_idx),
+                    "timestamp_sec": round(frame_idx / fps, 3),
+                    "n_visible": len(visible_ids),
+                    # Source frame dimensions BEFORE the side panel is
+                    # appended. Bboxes live in (video_w × video_h)
+                    # space; the JS overlay uses these to scale
+                    # correctly even when the JPG ships at a different
+                    # resolution (e.g. ``?w=1080`` downscaling).
+                    "video_w": int(width),
+                    "video_h": int(height),
+                    # Full JPG size (incl. roster panel) so the JS knows
+                    # the original aspect ratio that backs the rendered
+                    # ``naturalWidth``.
+                    "jpg_w": int(out_w),
+                    "jpg_h": int(height),
+                    "tracks": sidecar_tracks,
+                }, jf)
 
         if writer is not None:
-            writer.write(frame)
-        # Only dump per-frame JPGs for video frames that actually had
-        # tracker output. The tracker samples at process_fps (e.g. 30
-        # on a 60 fps source), so half the video frames have an empty
-        # tracks-json entry and would otherwise produce blank /
-        # detection-less JPGs the /pipeline page treats as missing
-        # data. Skipping them keeps the frame slider free of empties.
-        if (vis_frame_stride > 0
-                and frame_idx % vis_frame_stride == 0
-                and tracks_now):
+            # Mp4 path keeps the legacy baked-in overlays for ad-hoc
+            # video playback; only the per-frame JPG path went clean.
+            mp4_frame = frame.copy()
+            for t in tracks_now:
+                tid = str(t["track_id"])
+                player = player_by_id.get(tid)
+                color = _player_color(player, t)
+                orig_tid = t.get("orig_track_id")
+                label = _player_label(tid, player, orig_tid=orig_tid)
+                x1, y1, x2, y2 = (int(v) for v in t["bbox"])
+                cv2.rectangle(mp4_frame, (x1, y1), (x2, y2), color, rect_thick)
+                (tw, th), _ = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_thick,
+                )
+                cv2.rectangle(
+                    mp4_frame, (x1, y1 - th - 8), (x1 + tw + 8, y1), color, -1,
+                )
+                cv2.putText(
+                    mp4_frame, label, (x1 + 4, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                    (255, 255, 255), text_thick, cv2.LINE_AA,
+                )
+            cv2.putText(
+                mp4_frame, f"frame {frame_idx}  |  visible: {len(visible_ids)}",
+                (10, int(40 * font_scale + 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0),
+                text_thick + 1, cv2.LINE_AA,
+            )
+            if show_panel:
+                mp4_frame = _draw_side_panel(mp4_frame, players, visible_ids)
+            writer.write(mp4_frame)
+
+        if want_jpg:
+            # Clean frame for the web overlay path: just the source
+            # video frame, no bbox / label / text / roster panel. The
+            # JS overlay draws everything on top. Panel was removed
+            # because it (a) changed JPG aspect ratio away from the
+            # source video and (b) baked a permanent label/legend
+            # block that the user can't control client-side.
             cv2.imwrite(str(frames_dir / f"frame_{frame_idx:05d}.jpg"), frame)
 
         frame_idx += 1
