@@ -13,7 +13,7 @@ Run:
       --video data/raw_videos/kids_soccer_clip_1250_1310.mp4 \\
       --poses output/kids_prtreid_iou_fix/field_registration/camera_poses.pkl \\
       --output output/kids_prtreid_iou_fix/yolo_raw \\
-      --config configs/kids_soccer_physical.yaml
+      --config workspace/configs/kids_soccer_physical.yaml
 """
 from __future__ import annotations
 
@@ -43,14 +43,13 @@ from goalinsight.utils.config import merge_configs
 
 
 def load_config(path: Path) -> dict:
-    default_path = REPO / "configs/default.yaml"
-    with open(default_path) as f:
-        cfg = yaml.safe_load(f) or {}
-    if path != default_path:
-        with open(path) as f:
-            override = yaml.safe_load(f) or {}
-        cfg = merge_configs(cfg, override)
-    return cfg
+    # Templates are self-contained; just load the picked one without
+    # an implicit default-yaml merge. Falls back to the FIFA template
+    # when called with the default ``--config`` arg.
+    default_path = REPO / "configs/templates/fifa.yaml"
+    target = path if path.exists() else default_path
+    with open(target) as f:
+        return yaml.safe_load(f) or {}
 
 
 def project_to_pitch(bbox, pose):
@@ -92,7 +91,7 @@ def main():
     ap.add_argument("--video", required=True)
     ap.add_argument("--poses", required=True, help="camera_poses.pkl from field_registration")
     ap.add_argument("--output", required=True)
-    ap.add_argument("--config", default="configs/default.yaml")
+    ap.add_argument("--config", default="configs/templates/fifa.yaml")
     ap.add_argument("--max-frames", type=int, default=None,
                     help="Optional cap on number of sampled frames")
     args = ap.parse_args()

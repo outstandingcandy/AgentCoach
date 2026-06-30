@@ -1,16 +1,31 @@
-# default.yaml
-# Comments / rationale live in docs/config_notes.md (#default.yaml).
+# Children / youth 7-a-side video pipeline template.
+#
+# Self-contained: every key the pipeline reads is in this file — no
+# implicit ``default.yaml`` merge happens. Copy this file when you
+# want to spin up a new scene or per-video variant.
+#
+# Differences vs the FIFA template:
+#   * pitch_type: kids_soccer  (66 × 43 m reduced youth field)
+#   * physical.camera_profile: kids_soccer_1080p
+#                              (different sensor + pole height than
+#                               broadcast veo cams)
+#
+# Everything else (detection / tracking / events / reid backend) is
+# inherited from the FIFA template — adjust as needed for your rig.
+
+pitch_type: kids_soccer
 
 video:
   process_fps: 10
   resize_width: 1920
   resize_height: 1080
+
 field_registration:
-  backend: "pnlcalib"
+  backend: pnlcalib
   pnlcalib:
-    keypoint_weights: "SV_kp"
+    keypoint_weights: SV_kp
     keypoint_threshold: 0.3434
-    line_weights: "SV_lines"
+    line_weights: SV_lines
     line_threshold: 0.15
     pnl_refine: false
     line_weight: 1.0
@@ -18,7 +33,7 @@ field_registration:
     use_prev_homography: true
     weights_dir:
   physical:
-    camera_profile: "veo_1080p"
+    camera_profile: kids_soccer_1080p
     camera_profiles_path:
     detection_batch_size: 8
     ransac_reproj_error: 15.0
@@ -36,43 +51,46 @@ field_registration:
     world_error_threshold: 5.0
     calibration_skip: 1
   keypoint_detector:
-    backend: "resnet50"
-    model: "resnet50"
+    backend: resnet50
+    model: resnet50
     confidence_threshold: 0.5
     num_keypoints: 115
     pnlcalib:
-      weights: "SV_kp"
+      weights: SV_kp
       confidence_threshold: 0.3434
   line_detector:
-    backend: "hough"
+    backend: hough
     hough_threshold: 50
     min_line_length: 100
     max_line_gap: 10
     pnlcalib:
-      weights: "SV_lines"
+      weights: SV_lines
       confidence_threshold: 0.15
   pnl_solver:
     ransac_iterations: 1000
     reprojection_threshold: 8.0
     pnl_refine: false
     line_weight: 1.0
+
 unified_detection:
   enabled: true
-  model: "yolov8x"
+  model: yolov8x
   confidence_threshold: 0.3
   iou_threshold: 0.45
   imgsz: 0
   batch_size: 4
   player_confidence_threshold: 0.5
+
 detection:
-  model: "yolov8x"
+  model: yolov8x
   confidence_threshold: 0.5
   iou_threshold: 0.45
   classes: [0]
   imgsz: 1280
+
 ball_detection:
   enabled: true
-  model: "yolov8x"
+  model: yolov8x
   confidence_threshold: 0.3
   iou_threshold: 0.45
   classes: [32]
@@ -86,7 +104,7 @@ ball_detection:
   sahi_slice_size: 640
   sahi_overlap_ratio: 0.2
   sahi_perform_standard_pred: true
-  sahi_postprocess_type: "GREEDYNMM"
+  sahi_postprocess_type: GREEDYNMM
   sahi_postprocess_match_threshold: 0.5
   two_pass: true
   pass1_confidence_threshold: 0.5
@@ -104,6 +122,7 @@ ball_detection:
     speed_violation_ratio: 0.2
     min_displacement: 1.0
     merge_max_distance: 40.0
+
 ball_tracking:
   enabled: true
   tracker_type: botsort
@@ -114,7 +133,7 @@ ball_tracking:
   new_track_thresh: 0.4
   max_position_distance: 120
   fuse_score: true
-  gmc_method: "none"
+  gmc_method: none
   with_reid: false
   proximity_thresh: 0.5
   appearance_thresh: 0.25
@@ -126,8 +145,9 @@ ball_tracking:
     ball_real_diameter: 0.22
     bbox_padding: 1.0
     ground_contact_weight: 2.0
+
 tracking:
-  algorithm: "strongsort"
+  algorithm: strongsort
   max_age: 30
   min_hits: 3
   iou_threshold: 0.3
@@ -136,31 +156,36 @@ tracking:
   reid_iou_min: 0.1
   reid_pitch_max_m: 1.5
   dump_yolo_raw: true
+
 reid:
-  backend: "osnet"
-  model: "osnet_x1_0"
+  backend: osnet
+  model: osnet_x1_0
   feature_dim: 512
   batch_size: 32
   osnet:
-    model: "osnet_x1_0"
+    model: osnet_x1_0
     feature_dim: 512
+    weights_path:
   prtreid:
     feature_dim: 256
     referee_confidence_threshold: 0.85
     goalkeeper_confidence_threshold: 0.7
     weights_path:
   clip_reid:
-    backbone: "ViT-L-14"
-    pretrained: "openai"
+    backbone: ViT-L-14
+    pretrained: openai
     weights_path:
     remove_proj: true
     batch_size: 32
+
 team_classification:
-  backend: "kmeans"
+  backend: kmeans
   position_weight: 0.1
   min_samples_per_team: 5
+
 visualization:
-  backend: "minimal"
+  backend: minimal
+
 highlights:
   enabled: false
   output_fps: 25.0
@@ -195,10 +220,11 @@ highlights:
   goal_detection:
     min_confidence: 0.15
   recipes:
-  - name: "goal_highlight"
-    detector: "goal"
-    analyzer: "scorer"
-    composer: "segment"
+  - name: goal_highlight
+    detector: goal
+    analyzer: scorer
+    composer: segment
+
 track_consolidation:
   enabled: false
   min_track_seconds: 3.0
@@ -213,8 +239,8 @@ track_consolidation:
     rapidocr:
       upscale: 4.0
       min_confidence: 0.5
-    model_id: "us.anthropic.claude-opus-4-7"
-    region: "us-east-1"
+    model_id: us.anthropic.claude-opus-4-7
+    region: us-east-1
     max_concurrency: 32
     ocr_per_track_concurrency: 8
     decision_subset_size: 8
@@ -230,6 +256,7 @@ track_consolidation:
   goalkeeper:
     enabled: true
     goal_area_depth: 16.5
+
 annotated_video:
   enabled: false
   output_fps:
@@ -261,14 +288,17 @@ annotated_video:
     height_frac: 0.28
     alpha: 0.85
     margin_px: 20
+
 output:
-  format: "json"
+  format: json
   save_visualizations: true
   visualization_fps: 10
   save_embeddings: false
-device: "cuda"
+
+device: cuda
 num_workers: 4
 batch_size: 16
+
 events:
   detectors:
   - possession
@@ -302,6 +332,7 @@ events:
     tackle_deflection_angle: 30.0
     tackle_max_gap_seconds: 1.0
     deflection_window_seconds: 0.5
+
 player_profile:
   heatmap_bins: 30
   spotlights:
@@ -316,19 +347,9 @@ player_profile:
     crf: 23
     preset: medium
     min_observations: 30
+
 pipeline:
   stages:
   - field_registration
   - tracking
-sagemaker:
-  region: ""
-  role_arn: ""
-  image_uri: ""
-  s3_bucket: ""
-  s3_prefix: pipeline-runs
-  weights_s3_prefix: weights
-  default_instance_type: ml.g5.xlarge
-  instance_count: 1
-  volume_size_gb: 50
-  max_runtime_seconds: 3600
-  fetch_visualizations: false
+  - event_detection

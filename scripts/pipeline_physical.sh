@@ -3,5 +3,5 @@ python scripts/run_full_pipeline.py \
   --video data/raw_videos/football_sunday_output_007.mp4 \
   --output output/pipeline_007_2 \
   --stages 2 \
-  --config configs/clip_000_physical.yaml \
+  --config workspace/configs/clip_000_physical.yaml \
   --no-timestamp

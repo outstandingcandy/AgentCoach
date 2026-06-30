@@ -237,13 +237,15 @@ class JobManager:
         run_dir = self.workspace.run_dir(rec.run_name)  # type: ignore[arg-type]
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        # Apply per-video annotator overrides to the chosen YAML so the
-        # subprocess inherits them. Same merge order the old in-process
-        # path used; we just write the result to disk instead of
-        # passing a Python dict.
-        config = get_default_config()
+        # Apply per-video annotator overrides to the chosen template so
+        # the subprocess inherits them. Templates are self-contained
+        # (no implicit ``default.yaml`` merge base), so we either load
+        # the user-picked yaml or fall back to the FIFA template and
+        # then layer the per-video annotator overrides on top.
         if p.get("config_path"):
-            config = merge_configs(config, load_config(p["config_path"]))
+            config = load_config(p["config_path"])
+        else:
+            config = get_default_config()
         config = _merge_per_video_overrides(
             config,
             annotations_dir=self.workspace.annotations_dir,

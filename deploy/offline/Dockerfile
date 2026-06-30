@@ -3,7 +3,7 @@
 # Build:  ./deploy/offline/build.sh
 # Run:    docker run --gpus all -v $PWD/out:/output goalinsight:offline-latest \
 #             --video /opt/goalinsight/example_video.mp4 \
-#             --config /opt/goalinsight/example_configs/futsal_sample.yaml \
+#             --config /opt/goalinsight/configs/templates/futsal.yaml \
 #             --output /output
 #
 # Image contents:
@@ -120,7 +120,9 @@ COPY deploy/offline/_build_assets/clip_reid_weights/ \
      /opt/goalinsight/models/clip_reid/
 
 # --- Layer 6: Examples -------------------------------------------
-COPY deploy/offline/example_configs/ /opt/goalinsight/example_configs/
+# The 3 user-facing scene templates already landed at
+# /opt/goalinsight/configs/templates/ via the source COPY above —
+# entrypoint.sh seeds workspace/configs/ from there.
 COPY deploy/offline/_build_assets/example_video.mp4 \
      /opt/goalinsight/example_video.mp4
 COPY deploy/offline/_build_assets/annotations/ \

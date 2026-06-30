@@ -19,7 +19,7 @@ Usage:
 
     # Remote (SageMaker TrainingJob, same flags)
     python scripts/train_finetune.py --kind line --remote \\
-        --config configs/kids_soccer_physical.yaml \\
+        --config workspace/configs/kids_soccer_physical.yaml \\
         --annotations_dir output/annotations/kids_soccer_clip_1250_1310 \\
         --pretrained ~/.cache/goal-insight/pnlcalib/SV_lines \\
         --output_dir data/finetuned_line_models \\

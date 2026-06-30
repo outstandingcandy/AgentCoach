@@ -1,0 +1,352 @@
+# FIFA 11-a-side video pipeline template.
+#
+# Self-contained: every key the pipeline reads is in this file — no
+# implicit ``default.yaml`` merge happens. Copy this file when you
+# want to spin up a new scene or per-video variant.
+#
+# Three reference libraries it points at (by name, not path):
+#   * ``pitch_type``                        → configs/pitches.yaml
+#   * ``field_registration.physical.camera_profile`` → configs/camera_profiles.yaml
+#
+# This is also the fallback the CLI loads when ``--config`` is unset.
+
+pitch_type: fifa
+
+video:
+  process_fps: 10
+  resize_width: 1920
+  resize_height: 1080
+
+field_registration:
+  backend: pnlcalib
+  pnlcalib:
+    keypoint_weights: SV_kp
+    keypoint_threshold: 0.3434
+    line_weights: SV_lines
+    line_threshold: 0.15
+    pnl_refine: false
+    line_weight: 1.0
+  nbjw:
+    use_prev_homography: true
+    weights_dir:
+  physical:
+    camera_profile: veo_1080p
+    camera_profiles_path:
+    detection_batch_size: 8
+    ransac_reproj_error: 15.0
+    line_weight: 1.0
+    line_sample_points: 20
+    max_reproj_error: 15.0
+    use_line_model: false
+    focal_hfov_deg_bounds: [27.0, 50.0]
+    cx_bounds: [-100.0, 100.0]
+    cy_bounds: [-50.0, 50.0]
+    k1_bounds: [-0.35, -0.15]
+    k2_bounds: [-0.05, 0.10]
+    k3_bounds: [-0.05, 0.05]
+    world_residual_weight: 0.0
+    world_error_threshold: 5.0
+    calibration_skip: 1
+  keypoint_detector:
+    backend: resnet50
+    model: resnet50
+    confidence_threshold: 0.5
+    num_keypoints: 115
+    pnlcalib:
+      weights: SV_kp
+      confidence_threshold: 0.3434
+  line_detector:
+    backend: hough
+    hough_threshold: 50
+    min_line_length: 100
+    max_line_gap: 10
+    pnlcalib:
+      weights: SV_lines
+      confidence_threshold: 0.15
+  pnl_solver:
+    ransac_iterations: 1000
+    reprojection_threshold: 8.0
+    pnl_refine: false
+    line_weight: 1.0
+
+unified_detection:
+  enabled: true
+  model: yolov8x
+  confidence_threshold: 0.3
+  iou_threshold: 0.45
+  imgsz: 0
+  batch_size: 4
+  player_confidence_threshold: 0.5
+
+detection:
+  model: yolov8x
+  confidence_threshold: 0.5
+  iou_threshold: 0.45
+  classes: [0]
+  imgsz: 1280
+
+ball_detection:
+  enabled: true
+  model: yolov8x
+  confidence_threshold: 0.3
+  iou_threshold: 0.45
+  classes: [32]
+  imgsz: 0
+  min_size: 3
+  max_size: 100
+  min_aspect_ratio: 0.5
+  max_aspect_ratio: 3.0
+  aspect_filter_conf_skip: 0.6
+  use_sahi: false
+  sahi_slice_size: 640
+  sahi_overlap_ratio: 0.2
+  sahi_perform_standard_pred: true
+  sahi_postprocess_type: GREEDYNMM
+  sahi_postprocess_match_threshold: 0.5
+  two_pass: true
+  pass1_confidence_threshold: 0.5
+  crop_size: 300
+  crop_enlarge_to: 640
+  max_interpolation_gap: 300
+  pass1_batch_size: 8
+  pass2_batch_size: 32
+  field_filter:
+    enabled: true
+    max_speed_ms: 40.0
+    position_margin: 8.0
+    min_trajectory_length: 3
+    smoothness_threshold: 0.6
+    speed_violation_ratio: 0.2
+    min_displacement: 1.0
+    merge_max_distance: 40.0
+
+ball_tracking:
+  enabled: true
+  tracker_type: botsort
+  track_high_thresh: 0.15
+  track_low_thresh: 0.1
+  track_buffer: 60
+  match_thresh: 0.8
+  new_track_thresh: 0.4
+  max_position_distance: 120
+  fuse_score: true
+  gmc_method: none
+  with_reid: false
+  proximity_thresh: 0.5
+  appearance_thresh: 0.25
+  trajectory_3d:
+    enabled: true
+    window_size: 15
+    min_observations: 4
+    gravity: 9.81
+    ball_real_diameter: 0.22
+    bbox_padding: 1.0
+    ground_contact_weight: 2.0
+
+tracking:
+  algorithm: strongsort
+  max_age: 30
+  min_hits: 3
+  iou_threshold: 0.3
+  max_iou_distance: 0.7
+  max_iou_distance_tentative: 0.55
+  reid_iou_min: 0.1
+  reid_pitch_max_m: 1.5
+  dump_yolo_raw: true
+
+reid:
+  backend: osnet
+  model: osnet_x1_0
+  feature_dim: 512
+  batch_size: 32
+  osnet:
+    model: osnet_x1_0
+    feature_dim: 512
+    weights_path:
+  prtreid:
+    feature_dim: 256
+    referee_confidence_threshold: 0.85
+    goalkeeper_confidence_threshold: 0.7
+    weights_path:
+  clip_reid:
+    backbone: ViT-L-14
+    pretrained: openai
+    weights_path:
+    remove_proj: true
+    batch_size: 32
+
+team_classification:
+  backend: kmeans
+  position_weight: 0.1
+  min_samples_per_team: 5
+
+visualization:
+  backend: minimal
+
+highlights:
+  enabled: false
+  output_fps: 25.0
+  crossfade_frames: 4
+  closeup:
+    output_size: [640, 360]
+    padding_factor: 2.0
+    smooth_alpha: 0.3
+    medium_padding_factor: 4.0
+  temporal:
+    buildup_max_seconds: 10.0
+    buildup_padding_seconds: 2.0
+    buildup_view: wide
+    strike_pre_seconds: 0.5
+    strike_post_seconds: 1.5
+    strike_view: closeup
+    celebration_seconds: 10.0
+    celebration_view: medium
+    replay_enabled: true
+    replay_speed: 0.4
+  effects:
+    shooter_spotlight: true
+    spotlight_color: [0, 215, 255]
+    spotlight_alpha: 0.4
+    ball_trail: true
+    trail_length: 15
+    trail_color: [0, 255, 255]
+  overlays:
+    enabled: true
+    show_event_label: true
+    show_timestamp: true
+  goal_detection:
+    min_confidence: 0.15
+  recipes:
+  - name: goal_highlight
+    detector: goal
+    analyzer: scorer
+    composer: segment
+
+track_consolidation:
+  enabled: false
+  min_track_seconds: 3.0
+  frames_per_track: 0
+  max_crops_per_track: 200
+  sampler:
+    min_bbox_height: 80
+    upper_body_ratio: 0.65
+  jersey:
+    backend: claude
+    ocr_backend: llm
+    rapidocr:
+      upscale: 4.0
+      min_confidence: 0.5
+    model_id: us.anthropic.claude-opus-4-7
+    region: us-east-1
+    max_concurrency: 32
+    ocr_per_track_concurrency: 8
+    decision_subset_size: 8
+    max_retries: 2
+    max_tokens: 128
+    max_crop_dim: 384
+    jpeg_quality: 85
+    min_confidence: 0.25
+  reid:
+    same_person_threshold: 0.9
+    orphan_absorb_threshold: 0.92
+    jersey_aware_merge_threshold: 0.8
+  goalkeeper:
+    enabled: true
+    goal_area_depth: 16.5
+
+annotated_video:
+  enabled: false
+  output_fps:
+  glow:
+    enabled: true
+    alpha: 0.35
+  carrier:
+    max_distance_m: 2.0
+    exclude_goalkeeper: true
+    hysteresis_frames: 5
+    outline_color: [0, 255, 255]
+  distance_network:
+    n_opponents: 3
+    max_edge_m: 20.0
+    line_color: [200, 200, 255]
+  speed:
+    window_frames: 5
+    ema_alpha: 0.4
+    min_samples: 2
+  labels:
+    font_scale: 0.5
+    bg_alpha: 0.55
+  ball_trail:
+    enabled: true
+    length: 15
+    color: [0, 255, 255]
+  minimap:
+    enabled: true
+    height_frac: 0.28
+    alpha: 0.85
+    margin_px: 20
+
+output:
+  format: json
+  save_visualizations: true
+  visualization_fps: 10
+  save_embeddings: false
+
+device: cuda
+num_workers: 4
+batch_size: 16
+
+events:
+  detectors:
+  - possession
+  - pass
+  - shot
+  - carry
+  - defensive
+  possession:
+    distance_threshold: 3.0
+    min_consecutive_seconds: 0.5
+    speed_break_threshold: 20.0
+  pass:
+    pass_speed_threshold: 3.0
+    max_transit_seconds: 3.0
+  shot:
+    shot_speed_threshold: 8.0
+    max_angle_to_goal: 30.0
+    min_confidence: 0.15
+    shooter_lookback_seconds: 5.0
+    dedup_gap_seconds: 2.0
+    approach_window_seconds: 1.5
+    max_frame_gap_seconds: 1.0
+    approach_margin: 3.0
+    tracking_lost_seconds: 1.0
+  carry:
+    min_duration_seconds: 1.0
+    min_total_distance: 3.0
+    min_forward_distance: 2.0
+  defensive:
+    tackle_proximity: 3.0
+    tackle_deflection_angle: 30.0
+    tackle_max_gap_seconds: 1.0
+    deflection_window_seconds: 0.5
+
+player_profile:
+  heatmap_bins: 30
+  spotlights:
+    enabled: true
+    output_size: [1920, 1080]
+    target_player_height_frac: 0.66666
+    presence_gap_seconds: 1.0
+    trail: false
+    trail_seconds: 1.5
+    ellipse: true
+    name_badge: true
+    crf: 23
+    preset: medium
+    min_observations: 30
+
+pipeline:
+  stages:
+  - field_registration
+  - tracking
+  - event_detection

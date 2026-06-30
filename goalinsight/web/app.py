@@ -114,7 +114,7 @@ def create_workspace_app(
 
     *pitch* overrides the annotator's default FIFA pitch — required when
     annotations were saved against a non-FIFA pitch (e.g. youth fields
-    where ``configs/kids_soccer_physical.yaml`` ships dims like 66.28×43.15).
+    where ``configs/templates/children.yaml`` ships pitch_type kids_soccer).
     """
     ws = resolve_workspace(workspace_dir)
 

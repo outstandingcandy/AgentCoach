@@ -20,6 +20,8 @@ from goalinsight.pipeline import Pipeline
 from goalinsight.utils.config import get_default_config, load_config, merge_configs
 from goalinsight.utils.config_resolver import resolve_config
 
+logger = logging.getLogger(__name__)
+
 
 def main():
     # Stream INFO from goalinsight.* loggers to stderr so module-level
@@ -112,11 +114,16 @@ def main():
 
     print(f"Output directory: {output_dir}")
 
-    # Load configuration
-    config = get_default_config()
+    # Load configuration. Templates are self-contained (every default
+    # key is inlined), so we load whichever the user picked — or fall
+    # back to the FIFA template if --config was omitted.
     if args.config:
-        user_config = load_config(args.config)
-        config = merge_configs(config, user_config)
+        config = load_config(args.config)
+    else:
+        logger.info(
+            "no --config supplied; using configs/templates/fifa.yaml as fallback"
+        )
+        config = get_default_config()
 
     # Override keypoint model path if specified
     if args.keypoint_model:

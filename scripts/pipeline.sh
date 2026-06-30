@@ -6,4 +6,4 @@ python scripts/run_full_pipeline.py \
   --stages tracking,event_detection,highlights \
   --no-timestamp \
   --no-viz \
-  --config configs/clip_000_physical.yaml
+  --config workspace/configs/clip_000_physical.yaml

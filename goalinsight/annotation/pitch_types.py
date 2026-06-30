@@ -1,4 +1,4 @@
-"""Named pitch types loaded from ``configs/pitches/*.yaml``.
+"""Named pitch types loaded from ``configs/pitches.yaml``.
 
 The user references a type by name in a main pipeline yaml::
 
@@ -13,16 +13,18 @@ The resolver (config_resolver / per_video_settings._expand_pitch_type)
 expands that to the full ``pitch:`` block at load time so the rest of
 the codebase only sees resolved dims.
 
-Each pitch type is one yaml file under ``configs/pitches/``:
+The library is a single yaml file (mirrors ``configs/camera_profiles.yaml``)::
 
-    label:        # short human-readable label (shown in the annotate UI)
-    description:  # optional one-line note
-    pitch:
-      pitch_length: <m>
-      pitch_width: <m>
-      ...
+    profiles:
+      fifa:
+        label: ...
+        pitch_length: 105.0
+        pitch_width: 68.0
+        ...
+      futsal:
+        ...
 
-Add a new type by dropping in a new yaml file — no code change required.
+Add a new type by appending to the file — no code change required.
 """
 
 from __future__ import annotations
@@ -37,45 +39,49 @@ logger = logging.getLogger(__name__)
 
 # Pitches live next to the rest of the pipeline configs. Resolved once
 # relative to the goalinsight package root so test runs / non-cwd
-# invocations still find them.
-_PITCHES_DIR = (
-    Path(__file__).resolve().parent.parent.parent / "configs" / "pitches"
+# invocations still find the file.
+_PITCHES_FILE = (
+    Path(__file__).resolve().parent.parent.parent / "configs" / "pitches.yaml"
 )
 
 
 @functools.lru_cache(maxsize=1)
 def _load_registry() -> dict[str, dict]:
-    """Discover and parse every ``configs/pitches/*.yaml``.
+    """Parse ``configs/pitches.yaml`` and return a name→entry map.
 
-    Returns a dict keyed by file stem (e.g. ``"fifa"``) whose values
-    carry the parsed top-level keys. Each entry must have a ``pitch:``
-    sub-dict with at minimum ``pitch_length`` and ``pitch_width``. Files
-    that fail to parse or miss those keys are logged and dropped — a
-    bad single file shouldn't take the whole annotator down.
+    Each entry has the dims (pitch_length, pitch_width, ...) plus
+    optional ``label`` / ``description`` strings flattened at the
+    profile root — mirrors the shape of camera_profiles.yaml. Profiles
+    missing the two required keys (pitch_length / pitch_width) are
+    logged and dropped rather than crashing the annotator.
     """
+    if not _PITCHES_FILE.is_file():
+        logger.warning("Pitches library not found: %s", _PITCHES_FILE)
+        return {}
+    try:
+        data = yaml.safe_load(_PITCHES_FILE.read_text()) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("Malformed pitches yaml %s: %s", _PITCHES_FILE, exc)
+        return {}
+    profiles = data.get("profiles") or {}
+    if not isinstance(profiles, dict):
+        logger.warning(
+            "Pitches yaml %s: top-level ``profiles:`` missing or not a dict",
+            _PITCHES_FILE,
+        )
+        return {}
     out: dict[str, dict] = {}
-    if not _PITCHES_DIR.is_dir():
-        logger.warning("Pitches dir not found: %s", _PITCHES_DIR)
-        return out
-    for path in sorted(_PITCHES_DIR.glob("*.yaml")):
-        try:
-            data = yaml.safe_load(path.read_text()) or {}
-        except (OSError, yaml.YAMLError) as exc:
-            logger.warning("Skipping malformed pitch yaml %s: %s", path, exc)
+    for name, entry in profiles.items():
+        if not isinstance(entry, dict):
+            logger.warning("Pitch profile %r is not a dict; skipping", name)
             continue
-        if not isinstance(data, dict) or not isinstance(data.get("pitch"), dict):
+        if "pitch_length" not in entry or "pitch_width" not in entry:
             logger.warning(
-                "Pitch yaml %s missing a top-level ``pitch:`` dict; skipping",
-                path,
+                "Pitch profile %r missing pitch_length/pitch_width; skipping",
+                name,
             )
             continue
-        pitch = data["pitch"]
-        if "pitch_length" not in pitch or "pitch_width" not in pitch:
-            logger.warning(
-                "Pitch yaml %s missing pitch_length/pitch_width; skipping", path,
-            )
-            continue
-        out[path.stem] = data
+        out[str(name)] = entry
     return out
 
 
@@ -89,16 +95,20 @@ def resolve(name: str) -> dict:
 
     Numeric values are coerced to ``float``; the optional
     ``penalty_area_shape`` string passes through unchanged. The returned
-    dict is a fresh copy so callers may mutate it.
+    dict is a fresh copy so callers may mutate it. Non-dim keys
+    (``label`` / ``description``) are dropped so downstream code that
+    treats the dict as a pitch geometry doesn't trip over them.
     """
     reg = _load_registry()
     if name not in reg:
         raise KeyError(
             f"unknown pitch_type {name!r}; known: {known_types()}"
         )
-    pitch = reg[name]["pitch"]
+    entry = reg[name]
     out: dict = {}
-    for k, v in pitch.items():
+    for k, v in entry.items():
+        if k in ("label", "description"):
+            continue
         if isinstance(v, (int, float)):
             out[k] = float(v)
         elif k == "penalty_area_shape" and isinstance(v, str):
@@ -117,9 +127,9 @@ def describe(name: str) -> dict[str, str]:
 
 
 def reload() -> None:
-    """Drop the cached registry so the next access re-reads the yaml dir.
+    """Drop the cached registry so the next access re-reads the yaml file.
 
-    Useful in long-running processes (the web app) after a user adds or
-    edits a pitch yaml without restarting.
+    Useful in long-running processes (the web app) after a user edits
+    the pitches yaml without restarting.
     """
     _load_registry.cache_clear()
