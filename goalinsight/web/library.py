@@ -20,7 +20,14 @@ from ._workspace import VIDEO_EXTS, Workspace
 
 logger = logging.getLogger(__name__)
 
-CONFIGS_DIR = Path(__file__).resolve().parents[2] / "configs"
+# Three user-facing video pipeline templates (fifa / futsal / children)
+# live here. The library API exposes them as the "builtin" layer next
+# to user-staged workspace/configs/*.yaml. The rest of the repo's
+# ``configs/`` (pitches.yaml, camera_profiles.yaml) is infrastructure,
+# not user-pickable.
+CONFIGS_DIR = (
+    Path(__file__).resolve().parents[2] / "configs" / "templates"
+)
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -420,22 +427,19 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
     def list_configs() -> JSONResponse:
         # Resolve each config's pipeline.stages list inline so the
         # library can submit a pipeline job without a second
-        # request-per-click. Configs that don't declare stages fall
-        # back to default.yaml's list.
+        # request-per-click.
         #
-        # Two sources are merged, in this order:
-        #   1. ``workspace/configs/*.yaml`` — user-staged configs in
-        #      the bind-mounted workspace (visible in docker deployments
-        #      where the user adds their own configs at runtime).
-        #   2. ``<repo>/configs/*.yaml`` — base configs shipped with
-        #      the install. Skipped if a workspace config with the same
-        #      filename already won, so user overrides take precedence.
+        # Two sources, in priority order:
+        #   1. ``workspace/configs/*.yaml`` — user-staged configs
+        #      (per-video overrides, the 3 templates the docker
+        #      entrypoint seeds, anything the user has saved).
+        #   2. ``configs/templates/*.yaml`` — the 3 built-in templates
+        #      (fifa / futsal / children) shipped with the install.
         out = []
         seen: set[str] = set()
-        default_stages = _read_pipeline_stages(CONFIGS_DIR / "default.yaml")
         if workspace.configs_dir.is_dir():
             for p in sorted(workspace.configs_dir.glob("*.yaml")):
-                stages = _read_pipeline_stages(p) or default_stages
+                stages = _read_pipeline_stages(p)
                 out.append({
                     "name": p.name, "path": str(p), "stages": stages,
                     "source": "workspace",
@@ -445,7 +449,7 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
             for p in sorted(CONFIGS_DIR.glob("*.yaml")):
                 if p.name in seen:
                     continue
-                stages = _read_pipeline_stages(p) or default_stages
+                stages = _read_pipeline_stages(p)
                 out.append({
                     "name": p.name, "path": str(p), "stages": stages,
                     "source": "builtin",

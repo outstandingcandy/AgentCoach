@@ -31,7 +31,7 @@ GROUND_LINE_IDS = set(range(23)) - {6, 7, 8, 9, 10, 11}
 # Symmetric ±roll cap (degrees) for the locked-C look-at LM. Wide enough
 # for handheld jitter; tight enough that "camera flipped sideways"
 # degenerate solutions can't fit. 15° matches the existing default
-# pitch_bounds_deg upper end (``configs/sunday_soccer.yaml``: [2, 15]).
+# pitch_bounds_deg upper end (``workspace/configs/sunday_soccer.yaml``: [2, 15]).
 _LOOKAT_ROLL_BOUND_DEG = 15.0
 
 

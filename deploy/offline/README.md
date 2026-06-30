@@ -60,7 +60,7 @@ docker run --rm --gpus all --entrypoint goalinsight \
     -v "$PWD/out:/output" \
     goalinsight:offline-latest \
     --video /opt/goalinsight/example_video.mp4 \
-    --config /opt/goalinsight/example_configs/futsal_sample.yaml \
+    --config /opt/goalinsight/configs/templates/futsal.yaml \
     --output /output \
     --run-name smoke \
     --no-timestamp
@@ -84,9 +84,9 @@ docker run --rm --gpus all --entrypoint goalinsight \
     --run-name my_match
 ```
 
-Where `my_config.yaml` is one of the bundled samples copied + edited
-(see `/opt/goalinsight/example_configs/` inside the container, or
-`deploy/offline/example_configs/` in the repo).
+Where `my_config.yaml` is one of the bundled templates copied + edited
+(see `/opt/goalinsight/configs/templates/` inside the container, or
+`configs/templates/` in the repo).
 
 ## Enabling jersey-number recognition (optional)
 
@@ -136,7 +136,7 @@ Same idea: `jersey.backend: gemini` in config, pass
 | Path | What |
 |------|------|
 | `/opt/goalinsight` | Code + `pip install -e .` |
-| `/opt/goalinsight/example_configs/` | `futsal_sample.yaml`, `fifa_sample.yaml`, `kids_soccer_sample.yaml` |
+| `/opt/goalinsight/configs/templates/` | `fifa.yaml`, `futsal.yaml`, `children.yaml` — seeded into `workspace/configs/` on first launch |
 | `/opt/goalinsight/example_video.mp4` | 10s futsal demo clip |
 | `/opt/goalinsight/annotations/example_video/` | Calibration annotation for the demo clip's `fixed_camera` backend |
 | `/opt/goalinsight/models/clip_reid/` | CLIP-ReID ViT-L-14 fine-tuned weights |

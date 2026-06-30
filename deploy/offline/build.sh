@@ -63,9 +63,10 @@ else
     cp "$EXAMPLE_VIDEO_SRC" "$ASSETS_DIR/example_video.mp4"
 fi
 
-# Annotation for fixed_camera backend. Copy the same frame_0.json
-# the futsal_sample.yaml references; tagged under stem
-# "example_video" because that's what the bundled video is named.
+# Annotation for the fixed_camera backend. Tagged under stem
+# "example_video" because that's what the bundled video is named —
+# the futsal template's fixed_camera backend resolves it from
+# workspace/annotations/example_video/ at runtime.
 cp -r "$EXAMPLE_ANNOTATIONS_SRC"/. "$ASSETS_DIR/annotations/example_video/"
 
 # Surface human-readable summary so the build log shows what was

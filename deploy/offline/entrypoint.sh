@@ -12,15 +12,13 @@
 
 set -e
 
-TEMPLATE_DIR=/opt/goalinsight/example_configs
+TEMPLATE_DIR=/opt/goalinsight/configs/templates
 WORKSPACE=/workspace
 WORKSPACE_CONFIGS="$WORKSPACE/configs"
 
-declare -A SEEDS=(
-    [fifa.yaml]=fifa_sample.yaml
-    [futsal.yaml]=futsal_sample.yaml
-    [children.yaml]=kids_soccer_sample.yaml
-)
+# Filenames are 1:1 between the template library and the workspace
+# seed, so no rename mapping is needed any more.
+SEED_FILES=(fifa.yaml futsal.yaml children.yaml)
 
 # Warn when /workspace lives inside the container's writable layer
 # rather than a bind-mounted host directory. ``docker rm`` would
@@ -42,9 +40,9 @@ fi
 # dir, but it only fires AFTER exec — so we mkdir here so seeding can
 # always run.
 mkdir -p "$WORKSPACE_CONFIGS"
-for dest_name in "${!SEEDS[@]}"; do
-    src="$TEMPLATE_DIR/${SEEDS[$dest_name]}"
-    dest="$WORKSPACE_CONFIGS/$dest_name"
+for name in "${SEED_FILES[@]}"; do
+    src="$TEMPLATE_DIR/$name"
+    dest="$WORKSPACE_CONFIGS/$name"
     if [ -f "$src" ] && [ ! -e "$dest" ]; then
         cp "$src" "$dest"
         echo "seeded $dest from $src"

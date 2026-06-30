@@ -62,14 +62,21 @@ def load_pitch_template(template_path: str | Path | None = None) -> dict[str, An
 
 
 def get_default_config() -> dict[str, Any]:
-    """Get default configuration.
+    """Return the fallback pipeline config.
 
-    Returns:
-        Default configuration dictionary.
+    Resolves to ``configs/templates/fifa.yaml`` — the canonical
+    self-contained scene template. Callers that previously relied on
+    this as a merge base (``merge_configs(get_default_config(), user)``)
+    no longer need to merge: every template inlines all default keys,
+    so loading the user's chosen template directly is sufficient.
+    The function stays as a convenience for internal "give me *some*
+    config" paths (factories, test stubs, the tracking orchestrator's
+    no-config fallback).
     """
-    # project_root/configs/default.yaml
-    default_path = Path(__file__).parent.parent.parent / "configs" / "default.yaml"
-    return load_config(default_path)
+    fallback = (
+        Path(__file__).parent.parent.parent / "configs" / "templates" / "fifa.yaml"
+    )
+    return load_config(fallback)
 
 
 def merge_configs(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

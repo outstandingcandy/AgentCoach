@@ -1,0 +1,64 @@
+# Pitch profile library — keyed by name, referenced from pipeline
+# templates via ``pitch_type: <key>``.
+#
+# Mirrors the shape of camera_profiles.yaml: a top-level ``profiles:``
+# dict with one entry per supported pitch. The resolver in
+# goalinsight/annotation/pitch_types.py loads this file once, caches
+# the parse, and returns ``profiles[name]`` for downstream callers
+# (field_registration backends, pitch overlays, event detectors).
+#
+# All measurements in metres. Coordinate convention: x along
+# pitch_length, y across pitch_width with the centre at (0, 0).
+profiles:
+  fifa:
+    label: "FIFA 11-a-side (105×68 m)"
+    description: "Full-size FIFA standard pitch."
+    pitch_length: 105.0
+    pitch_width: 68.0
+    penalty_area_width: 40.32
+    penalty_area_length: 16.5
+    goal_area_width: 18.32
+    goal_area_length: 5.5
+    goal_line_to_penalty_mark: 11.0
+    center_circle_radius: 9.15
+    goal_height: 2.44
+    goal_length: 7.32
+
+  futsal:
+    label: "Futsal 5-a-side (40×20 m)"
+    description: |
+      FIFA Futsal Laws — D-shape penalty area. Two r=6m quarter-arcs
+      centered on the goal posts joined by a 3m straight chord at the
+      front of the area. ``penalty_area_shape: d`` switches the renderer
+      in pitch_diagram.draw_pitch_structure off the FIFA-style single
+      penalty-mark arc.
+    pitch_length: 40.0
+    pitch_width: 20.0
+    penalty_area_shape: d
+    penalty_area_width: 3.0
+    penalty_area_length: 6.0
+    goal_area_width: 3.0
+    goal_area_length: 3.0
+    goal_line_to_penalty_mark: 6.0
+    center_circle_radius: 3.0
+    goal_height: 2.0
+    goal_length: 3.0
+
+  kids_soccer:
+    label: "Kids 7-a-side (66×43 m)"
+    description: |
+      Reduced youth pitch matching the kids-cup footage. Dimensions
+      from on-site annotations; goal_line_to_penalty_mark and
+      center_circle_radius are unconstrained by markings so values
+      are best-guess and may need a revisit when those landmarks
+      become visible.
+    pitch_length: 66.28
+    pitch_width: 43.15
+    penalty_area_width: 21.84
+    penalty_area_length: 9.96
+    goal_area_width: 11.79
+    goal_area_length: 4.13
+    goal_line_to_penalty_mark: 8.0
+    center_circle_radius: 7.0
+    goal_height: 2.15
+    goal_length: 4.44
