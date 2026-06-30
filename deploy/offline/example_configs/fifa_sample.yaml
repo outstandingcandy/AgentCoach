@@ -35,21 +35,13 @@ tracking:
   dump_yolo_raw: false
   dump_ball_diag: false
 
-jersey_recognition:
-  enabled: true
-  backend: mmocr
-
-track_consolidation:
-  min_track_seconds: 1.0
-  jersey:
-    backend: mmocr
-    ocr_backend: rapidocr
-  frame_stride: 8
+# track_consolidation needs a VLM jersey backend (claude/gemini/qwen);
+# disabled by default. See futsal_sample.yaml for how to enable.
 
 pipeline:
   stages:
     - field_registration
     - tracking
-    - track_consolidation
+    # - track_consolidation     # needs API key — see futsal_sample.yaml
     - event_detection
-    - player_profile
+    # - player_profile          # depends on track_consolidation

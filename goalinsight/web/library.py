@@ -132,25 +132,50 @@ def _probe_video_meta(path: Path) -> dict[str, Any]:
 def _annotation_summary(workspace: Workspace) -> dict[str, dict[str, Any]]:
     """Read the annotation index once and return a stem→summary map.
 
-    The index format (``annotations/index.json``) is keyed by video stem
-    (``Path(video).stem``) and stores ``{frames: [...], last_modified}``
-    per video. We surface frame count + last_modified for the library UI.
+    Primary source: ``annotations/index.json`` (written by the
+    annotator UI), keyed by video stem with
+    ``{frames: [...], last_modified}`` per video.
+
+    Fallback: any ``annotations/<stem>/frame_*.json`` files on disk —
+    so externally-staged annotations (e.g. copied into a docker
+    workspace from a pre-baked location, or shared between users via
+    rsync) still show as "annotated" in the library UI even when no
+    index.json was written.
     """
     idx_path = workspace.annotations_dir / "index.json"
-    if not idx_path.exists():
-        return {}
-    try:
-        idx = json.loads(idx_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-    raw = idx.get("annotations") or {}
     out: dict[str, dict[str, Any]] = {}
-    for stem, info in raw.items():
-        frames = info.get("frames") or []
-        out[stem] = {
-            "frame_count": len(frames),
-            "last_modified": info.get("last_modified"),
-        }
+    if idx_path.exists():
+        try:
+            idx = json.loads(idx_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            idx = {}
+        for stem, info in (idx.get("annotations") or {}).items():
+            frames = info.get("frames") or []
+            out[stem] = {
+                "frame_count": len(frames),
+                "last_modified": info.get("last_modified"),
+            }
+
+    # Filesystem fallback for stems missing from the index — gives the
+    # library a useful annotation summary even for hand-staged dirs.
+    # ``last_modified`` must be an ISO string (not a float) because the
+    # frontend's fmtTimestamp() calls .replace() on it and would crash
+    # the entire video card render on a float.
+    if workspace.annotations_dir.exists():
+        from datetime import datetime, timezone
+        for sub in workspace.annotations_dir.iterdir():
+            if not sub.is_dir() or sub.name in out:
+                continue
+            frames = sorted(sub.glob("frame_*.json"))
+            if not frames:
+                continue
+            mtime = max(f.stat().st_mtime for f in frames)
+            out[sub.name] = {
+                "frame_count": len(frames),
+                "last_modified": datetime.fromtimestamp(
+                    mtime, tz=timezone.utc,
+                ).isoformat(),
+            }
     return out
 
 
@@ -339,7 +364,13 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
             if vc.exists():
                 config_path = vc
         if config_path is None:
-            config_path = CONFIGS_DIR / _safe_filename(str(config_name))
+            # Resolution order matches list_configs / get_config_raw:
+            # workspace-staged configs win over the builtin ones, so a
+            # user who dropped a custom yaml into workspace/configs/
+            # can pick it from the dropdown without it landing on 404.
+            safe = _safe_filename(str(config_name))
+            ws_cfg = workspace.configs_dir / safe
+            config_path = ws_cfg if ws_cfg.exists() else (CONFIGS_DIR / safe)
         if not config_path.exists():
             raise HTTPException(404, f"config not found: {config_name}")
 
@@ -391,13 +422,34 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
         # library can submit a pipeline job without a second
         # request-per-click. Configs that don't declare stages fall
         # back to default.yaml's list.
+        #
+        # Two sources are merged, in this order:
+        #   1. ``workspace/configs/*.yaml`` — user-staged configs in
+        #      the bind-mounted workspace (visible in docker deployments
+        #      where the user adds their own configs at runtime).
+        #   2. ``<repo>/configs/*.yaml`` — base configs shipped with
+        #      the install. Skipped if a workspace config with the same
+        #      filename already won, so user overrides take precedence.
         out = []
-        if not CONFIGS_DIR.is_dir():
-            return JSONResponse(out)
+        seen: set[str] = set()
         default_stages = _read_pipeline_stages(CONFIGS_DIR / "default.yaml")
-        for p in sorted(CONFIGS_DIR.glob("*.yaml")):
-            stages = _read_pipeline_stages(p) or default_stages
-            out.append({"name": p.name, "path": str(p), "stages": stages})
+        if workspace.configs_dir.is_dir():
+            for p in sorted(workspace.configs_dir.glob("*.yaml")):
+                stages = _read_pipeline_stages(p) or default_stages
+                out.append({
+                    "name": p.name, "path": str(p), "stages": stages,
+                    "source": "workspace",
+                })
+                seen.add(p.name)
+        if CONFIGS_DIR.is_dir():
+            for p in sorted(CONFIGS_DIR.glob("*.yaml")):
+                if p.name in seen:
+                    continue
+                stages = _read_pipeline_stages(p) or default_stages
+                out.append({
+                    "name": p.name, "path": str(p), "stages": stages,
+                    "source": "builtin",
+                })
         return JSONResponse(out)
 
     @app.get("/api/library/configs/{name}/raw")
@@ -408,9 +460,13 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
         whichever base config the user picked. ``name`` is matched
         against the file name (not the path) and sanitised against path
         traversal.
+
+        Resolution order matches ``list_configs``: workspace overrides
+        win, then the builtin repo configs.
         """
         safe = _safe_filename(name)
-        path = CONFIGS_DIR / safe
+        ws_path = workspace.configs_dir / safe
+        path = ws_path if ws_path.exists() else (CONFIGS_DIR / safe)
         if not path.exists():
             raise HTTPException(404, f"config not found: {name}")
         try:

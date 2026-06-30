@@ -23,13 +23,11 @@ from typing import Any, Protocol
 from ..highlights._context import MatchContext
 from ._sessions import SessionStore
 from ._workspace import VIDEO_EXTS, Workspace
-from .chat import ChatEngine
-from .chat_remote import (
-    RemoteChatEngine,
-    runtime_arn_from_env,
-    s3_bucket_from_env,
-    s3_prefix_for,
-)
+
+# ``.chat`` / ``.chat_remote`` are imported lazily inside the engine
+# factories below — they pull boto3 + Bedrock client setup into memory,
+# and an offline / chat-disabled deployment shouldn't pay that cost
+# just to list runs or render the match-detail page.
 
 
 class ChatEngineLike(Protocol):
@@ -203,10 +201,18 @@ class RunRegistry:
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
         prefix = self.url_prefix_for(run_name)
-        runtime_arn = runtime_arn_from_env()
-        s3_bucket = s3_bucket_from_env() if runtime_arn else None
 
         def _build_engine() -> ChatEngineLike:
+            from .chat import ChatEngine
+            from .chat_remote import (
+                RemoteChatEngine,
+                runtime_arn_from_env,
+                s3_bucket_from_env,
+                s3_prefix_for,
+            )
+
+            runtime_arn = runtime_arn_from_env()
+            s3_bucket = s3_bucket_from_env() if runtime_arn else None
             if runtime_arn:
                 if not s3_bucket:
                     raise RuntimeError(
@@ -239,6 +245,16 @@ class RunRegistry:
             artifact_url_prefix: str,
             agentcore_session_id: str | None,
         ) -> ChatEngineLike:
+            from .chat import ChatEngine
+            from .chat_remote import (
+                RemoteChatEngine,
+                runtime_arn_from_env,
+                s3_bucket_from_env,
+                s3_prefix_for,
+            )
+
+            runtime_arn = runtime_arn_from_env()
+            s3_bucket = s3_bucket_from_env() if runtime_arn else None
             if runtime_arn:
                 # RemoteChatEngine doesn't expose AgentCore session
                 # reuse; in Runtime mode every session shares the

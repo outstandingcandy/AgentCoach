@@ -22,14 +22,41 @@ docker load -i goalinsight-offline-latest.tar
 # docker pull <your-registry>/goalinsight:offline-latest
 ```
 
-## First run — the bundled smoke test
+## First run — launch the web viewer
 
-The image ships with a 10-second futsal clip + matching config and
-annotation. Run end-to-end to verify your GPU + Docker setup:
+The image's default entrypoint is the FastAPI web app (library /
+pipeline / match / tracking / annotate tabs). LLM chat is disabled by
+default so no cloud credentials are needed.
+
+```bash
+mkdir -p workspace
+docker run --rm --gpus all \
+    -p 8000:8000 \
+    -v "$PWD/workspace:/workspace" \
+    goalinsight:offline-latest
+# Then open http://localhost:8000/library in your browser.
+```
+
+The first launch creates `workspace/{videos,configs,runs,annotations}/`
+on disk and seeds `workspace/configs/` with three starter templates
+(`fifa.yaml`, `futsal.yaml`, `children.yaml`) you can pick from the
+Library page. Drop input videos into `workspace/videos/` and start a
+pipeline from the `/pipeline` tab, or trigger one via the CLI override
+below.
+
+> **Important — always bind-mount `/workspace`.** Without the
+> ``-v "$PWD/workspace:/workspace"`` flag every uploaded video,
+> annotation, and pipeline output lives inside the container and is
+> destroyed on ``docker rm``. The entrypoint prints a warning at
+> startup when it detects a non-mounted workspace.
+
+## Run a pipeline (CLI mode)
+
+To process a single video without the web UI, override the entrypoint:
 
 ```bash
 mkdir -p out
-docker run --rm --gpus all \
+docker run --rm --gpus all --entrypoint goalinsight \
     -v "$PWD/out:/output" \
     goalinsight:offline-latest \
     --video /opt/goalinsight/example_video.mp4 \
@@ -39,13 +66,15 @@ docker run --rm --gpus all \
     --no-timestamp
 ```
 
-Expected: ~3 min wall-clock. Outputs land under
-`out/smoke/{field_registration,tracking,track_consolidation,event_detection,player_profile}/`.
+Expected: ~80 s wall-clock for the bundled 10-second futsal demo.
+Outputs land under `out/smoke/{field_registration,tracking,event_detection}/`.
+Use `--entrypoint goalinsight` for any CLI invocation; the same image
+serves both modes.
 
 ## Run on your own video
 
 ```bash
-docker run --rm --gpus all \
+docker run --rm --gpus all --entrypoint goalinsight \
     -v "$PWD/inputs:/input:ro" \
     -v "$PWD/out:/output" \
     goalinsight:offline-latest \
@@ -59,10 +88,21 @@ Where `my_config.yaml` is one of the bundled samples copied + edited
 (see `/opt/goalinsight/example_configs/` inside the container, or
 `deploy/offline/example_configs/` in the repo).
 
-## Switching jersey-OCR backends
+## Enabling jersey-number recognition (optional)
 
-The default config uses **local mmocr** (no cloud credentials needed).
-For higher accuracy with a multi-modal LLM, switch the config:
+The default pipeline **skips `track_consolidation`** — that stage
+needs a VLM jersey-OCR backend (Claude / Gemini / local Qwen vLLM
+server), all of which require cloud credentials or a separate model
+server. Without it, the pipeline still produces tracks + events +
+heatmaps, but tracks stay as raw tracker tids instead of stable
+`A-9` / `B-GK` player names with jersey numbers.
+
+To enable it, edit your config:
+1. uncomment `- track_consolidation` under `pipeline.stages`
+2. uncomment the `track_consolidation:` block
+3. supply the matching API key at `docker run` time (see below).
+
+## Switching jersey-OCR backends
 
 ### Bedrock Claude (Sonnet 4.6)
 1. In your config, set:

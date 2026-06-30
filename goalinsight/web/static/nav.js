@@ -112,10 +112,25 @@
       const a = document.createElement('a');
       a.href = href;
       a.textContent = item.label;
+      a.dataset.navId = item.id;
       if (item.id === CURRENT) a.classList.add('active');
       nav.appendChild(a);
     }
   }
+
+  // Hide the Insights tab when the server tells us chat is disabled
+  // (offline deployment). Asynchronous so the rest of the nav renders
+  // immediately — the user only sees the Insights tab disappear if
+  // they happen to be staring at the nav at <100ms latency.
+  fetch('/api/features', { cache: 'no-store' })
+    .then(r => r.ok ? r.json() : null)
+    .then(features => {
+      if (features && features.chat_enabled === false) {
+        const el = nav.querySelector('a[data-nav-id="insights"]');
+        if (el) el.remove();
+      }
+    })
+    .catch(() => { /* feature probe unreachable — keep default nav */ });
 
   if (RUN_NAME) {
     const pill = document.createElement('span');

@@ -2,11 +2,17 @@
 # example_video.mp4 + annotations/example_video/.
 #
 # Defaults to local-only inference (no AWS / no Google API keys
-# required). To swap to Bedrock Claude jersey OCR:
-#   1. set ``track_consolidation.jersey.backend: claude`` below, and
-#   2. pass AWS creds at ``docker run`` time via
-#      ``-e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... \
-#       -e AWS_DEFAULT_REGION=us-east-1``.
+# required). The track_consolidation stage is OMITTED from the
+# default pipeline because all of its jersey-OCR backends need
+# either a cloud API (claude / gemini) or a heavy local VLM
+# (qwen vLLM server). To enable it:
+#   * uncomment the ``track_consolidation`` line in ``pipeline.stages``,
+#   * set ``track_consolidation.jersey.backend: claude``,
+#   * pass AWS creds at ``docker run`` time via
+#     ``-e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... \
+#      -e AWS_DEFAULT_REGION=us-east-1``.
+# Without it, downstream stages still work but track ids stay as raw
+# tracker tids (no stable A-9 / B-GK player names + no jersey numbers).
 
 video:
   process_fps: 30
@@ -52,24 +58,23 @@ tracking:
   dump_yolo_raw: false
   dump_ball_diag: false
 
-# Jersey number recognition — local mmocr by default so no cloud
-# creds are needed. Swap to ``backend: claude`` + set Bedrock creds
-# for higher accuracy.
-jersey_recognition:
-  enabled: true
-  backend: mmocr
-
-track_consolidation:
-  min_track_seconds: 1.0
-  jersey:
-    backend: mmocr
-    ocr_backend: rapidocr      # secondary OCR for per-crop number
-  frame_stride: 8
+# track_consolidation defaults (commented out below). Uncomment +
+# add an API key env var to enable jersey-aware consolidation.
+# track_consolidation:
+#   min_track_seconds: 1.0
+#   jersey:
+#     backend: claude
+#     model_id: us.anthropic.claude-sonnet-4-6
+#     region: us-east-1
+#     ocr_backend: llm
+#   frame_stride: 8
 
 pipeline:
   stages:
     - field_registration
     - tracking
-    - track_consolidation
+    # - track_consolidation     # enable after configuring an API key
     - event_detection
-    - player_profile
+    # player_profile depends on track_consolidation/players.json — enable
+    # both together (uncomment track_consolidation above + add API key).
+    # - player_profile
