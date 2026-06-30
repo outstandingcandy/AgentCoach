@@ -170,6 +170,79 @@ highlights/           goal_highlight_0001.mp4, ...
 annotated_video/      full match with overlays (optional)
 ```
 
+## Offline pipeline as a Docker image (recommended for sharing)
+
+If you want to hand the pipeline to a colleague — they shouldn't have
+to clone the repo, set up Python 3.12, install mmocr from source, find
+the CLIP-ReID weights on Google Drive, and create an AWS account just
+to try it. Use the self-contained Docker image instead.
+
+```bash
+# One-time: build the image (~10-15 min on first run; needs CLIP-ReID
+# weights staged at workspace/models/ViT-L-14_openai/Paper/weights_e4.pth)
+./deploy/offline/build.sh
+
+# Smoke test with the bundled 10s demo (verifies GPU + Docker setup)
+mkdir -p out
+docker run --rm --gpus all \
+    -v "$PWD/out:/output" \
+    goalinsight:offline-latest \
+    --video /opt/goalinsight/example_video.mp4 \
+    --config /opt/goalinsight/example_configs/futsal_sample.yaml \
+    --output /output --run-name smoke --no-timestamp
+
+# Run on your own video
+docker run --rm --gpus all \
+    -v "$PWD/inputs:/input:ro" \
+    -v "$PWD/out:/output" \
+    goalinsight:offline-latest \
+    --video /input/my_match.mp4 \
+    --config /input/my_config.yaml \
+    --output /output --run-name my_match
+```
+
+### What the image bundles
+
+- **Pre-baked weights** so the container works offline (`--network none`):
+  YOLOv8x, OSNet, PRTReID, PnLCalib SV_kp + SV_lines, mmocr DBNet+SAR,
+  CLIP-ReID ViT-L-14 fine-tuned.
+- **No AWS credentials required by default** — jersey OCR uses local mmocr.
+  Opt into Bedrock Claude / Gemini by editing the config + passing
+  `-e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=...` (or
+  `-e GOOGLE_GENAI_API_KEY=...`) at `docker run` time.
+- **Three example configs**: `futsal_sample.yaml`, `fifa_sample.yaml`,
+  `kids_soccer_sample.yaml` — each is a runnable starting point per pitch
+  type.
+- **No web app** — the image is CLI-only (smaller, simpler). Use the local
+  `python -m goalinsight.web` against the output directory if you want
+  the viewer / chat.
+
+### Sharing the image
+
+```bash
+# Option A: push to a container registry
+docker tag goalinsight:offline-latest <your-registry>/goalinsight:offline-latest
+docker push <your-registry>/goalinsight:offline-latest
+
+# Option B: ship a tarball
+docker save goalinsight:offline-latest | gzip > goalinsight-offline.tar.gz
+# receiver:
+docker load -i goalinsight-offline.tar.gz
+```
+
+### Requirements on the host
+
+| Item | Requirement |
+|------|-------------|
+| OS | Linux (Ubuntu 22.04+) or Windows + WSL2 |
+| GPU | NVIDIA, ≥ 6 GB VRAM (CLIP-ReID + YOLOv8x concurrently), driver 530+ |
+| Docker | 24.0+ with `nvidia-container-toolkit` installed |
+| Disk | ~8 GB for the image; ~3 GB per pipeline run output |
+| **Mac users** | macOS Docker can't pass through to GPU — **not supported** for production. Either ssh to a Linux/GPU host, rent cloud GPU (Lambda Labs / Vast.ai), or run the pipeline elsewhere and `docker load` outputs locally to inspect via the web viewer. |
+
+Detailed quickstart + troubleshooting + license inventory:
+[`deploy/offline/README.md`](deploy/offline/README.md).
+
 ## CLI flags
 
 | Flag | Default | Description |
@@ -303,6 +376,9 @@ goalinsight/
   utils/, interfaces/        # factories + ABCs
 configs/                     # default + per-clip + camera profiles
 sagemaker/                   # setup, build, weights upload, entrypoint
+deploy/offline/              # self-contained Docker image for sharing
+                             # the offline pipeline (see Offline pipeline
+                             # section above)
 deploy/agentcore_runtime/    # optional AgentCore Runtime image for chat
 scripts/                     # run_full_pipeline, pipeline.sh, audit/dump tools, ...
 tools/                       # make_comparison.py and other utilities
