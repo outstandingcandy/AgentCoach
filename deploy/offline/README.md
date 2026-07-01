@@ -88,19 +88,16 @@ Where `my_config.yaml` is one of the bundled templates copied + edited
 (see `/opt/goalinsight/configs/templates/` inside the container, or
 `configs/templates/` in the repo).
 
-## Enabling jersey-number recognition (optional)
+## Jersey-number recognition
 
-The default pipeline **skips `track_consolidation`** — that stage
-needs a VLM jersey-OCR backend (Claude / Gemini / local Qwen vLLM
-server), all of which require cloud credentials or a separate model
-server. Without it, the pipeline still produces tracks + events +
-heatmaps, but tracks stay as raw tracker tids instead of stable
-`A-9` / `B-GK` player names with jersey numbers.
-
-To enable it, edit your config:
-1. uncomment `- track_consolidation` under `pipeline.stages`
-2. uncomment the `track_consolidation:` block
-3. supply the matching API key at `docker run` time (see below).
+The default templates ship with `track_consolidation` **enabled** and
+`jersey.backend: qwen` (in-process Qwen3.5-2B, HuggingFace
+`transformers`). Weights are pre-fetched during image build so the
+first track_consolidation run works fully offline. Expect ~8 GB of
+GPU memory during that stage. To disable it (e.g. for a batch-only
+run where you only want tracks + events), edit the workspace yaml
+and remove `- track_consolidation` + `- player_profile` from
+`pipeline.stages`.
 
 ## Switching jersey-OCR backends
 
@@ -143,6 +140,7 @@ Same idea: `jersey.backend: gemini` in config, pass
 | `/opt/goalinsight/models/yolo/` | YOLOv8x detector |
 | `~/.cache/torch/` | OSNet + PRTReID |
 | `~/.cache/goal-insight/pnlcalib/` | PnLCalib SV_kp + SV_lines |
+| `/opt/goalinsight/models/hf/` | Qwen3.5-2B HF snapshot (~8 GB, for jersey OCR) |
 
 ## Output layout
 

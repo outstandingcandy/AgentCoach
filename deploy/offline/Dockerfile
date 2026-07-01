@@ -35,7 +35,11 @@
 # tracking → event_detection → player_profile, which works fully
 # offline.
 
-FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+# ``-devel`` (not ``-runtime``) ships nvcc + CUDA headers + cutlass/
+# cccl bundled with the toolkit, which flashinfer's runtime JIT path
+# (used by vLLM for sampling kernels) requires. Runtime image alone
+# would fail EngineCore init with ``nvcc: not found``.
+FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -69,6 +73,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libgl1 \
         libglib2.0-0 \
+        # gcc is needed at runtime by Triton's JIT compilation path —
+        # vLLM's Qwen3-VL model calls a triton kernel that compiles a
+        # tiny CUDA driver util on first use. Without a C compiler on
+        # PATH, EngineCore init crashes with "Failed to find C compiler".
+        gcc \
+        g++ \
+        libc6-dev \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
@@ -113,6 +124,19 @@ RUN python -c "from ultralytics import YOLO; YOLO('yolov8x.pt')" \
                    import PnLCalibWeightDownloader; \
                d = PnLCalibWeightDownloader(); \
                d.get_weight_path('SV_kp'); d.get_weight_path('SV_lines')"
+
+# Pre-fetch two HuggingFace snapshots so first-run pipelines can
+# actually work offline:
+#   * ``Qwen/Qwen3.5-2B`` — the VLM the track_consolidation stage's
+#     vLLM daemon serves (~4 GB weights, image-text-to-text).
+#   * ``timm/vit_large_patch14_clip_224.openai`` — the base ViT-L-14
+#     OpenAI CLIP checkpoint that ``open_clip.create_model('ViT-L-14',
+#     pretrained='openai')`` fetches at import time. The fine-tuned
+#     CLIP-ReID weights (weights_e4.pth) are loaded ON TOP of these
+#     via ``load_state_dict``, so both are required.
+RUN python -c "from huggingface_hub import snapshot_download; \
+               snapshot_download('Qwen/Qwen3.5-2B'); \
+               snapshot_download('timm/vit_large_patch14_clip_224.openai')"
 
 # CLIP-ReID fine-tuned weights. build.sh stages these into
 # deploy/offline/_build_assets/ from the host workspace.

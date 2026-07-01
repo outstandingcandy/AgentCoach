@@ -1476,7 +1476,7 @@ def _pitch_dims(pipeline_output_dir: Path) -> tuple[float, float]:
 
 
 def _build_recognizer(jersey_cfg: dict[str, Any]):
-    backend = jersey_cfg.get("backend", "claude").lower()
+    backend = jersey_cfg.get("backend", "qwen").lower()
     if backend == "claude":
         from ..jersey.claude_recognizer import ClaudeJerseyRecognizer
         return ClaudeJerseyRecognizer(config=jersey_cfg)
@@ -1484,11 +1484,85 @@ def _build_recognizer(jersey_cfg: dict[str, Any]):
         from ..jersey.gemini_recognizer import GeminiJerseyRecognizer
         return GeminiJerseyRecognizer(config=jersey_cfg)
     if backend == "qwen":
+        # Route ``QwenVLMRecognizer`` (which speaks OpenAI-compat HTTP)
+        # at a pre-launched vLLM daemon. The daemon MUST be running
+        # already — in docker the entrypoint starts it at container
+        # boot; for dev see ``scripts/start_qwen_vllm.sh``. Errors out
+        # clearly when the URL isn't set / reachable.
+        base_url = _resolve_vllm_base_url()
+        from ..jersey.qwen_vlm_recognizer import QwenVLMRecognizer
+        merged_cfg = dict(jersey_cfg)
+        merged_cfg.setdefault("api", {})
+        merged_cfg["api"] = {
+            **merged_cfg["api"],
+            "base_url": base_url,
+            "model": (
+                jersey_cfg.get("local", {}).get("model")
+                or jersey_cfg.get("model")
+                or "Qwen/Qwen3.5-4B"
+            ),
+        }
+        return QwenVLMRecognizer(config=merged_cfg)
+    if backend == "qwen_vl":
+        # Explicit "point at an already-running vLLM" path (skip the
+        # in-runner daemon spawn).
         from ..jersey.qwen_vllm_recognizer import QwenVLLMRecognizer
         return QwenVLLMRecognizer(config=jersey_cfg)
     raise ValueError(
         f"track_consolidation.jersey.backend must be one of "
-        f"{{claude, gemini, qwen}}, got {backend!r}")
+        f"{{qwen, qwen_vl, claude, gemini}}, got {backend!r}")
+
+
+def _resolve_vllm_base_url() -> str:
+    """Return the base_url for a pre-launched Qwen VL vLLM server.
+
+    The daemon is expected to be started **outside** this pipeline
+    process — either by the docker container's entrypoint or by an
+    operator running ``vllm serve`` in a separate terminal — and its
+    URL passed in via the ``QWEN_VLLM_BASE_URL`` env var. We just
+    poll ``/v1/models`` until it answers.
+
+    We do NOT spawn vLLM ourselves. Cold-starting a 4B VL model
+    inside a per-pipeline subprocess costs 30 s – 5 min (flashinfer
+    JIT + weight load + engine init) and racing multiple concurrent
+    jobs would fight for the same GPU. Requiring a caller-owned
+    daemon makes the lifecycle explicit.
+    """
+    import os
+    import time as _time
+    import urllib.request
+
+    preset = os.environ.get("QWEN_VLLM_BASE_URL")
+    if not preset:
+        raise RuntimeError(
+            "QWEN_VLLM_BASE_URL is not set. track_consolidation with "
+            "``jersey.backend: qwen`` needs a pre-launched vLLM server. "
+            "In docker, the entrypoint starts one automatically — "
+            "either the container is unhealthy or you exported "
+            "``QWEN_VLLM_DISABLE=1``. For a dev host, run "
+            "``bash scripts/start_qwen_vllm.sh`` and export "
+            "``QWEN_VLLM_BASE_URL=http://127.0.0.1:8000/v1`` before "
+            "invoking the pipeline.",
+        )
+    base_url = preset.rstrip("/")
+    deadline = _time.time() + int(
+        os.environ.get("QWEN_STARTUP_TIMEOUT_S", "600")
+    )
+    while _time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{base_url}/models", timeout=2) as r:
+                if r.status == 200:
+                    logger.info(
+                        "track_consolidation: using vLLM at %s", base_url,
+                    )
+                    return base_url
+        except Exception:  # noqa: BLE001
+            _time.sleep(2)
+    raise RuntimeError(
+        f"vLLM daemon at {base_url} did not answer /models within "
+        f"{os.environ.get('QWEN_STARTUP_TIMEOUT_S', '600')}s. Check "
+        f"the daemon log (in docker: /workspace/logs/vllm.log).",
+    )
 
 
 def _write_consolidated_tracks(

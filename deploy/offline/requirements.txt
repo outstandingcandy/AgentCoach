@@ -32,10 +32,16 @@ tensorboard==2.20.0
 torchreid==0.2.5
 open_clip_torch==3.3.0
 
-# VLM for jersey number recognition (transformers + qwen-vl-utils
-# enable the local Qwen-VL backend; transformers also gates other
-# HF-based loaders we may use).
+# VLM for jersey number recognition. Two paths:
+#   * ``transformers`` — used by all recognizers as the tokenizer / vision
+#     tower loader for image preprocessing.
+#   * ``vllm`` — track_consolidation spawns a local vLLM server on-demand
+#     (only during that stage) so the pipeline's other GPU-heavy stages
+#     don't compete with a permanent LLM daemon for VRAM. See
+#     ``goalinsight/track_consolidation/_runner.py::_launch_vllm_daemon_if_needed``.
 transformers==5.10.1
+vllm>=0.11
+requests>=2.28
 
 # Computer vision
 opencv-python==4.13.0.92

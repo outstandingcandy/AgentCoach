@@ -203,6 +203,26 @@ def run_stage1_physical(
     Returns:
         Dict with calibration statistics.
     """
+    # Fixed-rig short-circuit. The scene-setup wizard writes
+    # ``lock_camera_position: true`` + ``annotation_frame_path: ...``
+    # when the user picks "fixed camera" — that's a pure re-projection
+    # of a single solved pose, not a per-frame HRNet run. Delegate to
+    # the fixed_camera runner (same schema, cheaper solver) so the
+    # user's wizard choice actually saves the HRNet cost.
+    phys_config = config.get("field_registration", {}).get("physical", {}) or {}
+    if (
+        phys_config.get("lock_camera_position")
+        and phys_config.get("annotation_frame_path")
+    ):
+        logger.info(
+            "Stage 1 (Physical): fixed-rig fast path — "
+            "delegating to fixed_camera runner",
+        )
+        from .fixed_camera_runner import run_stage1_fixed_camera
+        return run_stage1_fixed_camera(
+            video_path, output_dir, vis_dir, config, process_fps,
+        )
+
     from . import KeypointDetector
     from .pnlcalib import KeypointMapper, LineMapper
     from .physical_calibrator import PhysicalCalibrator
