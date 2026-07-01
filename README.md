@@ -60,164 +60,81 @@ Raw fixed-camera video
 └──────────────────┘
 ```
 
-Full system view, including the SageMaker remote-execution path and the Bedrock + AgentCore chat surface:
-
-![GoalInsight on AWS — full architecture](docs/goalinsight-aws-architecture.png)
-
-The editable source is [`docs/goalinsight-aws-architecture.drawio`](docs/goalinsight-aws-architecture.drawio) (open in [draw.io](https://app.diagrams.net)).
-
 A still from the tracking stage (annotated player + ball detections, with team colors and IDs):
 
 ![Tracking output frame](docs/media/tracking_screenshot.png)
 
 ## Quick start
 
-Tested on Python 3.12, Ubuntu 22.04, NVIDIA L40S/A10G. CPU-only execution works for the smaller stages but tracking+calibration are practically GPU-bound.
+The supported way to run GoalInsight is a self-contained Docker image
+that ships the full pipeline plus a FastAPI web UI (library / pipeline
+launcher / match viewer / annotator). No repo clone, no AWS account,
+no manual model downloads.
+
+**Host requirements**
+
+| Item | Requirement |
+|------|-------------|
+| OS | Linux (Ubuntu 22.04+) or Windows + WSL2 |
+| GPU | NVIDIA, ≥ 16 GB VRAM (Qwen VL for jersey OCR + YOLOv8x + CLIP-ReID), driver 530+ |
+| Docker | 24.0+ with `nvidia-container-toolkit` installed |
+| Disk | ~50 GB for the image; ~3 GB per pipeline run output |
+| **Mac** | Docker on Mac can't reach an NVIDIA GPU — **not supported**. Run on a Linux host or rent a cloud GPU (Lambda Labs / Vast.ai). |
+
+**Build the image** (one time, ~15 min on first build; needs the fine-tuned
+CLIP-ReID weights at `workspace/models/ViT-L-14_openai/Paper/weights_e4.pth`
+and a short demo video at `workspace/videos/`):
 
 ```bash
-git clone https://github.com/outstandingcandy/AgentCoach.git
-cd AgentCoach
-python3.12 -m venv venv && source venv/bin/activate
-pip install -e .
-pip install -r requirements.txt
-```
-
-Drop a video at `data/raw_videos/<your-clip>.mp4` and run:
-
-```bash
-goalinsight \
-  --video data/raw_videos/<your-clip>.mp4 \
-  --output output/ \
-  --config configs/clip_000_finetuned.yaml \
-  --stages field_registration,tracking,event_detection,highlights
-```
-
-### Reproducing the kids_soccer demo
-
-The 60-second `kids_soccer_clip_1250_1310` demo and its fine-tuned KP/line
-models are not in git (~520 MB). They live in S3; export the bucket
-name via env var and pull them down:
-
-```bash
-export GOALINSIGHT_S3_BUCKET=<your-bucket>   # see internal docs
-
-mkdir -p workspace/videos workspace/annotations \
-         data/finetuned_models/run_20260605_073045/models \
-         data/finetuned_line_models/run_20260605_073744/models
-
-# Demo video → workspace/videos/ (picked up by `goalinsight-web` Library tab)
-aws s3 cp "s3://${GOALINSIGHT_S3_BUCKET}/raw_videos/kids_soccer_clip_1250_1310.mp4" \
-          workspace/videos/
-
-# Fine-tuned weights → data/finetuned_*/ (paths are hard-coded in
-# configs/kids_soccer_physical.yaml, so don't relocate these)
-aws s3 cp "s3://${GOALINSIGHT_S3_BUCKET}/finetuned_models/run_20260605_073045/best_model_final.pt" \
-          data/finetuned_models/run_20260605_073045/models/
-aws s3 cp "s3://${GOALINSIGHT_S3_BUCKET}/finetuned_line_models/run_20260605_073744/best_model_final.pt" \
-          data/finetuned_line_models/run_20260605_073744/models/
-
-goalinsight \
-  --video workspace/videos/kids_soccer_clip_1250_1310.mp4 \
-  --output output/kids_demo \
-  --config configs/kids_soccer_physical.yaml
-```
-
-#### Annotations land in `workspace/annotations/`
-
-`goalinsight-web` (the unified Library / Annotate / Pipeline / Insights
-UI) reads annotations from `workspace/annotations/<video_stem>/`. Save
-new annotations there directly — the Annotate tab does this for you when
-you `goalinsight-web --workspace ./workspace`.
-
-The 7-frame v2 finetune training set is checked into git under
-`output/annotations/kids_soccer_v2/` for reproducibility. To see it in
-the Annotate UI, link it into the workspace and bootstrap the index
-(`AnnotationIndex` only enumerates frames listed in `index.json` —
-it does not scan):
-
-```bash
-ln -s "$PWD/output/annotations/kids_soccer_v2" workspace/annotations/
-
-python3 - <<'PY'
-import json, re
-from pathlib import Path
-base = Path("workspace/annotations")
-ann = {}
-for sub in sorted(base.iterdir()):
-    if not sub.is_dir():
-        continue
-    frames = sorted(int(m.group(1)) for p in sub.iterdir()
-                    if (m := re.match(r"^frame_(\d+)\.json$", p.name)))
-    if frames:
-        ann[sub.name] = {"frames": frames, "last_modified": ""}
-(base / "index.json").write_text(
-    json.dumps({"version": "2.0", "annotations": ann}, indent=2)
-)
-PY
-```
-
-You can now reproduce the KP/line fine-tunes locally (or via the
-**Pipeline** tab's `finetune_keypoints` / `finetune_lines` cards) without
-re-annotating.
-
-Outputs land under `output/<run-name>-<timestamp>/`:
-
-```
-field_registration/   homographies.pkl, camera_poses.pkl/json, calibration_metadata.json
-tracking/             tracks.json, ball_tracks.json, team_assignments.json, tracking.mp4
-event_detection/      events.json (all events), goals.json
-highlights/           goal_highlight_0001.mp4, ...
-annotated_video/      full match with overlays (optional)
-```
-
-## Offline pipeline as a Docker image (recommended for sharing)
-
-If you want to hand the pipeline to a colleague — they shouldn't have
-to clone the repo, set up Python 3.12, install mmocr from source, find
-the CLIP-ReID weights on Google Drive, and create an AWS account just
-to try it. Use the self-contained Docker image instead.
-
-```bash
-# One-time: build the image (~10-15 min on first run; needs CLIP-ReID
-# weights staged at workspace/models/ViT-L-14_openai/Paper/weights_e4.pth)
 ./deploy/offline/build.sh
-
-# Smoke test with the bundled 10s demo (verifies GPU + Docker setup)
-mkdir -p out
-docker run --rm --gpus all \
-    -v "$PWD/out:/output" \
-    goalinsight:offline-latest \
-    --video /opt/goalinsight/example_video.mp4 \
-    --config /opt/goalinsight/example_configs/futsal_sample.yaml \
-    --output /output --run-name smoke --no-timestamp
-
-# Run on your own video
-docker run --rm --gpus all \
-    -v "$PWD/inputs:/input:ro" \
-    -v "$PWD/out:/output" \
-    goalinsight:offline-latest \
-    --video /input/my_match.mp4 \
-    --config /input/my_config.yaml \
-    --output /output --run-name my_match
 ```
 
-### What the image bundles
+**Launch the web app**:
 
-- **Pre-baked weights** so the container works offline (`--network none`):
-  YOLOv8x, OSNet, PRTReID, PnLCalib SV_kp + SV_lines, mmocr DBNet+SAR,
-  CLIP-ReID ViT-L-14 fine-tuned.
-- **No AWS credentials required by default** — jersey OCR uses local mmocr.
-  Opt into Bedrock Claude / Gemini by editing the config + passing
-  `-e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=...` (or
-  `-e GOOGLE_GENAI_API_KEY=...`) at `docker run` time.
-- **Three example configs**: `futsal_sample.yaml`, `fifa_sample.yaml`,
-  `kids_soccer_sample.yaml` — each is a runnable starting point per pitch
-  type.
-- **No web app** — the image is CLI-only (smaller, simpler). Use the local
-  `python -m goalinsight.web` against the output directory if you want
-  the viewer / chat.
+```bash
+mkdir -p workspace
+docker run -d --name gi --gpus all \
+    -p 8000:8000 \
+    -v "$PWD/workspace:/workspace" \
+    goalinsight:offline-latest
+# Open http://localhost:8000/library in your browser.
+```
 
-### Sharing the image
+On first launch the container's entrypoint:
+- Seeds `workspace/configs/` with `fifa.yaml` / `futsal.yaml` / `children.yaml`
+  starter templates you can pick from the Library.
+- Background-launches a local Qwen VL vLLM daemon on port 8100 so the
+  track_consolidation stage's jersey OCR works offline. Cold-start on
+  first container start-up takes 3–5 min (flashinfer JIT compile);
+  subsequent restarts warm up in ~30 s.
+
+**Workflow through the web UI**
+
+1. `/library` → drop a video into the upload zone. A scene-setup wizard
+   auto-opens: pick pitch type + camera profile, choose fixed rig vs
+   pan/tilt/zoom, and (for fixed rigs) type the physical camera position.
+2. For fixed rigs the wizard opens the annotator in a new tab; mark
+   ≥4 pitch keypoints, click *Compute*, *Save*, and return to the
+   wizard.
+3. Back on step 4 of the wizard, pick which visualizations to write
+   (field-reg / tracking / ball diag) and optionally toggle *Player
+   profile* (heatmaps + spotlight clips, +~50 s). Click *Launch
+   pipeline*.
+4. The Pipeline tab shows per-stage progress and vis outputs; the
+   Match tab shows events + roster + minimap.
+
+End-to-end runtime on a 10-second futsal clip:
+
+```
+field_registration:   0.5 s   (fixed-rig short-circuit, replays annotation pose)
+tracking:            32   s   (YOLOv8x + StrongSORT + CLIP-ReID)
+track_consolidation: 33   s   (Qwen VL jersey OCR, vLLM daemon already warm)
+event_detection:      3   s
+─────────────────────────────
+total:                ~70 s   (add ~50 s if you enable player_profile)
+```
+
+**Sharing the image**
 
 ```bash
 # Option A: push to a container registry
@@ -230,17 +147,8 @@ docker save goalinsight:offline-latest | gzip > goalinsight-offline.tar.gz
 docker load -i goalinsight-offline.tar.gz
 ```
 
-### Requirements on the host
-
-| Item | Requirement |
-|------|-------------|
-| OS | Linux (Ubuntu 22.04+) or Windows + WSL2 |
-| GPU | NVIDIA, ≥ 6 GB VRAM (CLIP-ReID + YOLOv8x concurrently), driver 530+ |
-| Docker | 24.0+ with `nvidia-container-toolkit` installed |
-| Disk | ~8 GB for the image; ~3 GB per pipeline run output |
-| **Mac users** | macOS Docker can't pass through to GPU — **not supported** for production. Either ssh to a Linux/GPU host, rent cloud GPU (Lambda Labs / Vast.ai), or run the pipeline elsewhere and `docker load` outputs locally to inspect via the web viewer. |
-
-Detailed quickstart + troubleshooting + license inventory:
+More detail (image layout, jersey-OCR backend swap to Claude/Gemini,
+troubleshooting, license inventory):
 [`deploy/offline/README.md`](deploy/offline/README.md).
 
 ## CLI flags
