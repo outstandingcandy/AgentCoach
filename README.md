@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 [![Code style: ruff](https://img.shields.io/badge/lint-ruff-46a2f1.svg)](https://github.com/astral-sh/ruff)
 
-End-to-end pipeline that turns a single fixed-camera soccer video into player tracks, events, and watchable highlight clips — with an LLM chat interface on top of the resulting match data.
+End-to-end pipeline that turns a single fixed-camera soccer video into player tracks, events, and watchable highlight clips.
 
 ![Tracking demo: ball + players, team-colored boxes, IDs, and a calibrated minimap](docs/media/tracking_demo.gif)
 
@@ -16,11 +16,9 @@ If you've ever recorded a youth soccer match on a fixed camera, you know the pro
 
 - The video is 60–90 minutes long, the action is 20% of that, and finding the goal you actually want to re-watch means scrubbing.
 - Pro broadcasters get tracking data, event tags, and slow-mo replays for free; amateur footage gets none of that.
-- Commercial services (Veo, Pixellot, Trace) are great but closed, expensive per-team, and don't let you ask questions like "how far did number 9 actually run today?"
+- Commercial services (Veo, Pixellot, Trace) are great but closed, expensive per-team, and don't let you inspect the raw tracks / events.
 
-GoalInsight runs entirely on your own machine (or on AWS if you want GPUs you don't own), gives you the same kinds of artifacts a broadcaster's stack produces — calibration, tracks, events, highlight clips — and exposes them through a chat interface so you can ask things like "show me every shot from team A in the second half" and get back clickable seek tags.
-
-It's also a deliberate sandbox for putting modern Bedrock + AgentCore tool-use against a non-trivial domain dataset.
+GoalInsight runs entirely on your own machine and gives you the same kinds of artifacts a broadcaster's stack produces — calibration, tracks, events, highlight clips — as inspectable JSON + a browsable web UI.
 
 ## What it does
 
@@ -51,13 +49,8 @@ Raw fixed-camera video
 │ Highlights       │    plans 4 segments (buildup → strike → celebration →
 │ (per goal)       │    replay), and a composer that crops/zooms per
 └──────────────────┘    segment, draws the shooter spotlight + ball trail,
-        │               and produces an MP4 with optional video2x upscaling
-        ▼               + RIFE slow-motion replay.
-┌──────────────────┐    FastAPI viewer + Bedrock-backed chat with five
-│ Web chat         │    tools (list_events, get_player_stats,
-│ (analytics on    │    get_team_stats, get_frame_snapshot, run_python in
-│  the run)        │    an AgentCore Code Interpreter sandbox).
-└──────────────────┘
+                        and produces an MP4 with optional video2x upscaling
+                        + RIFE slow-motion replay.
 ```
 
 A still from the tracking stage (annotated player + ball detections, with team colors and IDs):
@@ -151,153 +144,36 @@ More detail (image layout, jersey-OCR backend swap to Claude/Gemini,
 troubleshooting, license inventory):
 [`deploy/offline/README.md`](deploy/offline/README.md).
 
-## CLI flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--video` | required | Source video path. |
-| `--output` | required | Run output directory. |
-| `--config` | required | YAML config file (deep-merged onto `configs/default.yaml`). |
-| `--stages` | `field_registration,tracking` | Comma-separated subset of `field_registration,tracking,track_consolidation,event_detection,player_profile,highlights,annotated_video`. `track_consolidation` must precede `event_detection` so events carry stable `A-9`-style player_ids. |
-| `--no-viz` | off | Skip the tracking visualization video (saves time and memory). |
-| `--keypoint-model` | from config | Override `field_registration.keypoint_model_path`. |
-| `--remote-stages` | `none` | Comma-separated stages to run on SageMaker instead of locally (see [SageMaker](#sagemaker-remote-execution-optional)). |
-| `--skip-existing` | off | Skip a stage if its output already exists. Useful for partial reruns. |
-| `--run-name` | `<config-name>` | Name segment in the output dir. |
-| `--no-timestamp` | off | Don't append a timestamp to the run dir. |
-
-## Configuration
-
-Configs in `configs/` override `configs/default.yaml`. The presets that ship:
-
-- `clip_000_finetuned.yaml` — recommended starting point. PnLCalib (finetuned HRNet keypoint+line detector) on broadcast-style footage.
-- `clip_000_broadtrack.yaml` — BroadTrack backend (9-parameter camera + Cauchy robust loss + arc-length line constraints). Better on heavy lens distortion.
-- `clip_000_physical.yaml` — Fixed-intrinsic camera profile from `camera_profiles.yaml` (e.g. Veo). 7-DOF bounded extrinsics. The most stable backend on non-FIFA pitches.
-- `clip_000_homography.yaml` — Plain ground-plane DLT homography. Fast baseline.
-- `kids_soccer*.yaml` — Variants tuned for non-FIFA-spec youth pitches (smaller, different goal width).
-
-Key knobs (full list in `configs/default.yaml`):
-
-```yaml
-field_registration:
-  backend: pnlcalib       # pnlcalib | broadtrack | nbjw | physical | homography
-  keypoint_threshold: 0.5
-  ransac_threshold: 30    # px
-
-video:
-  process_fps: 5          # frame sample rate
-
-detection:
-  model: yolov8x.pt
-
-reid:
-  backend: osnet          # osnet | prtreid
-team_classification:
-  backend: kmeans         # kmeans | tracklet
-jersey_recognition:
-  backend: qwen           # qwen (VLM) | mmocr (DBNet+SAR)
-
-events:
-  detectors: [possession, pass, shot, carry, defensive]
-
-highlights:
-  recipes: [...]
-video_enhancement:
-  enabled: false          # video2x upscaling + RIFE slow-mo
-  mode: docker            # binary | docker
-```
-
-## SageMaker remote execution (optional)
-
-`field_registration` and `tracking` are GPU-bound. They can run on a SageMaker Processing Job (`ml.g5.xlarge`, ~$1.41/hr) instead of locally; the rest of the pipeline still runs on your workstation.
-
-One-time setup:
-
-```bash
-bash sagemaker/setup_aws.sh        # creates IAM role, ECR repo, S3 bucket
-bash sagemaker/upload_weights.sh   # pushes finetuned weights to S3
-bash sagemaker/build_and_push.sh   # builds and pushes the container image
-```
-
-Copy the `sagemaker:` block printed by `setup_aws.sh` into `configs/default.yaml`. Then opt in per-run:
-
-```bash
-goalinsight --video clip.mp4 --output output/ --config configs/kids_soccer.yaml \
-            --remote-stages field_registration,tracking
-```
-
-A 10-minute clip costs ~$0.10 wall-clock-equivalent. Full notes in [`sagemaker/README.md`](sagemaker/README.md).
-
-## Web viewer + chat
-
-```bash
-python -m goalinsight.web --workspace ./workspace
-# default: http://127.0.0.1:8000/
-```
-
-A unified workspace UI: pipeline launcher (`/pipeline`), per-stage results
-viewer, single-run video viewer + chat (`/insights/<run>`), tracking
-diagnostics (`/tracking/<run>`), pitch annotator (`/annotate`), and a
-library of videos / runs (`/library`). Runs live under
-`<workspace>/runs/<run-name>/`; videos under `<workspace>/videos/`. Use
-symlinks to point an existing `output/` tree at `<workspace>/runs`.
-
-The viewer streams the match video alongside a Bedrock-backed chat. The model has five tools:
-
-- `list_events` — filter events by type/team/player/time window
-- `get_player_stats` — per-player distance, top speed, touches, passes, shots, goals
-- `get_team_stats` — possession share, pass success, shots, tackles, interceptions
-- `get_frame_snapshot` — who's on screen and what's near the ball at a moment
-- `run_python` — execute Python in an AgentCore Code Interpreter sandbox for ad-hoc analysis (heatmaps, custom aggregations); plots come back as inline images
-
-Example questions that work today:
-
-> "How far did A-9 run? When did they have their best chance?"
-> "Compare B-10's first-half and second-half pass success rate."
-> "Plot a heatmap of where team A's possessions ended."
-
-### Optional: chat on AgentCore Runtime
-
-The chat agent can also run as an AWS-managed AgentCore Runtime
-container instead of inside the FastAPI process — same prompts, same
-tools, same SSE shape on the wire. The local app proxies turns to the
-runtime via `bedrock-agentcore.InvokeAgentRuntime` and streams the
-response back to the browser unchanged. Setup, deploy, and per-run S3
-sync are documented in [`deploy/agentcore_runtime/README.md`](deploy/agentcore_runtime/README.md);
-toggle by setting `GOALINSIGHT_AGENTCORE_RUNTIME_ARN` (and unset to
-revert to local chat).
-
 ## Repository layout
 
 ```
 goalinsight/
   cli.py                     # CLI entry (-> goalinsight)
-  pipeline/                  # stage framework, registry, adapters, remote
+  pipeline/                  # stage framework, registry, adapters
   field_registration/        # 5 calibration backends + finetune machinery
   tracking/                  # detection, ByteTrack, ReID, ball detector + 3D
+  track_consolidation/       # ReID + jersey-OCR player id consolidation
   events/                    # detector framework + possession/pass/shot/...
   highlights/                # MatchContext + recipe agents
-  annotation/                # Gradio-based pitch keypoint annotator
-  web/                       # FastAPI viewer + Bedrock chat
-  jersey/                    # OCR + VLM jersey-number recognizers
+  annotation/                # pitch keypoint annotator
+  web/                       # FastAPI viewer (library / pipeline / match)
+  jersey/                    # Qwen VL + OCR jersey-number recognizers
   video_enhancement/         # video2x wrapper (binary or docker mode)
   utils/, interfaces/        # factories + ABCs
-configs/                     # default + per-clip + camera profiles
-sagemaker/                   # setup, build, weights upload, entrypoint
-deploy/offline/              # self-contained Docker image for sharing
-                             # the offline pipeline (see Offline pipeline
-                             # section above)
-deploy/agentcore_runtime/    # optional AgentCore Runtime image for chat
-scripts/                     # run_full_pipeline, pipeline.sh, audit/dump tools, ...
+configs/
+  templates/                 # 3 user-facing scene templates
+                             # (fifa / futsal / children)
+  pitches.yaml               # pitch geometry library
+  camera_profiles.yaml       # camera intrinsics library
+deploy/offline/              # self-contained Docker image
+scripts/                     # pipeline diagnostics / one-off tooling
 tools/                       # make_comparison.py and other utilities
-docs/                        # architecture diagrams (draw.io)
 ```
 
-## Architecture quick links
+## Architecture
 
-- Full pipeline & AWS architecture diagram → [`docs/goalinsight-aws-architecture.drawio`](docs/goalinsight-aws-architecture.drawio)
-- SageMaker-only zoom → [`docs/goalinsight-sagemaker-deployment.drawio`](docs/goalinsight-sagemaker-deployment.drawio)
-- Internal architecture deep-dive → [`CLAUDE.md`](CLAUDE.md) (kept up-to-date as a guide for AI coding assistants and humans alike)
+Internal deep-dive → [`CLAUDE.md`](CLAUDE.md) (kept up-to-date as a
+guide for AI coding assistants and humans alike).
 
 ## Development
 
@@ -321,12 +197,10 @@ There is no formal test suite. Test/debug scripts at the repo root use the `test
 
 This is a single-user research tool. The defaults are safe; the configurable footguns are documented:
 
-- **`python -m goalinsight.web` binds to `127.0.0.1` and ships without authentication.** Intended for local single-user use. If you pass `--host 0.0.0.0` to expose it on a network, add your own authentication layer (nginx + basic auth, SSH port-forwarding, etc.).
-- **The chat `run_python` tool executes arbitrary Python in an AWS Bedrock AgentCore Code Interpreter sandbox.** The sandbox is AWS-managed, but token usage and sandbox session minutes are billed against the AWS account whose credentials are picked up from the default credential chain.
+- **The docker image's web app binds to `0.0.0.0:8000` inside the container** so a browser on the host can reach it via port mapping. If you publish that port to the internet, add your own authentication layer (nginx + basic auth, SSH port-forwarding, etc.).
 - **Pipeline calibration outputs (`homographies.pkl`, `camera_poses.pkl`) are pickle files.** Do not load pipeline output directories you didn't produce yourself — pickle deserialization is RCE-equivalent. A safer on-disk format is on the roadmap.
-- **`video_enhancement.mode: docker` runs `ghcr.io/k4yt3x/video2x` with `--gpus all` and a host-directory volume mount.** Filenames and config arguments are now `shlex.quote`'d before reaching `bash -c`, but the container itself runs as root.
-- **The SageMaker execution role created by `sagemaker/setup_aws.sh` uses `AmazonS3FullAccess` for ergonomic setup.** Production deployments should narrow this to a bucket-scoped inline policy; the script flags this in a comment.
-- **Model weights downloaded from PnLCalib's GitHub releases are unpickled by `torch.load(weights_only=False)`.** `weight_downloader.py` now SHA-256-verifies downloads when the hash is pinned in `AVAILABLE_WEIGHTS`; the `sha256` fields ship empty so first-time use logs the hash for you to pin.
+- **`video_enhancement.mode: docker` runs `ghcr.io/k4yt3x/video2x` with `--gpus all` and a host-directory volume mount.** Filenames and config arguments are `shlex.quote`'d before reaching `bash -c`, but the container itself runs as root.
+- **Model weights downloaded from PnLCalib's GitHub releases are unpickled by `torch.load(weights_only=False)`.** `weight_downloader.py` SHA-256-verifies downloads when the hash is pinned in `AVAILABLE_WEIGHTS`; the `sha256` fields ship empty so first-time use logs the hash for you to pin.
 
 ## Acknowledgements
 
