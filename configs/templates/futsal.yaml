@@ -391,4 +391,3 @@ pipeline:
   - tracking
   - track_consolidation
   - event_detection
-  - player_profile

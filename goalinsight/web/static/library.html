@@ -353,6 +353,25 @@
             Ball diagnostics
           </label>
         </div>
+        <!-- Optional pipeline stages the templates omit by default
+             because they add real wall-clock time. Player profile
+             takes ~50 s on a 10 s clip (spotlight mp4s + heatmaps
+             per player) so we default OFF; users tick it when they
+             want it. -->
+        <div style="margin-top:10px;padding:8px 10px;background:#1a2027;
+                    border:1px solid #232a32;border-radius:4px">
+          <div style="color:#9aa3ad;font-size:12px;margin-bottom:6px">
+            Optional stages
+          </div>
+          <label style="display:inline-flex;gap:5px;align-items:center;
+                        color:#cfe3ff;font-size:12px;cursor:pointer">
+            <input type="checkbox" id="wiz-stage-player-profile">
+            Player profile
+            <span style="color:#6b7380;margin-left:4px">
+              (heatmaps + spotlight clips, +~50s)
+            </span>
+          </label>
+        </div>
         <div style="display:flex;gap:6px;align-items:center;margin-top:10px">
           <label style="color:#9aa3ad">Run name</label>
           <input id="wiz-run-name" type="text" style="flex:1"
@@ -1147,9 +1166,27 @@
           {run_name: runName, video_name: wizState.video,
            config_name: wizState.cfg_path.split('/').pop()});
         const video = lastVideos.find(v => v.name === wizState.video);
+        // Read the stages list back from the config we just wrote so
+        // wizard-controlled toggles (track_consolidation, etc.)
+        // actually take effect. list_configs returns each config's
+        // ``pipeline.stages`` inline so we don't need to fetch +
+        // parse the yaml on the client.
+        let stages = ['field_registration', 'tracking', 'event_detection'];
+        try {
+          const cfgs = await api('GET', '/api/library/configs');
+          const match = cfgs.find(c => c.path === wizState.cfg_path);
+          if (match?.stages?.length) stages = [...match.stages];
+        } catch (_) { /* fall through to the default 3-stage list */ }
+        // Append player_profile only when the user opted in; the
+        // templates omit it by default because it adds ~50s per
+        // pipeline run.
+        if ($("#wiz-stage-player-profile").checked
+            && !stages.includes('player_profile')) {
+          stages.push('player_profile');
+        }
         const job = await api('POST', '/api/jobs/pipeline', {
           run_name: runName,
-          stages: ['field_registration', 'tracking', 'event_detection'],
+          stages,
           config_path: wizState.cfg_path,
           video_path: video.path,
           skip_existing: true,
