@@ -12,11 +12,13 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+import yaml
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from ._runs import _detect_stage_completion, list_runs
 from ._workspace import VIDEO_EXTS, Workspace
+from ..utils.config import load_config, merge_configs
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,15 @@ logger = logging.getLogger(__name__)
 # not user-pickable.
 CONFIGS_DIR = (
     Path(__file__).resolve().parents[2] / "configs" / "templates"
+)
+# Reference libraries the scene-setup wizard reads for its dropdowns.
+# Both live at repo-root ``configs/`` — user-editable in the dev
+# workflow, baked into the docker image via ``COPY configs/`` at build.
+CAMERA_PROFILES_PATH = (
+    Path(__file__).resolve().parents[2] / "configs" / "camera_profiles.yaml"
+)
+PITCHES_PATH = (
+    Path(__file__).resolve().parents[2] / "configs" / "pitches.yaml"
 )
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -479,6 +490,51 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
             raise HTTPException(500, f"failed to read {name}: {exc}") from exc
         return JSONResponse({"name": safe, "path": str(path), "text": text})
 
+    @app.get("/api/library/pitch_profiles")
+    def list_pitch_profiles() -> JSONResponse:
+        """Return ``[{key, label, description}]`` for the scene-setup wizard.
+
+        Reads ``configs/pitches.yaml`` — the same file
+        ``goalinsight.annotation.pitch_types`` resolves against, so the
+        keys shown here are guaranteed to be valid ``pitch_type:`` values.
+        """
+        out = []
+        try:
+            data = yaml.safe_load(PITCHES_PATH.read_text()) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise HTTPException(500, f"pitches.yaml unreadable: {exc}") from exc
+        for key, entry in (data.get("profiles") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            out.append({
+                "key": key,
+                "label": entry.get("label", key),
+                "description": entry.get("description", ""),
+            })
+        return JSONResponse(sorted(out, key=lambda p: p["key"]))
+
+    @app.get("/api/library/camera_profiles")
+    def list_camera_profiles() -> JSONResponse:
+        """Return ``[{key, label, image_size}]`` for the wizard camera dropdown.
+
+        Excludes the K/dist_coeffs numeric matrices — those aren't user-
+        facing. The wizard only needs the key + a human-readable label.
+        """
+        out = []
+        try:
+            data = yaml.safe_load(CAMERA_PROFILES_PATH.read_text()) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise HTTPException(500, f"camera_profiles.yaml unreadable: {exc}") from exc
+        for key, entry in (data.get("profiles") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            out.append({
+                "key": key,
+                "label": entry.get("label", key),
+                "image_size": entry.get("image_size"),
+            })
+        return JSONResponse(sorted(out, key=lambda p: p["key"]))
+
     @app.get("/api/library/videos/{name}/config")
     def get_video_config(name: str) -> JSONResponse:
         """Return the saved per-video config for *name* (or empty meta).
@@ -555,4 +611,120 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
             "exists": True,
             "path": str(cfg_path),
             "text": text,
+        })
+
+    @app.post("/api/library/videos/{name}/scene-setup")
+    async def scene_setup(name: str, request: Request) -> JSONResponse:
+        """Wizard-driven per-video config write.
+
+        Accepts a structured payload (pitch, camera profile, fixed vs
+        PTZ, physical camera position for fixed rigs) and materialises
+        the answers as a per-video ``workspace/configs/<stem>.yaml``.
+        Seeds from the matching pitch template
+        (``configs/templates/<pitch_type>.yaml``) so downstream stages
+        see a fully-populated config, then overlays the wizard's
+        physical / camera / mode overrides via ``merge_configs``.
+
+        Two payload variants:
+
+        * Regular wizard turn — carries ``pitch_type``,
+          ``camera_profile``, ``camera_mode`` (``"fixed"`` | ``"ptz"``),
+          plus mode-specific extras (``camera_position``,
+          ``focal_hfov_deg_bounds``).
+        * ``{"first_annotation": true, "annotation_frame_path": "..."}``
+          — the annotator posts this after the user saves their first
+          calibration frame so the physical runner knows where to
+          find the fixed pose.
+        """
+        safe = _safe_filename(name)
+        video_path = workspace.videos_dir / safe
+        if not video_path.exists():
+            raise HTTPException(404, f"video not found: {name}")
+
+        payload = await request.json()
+        cfg_path = workspace.config_for(video_path)
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Load existing per-video config if present, else seed from the
+        # template matching the payload's pitch_type (or FIFA fallback).
+        if cfg_path.exists():
+            base = load_config(cfg_path)
+        else:
+            template_name = payload.get("pitch_type") or "fifa"
+            template_map = {
+                "fifa": "fifa.yaml",
+                "futsal": "futsal.yaml",
+                "kids_soccer": "children.yaml",
+            }
+            tpl_path = CONFIGS_DIR / template_map.get(template_name, "fifa.yaml")
+            base = load_config(tpl_path) if tpl_path.exists() else {}
+
+        overlay: dict[str, Any] = {}
+        if pt := payload.get("pitch_type"):
+            overlay["pitch_type"] = pt
+
+        # Everything about calibration lives under ``field_registration``.
+        # Backend is always ``physical`` — the same solver handles fixed
+        # (lock_camera_position=true) and PTZ (=false) via a single flag,
+        # so the wizard doesn't force the user to think about backends.
+        fr_phys: dict[str, Any] = {}
+        if profile := payload.get("camera_profile"):
+            fr_phys["camera_profile"] = profile
+        if pos := payload.get("camera_position"):
+            fr_phys["camera_position"] = [float(v) for v in pos]
+        if hfov := payload.get("focal_hfov_deg_bounds"):
+            fr_phys["focal_hfov_deg_bounds"] = [float(v) for v in hfov]
+        mode = payload.get("camera_mode")
+        if mode == "fixed":
+            fr_phys["lock_camera_position"] = True
+            fr_phys["position_bounds_m"] = [0.0, 0.0, 0.0]
+            fr_phys["joint_optimize"] = False
+        elif mode == "ptz":
+            fr_phys["lock_camera_position"] = False
+            fr_phys["position_bounds_m"] = [8.0, 8.0, 3.0]
+            fr_phys["joint_optimize"] = True
+
+        # First-annotation hook: the annotator calls back with the saved
+        # frame path so the physical runner can short-circuit its
+        # per-frame HRNet inference in fixed mode.
+        if payload.get("first_annotation") and (afp := payload.get("annotation_frame_path")):
+            fr_phys["annotation_frame_path"] = str(afp)
+
+        if fr_phys or mode:
+            overlay.setdefault("field_registration", {})["backend"] = "physical"
+            if fr_phys:
+                overlay["field_registration"]["physical"] = fr_phys
+
+        # Per-stage visualization toggles from the wizard's step 4.
+        # Each key is optional — when unset, the merged base config's
+        # value stays (which for the shipped templates defaults to on).
+        vis = payload.get("visualizations") or {}
+        if "field_registration" in vis:
+            on = bool(vis["field_registration"])
+            # ``vis_interval: 0`` disables per-frame vis JPGs in the
+            # physical / fixed_camera runners; 30 is the template default.
+            overlay.setdefault(
+                "field_registration", {}
+            ).setdefault("physical", {})["vis_interval"] = 30 if on else 0
+        if "tracking" in vis:
+            on = bool(vis["tracking"])
+            overlay.setdefault("tracking", {})["vis_frames_enabled"] = on
+            overlay["tracking"]["dump_yolo_raw"] = on
+        if "ball_diag" in vis:
+            overlay.setdefault("tracking", {})["dump_ball_diag"] = bool(
+                vis["ball_diag"],
+            )
+
+        merged = merge_configs(base, overlay) if overlay else base
+        try:
+            text = yaml.safe_dump(merged, sort_keys=False, width=100)
+        except yaml.YAMLError as exc:
+            raise HTTPException(500, f"failed to serialize config: {exc}") from exc
+        cfg_path.write_text(text)
+        return JSONResponse({
+            "stem": video_path.stem,
+            "path": str(cfg_path),
+            "text": text,
+            "backend": merged.get("field_registration", {}).get("backend"),
+            "mode": mode,
         })

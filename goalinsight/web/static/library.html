@@ -136,6 +136,25 @@
     #upload-card .close:hover { color: #fff; }
 
     /* Edit-config modal */
+    /* Wizard reuses the same overlay geometry as the raw-YAML modal. */
+    #wiz-modal { position: fixed; inset: 0; display: none; align-items: center;
+                 justify-content: center; background: rgba(0, 0, 0, 0.65);
+                 z-index: 100; }
+    #wiz-modal.show { display: flex; }
+    #wiz-modal .panel { background: #161b21; border: 1px solid #2a323c;
+                        border-radius: 8px; padding: 16px 18px;
+                        max-width: 560px; width: 100%; }
+    #wiz-modal .head .video-name { color: #cfe3ff; font-weight: 700; flex: 1;
+                                   font-size: 14px; }
+    #wiz-modal .head .close { background: transparent; color: #9aa3ad;
+                              border: none; font-size: 22px; cursor: pointer; }
+    #wiz-modal .actions { display: flex; gap: 8px; justify-content: flex-end;
+                          margin-top: 4px; }
+    #wiz-modal .actions .spacer { flex: 1; }
+    #wiz-modal .error { color: #fca5a5; font-size: 12px; min-height: 16px; }
+    #wiz-modal input, #wiz-modal select {
+      background: #1a2027; color: #e2e6eb; border: 1px solid #2a323c;
+      padding: 6px 8px; border-radius: 4px; font-size: 13px; }
     #cfg-modal { position: fixed; inset: 0; display: none; align-items: center;
                  justify-content: center; background: rgba(0,0,0,0.55); z-index: 50; }
     #cfg-modal.show { display: flex; }
@@ -203,6 +222,154 @@
   </div>
 
   <div id="toast"></div>
+
+  <!-- Scene-setup wizard: guides a user through pitch / camera / mode
+       choices after uploading a video, writing the answers to
+       workspace/configs/<stem>.yaml via POST /api/library/videos/<name>/scene-setup.
+       Same overlay styling as the raw-YAML modal below. -->
+  <div id="wiz-modal" aria-hidden="true">
+    <div class="panel" role="dialog" aria-modal="true"
+         style="max-width:560px;display:flex;flex-direction:column;gap:14px">
+      <div class="head">
+        <span class="video-name" id="wiz-video">Set up scene</span>
+        <button class="close" id="wiz-close" title="Close">&times;</button>
+      </div>
+      <div id="wiz-steps" style="color:#9aa3ad;font-size:12px"></div>
+
+      <!-- Step 1: pitch + camera type -->
+      <section id="wiz-step-1" class="wiz-step">
+        <p style="color:#cfe3ff;margin:0 0 8px 0">
+          What's in this video?
+        </p>
+        <div style="display:flex;gap:10px;align-items:center;margin:6px 0">
+          <label style="width:110px;color:#9aa3ad">Pitch type</label>
+          <select id="wiz-pitch" style="flex:1"></select>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;margin:6px 0">
+          <label style="width:110px;color:#9aa3ad">Camera profile</label>
+          <select id="wiz-cam" style="flex:1"></select>
+        </div>
+      </section>
+
+      <!-- Step 2: fixed vs PTZ + physical position -->
+      <section id="wiz-step-2" class="wiz-step" style="display:none">
+        <p style="color:#cfe3ff;margin:0 0 8px 0">
+          Does the camera move?
+        </p>
+        <label style="display:block;margin:8px 0;cursor:pointer">
+          <input type="radio" name="wiz-mode" value="fixed" checked>
+          <strong>Fixed rig</strong> — mounted, no pan / tilt / zoom
+        </label>
+        <label style="display:block;margin:8px 0;cursor:pointer">
+          <input type="radio" name="wiz-mode" value="ptz">
+          <strong>Pan / tilt / zoom</strong> — handheld or actively operated
+        </label>
+        <div id="wiz-fixed-fields" style="margin-top:12px">
+          <p style="color:#9aa3ad;font-size:12px;margin:6px 0">
+            Camera position on the pitch (metres, origin at pitch centre):
+          </p>
+          <div style="display:flex;gap:6px;align-items:center">
+            <label style="color:#9aa3ad">x</label>
+            <input id="wiz-pos-x" type="number" value="-20" step="0.5" style="width:80px">
+            <label style="color:#9aa3ad;margin-left:8px">y</label>
+            <input id="wiz-pos-y" type="number" value="-10" step="0.5" style="width:80px">
+            <label style="color:#9aa3ad;margin-left:8px">z</label>
+            <input id="wiz-pos-z" type="number" value="5" step="0.5" style="width:80px">
+          </div>
+          <p style="color:#9aa3ad;font-size:12px;margin:12px 0 6px 0">
+            Horizontal field of view (degrees):
+          </p>
+          <div style="display:flex;gap:6px;align-items:center">
+            <label style="color:#9aa3ad">min</label>
+            <input id="wiz-hfov-lo" type="number" value="70" min="20" max="120"
+                   step="1" style="width:80px">
+            <label style="color:#9aa3ad;margin-left:8px">max</label>
+            <input id="wiz-hfov-hi" type="number" value="90" min="20" max="120"
+                   step="1" style="width:80px">
+          </div>
+        </div>
+      </section>
+
+      <!-- Step 3: calibrate -->
+      <section id="wiz-step-3" class="wiz-step" style="display:none">
+        <p style="color:#cfe3ff;margin:0 0 8px 0" id="wiz-cal-headline">
+          Calibrate the camera
+        </p>
+        <p style="color:#9aa3ad;font-size:12px" id="wiz-cal-body"></p>
+        <div style="display:flex;gap:8px;margin-top:10px" id="wiz-cal-actions">
+          <button id="wiz-goto-annotate">Open annotator</button>
+          <button class="secondary" id="wiz-preview-only" style="display:none">
+            Preview pretrained detection
+          </button>
+        </div>
+      </section>
+
+      <!-- Step 4: launch -->
+      <section id="wiz-step-4" class="wiz-step" style="display:none">
+        <p style="color:#cfe3ff;margin:0 0 8px 0">
+          Ready to run
+        </p>
+        <p style="color:#9aa3ad;font-size:12px">
+          Config saved at <code id="wiz-cfg-path">workspace/configs/&lt;stem&gt;.yaml</code>.
+        </p>
+        <!-- Fixed-rig launch guardrail: the physical short-circuit
+             needs an annotation on disk. Without it the pipeline
+             would run per-frame HRNet keypoint detection, which is
+             trained on broadcast 11-a-side and reliably fails on
+             non-FIFA pitches (e.g. futsal, indoor cams). We surface
+             this before the user hits Launch. -->
+        <div id="wiz-anno-warning" style="display:none;color:#fca5a5;
+              background:#3b1f1f;border:1px solid #5c2e2e;
+              padding:8px 12px;border-radius:4px;font-size:12px;
+              margin-top:10px">
+          <strong>Annotate a calibration frame first.</strong>
+          Fixed-rig mode needs a manually-solved pose to reuse across
+          every frame — pretrained HRNet keypoint detection will not
+          work on this pitch style. Click <em>Back</em> then
+          <em>Open annotator</em> to mark 4+ pitch points.
+        </div>
+        <!-- Per-stage visualization toggles. Writing extra JPGs +
+             tracking.mp4 costs a few seconds per stage but is what
+             the /pipeline?stage=... page shows; users who just want
+             the JSON output (e.g. batch runs) can uncheck. -->
+        <div style="margin-top:12px;padding:8px 10px;background:#1a2027;
+                    border:1px solid #232a32;border-radius:4px">
+          <div style="color:#9aa3ad;font-size:12px;margin-bottom:6px">
+            Save per-stage visualizations
+          </div>
+          <label style="display:inline-flex;gap:5px;align-items:center;
+                        margin-right:12px;color:#cfe3ff;font-size:12px;cursor:pointer">
+            <input type="checkbox" id="wiz-vis-fr" checked>
+            Field registration
+          </label>
+          <label style="display:inline-flex;gap:5px;align-items:center;
+                        margin-right:12px;color:#cfe3ff;font-size:12px;cursor:pointer">
+            <input type="checkbox" id="wiz-vis-tracking" checked>
+            Tracking
+          </label>
+          <label style="display:inline-flex;gap:5px;align-items:center;
+                        color:#cfe3ff;font-size:12px;cursor:pointer">
+            <input type="checkbox" id="wiz-vis-ball" checked>
+            Ball diagnostics
+          </label>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;margin-top:10px">
+          <label style="color:#9aa3ad">Run name</label>
+          <input id="wiz-run-name" type="text" style="flex:1"
+                 placeholder="run_<video>">
+          <button id="wiz-launch">Launch pipeline</button>
+        </div>
+      </section>
+
+      <div class="error" id="wiz-error"></div>
+      <div class="actions">
+        <button class="secondary" id="wiz-back" style="display:none">Back</button>
+        <span class="spacer"></span>
+        <button class="secondary" id="wiz-cancel">Cancel</button>
+        <button id="wiz-next">Next</button>
+      </div>
+    </div>
+  </div>
 
   <div id="cfg-modal" aria-hidden="true">
     <div class="panel" role="dialog" aria-modal="true">
@@ -370,9 +537,15 @@
           ${annotationBlock(v)}
           ${latestRunBlock(v)}
           <div class="actions" style="margin-top:auto">
-            <button onclick="seedNewRun('${v.name}')">New run with this video</button>
+            <button onclick="openWizard('${v.name}')"
+                    title="Guided setup — pitch, camera type, calibration mode">
+              Configure scene
+            </button>
+            <button class="secondary" onclick="seedNewRun('${v.name}')">
+              New run
+            </button>
             <button class="secondary" onclick="openCfgModal('${v.name}')"
-                    title="Pick a base config, edit it, save it as the per-video config">
+                    title="Raw YAML editor — advanced users">
               ${cfgBtnLabel}
             </button>
           </div>
@@ -620,7 +793,15 @@
           uploadMeta.textContent =
             `${fmtBytes(file.size)} uploaded in ${fmtEta((performance.now() - t0) / 1000)}`;
           flash(`Uploaded ${data?.name || file.name}`);
-          refreshVideos();
+          refreshVideos().then(() => {
+            // Auto-open the scene-setup wizard for newly-uploaded videos
+            // so the user doesn't have to hunt for the "Configure scene"
+            // button. Skip if a config already exists (re-upload case).
+            const name = data?.name || file.name;
+            api('GET', `/api/library/videos/${encodeURIComponent(name)}/config`)
+              .then(cfg => { if (!cfg.exists) openWizard(name); })
+              .catch(() => {});
+          });
           // Auto-dismiss the success card after a few seconds; errors
           // stay until the user closes them.
           setTimeout(() => uploadCard.classList.remove('show', 'done'), 4000);
@@ -757,6 +938,239 @@
         closeCfgModal();
       }
     });
+
+    // ----- Scene-setup wizard --------------------------------------
+    // Walks a user through pitch / camera type / fixed-vs-PTZ, POSTs
+    // the answers to /api/library/videos/<name>/scene-setup (which
+    // writes workspace/configs/<stem>.yaml), then hands off to the
+    // annotator or the pipeline launcher depending on the mode.
+    const wizModal = $("#wiz-modal");
+    const wizStepsEl = $("#wiz-steps");
+    const wizErrEl = $("#wiz-error");
+    let wizState = {video: null, step: 1};
+
+    function openWizard(videoName) {
+      wizState = {video: videoName, step: 1};
+      $("#wiz-video").textContent = `Set up scene — ${videoName}`;
+      wizErrEl.textContent = '';
+      populateWizardLibraries();
+      showWizStep(1);
+      wizModal.classList.add('show');
+    }
+
+    function closeWizard() { wizModal.classList.remove('show'); }
+
+    async function populateWizardLibraries() {
+      try {
+        const [pitches, cams] = await Promise.all([
+          api('GET', '/api/library/pitch_profiles'),
+          api('GET', '/api/library/camera_profiles'),
+        ]);
+        const pitchSel = $("#wiz-pitch");
+        pitchSel.innerHTML = pitches.map(p =>
+          `<option value="${p.key}">${p.label}</option>`).join('');
+        const camSel = $("#wiz-cam");
+        camSel.innerHTML = cams.map(c =>
+          `<option value="${c.key}">${c.label}</option>`).join('');
+      } catch (e) {
+        wizErrEl.textContent = `Failed to load profiles: ${e.message}`;
+      }
+    }
+
+    function showWizStep(n) {
+      wizState.step = n;
+      for (let i = 1; i <= 4; i++) {
+        const el = document.getElementById(`wiz-step-${i}`);
+        if (el) el.style.display = i === n ? 'block' : 'none';
+      }
+      wizStepsEl.textContent = `Step ${n} of 4`;
+      $("#wiz-back").style.display = n > 1 ? 'inline-block' : 'none';
+      // Step 4's primary CTA is the "Launch pipeline" button inside
+      // the section; the trailing Next button becomes redundant with
+      // the Cancel/close buttons, so hide it there entirely.
+      $("#wiz-next").style.display = (n === 4) ? 'none' : 'inline-block';
+      if (n === 2) toggleFixedFields();
+      if (n === 4) refreshFixedGuardrail();
+    }
+
+    // Fixed-rig mode needs an annotation frame on disk before Launch —
+    // otherwise the pipeline's physical short-circuit gate won't fire
+    // and HRNet will be run instead (unreliable on non-FIFA pitches).
+    // Called every time step 4 opens; also cheap enough to invoke on
+    // each mode-toggle in step 2.
+    async function refreshFixedGuardrail() {
+      const banner = $("#wiz-anno-warning");
+      const launch = $("#wiz-launch");
+      // Only fixed-rig runs need a saved annotation.
+      if (wizState.mode !== 'fixed') {
+        banner.style.display = 'none';
+        launch.disabled = false;
+        launch.title = '';
+        return;
+      }
+      try {
+        const videos = await api('GET', '/api/library/videos');
+        const v = videos.find(x => x.name === wizState.video);
+        const hasAnnotation = !!(v && v.annotation && v.annotation.frame_count > 0);
+        banner.style.display = hasAnnotation ? 'none' : 'block';
+        launch.disabled = !hasAnnotation;
+        launch.title = hasAnnotation
+          ? ''
+          : 'Annotate a calibration frame first (see the banner above)';
+      } catch (e) {
+        // Fail-open: if we can't reach the API let the user try to
+        // launch; the pipeline will still surface any error on stage 1.
+        banner.style.display = 'none';
+        launch.disabled = false;
+      }
+    }
+
+    function toggleFixedFields() {
+      const mode = document.querySelector('input[name="wiz-mode"]:checked').value;
+      $("#wiz-fixed-fields").style.display = mode === 'fixed' ? 'block' : 'none';
+    }
+
+    document.querySelectorAll('input[name="wiz-mode"]').forEach(r =>
+      r.addEventListener('change', toggleFixedFields));
+
+    function readWizardPayload() {
+      const mode = document.querySelector('input[name="wiz-mode"]:checked').value;
+      const payload = {
+        pitch_type: $("#wiz-pitch").value,
+        camera_profile: $("#wiz-cam").value,
+        camera_mode: mode,
+      };
+      if (mode === 'fixed') {
+        payload.camera_position = [
+          parseFloat($("#wiz-pos-x").value),
+          parseFloat($("#wiz-pos-y").value),
+          parseFloat($("#wiz-pos-z").value),
+        ];
+        payload.focal_hfov_deg_bounds = [
+          parseFloat($("#wiz-hfov-lo").value),
+          parseFloat($("#wiz-hfov-hi").value),
+        ];
+      }
+      return payload;
+    }
+
+    async function saveWizardConfig() {
+      const payload = readWizardPayload();
+      const res = await api('POST',
+        `/api/library/videos/${encodeURIComponent(wizState.video)}/scene-setup`,
+        payload);
+      wizState.mode = payload.camera_mode;
+      wizState.cfg_path = res.path;
+      wizState.cfg_text = res.text;
+      $("#wiz-cfg-path").textContent = res.path;
+      $("#wiz-run-name").value = `run_${wizState.video.replace(/\.[^.]+$/, '')}`;
+      // Prep step 3 body copy based on the mode.
+      if (payload.camera_mode === 'fixed') {
+        $("#wiz-cal-headline").textContent = 'Annotate one calibration frame';
+        $("#wiz-cal-body").innerHTML =
+          `The fixed-rig path needs a single annotated frame so the
+           physical solver can recover the pose. Mark the 4+ pitch
+           corners you can see, click <em>Compute</em>, then <em>Save</em>.
+           Come back here when done.`;
+        $("#wiz-preview-only").style.display = 'none';
+      } else {
+        $("#wiz-cal-headline").textContent = 'Preview pretrained keypoints';
+        $("#wiz-cal-body").innerHTML =
+          `The PTZ path runs pretrained HRNet keypoint detection every
+           frame. Preview the pretrained model's output on this video
+           — if the keypoints land in the right places, you can launch
+           the pipeline as-is. If the detection is empty or badly off,
+           open the annotator to mark keypoints for a fine-tune.`;
+        $("#wiz-preview-only").style.display = 'inline-block';
+      }
+    }
+
+    $("#wiz-close").addEventListener('click', closeWizard);
+    $("#wiz-cancel").addEventListener('click', closeWizard);
+    wizModal.addEventListener('click', (e) => {
+      if (e.target.id === 'wiz-modal') closeWizard();
+    });
+
+    $("#wiz-back").addEventListener('click', () => {
+      if (wizState.step > 1) showWizStep(wizState.step - 1);
+    });
+
+    $("#wiz-next").addEventListener('click', async () => {
+      wizErrEl.textContent = '';
+      try {
+        if (wizState.step === 2) {
+          // Step 2 → 3 also writes the config so subsequent steps can
+          // refer to a real file path.
+          await saveWizardConfig();
+          showWizStep(3);
+        } else {
+          showWizStep(wizState.step + 1);
+        }
+      } catch (e) {
+        wizErrEl.textContent = e.message;
+      }
+    });
+
+    $("#wiz-goto-annotate").addEventListener('click', () => {
+      const mode = wizState.mode === 'fixed' ? 'annotate' : 'preview';
+      // Opens the annotate page in a new tab so the wizard stays open.
+      const url = `/annotate?video=${encodeURIComponent(wizState.video)}&mode=${mode}`;
+      window.open(url, '_blank');
+    });
+
+    $("#wiz-preview-only").addEventListener('click', () => {
+      const url = `/annotate?video=${encodeURIComponent(wizState.video)}&mode=preview`;
+      window.open(url, '_blank');
+    });
+
+    $("#wiz-launch").addEventListener('click', async () => {
+      wizErrEl.textContent = '';
+      try {
+        const runName = $("#wiz-run-name").value.trim();
+        if (!runName) { wizErrEl.textContent = 'run name required'; return; }
+        // Fold the step 4 vis-toggle answers into the workspace yaml
+        // BEFORE launching. Uses the same scene-setup endpoint so the
+        // merge is server-side. The wizard's earlier POST already
+        // wrote pitch/camera/mode; this second POST layers vis on top.
+        await api('POST',
+          `/api/library/videos/${encodeURIComponent(wizState.video)}/scene-setup`,
+          {
+            visualizations: {
+              field_registration: $("#wiz-vis-fr").checked,
+              tracking: $("#wiz-vis-tracking").checked,
+              ball_diag: $("#wiz-vis-ball").checked,
+            },
+          });
+        // Reuse the existing 2-step create-run flow: POST /runs then
+        // POST /jobs/pipeline. Config comes from the wizard-written yaml.
+        await api('POST', '/api/library/runs',
+          {run_name: runName, video_name: wizState.video,
+           config_name: wizState.cfg_path.split('/').pop()});
+        const video = lastVideos.find(v => v.name === wizState.video);
+        const job = await api('POST', '/api/jobs/pipeline', {
+          run_name: runName,
+          stages: ['field_registration', 'tracking', 'event_detection'],
+          config_path: wizState.cfg_path,
+          video_path: video.path,
+          skip_existing: true,
+        });
+        flash(`Run ${runName} launched — job ${job.id}`);
+        closeWizard();
+        // Redirect to /pipeline?run=<runName> so the nav bar's RUN_NAME
+        // picks up the fresh run — subsequent clicks on Pipeline /
+        // Tracking / Match tabs all deep-link to this run automatically.
+        // The pipeline page's SSE hook re-attaches to the running job.
+        window.location.href =
+          `/pipeline?run=${encodeURIComponent(runName)}&stage=field_registration`;
+      } catch (e) {
+        wizErrEl.textContent = e.message;
+      }
+    });
+
+    // Auto-open the wizard after a successful upload of a new video.
+    // Piggy-backs on the existing xhr.onload path — the "Configure scene"
+    // button on each card also triggers this manually.
+    const _prevOnload = null;
 
     refreshVideos();
     refreshConfigs();

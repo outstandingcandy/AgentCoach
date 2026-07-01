@@ -129,11 +129,24 @@
   <label style="margin-left: auto; display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted);">
     <input type="checkbox" id="toggle-projection" checked /> Projection
   </label>
+  <label style="display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); margin-left: 12px;"
+         id="toggle-pretrained-label" title="Overlay pretrained HRNet keypoint detections on this frame">
+    <input type="checkbox" id="toggle-pretrained" /> Pretrained kpts
+  </label>
 </header>
 <main>
   <section class="left">
-    <div class="frame-wrap panel" style="padding: 4px;">
+    <!-- Wizard-launched sessions (?mode=preview | ?mode=finetune) get a
+         contextual banner above the frame explaining what to do. -->
+    <div id="mode-banner" class="panel"
+         style="display:none; background:#1e242b; color:#cfe3ff;
+                padding:8px 12px; font-size:13px; border-left:3px solid #3b82f6;"></div>
+    <div class="frame-wrap panel" style="padding: 4px; position: relative;">
       <img id="frame-img" alt="frame" draggable="false" />
+      <img id="pretrained-overlay" alt="pretrained kpts overlay"
+           style="display:none; position:absolute; top:4px; left:4px;
+                  pointer-events:none; opacity:0.85;
+                  width:calc(100% - 8px); height:calc(100% - 8px);" />
     </div>
 
     <div class="panel frame-controls">
@@ -911,10 +924,45 @@ async function init() {
   // by the server-side open hook. The library page links here with the
   // raw filename (e.g. ``0626_1_part_000.mov``); /api/annotate/jump
   // keys by stem, so strip the extension.
-  const qVideo = new URLSearchParams(window.location.search).get("video");
+  const qs = new URLSearchParams(window.location.search);
+  const qVideo = qs.get("video");
   if (qVideo) {
     const stem = qVideo.replace(/\.(mp4|mov|mkv|avi)$/i, "");
     await jumpTo(stem, 0);
+  }
+
+  // ``?mode=preview`` (wizard PTZ path): auto-flip the pretrained
+  // overlay on so the user immediately sees whether SV_kp works.
+  // ``?mode=finetune`` (wizard PTZ + user rejected pretrained): show a
+  // banner telling them to annotate a batch of frames + expose the
+  // "Train from these frames" button.
+  const qMode = qs.get("mode");
+  if (qMode === "preview") {
+    $("#toggle-pretrained").checked = true;
+    refreshPretrainedOverlay();
+    $("#mode-banner").style.display = "block";
+    $("#mode-banner").innerHTML =
+      `<strong>Preview mode</strong> — pretrained keypoints are overlaid
+       in cyan. If the points land where you expect on this pitch,
+       go back to Library and launch the pipeline as-is. If they're
+       empty or badly off, annotate 20-30 frames and click
+       "Train from these frames" to fine-tune the detector.`;
+  } else if (qMode === "annotate") {
+    $("#mode-banner").style.display = "block";
+    $("#mode-banner").innerHTML =
+      `<strong>Fixed-rig calibration</strong> — mark 4+ pitch keypoints
+       on this single frame, click <em>Compute</em> to solve the pose,
+       then <em>Save</em>. The pipeline will replay this pose to every
+       frame (no per-frame HRNet), so you only ever need one annotated
+       frame for a fixed camera.`;
+  } else if (qMode === "finetune") {
+    $("#mode-banner").style.display = "block";
+    $("#mode-banner").innerHTML =
+      `<strong>Fine-tune mode</strong> — the pretrained model didn't
+       work on this pitch style. Annotate 20-30 frames spread across
+       the video, then click <em>Train from these frames</em> to
+       kick off a HRNet fine-tune. When training finishes the pipeline
+       will pick up your new weights automatically.`;
   }
 
   // Initial state
@@ -922,6 +970,26 @@ async function init() {
   applyState(state);
   refreshFrame();
 }
+
+// Toggle-driven pretrained overlay — piggy-backs on the annotator's
+// existing frame accessor so it always renders the frame currently
+// loaded server-side (respects jump/next/prev navigation).
+function refreshPretrainedOverlay() {
+  const overlay = $("#pretrained-overlay");
+  const toggle = $("#toggle-pretrained");
+  if (!toggle.checked) {
+    overlay.style.display = "none";
+    return;
+  }
+  const ts = Date.now();
+  overlay.src = `/api/annotate/pretrained_preview.jpg?ts=${ts}`;
+  overlay.style.display = "block";
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  const tp = document.getElementById("toggle-pretrained");
+  if (tp) tp.addEventListener("change", refreshPretrainedOverlay);
+});
 
 
 init().catch(err => {

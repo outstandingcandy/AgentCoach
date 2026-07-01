@@ -246,11 +246,24 @@ def run_stage1_fixed_camera(
         frame_indices = list(sampler)
 
         # 4. Pick an annotation frame and solve once.
+        # ``annotation_frame_path`` (a full path, set by the scene-setup
+        # wizard after the user saves their first calibration frame) wins
+        # over ``annotation_frame`` (a bare integer index, legacy). Falls
+        # back to auto-picking the most recent annotation in the standard
+        # workspace/annotations/<stem>/ dir when neither is set.
         annotations_dir = _resolve_annotations_dir(video_path)
-        explicit = phys_config.get("annotation_frame")
-        annotation_path = _pick_annotation_frame(
-            annotations_dir, int(explicit) if explicit is not None else None,
-        )
+        explicit_path = phys_config.get("annotation_frame_path")
+        if explicit_path:
+            annotation_path = Path(explicit_path)
+            if not annotation_path.exists():
+                raise FileNotFoundError(
+                    f"annotation_frame_path={explicit_path} does not exist",
+                )
+        else:
+            explicit = phys_config.get("annotation_frame")
+            annotation_path = _pick_annotation_frame(
+                annotations_dir, int(explicit) if explicit is not None else None,
+            )
         logger.info(
             "Stage 1 (Fixed): solving once from %s",
             annotation_path.relative_to(annotation_path.parents[2])

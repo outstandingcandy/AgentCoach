@@ -92,13 +92,17 @@ def get_reid_extractor(config: dict[str, Any] | None = None) -> "BaseReIDExtract
     else:
         # Default: OSNet
         from ..tracking.reid import OSNetExtractor
+        osnet_block = reid_config.get("osnet", {})
         extractor_config = {
-            "model": reid_config.get("model", "osnet_x1_0"),
-            "feature_dim": reid_config.get("feature_dim", 512),
+            "model": osnet_block.get("model", reid_config.get("model", "osnet_x1_0")),
+            "feature_dim": osnet_block.get("feature_dim", reid_config.get("feature_dim", 512)),
             "batch_size": reid_config.get("batch_size", 32),
             "device": config.get("device", "cuda"),
         }
-        return OSNetExtractor(extractor_config)
+        weights_path = osnet_block.get("weights_path") or reid_config.get("weights_path")
+        extractor = OSNetExtractor(extractor_config)
+        extractor.load_model(weights_path) if weights_path else extractor.load_model(None)
+        return extractor
 
 
 def get_jersey_recognizer(config: dict[str, Any] | None = None) -> "BaseJerseyRecognizer":
@@ -133,16 +137,19 @@ def get_jersey_recognizer(config: dict[str, Any] | None = None) -> "BaseJerseyRe
     elif backend == "gemini":
         from ..jersey.gemini_recognizer import GeminiJerseyRecognizer
         return GeminiJerseyRecognizer(jr_config.get("gemini", jr_config))
-    elif backend in ("qwen_vl", "qwen"):
-        # New OpenAI-compatible adapter (vLLM server). Goes through
+    elif backend == "qwen_vl":
+        # OpenAI-compatible adapter (external vLLM server). Goes through
         # BaseVLMRecognizer so the same BATCHED_OCR_PROMPT + single-
         # digit guard the Claude/Gemini backends use also applies here.
+        # Requires ``bash scripts/start_qwen_vllm.sh`` (or another
+        # OpenAI-compat server) to be running.
         from ..jersey.qwen_vlm_recognizer import QwenVLMRecognizer
         return QwenVLMRecognizer(jr_config)
-    else:
-        # Legacy Qwen path: HuggingFace-local model loader without the
-        # batched-OCR machinery. Kept for backwards compatibility with
-        # configs that don't have ``backend`` set explicitly.
+    elif backend == "qwen":
+        # In-process HuggingFace ``transformers`` loader — no external
+        # server needed. This is the default the docker image ships
+        # with because it works fully offline once the model weights
+        # are pre-fetched during image build.
         from ..jersey import QwenJerseyRecognizer
         recognizer_config = {
             "mode": jr_config.get("mode", "local"),
@@ -150,6 +157,13 @@ def get_jersey_recognizer(config: dict[str, Any] | None = None) -> "BaseJerseyRe
             "api": jr_config.get("api", {}),
         }
         return QwenJerseyRecognizer(recognizer_config)
+    else:
+        # Unknown backend name — surface it early instead of silently
+        # falling back to something the user didn't ask for.
+        raise ValueError(
+            f"unknown jersey_recognition.backend {backend!r}; "
+            f"expected one of: qwen | qwen_vl | mmocr | claude | gemini",
+        )
 
 
 def get_team_classifier(config: dict[str, Any] | None = None) -> "BaseTeamClassifier":

@@ -48,7 +48,7 @@ field_registration:
     use_prev_homography: true
     weights_dir:
   physical:
-    camera_profile: futsal_phone_1080p
+    camera_profile: dji_osmo_action_4_1080p
     free_intrinsics: true
     focal_hfov_deg_bounds: [70.0, 90.0]
     camera_position: [-20.0, -10.0, 5.0]
@@ -179,9 +179,13 @@ tracking:
   # max_cosine_distance: 0.2 would accept every nearby track. Flip
   # back to 0.2 if you switch reid.backend back to osnet/prtreid.
   max_cosine_distance: 0.012
-  dump_yolo_raw: false
-  vis_frames_enabled: false
-  dump_ball_diag: false
+  # Per-frame visualization JPGs + tracking.mp4 are what the /pipeline
+  # page shows for the tracking stage; keep them on so a fresh user
+  # sees results end-to-end. Turn any of these off in a per-video
+  # override if you want to shave a few seconds per run.
+  dump_yolo_raw: true
+  vis_frames_enabled: true
+  dump_ball_diag: true
 
 reid:
   backend: clip_reid
@@ -255,7 +259,7 @@ highlights:
     composer: segment
 
 track_consolidation:
-  enabled: false
+  enabled: true
   min_track_seconds: 3.0
   frames_per_track: 0
   max_crops_per_track: 200
@@ -263,15 +267,19 @@ track_consolidation:
     min_bbox_height: 80
     upper_body_ratio: 0.65
   jersey:
-    backend: claude
+    # Default: in-process Qwen VL (no external server / API keys).
+    # The docker image pre-fetches the HF weights during build so
+    # first-run is offline-safe. Swap to ``backend: claude`` +
+    # AWS creds if you want the cloud path.
+    backend: qwen
+    mode: local
+    local:
+      model: Qwen/Qwen3.5-2B
+      device: cuda
+      max_new_tokens: 32
     ocr_backend: llm
-    rapidocr:
-      upscale: 4.0
-      min_confidence: 0.5
-    model_id: us.anthropic.claude-opus-4-7
-    region: us-east-1
-    max_concurrency: 32
-    ocr_per_track_concurrency: 8
+    max_concurrency: 4
+    ocr_per_track_concurrency: 2
     decision_subset_size: 8
     max_retries: 2
     max_tokens: 128
@@ -381,4 +389,6 @@ pipeline:
   stages:
   - field_registration
   - tracking
+  - track_consolidation
   - event_detection
+  - player_profile

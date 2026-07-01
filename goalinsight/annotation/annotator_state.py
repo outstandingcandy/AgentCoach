@@ -259,15 +259,27 @@ class AnchorAnnotator:
                         self.derived_accepted[i] = bool(accepted)
                         break
 
-        if pitch_changed:
-            # Stale H0 was computed under a different pitch — recompute
-            # against the refreshed world coords so the overlay reappears
-            # without a manual "Compute homography" click.
+        # ``pitch_changed`` catches the case where saved world coords
+        # differ from the active pitch's. But when the JSON on disk
+        # stored keypoints with only ``keypoint_name`` (no ``world``
+        # field), load_frame_annotation re-resolves world from
+        # ``_pk.PITCH_POINTS`` against the CURRENT active pitch — so
+        # ``saved == resolved`` and pitch_changed stays False even
+        # though the frame's ``.npy`` H0 was solved under whichever
+        # pitch was active AT SAVE TIME (which may be different).
+        # Safest fix: whenever we have enough points to re-solve, drop
+        # the disk H0 and recompute against the active pitch's world
+        # coords. The recomputed H is what actually corresponds to
+        # what the user is seeing.
+        can_resolve = (
+            len(self.keypoint_names) + len(self.derived_points)
+        ) >= MIN_POINTS_FOR_PNLCALIB
+        if pitch_changed or (can_resolve and self.H0 is not None):
             self.H0 = None
             self.reprojection_error = 0.0
             self._solved_cam_position = None
             self._solved_camera = None
-            if (len(self.keypoint_names) + len(self.derived_points)) >= MIN_POINTS_FOR_PNLCALIB:
+            if can_resolve:
                 self.compute_homography()
         elif self.H0 is not None:
             _compute_auto_projections(self)

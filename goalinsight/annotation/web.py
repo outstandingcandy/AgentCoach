@@ -12,10 +12,34 @@ app uses this so the annotator and the viewer share one process.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
+import cv2
+import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
+
+logger = logging.getLogger(__name__)
+
+# Lazy singleton for the pretrained-preview route. Loading HRNet is
+# expensive (~1s + GPU mem), and the annotator UI can be opened and
+# closed many times per session, so we cache the model across calls.
+_KEYPOINT_DETECTOR = None
+
+
+def _get_pretrained_detector():
+    global _KEYPOINT_DETECTOR
+    if _KEYPOINT_DETECTOR is None:
+        from ..field_registration.keypoint_detector import KeypointDetector
+
+        det = KeypointDetector({
+            "backend": "pnlcalib",
+            "pnlcalib": {"weights": "SV_kp", "confidence_threshold": 0.3},
+        })
+        det.load_model()
+        _KEYPOINT_DETECTOR = det
+    return _KEYPOINT_DETECTOR
 
 from . import per_video_settings, pitch_constants
 from .pitch import keypoints as _pk
@@ -342,6 +366,59 @@ def register_annotation_routes(
         return Response(content=data, media_type="image/jpeg",
                         headers={"Cache-Control": "no-store"})
 
+    @app.get(f"{p}/pretrained_preview.jpg")
+    def pretrained_preview_jpg() -> Response:
+        """Overlay pretrained HRNet keypoint detections on the current frame.
+
+        Used by the scene-setup wizard's "preview calibration" step so
+        the user can eyeball whether SV_kp weights already work on
+        their pitch style, before deciding to annotate for a fine-tune
+        or use the pretrained model as-is. Runs the same detector the
+        physical / pnlcalib backends do at pipeline time.
+        """
+        frame = annotator.current_frame
+        if frame is None:
+            raise HTTPException(400, "no frame loaded — open a video first")
+        try:
+            det = _get_pretrained_detector()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("failed to init keypoint detector")
+            raise HTTPException(500, f"detector init failed: {exc}") from exc
+
+        try:
+            keypoints = det.detect(frame, convert_to_soccernet=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("keypoint detection failed")
+            raise HTTPException(500, f"detection failed: {exc}") from exc
+
+        vis = frame.copy()
+        for kp in keypoints:
+            x = kp.get("x")
+            y = kp.get("y")
+            conf = float(kp.get("confidence", 0.0))
+            if x is None or y is None:
+                continue
+            cv2.circle(vis, (int(round(x)), int(round(y))), 6, (0, 255, 255), -1)
+            cv2.circle(vis, (int(round(x)), int(round(y))), 8, (0, 0, 0), 1)
+            label = kp.get("name") or str(kp.get("id", ""))
+            if label:
+                cv2.putText(
+                    vis, str(label),
+                    (int(round(x)) + 8, int(round(y)) - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA,
+                )
+        ok, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            raise HTTPException(500, "jpeg encode failed")
+        return Response(
+            content=bytes(buf),
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Keypoints-Detected": str(len(keypoints)),
+            },
+        )
+
     @app.get(f"{p}/pitch.jpg")
     def pitch_jpg(highlight_keypoint: str | None = None,
                   highlight_line: str | None = None) -> Response:
@@ -479,7 +556,57 @@ def register_annotation_routes(
 
     @app.post(f"{p}/save")
     async def save() -> JSONResponse:
-        return _ok(annotator.save())
+        msg = annotator.save()
+        # After a successful save, thread the frame path into the
+        # per-video pipeline config so the physical runner's fixed-rig
+        # short-circuit can pick it up. Only when the wizard's mode
+        # produced a ``lock_camera_position: true`` config — otherwise
+        # PTZ users would get their config unexpectedly rewritten.
+        try:
+            _thread_annotation_into_config()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("failed to update per-video config: %s", exc)
+        return _ok(msg)
+
+    def _thread_annotation_into_config() -> None:
+        if configs_root_path is None:
+            return
+        video_name = getattr(annotator, "video_name", None)
+        if not video_name:
+            return
+        stem = Path(str(video_name)).stem
+        cfg_path = configs_root_path / f"{stem}.yaml"
+        if not cfg_path.exists():
+            return
+        import yaml
+        cfg = yaml.safe_load(cfg_path.read_text()) or {}
+        phys = (cfg.get("field_registration") or {}).get("physical") or {}
+        # Only threaded when the wizard picked "fixed rig" mode.
+        if not phys.get("lock_camera_position"):
+            return
+        # Pick the most-recently-saved frame_*.json in the annotations dir.
+        anns_dir = Path(annotator.annotations_dir) / stem
+        if not anns_dir.is_dir():
+            return
+        candidates = sorted(
+            (p for p in anns_dir.glob("frame_*.json")
+             if not p.name.endswith("_all_points.json")),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            return
+        latest = str(candidates[0].resolve())
+        if phys.get("annotation_frame_path") == latest:
+            return  # Nothing to do — already in sync.
+        cfg.setdefault("field_registration", {}).setdefault("physical", {})[
+            "annotation_frame_path"
+        ] = latest
+        cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+        logger.info(
+            "annotation frame saved — wrote annotation_frame_path=%s to %s",
+            latest, cfg_path.name,
+        )
 
     @app.post(f"{p}/derived/toggle")
     async def derived_toggle(request: Request) -> JSONResponse:

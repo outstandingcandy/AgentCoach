@@ -25,6 +25,58 @@
   // /pipeline?run=<run> uses a query string instead of a path segment.
   const RUN_NAME = RUN || queryRun || null;
 
+  // Fallback for the run-scoped tabs when the current page URL has no
+  // run in it (e.g. we're on /library). We fetch the most recently
+  // finished run once and rewrite the Pipeline / Match / Tracking
+  // links to point at it — otherwise clicking those tabs from Library
+  // lands on an empty picker or a 404. Async: happens after the nav
+  // is first rendered so the DOM is available.
+  let FALLBACK_RUN = null;
+  async function _loadFallbackRun() {
+    if (RUN_NAME) return;
+    try {
+      const r = await fetch('/api/library/runs', {cache: 'no-store'});
+      if (!r.ok) return;
+      const runs = await r.json();
+      // Prefer a run that has BOTH tracking+field_registration completed.
+      // The list order matches list_runs() which returns them
+      // most-recently-modified first.
+      const picked = runs.find(x => x.stages
+        && x.stages.field_registration && x.stages.tracking) || runs[0];
+      if (picked) FALLBACK_RUN = picked.run_name;
+    } catch (_) { /* silent — nav still works without it */ }
+  }
+  const _rewriteFallbackLinks = () => {
+    if (!FALLBACK_RUN) return;
+    // ``nav`` (the local variable, created below) holds the anchor
+    // elements even before ``inject()`` attaches it to document.body.
+    // Query directly through it so this fallback rewrite works
+    // regardless of whether the nav has been inserted yet.
+    const map = {
+      pipeline: `/pipeline?run=${encodeURIComponent(FALLBACK_RUN)}`,
+      match: `/match/${encodeURIComponent(FALLBACK_RUN)}`,
+      tracking: `/tracking/${encodeURIComponent(FALLBACK_RUN)}`,
+    };
+    for (const [id, href] of Object.entries(map)) {
+      const el = nav.querySelector(`a[data-nav-id="${id}"]`);
+      if (el) el.href = href;
+    }
+    // Tracking is rendered as a disabled span when no run was known —
+    // replace it with a real link now that we have one.
+    const span = nav.querySelector('span.disabled');
+    if (span && span.textContent === 'Tracking') {
+      const a = document.createElement('a');
+      a.href = map.tracking;
+      a.textContent = 'Tracking';
+      a.dataset.navId = 'tracking';
+      span.replaceWith(a);
+    }
+  };
+  // ``nav`` is created further down inside this IIFE; wrap the resolve
+  // in a defer so it always fires AFTER the anchors have been added.
+  _loadFallbackRun().then(() =>
+    Promise.resolve().then(_rewriteFallbackLinks));
+
   function moduleId() {
     if (path.startsWith('/library')) return 'library';
     if (path.startsWith('/pipeline')) return 'pipeline';

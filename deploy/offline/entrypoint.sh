@@ -49,5 +49,33 @@ for name in "${SEED_FILES[@]}"; do
     fi
 done
 
+# Background-launch the Qwen VL vLLM daemon on a fixed loopback port
+# so the track_consolidation stage can just talk to it. First cold
+# start (flashinfer JIT compile) takes 3-5 min; caching to
+# ``~/.cache/flashinfer/`` means subsequent container restarts warm
+# up in ~30s. Set QWEN_VLLM_DISABLE=1 to skip (e.g. no-GPU or
+# no-track_consolidation deployments).
+QWEN_VLLM_PORT="${QWEN_VLLM_PORT:-8100}"
+QWEN_VLLM_MODEL="${QWEN_VLLM_MODEL:-Qwen/Qwen3.5-2B}"
+if [ -z "${QWEN_VLLM_DISABLE:-}" ] && command -v vllm >/dev/null 2>&1; then
+    mkdir -p /workspace/logs 2>/dev/null || true
+    echo "starting vllm daemon: model=$QWEN_VLLM_MODEL port=$QWEN_VLLM_PORT" >&2
+    vllm serve "$QWEN_VLLM_MODEL" \
+        --host 127.0.0.1 \
+        --port "$QWEN_VLLM_PORT" \
+        --gpu-memory-utilization "${QWEN_GPU_UTIL:-0.25}" \
+        --max-model-len "${QWEN_MAX_LEN:-8192}" \
+        --max-num-seqs "${QWEN_MAX_NUM_SEQS:-4}" \
+        > /workspace/logs/vllm.log 2>&1 &
+    VLLM_PID=$!
+    # Expose the base_url to the pipeline subprocess so it skips its
+    # own spawn logic.
+    export QWEN_VLLM_BASE_URL="http://127.0.0.1:$QWEN_VLLM_PORT/v1"
+    echo "vllm pid=$VLLM_PID (log at /workspace/logs/vllm.log)" >&2
+    # Reap the daemon on entrypoint exit so ``docker stop`` cleans up
+    # cleanly instead of leaving zombies.
+    trap 'kill -TERM "$VLLM_PID" 2>/dev/null || true' EXIT INT TERM
+fi
+
 # Hand off to goalinsight-web (default) or the user's override.
 exec goalinsight-web "$@"

@@ -757,6 +757,20 @@ def create_workspace_app(
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="not found")
         return _Response(payload, media_type="image/jpeg", headers=no_cache)
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    # Static assets (JS / CSS / HTML fragments) evolve rapidly during
+    # dev; browser HTTP cache would silently serve stale files that
+    # confuse debugging (a familiar footgun: "why doesn't my JS
+    # change show up"). Wrap StaticFiles so every asset carries
+    # ``Cache-Control: no-store`` — no server-side caching cost, and
+    # the browser always fetches fresh.
+    class _NoCacheStatic(StaticFiles):
+        async def get_response(self, path, scope):
+            resp = await super().get_response(path, scope)
+            resp.headers["Cache-Control"] = (
+                "no-store, no-cache, must-revalidate, max-age=0"
+            )
+            return resp
+
+    app.mount("/static", _NoCacheStatic(directory=STATIC_DIR), name="static")
 
     return app
