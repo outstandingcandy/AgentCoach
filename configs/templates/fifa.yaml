@@ -19,11 +19,17 @@ video:
 
 field_registration:
   backend: pnlcalib
-  pnlcalib:
+  # Shared HRNet detector config — read by every backend that runs
+  # per-frame keypoint/line detection (pnlcalib, physical, broadtrack,
+  # homography). A fine-tuned model goes here as ``keypoint_model_path``.
+  keypoint_detection:
     keypoint_weights: SV_kp
     keypoint_threshold: 0.3434
     line_weights: SV_lines
     line_threshold: 0.15
+    keypoint_model_path:
+  # PnLCalib-solver-only knobs (used when backend: pnlcalib).
+  pnlcalib:
     pnl_refine: false
     line_weight: 1.0
   nbjw:
@@ -47,27 +53,6 @@ field_registration:
     world_residual_weight: 0.0
     world_error_threshold: 5.0
     calibration_skip: 1
-  keypoint_detector:
-    backend: resnet50
-    model: resnet50
-    confidence_threshold: 0.5
-    num_keypoints: 115
-    pnlcalib:
-      weights: SV_kp
-      confidence_threshold: 0.3434
-  line_detector:
-    backend: hough
-    hough_threshold: 50
-    min_line_length: 100
-    max_line_gap: 10
-    pnlcalib:
-      weights: SV_lines
-      confidence_threshold: 0.15
-  pnl_solver:
-    ransac_iterations: 1000
-    reprojection_threshold: 8.0
-    pnl_refine: false
-    line_weight: 1.0
 
 unified_detection:
   enabled: true
@@ -175,7 +160,10 @@ reid:
     weights_path:
   clip_reid:
     backbone: ViT-L-14
-    pretrained: openai
+    # ``pretrained: null`` avoids the ~4.8 GB base ViT-L-14 download —
+    # the fine-tune (weights_path) covers every visual-encoder key
+    # except ``visual.proj`` which ``remove_proj=True`` clears anyway.
+    pretrained: null
     weights_path:
     remove_proj: true
     batch_size: 32

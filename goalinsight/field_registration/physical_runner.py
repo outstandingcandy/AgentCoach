@@ -203,45 +203,28 @@ def run_stage1_physical(
     Returns:
         Dict with calibration statistics.
     """
-    # Fixed-rig short-circuit. The scene-setup wizard writes
-    # ``lock_camera_position: true`` + ``annotation_frame_path: ...``
-    # when the user picks "fixed camera" — that's a pure re-projection
-    # of a single solved pose, not a per-frame HRNet run. Delegate to
-    # the fixed_camera runner (same schema, cheaper solver) so the
-    # user's wizard choice actually saves the HRNet cost.
-    phys_config = config.get("field_registration", {}).get("physical", {}) or {}
-    if (
-        phys_config.get("lock_camera_position")
-        and phys_config.get("annotation_frame_path")
-    ):
-        logger.info(
-            "Stage 1 (Physical): fixed-rig fast path — "
-            "delegating to fixed_camera runner",
-        )
-        from .fixed_camera_runner import run_stage1_fixed_camera
-        return run_stage1_fixed_camera(
-            video_path, output_dir, vis_dir, config, process_fps,
-        )
+    # NOTE: the ``physical`` backend always runs per-frame HRNet keypoint
+    # estimation. The fixed-rig (replay-one-pose) path is a SEPARATE
+    # backend — ``fixed_camera`` — selected explicitly in config; this
+    # runner no longer delegates to it, so each backend stays independent
+    # and the config's ``backend:`` value matches what actually runs.
 
     from . import KeypointDetector
+    from ._detector_config import (
+        build_keypoint_detector_config,
+        build_line_detector_config,
+        get_detection_config,
+    )
     from .pnlcalib import KeypointMapper, LineMapper
     from .physical_calibrator import PhysicalCalibrator
 
     fr_config = config.get("field_registration", {})
-    pnl_config = fr_config.get("pnlcalib", {})
+    det_config = get_detection_config(fr_config)
     phys_config = fr_config.get("physical", {})
 
     # Initialize keypoint detector (reuse PnLCalib HRNet detector)
     logger.info("Stage 1 (Physical): Initializing keypoint detector...")
-    kp_config = {
-        "backend": "pnlcalib",
-        "pnlcalib": {
-            "weights": pnl_config.get("keypoint_weights", "SV_kp"),
-            "model_path": pnl_config.get("keypoint_model_path"),
-            "confidence_threshold": pnl_config.get("keypoint_threshold", 0.3434),
-        }
-    }
-    kp_detector = KeypointDetector(kp_config)
+    kp_detector = KeypointDetector(build_keypoint_detector_config(det_config))
     kp_detector.load_model()
     keypoint_mapper = KeypointMapper()
 
@@ -253,15 +236,8 @@ def run_stage1_physical(
     if use_line_model:
         from . import LineDetector
         logger.info("Stage 1 (Physical): Initializing line detector...")
-        line_config = {
-            "backend": "pnlcalib",
-            "pnlcalib": {
-                "weights": pnl_config.get("line_weights", "SV_lines"),
-                "confidence_threshold": pnl_config.get("line_threshold", 0.15),
-            }
-        }
-        line_detector = LineDetector(line_config)
-        line_detector.load_model(pnl_config.get("line_model_path"))
+        line_detector = LineDetector(build_line_detector_config(det_config))
+        line_detector.load_model(det_config.get("line_model_path"))
     else:
         logger.info("Stage 1 (Physical): Deriving lines from keypoints (no line model)")
 
@@ -435,7 +411,7 @@ def run_stage1_physical(
         result = calibrator.calibrate(
             keypoint_mapper,
             line_mapper if use_line_model else None,
-            min_confidence=pnl_config.get("keypoint_threshold", 0.3434),
+            min_confidence=det_config.get("keypoint_threshold", 0.3434),
             initial_rvec=init_rvec,
             initial_tvec=init_tvec,
         )
@@ -482,8 +458,8 @@ def run_stage1_physical(
         if idx % vis_interval == 0:
             fname = f"frame_{frame_idx:05d}.jpg"
             json_fname = f"frame_{frame_idx:05d}.json"
-            kp_thr = pnl_config.get("keypoint_threshold", 0.3434)
-            ln_thr = pnl_config.get("line_threshold", 0.15)
+            kp_thr = det_config.get("keypoint_threshold", 0.3434)
+            ln_thr = det_config.get("line_threshold", 0.15)
             cv2.imwrite(str(vis_kp_dir / fname),
                         draw_vis_keypoints(frame, keypoints, conf_threshold=kp_thr))
             cv2.imwrite(str(vis_line_dir / fname),
@@ -573,7 +549,7 @@ def run_stage1_physical(
                 result = calibrator.calibrate(
                     keypoint_mapper,
                     line_mapper if use_line_model else None,
-                    min_confidence=pnl_config.get("keypoint_threshold", 0.3434),
+                    min_confidence=det_config.get("keypoint_threshold", 0.3434),
                     initial_rvec=init_rvec,
                     initial_tvec=init_tvec,
                 )
@@ -701,7 +677,7 @@ def run_stage1_physical(
                 result = calibrator.calibrate(
                     keypoint_mapper,
                     line_mapper if use_line_model else None,
-                    min_confidence=pnl_config.get("keypoint_threshold", 0.3434),
+                    min_confidence=det_config.get("keypoint_threshold", 0.3434),
                     initial_rvec=init_rvec,
                     initial_tvec=init_tvec,
                 )

@@ -37,11 +37,19 @@ field_registration:
     # ``goalinsight-web --annotate`` writes its output here. The web
     # path expects this under workspace/annotations/<video_stem>/.
     annotations_dir:
-  pnlcalib:
+  # Shared HRNet detector config — read by every backend that runs
+  # per-frame keypoint/line detection (pnlcalib, physical, broadtrack,
+  # homography). Unused by the fixed_camera backend (it replays a saved
+  # annotation pose), but kept so switching backend needs no re-add.
+  # A fine-tuned model goes here as ``keypoint_model_path``.
+  keypoint_detection:
     keypoint_weights: SV_kp
     keypoint_threshold: 0.3434
     line_weights: SV_lines
     line_threshold: 0.15
+    keypoint_model_path:
+  # PnLCalib-solver-only knobs (used when backend: pnlcalib).
+  pnlcalib:
     pnl_refine: false
     line_weight: 1.0
   nbjw:
@@ -70,27 +78,6 @@ field_registration:
     world_residual_weight: 0.0
     world_error_threshold: 5.0
     calibration_skip: 1
-  keypoint_detector:
-    backend: resnet50
-    model: resnet50
-    confidence_threshold: 0.5
-    num_keypoints: 115
-    pnlcalib:
-      weights: SV_kp
-      confidence_threshold: 0.3434
-  line_detector:
-    backend: hough
-    hough_threshold: 50
-    min_line_length: 100
-    max_line_gap: 10
-    pnlcalib:
-      weights: SV_lines
-      confidence_threshold: 0.15
-  pnl_solver:
-    ransac_iterations: 1000
-    reprojection_threshold: 8.0
-    pnl_refine: false
-    line_weight: 1.0
 
 unified_detection:
   enabled: true
@@ -203,7 +190,12 @@ reid:
     weights_path:
   clip_reid:
     backbone: ViT-L-14
-    pretrained: openai
+    # ``pretrained: null`` avoids the ~4.8 GB base ViT-L-14 download —
+    # the fine-tune (weights_path below) covers every visual-encoder key
+    # except ``visual.proj``, which the extractor clears when
+    # ``remove_proj=True``. Set to ``openai`` if you swap in a different
+    # fine-tune that does NOT fully replace the visual encoder.
+    pretrained: null
     # The docker image stages these into /opt/goalinsight/models/clip_reid/
     # at build time. For a non-docker run point this at your local
     # workspace/models/ViT-L-14_openai/Paper/weights_e4.pth.

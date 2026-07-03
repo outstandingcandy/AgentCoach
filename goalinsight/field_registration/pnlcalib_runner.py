@@ -56,19 +56,20 @@ def _run_stage1_pnlcalib(
         LineMapper,
     )
 
+    from ._detector_config import (
+        build_keypoint_detector_config,
+        build_line_detector_config,
+        get_detection_config,
+    )
+
+    # Detector settings live in the shared ``keypoint_detection`` block;
+    # PnLCalib-solver knobs stay in ``pnlcalib``.
+    det_config = get_detection_config(fr_config)
     pnl_config = fr_config.get("pnlcalib", {})
 
     # Initialize detectors
     logger.info("Stage 1: Initializing keypoint detector (HRNet/PnLCalib)...")
-    kp_config = {
-        "backend": "pnlcalib",
-        "pnlcalib": {
-            "weights": pnl_config.get("keypoint_weights", "SV_kp"),
-            "model_path": pnl_config.get("keypoint_model_path"),  # Custom fine-tuned model
-            "confidence_threshold": pnl_config.get("keypoint_threshold", 0.3434),
-        }
-    }
-    kp_detector = KeypointDetector(kp_config)
+    kp_detector = KeypointDetector(build_keypoint_detector_config(det_config))
     kp_detector.load_model()
     keypoint_mapper = KeypointMapper()
 
@@ -79,18 +80,11 @@ def _run_stage1_pnlcalib(
     line_mapper = LineMapper(pitch_dims=config.get("pitch") or None)
     if use_lines:
         logger.info("Stage 1: Initializing line detector (HRNet/PnLCalib)...")
-        line_config = {
-            "backend": "pnlcalib",
-            "pnlcalib": {
-                "weights": pnl_config.get("line_weights", "SV_lines"),
-                "confidence_threshold": pnl_config.get("line_threshold", 0.15),
-            }
-        }
-        line_detector = LineDetector(line_config)
-        line_detector.load_model(pnl_config.get("line_model_path"))
+        line_detector = LineDetector(build_line_detector_config(det_config))
+        line_detector.load_model(det_config.get("line_model_path"))
     else:
         logger.info("Stage 1: Line detection disabled (keypoint-only mode)")
-    ransac_thresh = pnl_config.get("ransac_threshold", 30.0)
+    ransac_thresh = det_config.get("ransac_threshold", 30.0)
     calib_method = pnl_config.get("calibration_method", "iterative_pnp")
 
     pitch_template = get_pitch_template_points()
@@ -168,7 +162,7 @@ def _run_stage1_pnlcalib(
                 str(vis_kp_dir / fname),
                 draw_vis_keypoints(
                     frame, keypoints,
-                    conf_threshold=pnl_config.get("keypoint_threshold", 0.3434),
+                    conf_threshold=det_config.get("keypoint_threshold", 0.3434),
                 ),
             )
             if vis_line_dir is not None:
@@ -176,7 +170,7 @@ def _run_stage1_pnlcalib(
                     str(vis_line_dir / fname),
                     draw_vis_lines(
                         frame, lines,
-                        conf_threshold=pnl_config.get("line_threshold", 0.15),
+                        conf_threshold=det_config.get("line_threshold", 0.15),
                     ),
                 )
             if vis_inter_dir is not None:
@@ -222,35 +216,27 @@ def _run_stage1_pnlcalib_orig(
     from .pnlcalib_orig import FramebyFrameCalib, PnLCalibIdMap
     from ..annotation.pitch.geometry import SoccerPitch
 
+    from ._detector_config import (
+        build_keypoint_detector_config,
+        build_line_detector_config,
+        get_detection_config,
+    )
+
     fr_config = config.get("field_registration", {})
+    det_config = get_detection_config(fr_config)
     pnl_config = fr_config.get("pnlcalib", {})
     pitch_cfg = config.get("pitch", {})
 
     logger.info("Stage 1: Initializing keypoint detector (HRNet/PnLCalib)...")
-    kp_config = {
-        "backend": "pnlcalib",
-        "pnlcalib": {
-            "weights": pnl_config.get("keypoint_weights", "SV_kp"),
-            "model_path": pnl_config.get("keypoint_model_path"),
-            "confidence_threshold": pnl_config.get("keypoint_threshold", 0.3434),
-        },
-    }
-    kp_detector = KeypointDetector(kp_config)
+    kp_detector = KeypointDetector(build_keypoint_detector_config(det_config))
     kp_detector.load_model()
 
     use_lines = pnl_config.get("use_lines", False)
     line_detector = None
     if use_lines:
         logger.info("Stage 1: Initializing line detector (HRNet/PnLCalib)...")
-        line_config = {
-            "backend": "pnlcalib",
-            "pnlcalib": {
-                "weights": pnl_config.get("line_weights", "SV_lines"),
-                "confidence_threshold": pnl_config.get("line_threshold", 0.15),
-            },
-        }
-        line_detector = LineDetector(line_config)
-        line_detector.load_model(pnl_config.get("line_model_path"))
+        line_detector = LineDetector(build_line_detector_config(det_config))
+        line_detector.load_model(det_config.get("line_model_path"))
     else:
         logger.info("Stage 1: Line detection disabled (keypoint-only mode)")
 
@@ -493,7 +479,7 @@ def _run_stage1_pnlcalib_orig(
                 str(vis_kp_dir / fname),
                 draw_vis_keypoints(
                     frame, keypoints,
-                    conf_threshold=pnl_config.get("keypoint_threshold", 0.3434),
+                    conf_threshold=det_config.get("keypoint_threshold", 0.3434),
                 ),
             )
             if vis_line_dir is not None:
@@ -501,7 +487,7 @@ def _run_stage1_pnlcalib_orig(
                     str(vis_line_dir / fname),
                     draw_vis_lines(
                         frame, lines,
-                        conf_threshold=pnl_config.get("line_threshold", 0.15),
+                        conf_threshold=det_config.get("line_threshold", 0.15),
                     ),
                 )
             # Build an in-tree-shaped result for draw_vis_calibration.

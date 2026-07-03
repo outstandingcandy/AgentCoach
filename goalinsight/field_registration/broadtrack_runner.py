@@ -53,24 +53,21 @@ def run_stage1_broadtrack(
         Dict with calibration statistics.
     """
     from . import KeypointDetector
+    from ._detector_config import (
+        build_keypoint_detector_config,
+        build_line_detector_config,
+        get_detection_config,
+    )
     from .pnlcalib import KeypointMapper, LineMapper
     from .pnlcalib.broadtrack_calibrator import BroadTrackCalibrator
 
     fr_config = config.get("field_registration", {})
-    pnl_config = fr_config.get("pnlcalib", {})
+    det_config = get_detection_config(fr_config)
     bt_config = fr_config.get("broadtrack", {})
 
     # Initialize keypoint detector (reuse existing PnLCalib detector)
     logger.info("Stage 1 (BroadTrack): Initializing keypoint detector...")
-    kp_config = {
-        "backend": "pnlcalib",
-        "pnlcalib": {
-            "weights": pnl_config.get("keypoint_weights", "SV_kp"),
-            "model_path": pnl_config.get("keypoint_model_path"),
-            "confidence_threshold": pnl_config.get("keypoint_threshold", 0.3434),
-        }
-    }
-    kp_detector = KeypointDetector(kp_config)
+    kp_detector = KeypointDetector(build_keypoint_detector_config(det_config))
     kp_detector.load_model()
     keypoint_mapper = KeypointMapper()
 
@@ -82,19 +79,12 @@ def run_stage1_broadtrack(
     if use_line_model:
         from . import LineDetector
         logger.info("Stage 1 (BroadTrack): Initializing line detector...")
-        line_config = {
-            "backend": "pnlcalib",
-            "pnlcalib": {
-                "weights": pnl_config.get("line_weights", "SV_lines"),
-                "confidence_threshold": pnl_config.get("line_threshold", 0.15),
-            }
-        }
-        line_detector = LineDetector(line_config)
+        line_detector = LineDetector(build_line_detector_config(det_config))
         line_detector.load_model()
     else:
         logger.info("Stage 1 (BroadTrack): Deriving lines from keypoints (no line model)")
 
-    ransac_thresh = pnl_config.get("ransac_threshold", 30.0)
+    ransac_thresh = det_config.get("ransac_threshold", 30.0)
     pitch_template = get_pitch_template_points()
 
     # Open video
@@ -145,7 +135,7 @@ def run_stage1_broadtrack(
         # Run BroadTrack calibration
         result = calibrator.calibrate(
             keypoint_mapper, line_mapper if use_line_model else None,
-            min_confidence=pnl_config.get("keypoint_threshold", 0.3434),
+            min_confidence=det_config.get("keypoint_threshold", 0.3434),
         )
 
         if result is not None:
@@ -171,14 +161,14 @@ def run_stage1_broadtrack(
                 str(vis_kp_dir / fname),
                 draw_vis_keypoints(
                     frame, keypoints,
-                    conf_threshold=pnl_config.get("keypoint_threshold", 0.3434),
+                    conf_threshold=det_config.get("keypoint_threshold", 0.3434),
                 ),
             )
             cv2.imwrite(
                 str(vis_line_dir / fname),
                 draw_vis_lines(
                     frame, lines,
-                    conf_threshold=pnl_config.get("line_threshold", 0.15),
+                    conf_threshold=det_config.get("line_threshold", 0.15),
                 ),
             )
             # Draw calibration visualization
