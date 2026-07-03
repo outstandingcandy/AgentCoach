@@ -125,18 +125,16 @@ RUN python -c "from ultralytics import YOLO; YOLO('yolov8x.pt')" \
                d = PnLCalibWeightDownloader(); \
                d.get_weight_path('SV_kp'); d.get_weight_path('SV_lines')"
 
-# Pre-fetch two HuggingFace snapshots so first-run pipelines can
-# actually work offline:
-#   * ``Qwen/Qwen3.5-2B`` — the VLM the track_consolidation stage's
-#     vLLM daemon serves (~4 GB weights, image-text-to-text).
-#   * ``timm/vit_large_patch14_clip_224.openai`` — the base ViT-L-14
-#     OpenAI CLIP checkpoint that ``open_clip.create_model('ViT-L-14',
-#     pretrained='openai')`` fetches at import time. The fine-tuned
-#     CLIP-ReID weights (weights_e4.pth) are loaded ON TOP of these
-#     via ``load_state_dict``, so both are required.
+# Pre-fetch the Qwen VLM the track_consolidation stage's vLLM daemon
+# serves (~4 GB weights, image-text-to-text). The CLIP-ReID base
+# ViT-L-14 checkpoint is intentionally NOT pre-fetched: the fine-tuned
+# weights_e4.pth (loaded via the layer below) covers every visual-
+# encoder key except ``visual.proj``, which the extractor clears when
+# ``remove_proj=True`` (the default). Templates ship ``pretrained: null``
+# so open_clip builds the model randomly-initialised, then the fine-
+# tune fully overwrites it — saves ~4.8 GB.
 RUN python -c "from huggingface_hub import snapshot_download; \
-               snapshot_download('Qwen/Qwen3.5-2B'); \
-               snapshot_download('timm/vit_large_patch14_clip_224.openai')"
+               snapshot_download('Qwen/Qwen3.5-2B')"
 
 # CLIP-ReID fine-tuned weights. build.sh stages these into
 # deploy/offline/_build_assets/ from the host workspace.

@@ -71,7 +71,7 @@ no manual model downloads.
 | OS | Linux (Ubuntu 22.04+) or Windows + WSL2 |
 | GPU | NVIDIA, ≥ 16 GB VRAM (Qwen VL for jersey OCR + YOLOv8x + CLIP-ReID), driver 530+ |
 | Docker | 24.0+ with `nvidia-container-toolkit` installed |
-| Disk | ~50 GB for the image; ~3 GB per pipeline run output |
+| Disk | ~46 GB for the image; ~3 GB per pipeline run output |
 | **Mac** | Docker on Mac can't reach an NVIDIA GPU — **not supported**. Run on a Linux host or rent a cloud GPU (Lambda Labs / Vast.ai). |
 
 **Build the image** (one time, ~15 min on first build; needs the fine-tuned

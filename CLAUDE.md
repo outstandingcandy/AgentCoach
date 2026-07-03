@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 GoalInsight is a soccer video analysis pipeline plus an LLM chat surface
 on top of the resulting match data:
 
-- **Field registration** (camera calibration, 5 backends).
+- **Field registration** (camera calibration, 6 backends).
 - **Tracking** (player + ball detection, ReID, team classification).
 - **Track consolidation** (fragmented track_ids → stable `A-9` / `B-10` player_ids via ReID + jersey OCR).
 - **Event detection** (possession-driven state machine: pass / shot / carry / tackle / interception, with shot subsuming goal).
@@ -19,7 +19,7 @@ on top of the resulting match data:
 ## Environment & Running
 
 ```bash
-source venv/bin/activate  # NOT .venv
+source .venv/bin/activate
 pip install -e .           # editable install via pyproject.toml
 
 # CLI entry point (installed via pyproject.toml → goalinsight.cli:main)
@@ -42,7 +42,7 @@ bash scripts/pipeline_homography.sh # Plain DLT homography
 CLI flags:
 - `--video`, `--output`, `--config` (required)
 - `--stages` (comma-separated subset)
-- `--keypoint-model` (override `field_registration.keypoint_model_path`)
+- `--keypoint-model` (override `field_registration.keypoint_detection.keypoint_model_path`)
 - `--remote-stages` (comma-separated; offload `field_registration[,tracking]` to SageMaker)
 - `--skip-existing`, `--no-timestamp`, `--run-name`
 - `--no-viz` (skip tracking visualization video)
@@ -133,8 +133,21 @@ Selected via `field_registration.backend` config. Runner files in `field_registr
 - **PnLCalib** (default, `pnlcalib_runner.py`): Iterative PnP with multi-candidate sweep, LM optimization, full 5-param distortion. Uses HRNet for keypoint/line detection.
 - **BroadTrack** (`broadtrack_runner.py`): 9-parameter camera model with Cauchy robust loss and arc-length line constraints.
 - **NBJW** (`pnlcalib_runner.py`): Alternative calibration backend (`field_registration/nbjw/`).
-- **Physical** (`physical_runner.py`): Fixed camera intrinsics from `camera_profiles.yaml`. 7-DOF bounded extrinsics, 2-pass pipeline. Most stable on non-FIFA pitches.
+- **Physical** (`physical_runner.py`): Fixed camera intrinsics from `camera_profiles.yaml`. 7-DOF bounded extrinsics, 2-pass pipeline. Most stable on non-FIFA pitches. Runs per-frame HRNet keypoint estimation.
+- **Fixed camera** (`fixed_camera_runner.py`): Replays a single manually-annotated pose to every frame. Loads NO keypoint model — reads one `frame_*.json` annotation, solves PnP once. Cheapest backend; correct for a truly static rig.
 - **Homography** (`homography_runner.py`): Direct ground-plane homography via DLT.
+
+Backends are independent — no runtime delegation between them. The
+per-frame-detector backends (PnLCalib, BroadTrack, Physical, Homography)
+all read their HRNet detector settings from ONE shared config block,
+`field_registration.keypoint_detection` (`keypoint_weights`,
+`keypoint_model_path`, `keypoint_threshold`, `line_weights`,
+`line_threshold`), via the helper in `field_registration/_detector_config.py`.
+Backend-*solver* knobs stay in each backend's own block (e.g.
+`field_registration.pnlcalib` holds only `pnl_refine` / `line_weight` /
+`use_lines`; `field_registration.physical` holds intrinsics/extrinsics
+bounds). A fine-tuned keypoint model is wired in via
+`field_registration.keypoint_detection.keypoint_model_path`.
 
 A finetune machinery for the PnLCalib HRNet keypoint and line heads lives
 under `field_registration/pnlcalib/finetune_*.py`. Frame annotations come
@@ -338,8 +351,9 @@ installs the app on a fresh host.
 YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merge_configs`). After merging, the CLI runs `resolve_config(merged, video_w, video_h, video_fps)` (`goalinsight/utils/config_resolver.py`) once to fill in resolution/fps-coupled values from the source video — per-video YAMLs should describe physical facts (camera position, pitch dims, sensor identity, model paths) and let the resolver handle the rest. Key settings:
 
 - `pipeline.stages`: list of stages to run
-- `field_registration.backend`: `pnlcalib` | `broadtrack` | `physical` | `nbjw` | `homography`
-- `field_registration.keypoint_threshold`, `ransac_threshold` (default 30px)
+- `field_registration.backend`: `pnlcalib` | `broadtrack` | `physical` | `nbjw` | `homography` | `fixed_camera`
+- `field_registration.keypoint_detection.*`: shared HRNet detector config (weights, `keypoint_model_path`, thresholds) read by all per-frame-detector backends
+- `field_registration.keypoint_detection.keypoint_threshold`, `.ransac_threshold` (default 30px)
 - `video.process_fps`: frame sampling rate (auto-defaults to `min(30, source_fps)` when unset; `video.tracking_fps` overrides for tracking)
 - `sample.stride`: pipeline-wide vis-frame stride (per-stage `<stage>.vis_frame_stride` overrides)
 - `detection.model`: YOLOv8 variant (yolov8n/s/m/l/x, yolo11*)
