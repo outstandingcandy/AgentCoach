@@ -46,8 +46,22 @@ class LineDetector:
             pnlcalib_config = self.config.get("pnlcalib", {})
             self.confidence_threshold = pnlcalib_config.get("confidence_threshold", 0.7867)
             self._pnlcalib_weights = pnlcalib_config.get("weights", "SV_lines")
+            # Line decode mode:
+            #   "endpoints" (default) — per-class two-peak decode, the
+            #       upstream PnLCalib method. Precise class labels, but the
+            #       per-class endpoint heads need lots of training data;
+            #       on tiny fine-tunes they under-fit and only emit one
+            #       endpoint (collapsed lines).
+            #   "border" — recover line SEGMENTS from the border/segment
+            #       channel (the last one) via Hough + clustering. That
+            #       channel learns "where any line is" from every line's
+            #       supervision, so it stays reliable even when the
+            #       per-class endpoint heads don't. Produces unlabelled
+            #       segments (no class id), useful when endpoints collapse.
+            self.line_decode = pnlcalib_config.get("line_decode", "endpoints")
         else:
             self.confidence_threshold = self.config.get("confidence_threshold", 0.5)
+            self.line_decode = "endpoints"
 
         # Color thresholds for white line detection (in HSV) - used by hough backend
         self.white_lower = np.array([0, 0, 180])
@@ -175,14 +189,20 @@ class LineDetector:
         with torch.no_grad():
             heatmaps = self.model(tensor)  # (1, num_outputs, H', W')
 
-        # PnLCalib uses softmax, exclude the last channel (background)
-        # Heatmaps are at 1/2 resolution
-        heatmap_for_extraction = heatmaps[:, :-1, :, :]  # Exclude background
-
         # Get scaling factors (heatmap -> original frame)
         hm_h, hm_w = heatmaps.shape[2], heatmaps.shape[3]
         scale_x = w / hm_w
         scale_y = h / hm_h
+
+        # Border-channel decode: recover segments from the last (border)
+        # channel instead of the per-class endpoint peaks.
+        if self.line_decode == "border":
+            border = heatmaps[0, -1, :, :].detach().cpu().numpy()
+            return self._lines_from_border(border, scale_x, scale_y)
+
+        # PnLCalib uses softmax, exclude the last channel (background)
+        # Heatmaps are at 1/2 resolution
+        heatmap_for_extraction = heatmaps[:, :-1, :, :]  # Exclude background
 
         # Extract line extremities using maxpool-based detection
         # Use scale=1 to get raw heatmap coordinates, then scale manually
@@ -211,6 +231,97 @@ class LineDetector:
             line["class_name"] = HRNetLineModel.get_line_class_name(line["id"])
 
         return lines
+
+    def _lines_from_border(
+        self, border: np.ndarray, scale_x: float, scale_y: float,
+    ) -> list[dict[str, Any]]:
+        """Recover line segments from the border/segment heatmap channel.
+
+        The border channel marks "where any pitch line is" (a near-perfect
+        line-segmentation mask, since it's supervised by every line). We
+        binarise it, run probabilistic Hough to get raw segments, then
+        cluster segments by orientation + perpendicular offset and merge
+        each cluster into one line. Returns unlabelled segments (no class
+        id) — the class of each line is left to downstream geometric
+        matching against the pitch model.
+        """
+        thr = float(self.config.get("pnlcalib", {}).get("border_threshold", 0.3))
+        mask = (border > thr).astype(np.uint8) * 255
+        # Upscale to image resolution so endpoints are in image pixels.
+        h_img = int(round(border.shape[0] * scale_y))
+        w_img = int(round(border.shape[1] * scale_x))
+        mask = cv2.resize(mask, (w_img, h_img), interpolation=cv2.INTER_NEAREST)
+
+        raw = cv2.HoughLinesP(
+            mask, rho=2, theta=np.pi / 180,
+            threshold=int(self.config.get("pnlcalib", {}).get("hough_votes", 80)),
+            minLineLength=int(0.1 * w_img), maxLineGap=int(0.04 * w_img),
+        )
+        if raw is None:
+            return []
+        segs = [tuple(map(float, l[0])) for l in raw]
+
+        # Cluster by (angle, perpendicular offset from image centre). Two
+        # segments belong to the same physical line if their orientation
+        # and signed distance to origin are close.
+        def line_params(x1, y1, x2, y2):
+            ang = np.arctan2(y2 - y1, x2 - x1)
+            # fold to [0, pi) — a line and its reverse are the same
+            if ang < 0:
+                ang += np.pi
+            # perpendicular offset: distance from origin to the line
+            nx, ny = -np.sin(ang), np.cos(ang)
+            off = nx * x1 + ny * y1
+            return ang, off
+
+        ang_tol = np.deg2rad(8.0)
+        off_tol = 0.03 * w_img
+        clusters: list[list] = []
+        for s in segs:
+            a, o = line_params(*s)
+            placed = False
+            for cl in clusters:
+                ca, co = cl[0]
+                da = abs(a - ca)
+                da = min(da, np.pi - da)  # angle wrap
+                if da < ang_tol and abs(o - co) < off_tol:
+                    cl[1].append(s)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([(a, o), [s]])
+
+        out: list[dict[str, Any]] = []
+        for _, members in clusters:
+            # Merge cluster: collect all endpoints, fit the dominant
+            # direction, project endpoints onto it, take the extremes.
+            pts = np.array(
+                [[x1, y1] for x1, y1, _, _ in members]
+                + [[x2, y2] for _, _, x2, y2 in members],
+                dtype=np.float64,
+            )
+            mean = pts.mean(axis=0)
+            u, s_, vt = np.linalg.svd(pts - mean)
+            direction = vt[0]
+            t = (pts - mean) @ direction
+            p1 = mean + direction * t.min()
+            p2 = mean + direction * t.max()
+            length = float(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
+            # Drop clusters that are too short to be a real pitch line.
+            if length < 0.15 * w_img:
+                continue
+            out.append({
+                "id": -1,  # unlabelled — assigned later by geometric match
+                "x1": float(p1[0]), "y1": float(p1[1]),
+                "x2": float(p2[0]), "y2": float(p2[1]),
+                "length": length,
+                "angle": float(np.arctan2(p2[1] - p1[1], p2[0] - p1[0]) * 180 / np.pi),
+                "confidence": float(min(1.0, len(members) / 5.0)),
+                "class_name": "unlabelled",
+                "num_segments": len(members),
+            })
+        out.sort(key=lambda d: -d["length"])
+        return out
 
     def detect_batch(
         self,

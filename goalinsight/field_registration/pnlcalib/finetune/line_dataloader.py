@@ -176,6 +176,43 @@ def generate_line_endpoint_heatmaps(
     return full, mask
 
 
+def _clip_segment_to_box(
+    x1: float, y1: float, x2: float, y2: float,
+    w: int, h: int,
+) -> tuple[float, float, float, float] | None:
+    """Liang–Barsky clip of segment (x1,y1)-(x2,y2) to [0,w]x[0,h].
+
+    Returns the clipped segment, or None if it's entirely outside. The
+    clipped endpoints are REAL points on the line (its intersections with
+    the frame border), so shortening — rather than dropping — a line whose
+    endpoint zoomed out of frame keeps two valid, in-frame endpoints for
+    the two-peak heatmap target. That's what a straight pitch line looks
+    like in the cropped view: it runs off the edge, and the edge crossing
+    is a genuine visible endpoint.
+    """
+    dx, dy = x2 - x1, y2 - y1
+    p = [-dx, dx, -dy, dy]
+    q = [x1 - 0.0, w - x1, y1 - 0.0, h - y1]
+    t0, t1 = 0.0, 1.0
+    for pi, qi in zip(p, q):
+        if pi == 0:
+            if qi < 0:
+                return None  # parallel and outside this boundary
+        else:
+            t = qi / pi
+            if pi < 0:
+                if t > t1:
+                    return None
+                if t > t0:
+                    t0 = t
+            else:
+                if t < t0:
+                    return None
+                if t < t1:
+                    t1 = t
+    return (x1 + t0 * dx, y1 + t0 * dy, x1 + t1 * dx, y1 + t1 * dy)
+
+
 def _crop_lines(
     lines: dict[int, tuple[tuple[float, float], tuple[float, float]]],
     crop_x: float, crop_y: float, crop_w: float, crop_h: float,
@@ -183,11 +220,11 @@ def _crop_lines(
 ) -> dict[int, tuple[tuple[float, float], tuple[float, float]]]:
     """Apply the same crop+resize used by ``KeypointRandomZoomCrop`` to lines.
 
-    Endpoints outside the crop are not clipped to the boundary — clipping
-    would invent fake endpoints that don't exist on the real line. Instead
-    we let endpoints land outside the heatmap and rely on
-    ``generate_line_endpoint_heatmaps`` to drop classes whose both
-    endpoints are far out of frame.
+    When zoom-crop pushes an endpoint out of the frame we SHORTEN the line
+    to its visible sub-segment (clip to the output box) rather than drop
+    it — the border crossing is a real point on the pitch line, so the two
+    endpoints stay in-frame and the two-peak heatmap target is preserved.
+    Segments entirely outside the crop are omitted (genuinely not visible).
     """
     out: dict = {}
     for cls_idx, ((x1, y1), (x2, y2)) in lines.items():
@@ -195,7 +232,11 @@ def _crop_lines(
         ny1 = (y1 - crop_y) / crop_h * out_h
         nx2 = (x2 - crop_x) / crop_w * out_w
         ny2 = (y2 - crop_y) / crop_h * out_h
-        out[cls_idx] = ((nx1, ny1), (nx2, ny2))
+        clipped = _clip_segment_to_box(nx1, ny1, nx2, ny2, out_w, out_h)
+        if clipped is None:
+            continue
+        cx1, cy1, cx2, cy2 = clipped
+        out[cls_idx] = ((cx1, cy1), (cx2, cy2))
     return out
 
 
@@ -317,6 +358,7 @@ class AugmentedLineDataset(LineAnnotationDataset):
         zoom_range: tuple[float, float] = (1.0, 1.5),
         zoom_prob: float = 0.5,
         min_endpoints: int = 4,
+        hflip_prob: float = 0.5,
         seed: int | None = None,
         **kwargs,
     ):
@@ -326,6 +368,12 @@ class AugmentedLineDataset(LineAnnotationDataset):
         self.zoom_prob = zoom_prob
         self.zoom_range = zoom_range
         self.min_endpoints = min_endpoints
+        # Horizontal flip probability. ON by default: mirrored views teach
+        # left/right symmetry so the model generalises to a camera on the
+        # OTHER side of the pitch (next match may swap the rig). The mirror
+        # map (LINE_MIRROR_MAP) swaps left/right line classes so the flipped
+        # sample stays correctly labelled.
+        self.hflip_prob = hflip_prob
 
     def __len__(self) -> int:
         return len(self.annotation_files) * self.augment_factor
@@ -385,7 +433,7 @@ class AugmentedLineDataset(LineAnnotationDataset):
             image_np = gamma_correction(image_np, self.rng)
 
         # Horizontal flip — must swap class indices via mirror map.
-        if self.rng.random() > 0.5:
+        if self.hflip_prob > 0 and self.rng.random() < self.hflip_prob:
             image_np = np.fliplr(image_np).copy()
             new_lines: dict = {}
             for cls_idx, ((x1, y1), (x2, y2)) in lines.items():
