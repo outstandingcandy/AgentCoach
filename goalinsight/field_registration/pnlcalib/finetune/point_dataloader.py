@@ -352,6 +352,51 @@ def generate_heatmaps_from_keypoints(
     return heatmaps, mask
 
 
+def compute_negative_channels(
+    annotation_files: list[str], num_keypoints: int,
+) -> set[int]:
+    """1-indexed channels never annotated anywhere in the dataset.
+
+    The model has ``num_keypoints`` output channels but a pitch only uses
+    a subset, and the user annotates only some of those. Channels that
+    appear in NO annotation across the whole training set are supervised
+    with an all-zero target (see ``apply_negative_channels``) so the model
+    learns a low response there instead of firing per its FIFA pretraining.
+    Dataset-level, NOT per-frame: a channel annotated somewhere keeps its
+    normal per-frame mask (partial/incomplete labelling isn't punished).
+    """
+    annotated: set[int] = set()
+    for f in annotation_files:
+        try:
+            with open(f) as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        for p in data.get("all_points", []):
+            pnl = p.get("pnlcalib_id")
+            # Stored 0-indexed; heatmap channel is pnl + 1 (matches
+            # convert_annotation's ``pnlcalib_id + 1``).
+            if pnl is not None and pnl >= 0:
+                annotated.add(int(pnl) + 1)
+    return {c for c in range(1, num_keypoints + 1) if c not in annotated}
+
+
+def apply_negative_channels(
+    mask: np.ndarray, negative_channels: set[int] | None,
+) -> np.ndarray:
+    """Set mask=1 on never-annotated channels (their target is all-zero).
+
+    Turns them into negative samples so the model learns a low response.
+    No-op when ``negative_channels`` is empty/None.
+    """
+    if not negative_channels:
+        return mask
+    for c in negative_channels:  # 1-indexed; mask index is c-1
+        if 1 <= c <= len(mask):
+            mask[c - 1] = 1
+    return mask
+
+
 class PointAnnotationDataset(Dataset):
     """Dataset for point annotations with direct heatmap generation.
 
@@ -421,6 +466,28 @@ class PointAnnotationDataset(Dataset):
         else:
             print(f"Found {len(self.annotation_files)} annotation files")
 
+        # Dataset-level negative channels. The model has ``num_keypoints``
+        # output channels, but a given pitch only uses a subset, and the
+        # user only annotates some of those. Channels that appear in NO
+        # annotation across the whole training set are "never used": we
+        # supervise them with an all-zero target (mask=1, target already
+        # zero) so the model learns to output a low response there instead
+        # of leaving the FIFA-pretrained weights to fire spuriously.
+        #
+        # This is dataset-level, NOT per-frame: a channel the user DID
+        # annotate somewhere is left to the normal per-frame mask (so
+        # frames where they merely didn't label it stay ignored, mask=0 —
+        # respecting incomplete/partial annotation without punishing it).
+        self._negative_channels = compute_negative_channels(
+            self.annotation_files, self.num_keypoints,
+        )
+        if self._negative_channels:
+            print(
+                f"Negative-supervised channels (never annotated, forced "
+                f"low-response): {len(self._negative_channels)} of "
+                f"{self.num_keypoints}"
+            )
+
     def __len__(self) -> int:
         return len(self.annotation_files)
 
@@ -485,6 +552,12 @@ class PointAnnotationDataset(Dataset):
             sigma=self.sigma,
         )
 
+        # Force negative supervision on never-annotated channels: mask=1
+        # with an all-zero target (heatmap channel is already zero for
+        # any channel not in ``keypoints``) teaches the model to output a
+        # low response there, instead of firing per its FIFA pretraining.
+        mask = self._apply_negative_channels(mask)
+
         # Convert image to tensor
         image_np = np.array(image).astype(np.float32) / 255.0
         image_tensor = torch.from_numpy(image_np).permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
@@ -504,6 +577,12 @@ class PointAnnotationDataset(Dataset):
             image_tensor,
             torch.from_numpy(heatmaps).float(),
             torch.from_numpy(mask).float(),
+        )
+
+    def _apply_negative_channels(self, mask: np.ndarray) -> np.ndarray:
+        """Instance wrapper around ``apply_negative_channels``."""
+        return apply_negative_channels(
+            mask, getattr(self, "_negative_channels", None),
         )
 
     def get_frame_info(self, idx: int) -> dict:
@@ -622,6 +701,7 @@ class AugmentedPointDataset(PointAnnotationDataset):
             down_ratio=self.down_ratio,
             sigma=self.sigma,
         )
+        mask = self._apply_negative_channels(mask)
 
         # Convert to tensor
         image_tensor = torch.from_numpy(
@@ -782,6 +862,12 @@ class CachedAugmentedDataset(Dataset):
                 f"No annotation files found in {[str(d) for d in dirs]}"
             )
 
+        # Same dataset-level negative channels as the training set, so
+        # validation loss is measured on the same supervision signal.
+        self._negative_channels = compute_negative_channels(
+            annotation_files, num_keypoints,
+        )
+
         print(f"Pre-generating {len(annotation_files) * augment_factor} cached validation samples...")
 
         # Pre-generate all samples
@@ -849,6 +935,7 @@ class CachedAugmentedDataset(Dataset):
                     down_ratio=self.down_ratio,
                     sigma=self.sigma,
                 )
+                mask = apply_negative_channels(mask, self._negative_channels)
 
                 # Convert to tensors
                 image_tensor = torch.from_numpy(

@@ -219,6 +219,12 @@ def main():
     parser.add_argument("--zoom_range", type=float, nargs=2, default=[1.0, 1.5])
     parser.add_argument("--zoom_prob", type=float, default=0.5)
     parser.add_argument("--min_endpoints", type=int, default=4)
+    parser.add_argument(
+        "--hflip_prob", type=float, default=0.5,
+        help="Horizontal-flip probability (ON by default so the model "
+             "generalises to a camera on the other side of the pitch; the "
+             "line mirror map keeps flipped samples correctly labelled).",
+    )
     parser.add_argument("--down_ratio", type=int, default=2,
                         help="Heatmap downsample relative to input image")
     parser.add_argument("--sigma", type=float, default=2.0)
@@ -273,6 +279,7 @@ def main():
         zoom_range=tuple(args.zoom_range),
         zoom_prob=args.zoom_prob,
         min_endpoints=args.min_endpoints,
+        hflip_prob=args.hflip_prob,
     )
 
     val_aug = args.val_augment_factor if args.val_augment_factor else args.augment_factor
@@ -286,6 +293,7 @@ def main():
         zoom_range=tuple(args.zoom_range),
         zoom_prob=args.zoom_prob,
         min_endpoints=args.min_endpoints,
+        hflip_prob=args.hflip_prob,
         seed=args.val_seed,
     )
     print(f"Training samples: {len(train_dataset)}  |  Validation: {len(val_dataset)}")
