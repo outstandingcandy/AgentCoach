@@ -125,13 +125,13 @@ def main():
         )
         config = get_default_config()
 
-    # Override keypoint model path if specified
+    # Override keypoint model path if specified. Lives in the shared
+    # ``keypoint_detection`` block that every detector-using backend reads.
     if args.keypoint_model:
         if "field_registration" not in config:
             config["field_registration"] = {}
-        if "pnlcalib" not in config["field_registration"]:
-            config["field_registration"]["pnlcalib"] = {}
-        config["field_registration"]["pnlcalib"]["keypoint_model_path"] = args.keypoint_model
+        fr = config["field_registration"]
+        fr.setdefault("keypoint_detection", {})["keypoint_model_path"] = args.keypoint_model
 
     # Override visualization setting
     if args.no_viz:

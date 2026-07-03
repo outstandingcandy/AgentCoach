@@ -208,6 +208,166 @@ def _solve_from_annotation(
     return camera_pose, diag
 
 
+def _candidate_solve_frames(frame_indices: list[int], n: int = 12) -> list[int]:
+    """Pick up to *n* candidate frames spread across the sampled range.
+
+    A single frame's keypoint detection is unreliable (sparse pitch,
+    occlusion, motion blur), so the model-detection solve tries several
+    and keeps the best. Uniformly spaced over the middle 90% to skip
+    fade-in / end oddness.
+    """
+    if not frame_indices:
+        return [0]
+    lo = int(len(frame_indices) * 0.05)
+    hi = int(len(frame_indices) * 0.95)
+    span = frame_indices[lo:hi] or frame_indices
+    if len(span) <= n:
+        return list(span)
+    step = len(span) / n
+    return [span[int(i * step)] for i in range(n)]
+
+
+def _solve_from_model_detection(
+    video_path: Path,
+    frame_indices: list[int],
+    img_size: tuple[int, int],
+    fr_config: dict,
+    physical_cfg: dict,
+    camera_profiles: dict,
+) -> tuple[dict, dict]:
+    """Solve the fixed pose from a keypoint MODEL's detections.
+
+    Runs the configured HRNet keypoint model (``keypoint_detection`` block,
+    honoring a fine-tuned ``keypoint_model_path``) across several candidate
+    frames, maps each detected PnLCalib channel id → landmark name → the
+    active pitch's world coordinate, and POOLS all detections into one
+    correspondence set for a single free-intrinsics solve. This lets the
+    fixed-rig backend reuse the pitch-specific model the wizard selected,
+    with no manual annotation.
+
+    Why pool + free intrinsics: the true camera intrinsics are unknown
+    (the profile is a rough guess; wide action-cam lenses diverge from
+    it), so we let ``cv2.calibrateCamera`` fit focal / principal /
+    distortion. That needs ~12+ points — more than a single frame's 4-8
+    detections — but a FIXED rig shares one pose + intrinsics across all
+    frames, so pooling candidate frames' detections is valid and gives
+    enough points.
+
+    Returns the same ``(camera_pose, diag)`` shape as ``_solve_from_annotation``.
+    """
+    from . import KeypointDetector
+    from ._detector_config import (
+        build_keypoint_detector_config,
+        get_detection_config,
+    )
+    from ..annotation.pitch import keypoints as _pk
+    from ..annotation.pitch.keypoints import PITCH_POINT_TO_PNLCALIB_ID
+
+    det_config = get_detection_config(fr_config)
+    detector = KeypointDetector(build_keypoint_detector_config(det_config))
+    detector.load_model()
+
+    id_to_name = {v: k for k, v in PITCH_POINT_TO_PNLCALIB_ID.items()}
+    # 3D landmark world coords keyed by name (x, y, z). z != 0 for goal-post
+    # tops (on the crossbar) — solvePnP uses their height as extra pose
+    # constraint, so we must NOT flatten them to the ground plane. Matches
+    # the annotation path in _solve_from_annotation (same z-flip: the table
+    # stores crossbar z negative-up, OpenCV wants +z up).
+    kp_world = _pk.PITCH_POINTS
+    conf_thresh = float(det_config.get("keypoint_threshold", 0.3434))
+    # Always solve intrinsics free: the camera's true focal / principal /
+    # distortion are unknown (the profile is only a rough guess, and wide
+    # action-cam lenses diverge a lot from it). Because this is a FIXED
+    # rig, every frame shares one pose + one set of intrinsics, so we POOL
+    # detections across candidate frames into a single correspondence set
+    # — that gives calibrateCamera the ~12+ points it needs (a single
+    # frame's 4-8 detections aren't enough for free intrinsics).
+    solve_cfg = dict(physical_cfg)
+    solve_cfg["free_intrinsics"] = True
+
+    candidates = _candidate_solve_frames(frame_indices)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"cannot open video for fixed-pose solve: {video_path}")
+
+    pixel_pts: list[tuple[float, float]] = []
+    world_3d_pts: list[tuple[float, float, float]] = []
+    frames_with_pts = 0
+    try:
+        for fidx in candidates:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(fidx))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            keypoints = detector.detect(frame, convert_to_soccernet=False)
+            n_before = len(pixel_pts)
+            for kp in keypoints:
+                if kp.get("confidence", 0) < conf_thresh:
+                    continue
+                name = id_to_name.get(kp["id"])
+                world = kp_world.get(name) if name else None
+                if world is None:
+                    continue
+                pixel_pts.append((float(kp["x"]), float(kp["y"])))
+                # z-flip (crossbar stored negative-up → +z up for solvePnP);
+                # ground points have z=0 so the flip is a no-op for them.
+                zc = -float(world[2]) if len(world) > 2 else 0.0
+                world_3d_pts.append((float(world[0]), float(world[1]), zc))
+            if len(pixel_pts) > n_before:
+                frames_with_pts += 1
+    finally:
+        cap.release()
+
+    if len(pixel_pts) < 6:
+        raise RuntimeError(
+            f"keypoint-model fixed-pose solve failed: pooled only "
+            f"{len(pixel_pts)} usable pitch points across {len(candidates)} "
+            f"frames (conf≥{conf_thresh}, need ≥6 for a free-intrinsics "
+            f"solve). Use a pitch-matched fine-tuned model, or annotate a "
+            f"frame by hand.",
+        )
+
+    cam, mean_err, diag = solve_camera_physical(
+        pixel_pts, world_3d_pts, img_size,
+        physical_cfg=solve_cfg, camera_profiles=camera_profiles,
+    )
+    if cam is None:
+        raise RuntimeError(
+            f"keypoint-model fixed-pose solve diverged on {len(pixel_pts)} "
+            f"pooled points ({diag!r}). The detections are geometrically "
+            f"inconsistent — the model likely needs more/better training "
+            f"data. Annotate a frame by hand as a fallback.",
+        )
+
+    npts = len(pixel_pts)
+    logger.info(
+        "Stage 1 (Fixed): free-intrinsics solve on %d pooled points from "
+        "%d frames — reproj %.2f px",
+        npts, frames_with_pts, mean_err,
+    )
+
+    R = np.asarray(cam.rotation, dtype=np.float64)
+    rvec = np.asarray(
+        getattr(cam, "_pnp_rvec", cv2.Rodrigues(R)[0]), dtype=np.float64,
+    ).reshape(3)
+    pos = np.asarray(cam.position, dtype=np.float64).reshape(3)
+    tvec = (-R @ pos).reshape(3)
+    K = np.asarray(cam.calibration, dtype=np.float64)
+    dist = np.asarray(getattr(cam, "_pnp_dist", np.zeros(5)), dtype=np.float64).ravel()
+
+    camera_pose = {
+        "K": K.tolist(),
+        "dist_coeffs": dist.tolist(),
+        "rvec": rvec.tolist(),
+        "tvec": tvec.tolist(),
+        "reprojection_error": float(mean_err),
+        "world_error": 0.0,
+        "world_error_all": 0.0,
+        "inliers_count": int(npts),
+    }
+    return camera_pose, diag
+
+
 def run_stage1_fixed_camera(
     video_path: Path,
     output_dir: Path,
@@ -245,37 +405,69 @@ def run_stage1_fixed_camera(
         sampler = make_sampler(video, process_fps, backend_label="Stage 1 (Fixed)")
         frame_indices = list(sampler)
 
-        # 4. Pick an annotation frame and solve once.
-        # ``annotation_frame_path`` (a full path, set by the scene-setup
-        # wizard after the user saves their first calibration frame) wins
-        # over ``annotation_frame`` (a bare integer index, legacy). Falls
-        # back to auto-picking the most recent annotation in the standard
-        # workspace/annotations/<stem>/ dir when neither is set.
+        # 4. Solve the fixed pose once. Source priority:
+        #   (a) an explicit manual annotation (``annotation_frame_path``),
+        #   (b) else the configured keypoint MODEL, detected on a mid-clip
+        #       frame (``keypoint_detection.keypoint_model_path`` / SV_kp),
+        #   (c) else auto-pick the most-recent manual annotation on disk.
+        # (a)/(c) reuse the annotation JSON; (b) runs the model. Either
+        # way the solved pose is replicated to every frame below.
         annotations_dir = _resolve_annotations_dir(video_path)
         explicit_path = phys_config.get("annotation_frame_path")
+        # A ``keypoint_detection`` block (always present in the shipped
+        # templates) means we can solve the fixed pose from the model when
+        # the user didn't hand-annotate a frame. Legacy configs without the
+        # block fall through to auto-picking an on-disk annotation.
+        has_model = bool(fr_config.get("keypoint_detection"))
+        img_size = (video.width, video.height)
+
+        # ``solve_source`` records where the fixed pose came from (an
+        # annotation file path, or ``model:<name>``) for the run metadata.
+        solve_source: str
         if explicit_path:
             annotation_path = Path(explicit_path)
             if not annotation_path.exists():
                 raise FileNotFoundError(
                     f"annotation_frame_path={explicit_path} does not exist",
                 )
+            logger.info(
+                "Stage 1 (Fixed): solving once from annotation %s",
+                annotation_path.name,
+            )
+            camera_pose, diag = _solve_from_annotation(
+                annotation_path, img_size=img_size,
+                physical_cfg=phys_config, camera_profiles=camera_profiles,
+            )
+            solve_source = str(annotation_path)
+        elif has_model:
+            logger.info(
+                "Stage 1 (Fixed): solving from keypoint-model detection "
+                "(scanning candidate frames)",
+            )
+            camera_pose, diag = _solve_from_model_detection(
+                video_path, frame_indices, img_size=img_size,
+                fr_config=fr_config, physical_cfg=phys_config,
+                camera_profiles=camera_profiles,
+            )
+            kp_model = (fr_config.get("keypoint_detection") or {}).get(
+                "keypoint_model_path",
+            )
+            solve_source = f"model:{Path(kp_model).parent.parent.parent.name}" \
+                if kp_model else "model:SV_kp"
         else:
             explicit = phys_config.get("annotation_frame")
             annotation_path = _pick_annotation_frame(
                 annotations_dir, int(explicit) if explicit is not None else None,
             )
-        logger.info(
-            "Stage 1 (Fixed): solving once from %s",
-            annotation_path.relative_to(annotation_path.parents[2])
-            if len(annotation_path.parents) >= 3 else annotation_path,
-        )
-
-        camera_pose, diag = _solve_from_annotation(
-            annotation_path,
-            img_size=(video.width, video.height),
-            physical_cfg=phys_config,
-            camera_profiles=camera_profiles,
-        )
+            logger.info(
+                "Stage 1 (Fixed): solving once from annotation %s",
+                annotation_path.name,
+            )
+            camera_pose, diag = _solve_from_annotation(
+                annotation_path, img_size=img_size,
+                physical_cfg=phys_config, camera_profiles=camera_profiles,
+            )
+            solve_source = str(annotation_path)
 
         # 5. Build the ground-plane homography from (K, dist≈0 contribution
         # for the planar projection — dist would distort, but the planar
@@ -374,7 +566,7 @@ def run_stage1_fixed_camera(
             calibrated_count=len(frame_indices),
             exclude_interpolated=False,
             extra_stats={
-                "fixed_camera_source": str(annotation_path),
+                "fixed_camera_source": solve_source,
                 "fx": float(K[0, 0]),
                 "camera_position": list(cam_pos_xyz),
             },

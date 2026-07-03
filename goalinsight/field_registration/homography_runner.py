@@ -56,24 +56,20 @@ def run_stage1_homography(
         Dict with calibration statistics.
     """
     from . import KeypointDetector
+    from ._detector_config import (
+        build_keypoint_detector_config,
+        get_detection_config,
+    )
     from .pnlcalib import KeypointMapper
     from .homography_calibrator import HomographyCalibrator
 
     fr_config = config.get("field_registration", {})
-    pnl_config = fr_config.get("pnlcalib", {})
+    det_config = get_detection_config(fr_config)
     homog_config = fr_config.get("homography", {})
 
     # Initialize keypoint detector
     logger.info("Stage 1 (Homography): Initializing keypoint detector...")
-    kp_config = {
-        "backend": "pnlcalib",
-        "pnlcalib": {
-            "weights": pnl_config.get("keypoint_weights", "SV_kp"),
-            "model_path": pnl_config.get("keypoint_model_path"),
-            "confidence_threshold": pnl_config.get("keypoint_threshold", 0.3434),
-        }
-    }
-    kp_detector = KeypointDetector(kp_config)
+    kp_detector = KeypointDetector(build_keypoint_detector_config(det_config))
     kp_detector.load_model()
     keypoint_mapper = KeypointMapper()
 
@@ -125,7 +121,7 @@ def run_stage1_homography(
 
         result = calibrator.calibrate(
             keypoint_mapper,
-            min_confidence=pnl_config.get("keypoint_threshold", 0.3434),
+            min_confidence=det_config.get("keypoint_threshold", 0.3434),
         )
 
         if result is not None:
