@@ -236,98 +236,105 @@
       </div>
       <div id="wiz-steps" style="color:#9aa3ad;font-size:12px"></div>
 
-      <!-- Step 1: pitch + camera type -->
+      <!-- Step 1: pitch -->
       <section id="wiz-step-1" class="wiz-step">
         <p style="color:#cfe3ff;margin:0 0 8px 0">
-          What's in this video?
+          What pitch is this?
         </p>
         <div style="display:flex;gap:10px;align-items:center;margin:6px 0">
           <label style="width:110px;color:#9aa3ad">Pitch type</label>
           <select id="wiz-pitch" style="flex:1"></select>
         </div>
+        <p style="color:#9aa3ad;font-size:12px;margin-top:8px">
+          Sets pitch dimensions + markings the calibration solves against
+          (FIFA / futsal / kids).
+        </p>
+      </section>
+
+      <!-- Step 2: camera profile + position -->
+      <section id="wiz-step-2" class="wiz-step" style="display:none">
+        <p style="color:#cfe3ff;margin:0 0 8px 0">
+          Where is the camera?
+        </p>
         <div style="display:flex;gap:10px;align-items:center;margin:6px 0">
           <label style="width:110px;color:#9aa3ad">Camera profile</label>
           <select id="wiz-cam" style="flex:1"></select>
         </div>
-      </section>
-
-      <!-- Step 2: fixed vs PTZ + physical position -->
-      <section id="wiz-step-2" class="wiz-step" style="display:none">
-        <p style="color:#cfe3ff;margin:0 0 8px 0">
-          Does the camera move?
+        <p style="color:#9aa3ad;font-size:12px;margin:12px 0 6px 0">
+          Camera position on the pitch (metres, origin at pitch centre):
         </p>
-        <label style="display:block;margin:8px 0;cursor:pointer">
-          <input type="radio" name="wiz-mode" value="fixed" checked>
-          <strong>Fixed rig</strong> — mounted, no pan / tilt / zoom
-        </label>
-        <label style="display:block;margin:8px 0;cursor:pointer">
-          <input type="radio" name="wiz-mode" value="ptz">
-          <strong>Pan / tilt / zoom</strong> — handheld or actively operated
-        </label>
-        <div id="wiz-fixed-fields" style="margin-top:12px">
-          <p style="color:#9aa3ad;font-size:12px;margin:6px 0">
-            Camera position on the pitch (metres, origin at pitch centre):
-          </p>
-          <div style="display:flex;gap:6px;align-items:center">
-            <label style="color:#9aa3ad">x</label>
-            <input id="wiz-pos-x" type="number" value="-20" step="0.5" style="width:80px">
-            <label style="color:#9aa3ad;margin-left:8px">y</label>
-            <input id="wiz-pos-y" type="number" value="-10" step="0.5" style="width:80px">
-            <label style="color:#9aa3ad;margin-left:8px">z</label>
-            <input id="wiz-pos-z" type="number" value="5" step="0.5" style="width:80px">
-          </div>
-          <p style="color:#9aa3ad;font-size:12px;margin:12px 0 6px 0">
-            Horizontal field of view (degrees):
-          </p>
-          <div style="display:flex;gap:6px;align-items:center">
-            <label style="color:#9aa3ad">min</label>
-            <input id="wiz-hfov-lo" type="number" value="70" min="20" max="120"
-                   step="1" style="width:80px">
-            <label style="color:#9aa3ad;margin-left:8px">max</label>
-            <input id="wiz-hfov-hi" type="number" value="90" min="20" max="120"
-                   step="1" style="width:80px">
-          </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <label style="color:#9aa3ad">x</label>
+          <input id="wiz-pos-x" type="number" value="-20" step="0.5" style="width:80px">
+          <label style="color:#9aa3ad;margin-left:8px">y</label>
+          <input id="wiz-pos-y" type="number" value="-10" step="0.5" style="width:80px">
+          <label style="color:#9aa3ad;margin-left:8px">z</label>
+          <input id="wiz-pos-z" type="number" value="5" step="0.5" style="width:80px">
+        </div>
+        <p style="color:#9aa3ad;font-size:12px;margin:12px 0 6px 0">
+          Horizontal field of view (degrees):
+        </p>
+        <div style="display:flex;gap:6px;align-items:center">
+          <label style="color:#9aa3ad">min</label>
+          <input id="wiz-hfov-lo" type="number" value="70" min="20" max="120"
+                 step="1" style="width:80px">
+          <label style="color:#9aa3ad;margin-left:8px">max</label>
+          <input id="wiz-hfov-hi" type="number" value="90" min="20" max="120"
+                 step="1" style="width:80px">
         </div>
       </section>
 
-      <!-- Step 3: calibrate -->
+      <!-- Step 3: keypoint model + preview -->
       <section id="wiz-step-3" class="wiz-step" style="display:none">
-        <p style="color:#cfe3ff;margin:0 0 8px 0" id="wiz-cal-headline">
-          Calibrate the camera
-        </p>
-        <p style="color:#9aa3ad;font-size:12px" id="wiz-cal-body"></p>
-        <div style="display:flex;gap:8px;margin-top:10px" id="wiz-cal-actions">
-          <button id="wiz-goto-annotate">Open annotator</button>
-          <button class="secondary" id="wiz-preview-only" style="display:none">
-            Preview pretrained detection
-          </button>
-        </div>
-      </section>
-
-      <!-- Step 4: launch -->
-      <section id="wiz-step-4" class="wiz-step" style="display:none">
         <p style="color:#cfe3ff;margin:0 0 8px 0">
-          Ready to run
+          Pick a keypoint model
         </p>
         <p style="color:#9aa3ad;font-size:12px">
+          The model detects pitch landmarks used for calibration. Preview
+          its output on 3 random frames of this video (frame | detected
+          keypoints on the pitch) — click a thumbnail to enlarge.
+        </p>
+        <div style="margin-top:12px;padding:10px;background:#1a2027;
+                    border:1px solid #232a32;border-radius:4px">
+          <div style="display:flex;gap:8px;align-items:center;
+                      margin-bottom:8px">
+            <label style="color:#cfe3ff;font-size:13px;white-space:nowrap">
+              Keypoint model
+            </label>
+            <select id="wiz-kp-model" style="flex:1"></select>
+          </div>
+          <div id="wiz-kp-preview"
+               style="display:grid;grid-template-columns:repeat(3,1fr);
+                      gap:6px"></div>
+        </div>
+        <div style="margin-top:10px;color:#9aa3ad;font-size:12px">
+          Detection weak on your pitch? You can
+          <button class="secondary" id="wiz-goto-annotate"
+                  style="padding:2px 8px">annotate frames</button>
+          to fine-tune a model (opens the annotator).
+        </div>
+      </section>
+
+      <!-- Step 4: camera moves? + launch -->
+      <section id="wiz-step-4" class="wiz-step" style="display:none">
+        <p style="color:#cfe3ff;margin:0 0 8px 0">
+          Does the camera angle change?
+        </p>
+        <label style="display:block;margin:8px 0;cursor:pointer">
+          <input type="radio" name="wiz-moves" value="no" checked>
+          <strong>No — fixed rig</strong> — mounted, no pan / tilt / zoom.
+          Solves one pose (via the keypoint model or a hand-annotated
+          frame) and reuses it. <em>backend: fixed_camera</em>
+        </label>
+        <label style="display:block;margin:8px 0;cursor:pointer">
+          <input type="radio" name="wiz-moves" value="yes">
+          <strong>Yes — moves</strong> — handheld / pan-tilt-zoom.
+          Re-estimates the camera every frame with the keypoint model.
+          <em>backend: physical</em>
+        </label>
+        <p style="color:#9aa3ad;font-size:12px;margin-top:8px">
           Config saved at <code id="wiz-cfg-path">workspace/configs/&lt;stem&gt;.yaml</code>.
         </p>
-        <!-- Fixed-rig launch guardrail: the physical short-circuit
-             needs an annotation on disk. Without it the pipeline
-             would run per-frame HRNet keypoint detection, which is
-             trained on broadcast 11-a-side and reliably fails on
-             non-FIFA pitches (e.g. futsal, indoor cams). We surface
-             this before the user hits Launch. -->
-        <div id="wiz-anno-warning" style="display:none;color:#fca5a5;
-              background:#3b1f1f;border:1px solid #5c2e2e;
-              padding:8px 12px;border-radius:4px;font-size:12px;
-              margin-top:10px">
-          <strong>Annotate a calibration frame first.</strong>
-          Fixed-rig mode needs a manually-solved pose to reuse across
-          every frame — pretrained HRNet keypoint detection will not
-          work on this pitch style. Click <em>Back</em> then
-          <em>Open annotator</em> to mark 4+ pitch points.
-        </div>
         <!-- Per-stage visualization toggles. Writing extra JPGs +
              tracking.mp4 costs a few seconds per stage but is what
              the /pipeline?stage=... page shows; users who just want
@@ -388,6 +395,16 @@
         <button id="wiz-next">Next</button>
       </div>
     </div>
+  </div>
+
+  <!-- Full-size preview lightbox for the wizard's keypoint thumbnails. -->
+  <div id="kp-lightbox"
+       style="display:none;position:fixed;inset:0;z-index:1000;
+              background:rgba(0,0,0,0.85);align-items:center;
+              justify-content:center;cursor:zoom-out">
+    <img id="kp-lightbox-img" alt="keypoint preview"
+         style="max-width:95vw;max-height:95vh;
+                box-shadow:0 0 40px rgba(0,0,0,0.6)">
   </div>
 
   <div id="cfg-modal" aria-hidden="true">
@@ -1004,105 +1021,130 @@
       }
       wizStepsEl.textContent = `Step ${n} of 4`;
       $("#wiz-back").style.display = n > 1 ? 'inline-block' : 'none';
-      // Step 4's primary CTA is the "Launch pipeline" button inside
-      // the section; the trailing Next button becomes redundant with
-      // the Cancel/close buttons, so hide it there entirely.
+      // Step 4's primary CTA is the "Launch pipeline" button inside the
+      // section; hide the trailing Next button there.
       $("#wiz-next").style.display = (n === 4) ? 'none' : 'inline-block';
-      if (n === 2) toggleFixedFields();
-      if (n === 4) refreshFixedGuardrail();
     }
 
-    // Fixed-rig mode needs an annotation frame on disk before Launch —
-    // otherwise the pipeline's physical short-circuit gate won't fire
-    // and HRNet will be run instead (unreliable on non-FIFA pitches).
-    // Called every time step 4 opens; also cheap enough to invoke on
-    // each mode-toggle in step 2.
-    async function refreshFixedGuardrail() {
-      const banner = $("#wiz-anno-warning");
-      const launch = $("#wiz-launch");
-      // Only fixed-rig runs need a saved annotation.
-      if (wizState.mode !== 'fixed') {
-        banner.style.display = 'none';
-        launch.disabled = false;
-        launch.title = '';
-        return;
-      }
-      try {
-        const videos = await api('GET', '/api/library/videos');
-        const v = videos.find(x => x.name === wizState.video);
-        const hasAnnotation = !!(v && v.annotation && v.annotation.frame_count > 0);
-        banner.style.display = hasAnnotation ? 'none' : 'block';
-        launch.disabled = !hasAnnotation;
-        launch.title = hasAnnotation
-          ? ''
-          : 'Annotate a calibration frame first (see the banner above)';
-      } catch (e) {
-        // Fail-open: if we can't reach the API let the user try to
-        // launch; the pipeline will still surface any error on stage 1.
-        banner.style.display = 'none';
-        launch.disabled = false;
-      }
-    }
-
-    function toggleFixedFields() {
-      const mode = document.querySelector('input[name="wiz-mode"]:checked').value;
-      $("#wiz-fixed-fields").style.display = mode === 'fixed' ? 'block' : 'none';
-    }
-
-    document.querySelectorAll('input[name="wiz-mode"]').forEach(r =>
-      r.addEventListener('change', toggleFixedFields));
-
-    function readWizardPayload() {
-      const mode = document.querySelector('input[name="wiz-mode"]:checked').value;
+    // Write pitch + camera profile + position into the per-video config.
+    // Called on step 2 → 3; the camera-moves choice (backend) is layered
+    // in later at launch. Returns nothing (state updated in place).
+    async function saveSceneBasics() {
       const payload = {
         pitch_type: $("#wiz-pitch").value,
         camera_profile: $("#wiz-cam").value,
-        camera_mode: mode,
-      };
-      if (mode === 'fixed') {
-        payload.camera_position = [
+        camera_position: [
           parseFloat($("#wiz-pos-x").value),
           parseFloat($("#wiz-pos-y").value),
           parseFloat($("#wiz-pos-z").value),
-        ];
-        payload.focal_hfov_deg_bounds = [
+        ],
+        focal_hfov_deg_bounds: [
           parseFloat($("#wiz-hfov-lo").value),
           parseFloat($("#wiz-hfov-hi").value),
-        ];
-      }
-      return payload;
-    }
-
-    async function saveWizardConfig() {
-      const payload = readWizardPayload();
+        ],
+      };
       const res = await api('POST',
         `/api/library/videos/${encodeURIComponent(wizState.video)}/scene-setup`,
         payload);
-      wizState.mode = payload.camera_mode;
       wizState.cfg_path = res.path;
       wizState.cfg_text = res.text;
       $("#wiz-cfg-path").textContent = res.path;
       $("#wiz-run-name").value = `run_${wizState.video.replace(/\.[^.]+$/, '')}`;
-      // Prep step 3 body copy based on the mode.
-      if (payload.camera_mode === 'fixed') {
-        $("#wiz-cal-headline").textContent = 'Annotate one calibration frame';
-        $("#wiz-cal-body").innerHTML =
-          `The fixed-rig path needs a single annotated frame so the
-           physical solver can recover the pose. Mark the 4+ pitch
-           corners you can see, click <em>Compute</em>, then <em>Save</em>.
-           Come back here when done.`;
-        $("#wiz-preview-only").style.display = 'none';
-      } else {
-        $("#wiz-cal-headline").textContent = 'Preview pretrained keypoints';
-        $("#wiz-cal-body").innerHTML =
-          `The PTZ path runs pretrained HRNet keypoint detection every
-           frame. Preview the pretrained model's output on this video
-           — if the keypoints land in the right places, you can launch
-           the pipeline as-is. If the detection is empty or badly off,
-           open the annotator to mark keypoints for a fine-tune.`;
-        $("#wiz-preview-only").style.display = 'inline-block';
-      }
     }
+
+    // Write the chosen keypoint model into the config (step 3 → 4).
+    async function saveKeypointModelChoice() {
+      const id = $("#wiz-kp-model").value;
+      const models = await api('GET', '/api/library/keypoint_models');
+      const entry = models.find(m => m.id === id) || {id, path: null};
+      const res = await api('POST',
+        `/api/library/videos/${encodeURIComponent(wizState.video)}/scene-setup`,
+        {keypoint_model_id: entry.id, keypoint_model_path: entry.path});
+      wizState.cfg_path = res.path;
+      wizState.cfg_text = res.text;
+      $("#wiz-cfg-path").textContent = res.path;
+    }
+
+    // Write the camera-moves answer → backend (step 4, at launch).
+    async function saveCameraMoves() {
+      const moves = document.querySelector('input[name="wiz-moves"]:checked').value;
+      const res = await api('POST',
+        `/api/library/videos/${encodeURIComponent(wizState.video)}/scene-setup`,
+        {camera_moves: moves === 'yes'});
+      wizState.cfg_path = res.path;
+      wizState.cfg_text = res.text;
+    }
+
+    // ---- Keypoint-model picker + 3-frame preview (step 3) -----------
+
+    // Three frame indices spread across the clip, with a deterministic
+    // per-video jitter so the samples feel "random" but stay stable for
+    // the lifetime of the wizard (each preview img keeps one URL, so the
+    // lightbox and the browser cache both behave).
+    function previewFrameIndices() {
+      const v = lastVideos.find(x => x.name === wizState.video);
+      const total = (v && v.frame_count) ? v.frame_count : 0;
+      if (total <= 3) return [0, Math.floor(total / 2), Math.max(0, total - 1)];
+      // Cheap string hash → jitter in [0, span/4).
+      let h = 0;
+      for (const ch of (wizState.video || '')) h = (h * 31 + ch.charCodeAt(0)) & 0xffff;
+      const anchors = [0.2, 0.5, 0.8];
+      const span = total;
+      return anchors.map((a, i) => {
+        const jitter = ((h >> (i * 3)) & 0x7) / 8 * 0.1 - 0.05; // ±5%
+        return Math.max(0, Math.min(total - 1,
+          Math.round((a + jitter) * span)));
+      });
+    }
+
+    async function populateKeypointModels() {
+      const sel = $("#wiz-kp-model");
+      // The chosen pitch (step 1) decides which fine-tuned models apply:
+      // a futsal model's landmarks only make sense on a futsal pitch. We
+      // keep the builtin SV_kp (pitch_type null = works anywhere) plus
+      // any model whose pitch_type matches the video's pitch.
+      const pitch = $("#wiz-pitch").value;
+      try {
+        const models = await api('GET', '/api/library/keypoint_models');
+        const applicable = models.filter(m =>
+          m.pitch_type == null || m.pitch_type === pitch);
+        sel.innerHTML = applicable
+          .map(m => `<option value="${m.id}">${m.label}</option>`)
+          .join('');
+      } catch (e) {
+        sel.innerHTML = `<option value="sv_kp">Pretrained (SV_kp)</option>`;
+      }
+      renderKeypointPreview();
+    }
+
+    function renderKeypointPreview() {
+      const grid = $("#wiz-kp-preview");
+      const model = $("#wiz-kp-model").value || 'sv_kp';
+      const frames = previewFrameIndices();
+      const vid = encodeURIComponent(wizState.video);
+      grid.innerHTML = frames.map(f => {
+        const url = `/api/library/videos/${vid}/keypoint_preview.jpg`
+                  + `?frame=${f}&model=${encodeURIComponent(model)}`;
+        return `<img src="${url}" alt="frame ${f}" data-full="${url}"
+                     title="frame ${f} — click to enlarge"
+                     style="width:100%;border-radius:3px;cursor:zoom-in;
+                            background:#0c0f13;min-height:60px"
+                     onerror="this.style.opacity=0.3;this.title='detection failed'">`;
+      }).join('');
+      grid.querySelectorAll('img').forEach(img =>
+        img.addEventListener('click', () => openKeypointLightbox(img.dataset.full)));
+    }
+
+    function openKeypointLightbox(url) {
+      $("#kp-lightbox-img").src = url;
+      $("#kp-lightbox").style.display = 'flex';
+    }
+    $("#kp-lightbox").addEventListener('click', () => {
+      $("#kp-lightbox").style.display = 'none';
+      $("#kp-lightbox-img").src = '';
+    });
+
+    $("#wiz-kp-model").addEventListener('change', renderKeypointPreview);
 
     $("#wiz-close").addEventListener('click', closeWizard);
     $("#wiz-cancel").addEventListener('click', closeWizard);
@@ -1117,11 +1159,19 @@
     $("#wiz-next").addEventListener('click', async () => {
       wizErrEl.textContent = '';
       try {
-        if (wizState.step === 2) {
-          // Step 2 → 3 also writes the config so subsequent steps can
-          // refer to a real file path.
-          await saveWizardConfig();
+        if (wizState.step === 1) {
+          // Just advance — pitch is read from the select on step 2 save.
+          showWizStep(2);
+        } else if (wizState.step === 2) {
+          // Write pitch + camera + position, then populate the model
+          // picker (filtered by the chosen pitch) and its preview.
+          await saveSceneBasics();
+          await populateKeypointModels();
           showWizStep(3);
+        } else if (wizState.step === 3) {
+          // Record the chosen keypoint model, then advance to launch.
+          await saveKeypointModelChoice();
+          showWizStep(4);
         } else {
           showWizStep(wizState.step + 1);
         }
@@ -1131,14 +1181,9 @@
     });
 
     $("#wiz-goto-annotate").addEventListener('click', () => {
-      const mode = wizState.mode === 'fixed' ? 'annotate' : 'preview';
-      // Opens the annotate page in a new tab so the wizard stays open.
-      const url = `/annotate?video=${encodeURIComponent(wizState.video)}&mode=${mode}`;
-      window.open(url, '_blank');
-    });
-
-    $("#wiz-preview-only").addEventListener('click', () => {
-      const url = `/annotate?video=${encodeURIComponent(wizState.video)}&mode=preview`;
+      // Annotate frames to fine-tune a model for this pitch. Opens the
+      // annotator in a new tab so the wizard stays open.
+      const url = `/annotate?video=${encodeURIComponent(wizState.video)}&mode=finetune`;
       window.open(url, '_blank');
     });
 
@@ -1147,10 +1192,12 @@
       try {
         const runName = $("#wiz-run-name").value.trim();
         if (!runName) { wizErrEl.textContent = 'run name required'; return; }
+        // Step 4's camera-moves answer decides the backend
+        // (fixed_camera vs physical) — write it first.
+        await saveCameraMoves();
         // Fold the step 4 vis-toggle answers into the workspace yaml
         // BEFORE launching. Uses the same scene-setup endpoint so the
-        // merge is server-side. The wizard's earlier POST already
-        // wrote pitch/camera/mode; this second POST layers vis on top.
+        // merge is server-side. This layers vis on top of the earlier POSTs.
         await api('POST',
           `/api/library/videos/${encodeURIComponent(wizState.video)}/scene-setup`,
           {

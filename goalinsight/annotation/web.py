@@ -558,10 +558,10 @@ def register_annotation_routes(
     async def save() -> JSONResponse:
         msg = annotator.save()
         # After a successful save, thread the frame path into the
-        # per-video pipeline config so the physical runner's fixed-rig
-        # short-circuit can pick it up. Only when the wizard's mode
-        # produced a ``lock_camera_position: true`` config — otherwise
-        # PTZ users would get their config unexpectedly rewritten.
+        # per-video pipeline config so the fixed_camera runner can replay
+        # that pose. Only when the wizard's mode produced a
+        # ``lock_camera_position: true`` config (fixed rig) — otherwise
+        # PTZ / model users would get their config unexpectedly rewritten.
         try:
             _thread_annotation_into_config()
         except Exception as exc:  # noqa: BLE001

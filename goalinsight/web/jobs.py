@@ -253,7 +253,7 @@ class JobManager:
         )
         if p.get("keypoint_model"):
             config.setdefault("field_registration", {}) \
-                  .setdefault("pnlcalib", {})["keypoint_model_path"] = p["keypoint_model"]
+                  .setdefault("keypoint_detection", {})["keypoint_model_path"] = p["keypoint_model"]
         if p.get("no_viz"):
             config.setdefault("output", {})["save_visualizations"] = False
 

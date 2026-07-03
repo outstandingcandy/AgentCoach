@@ -14,7 +14,7 @@ from typing import Any
 
 import yaml
 from fastapi import FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from ._runs import _detect_stage_completion, list_runs
 from ._workspace import VIDEO_EXTS, Workspace
@@ -78,6 +78,191 @@ def _read_pipeline_stages(config_path: Path) -> list[str]:
     pipeline = data.get("pipeline") or {}
     stages = pipeline.get("stages") or []
     return [str(s) for s in stages if s]
+
+
+# ``sv_kp`` is the builtin/auto-downloaded pretrained model id; every
+# other id is a fine-tuned run directory name under workspace/models/.
+_BUILTIN_KP_MODEL_ID = "sv_kp"
+
+# Cache of loaded KeypointDetector instances keyed by model id, so the
+# 3-frame preview doesn't reload HRNet weights for each frame or each
+# refresh. Small (usually 1-2 entries: SV_kp + the user's fine-tune).
+_KP_DETECTOR_CACHE: dict[str, Any] = {}
+
+
+def _discover_keypoint_models(workspace: Workspace) -> list[dict[str, Any]]:
+    """List the builtin SV_kp plus fine-tuned keypoint models on disk.
+
+    Fine-tuned models are produced by the annotate → train loop and land
+    under ``workspace/models/keypoint_<name>/`` with the actual weights
+    at a nested ``.../best_model.pt`` (see ``jobs.py`` submit_train). We
+    surface the first ``best_model.pt`` found per run dir. The builtin
+    entry always comes first and carries ``path: None`` (+ ``pitch_type:
+    None`` — it works on any pitch) so the config layer omits
+    ``keypoint_model_path`` for it and the detector auto-downloads SV_kp.
+
+    Each fine-tuned model may carry a ``model_meta.json`` at its dir root
+    with ``{"pitch_type", "label"}`` to associate it with the pitch it
+    was trained for; the wizard uses ``pitch_type`` to filter the picker
+    down to models that match the video's chosen pitch.
+    """
+    out: list[dict[str, Any]] = [{
+        "id": _BUILTIN_KP_MODEL_ID,
+        "label": "Pretrained (SV_kp)",
+        "path": None,
+        "pitch_type": None,
+        "builtin": True,
+    }]
+    models_dir = workspace.models_dir
+    if not models_dir.is_dir():
+        return out
+    for run_dir in sorted(models_dir.glob("keypoint_*")):
+        if not run_dir.is_dir():
+            continue
+        weights = next(iter(sorted(run_dir.rglob("best_model.pt"))), None)
+        if weights is None:
+            continue
+        # Association metadata (pitch_type + friendly label), if present.
+        meta: dict[str, Any] = {}
+        meta_path = run_dir / "model_meta.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text()) or {}
+            except (OSError, json.JSONDecodeError):
+                meta = {}
+        # Default label: the dir name, or a friendly timestamp when the
+        # dir is the legacy ``keypoint_<YYYYMMDD_HHMMSS>`` form.
+        label = meta.get("label") or run_dir.name
+        if not meta.get("label"):
+            ts = run_dir.name[len("keypoint_"):]
+            if len(ts) == 15 and ts[8] == "_":  # YYYYMMDD_HHMMSS
+                label = (
+                    f"Fine-tuned {ts[:4]}-{ts[4:6]}-{ts[6:8]} "
+                    f"{ts[9:11]}:{ts[11:13]}"
+                )
+        out.append({
+            "id": run_dir.name,
+            "label": label,
+            "path": str(weights.resolve()),
+            "pitch_type": meta.get("pitch_type"),
+            "builtin": False,
+        })
+    return out
+
+
+def _get_keypoint_detector(model_id: str, model_path: str | None):
+    """Return a cached KeypointDetector for *model_id*, loading on miss.
+
+    ``model_path`` is None for the builtin SV_kp (auto-download); any
+    other value is a fine-tuned ``best_model.pt`` path.
+    """
+    det = _KP_DETECTOR_CACHE.get(model_id)
+    if det is not None:
+        return det
+    from ..field_registration.keypoint_detector import KeypointDetector
+
+    det = KeypointDetector({
+        "backend": "pnlcalib",
+        "pnlcalib": {
+            "weights": "SV_kp",
+            "confidence_threshold": 0.3,
+            "model_path": model_path,
+        },
+    })
+    det.load_model()
+    _KP_DETECTOR_CACHE[model_id] = det
+    return det
+
+
+def _resolve_pitch_for_video(workspace: Workspace, video_stem: str):
+    """Return a ``SoccerPitch`` for *video_stem* from its saved config.
+
+    Reads the top-level ``pitch_type`` out of the per-video
+    ``workspace/configs/<stem>.yaml`` (falls back to the FIFA-sized
+    default when absent/unknown). Each pitch type has its own keypoint
+    world-coordinate layout AND outline, so the top-down panel must be
+    built from the right one.
+    """
+    from ..annotation import pitch_types
+    from ..annotation.pitch.geometry import SoccerPitch
+
+    pitch_type = None
+    cfg_path = workspace.configs_dir / f"{video_stem}.yaml"
+    if cfg_path.exists():
+        try:
+            data = yaml.safe_load(cfg_path.read_text()) or {}
+            pitch_type = data.get("pitch_type")
+        except (OSError, yaml.YAMLError):
+            pitch_type = None
+    if pitch_type:
+        try:
+            return SoccerPitch(**pitch_types.resolve(str(pitch_type)))
+        except (KeyError, TypeError):
+            pass
+    return SoccerPitch()  # FIFA-sized default
+
+
+def _render_keypoints_topdown(keypoints, pitch, conf_threshold=0.3):
+    """Render a top-down view of *pitch* with detected keypoints placed on it.
+
+    A keypoint's landmark position is pitch-dependent: the detector emits
+    PnLCalib channel ids (raw, ``convert_to_soccernet=False``); each id
+    names a landmark (``PITCH_POINT_TO_PNLCALIB_ID`` inverse), and that
+    landmark's WORLD coordinate is computed from the active pitch's
+    dimensions (``keypoint_utils.get_hrnet_keypoints_2d`` reads the
+    live ``PITCH_POINTS``). So on a futsal pitch id 0 (TL_PITCH_CORNER)
+    lands at (-20, 10), on FIFA at (-52.5, 34). The outline is drawn from
+    the SAME pitch, so points and lines are consistent. Returns a BGR
+    image the caller resizes for hconcat.
+
+    NOTE: mutates process-global active-pitch state via ``set_active_pitch``
+    — matches the annotate web module's pattern; fine for this single-user
+    tool where the preview is a quick synchronous call.
+    """
+    import cv2
+    import numpy as np  # noqa: F401 — used by pitch_diagram helpers
+
+    from ..annotation import keypoint_utils, pitch_constants
+    from ..annotation.pitch.keypoints import PITCH_POINT_TO_PNLCALIB_ID
+    from ..annotation.pitch_diagram import draw_pitch_structure, make_pitch_canvas
+
+    # Make this pitch active so keypoint world coords resolve against it.
+    pitch_constants.set_active_pitch(pitch)
+    kp_world = keypoint_utils.get_hrnet_keypoints_2d()  # name -> (x, y) on this pitch
+    id_to_name = {v: k for k, v in PITCH_POINT_TO_PNLCALIB_ID.items()}
+
+    scale = 12  # px per metre — fine for a preview panel
+    margin = 20
+    img, to_px, _w, _h = make_pitch_canvas(scale, margin, pitch=pitch)
+    draw_pitch_structure(
+        img, to_px, scale=scale, color=(255, 255, 255), thickness=2,
+        draw_landmarks=True, landmark_radius=3, draw_arcs=True, pitch=pitch,
+    )
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    n_shown = 0
+    for kp in keypoints:
+        if kp.get("confidence", 0) < conf_threshold:
+            continue
+        name = id_to_name.get(kp["id"])
+        world = kp_world.get(name) if name else None
+        if world is None:
+            continue
+        px, py = to_px(world[0], world[1])
+        conf = float(kp.get("confidence", 0))
+        green = int(min(255, conf * 2 * 255))
+        red = int(max(0, (1 - conf) * 2 * 255))
+        cv2.circle(img, (px, py), 5, (0, green, red), -1)
+        cv2.circle(img, (px, py), 5, (0, 0, 0), 1)
+        cv2.putText(img, str(kp["id"]), (px + 6, py + 3), font, 0.35,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        n_shown += 1
+
+    cv2.putText(img, f"Top-down: {n_shown} pts", (8, 20), font, 0.5,
+                (255, 255, 255), 2)
+    cv2.putText(img, f"Top-down: {n_shown} pts", (8, 20), font, 0.5,
+                (0, 255, 0), 1)
+    return img
 
 
 def _extract_cover_frame(video_path: Path, dest: Path) -> bool:
@@ -535,6 +720,112 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
             })
         return JSONResponse(sorted(out, key=lambda p: p["key"]))
 
+    @app.get("/api/library/keypoint_models")
+    def list_keypoint_models() -> JSONResponse:
+        """Return ``[{id, label, path, builtin}]`` for the wizard picker.
+
+        The builtin SV_kp is always first; fine-tuned models discovered
+        under ``workspace/models/keypoint_*/`` follow. Used by the
+        scene-setup calibrate step's "use a keypoint model" option.
+        """
+        return JSONResponse(_discover_keypoint_models(workspace))
+
+    @app.get("/api/library/videos/{name}/keypoint_preview.jpg")
+    def keypoint_preview(name: str, frame: int = 0,
+                         model: str = _BUILTIN_KP_MODEL_ID) -> Response:
+        """Overlay a keypoint model's detections on one frame of *name*.
+
+        The wizard renders three of these (at spread-out frame indices)
+        so the user can eyeball whether the chosen model lands keypoints
+        correctly on this pitch before launching. ``model`` is a model id
+        from ``/api/library/keypoint_models``; ``frame`` is a 0-based
+        index (clamped to the clip length).
+        """
+        try:
+            import cv2
+            import numpy as np
+        except ImportError as exc:  # pragma: no cover
+            raise HTTPException(500, "opencv unavailable") from exc
+
+        safe = _safe_filename(name)
+        video_path = workspace.videos_dir / safe
+        if not video_path.exists():
+            raise HTTPException(404, f"video not found: {name}")
+
+        # Resolve the model id → weights path via the same discovery the
+        # dropdown uses, so an unknown/renamed id can't smuggle a path in.
+        models = {m["id"]: m for m in _discover_keypoint_models(workspace)}
+        entry = models.get(model)
+        if entry is None:
+            raise HTTPException(404, f"unknown keypoint model: {model}")
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise HTTPException(500, "failed to open video")
+        try:
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            idx = frame
+            if total > 0:
+                idx = max(0, min(int(frame), total - 1))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, img = cap.read()
+            if not ok or img is None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, img = cap.read()
+            if not ok or img is None:
+                raise HTTPException(500, "failed to read frame")
+        finally:
+            cap.release()
+
+        try:
+            det = _get_keypoint_detector(entry["id"], entry.get("path"))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("failed to init keypoint detector")
+            raise HTTPException(500, f"detector init failed: {exc}") from exc
+
+        try:
+            # Raw PnLCalib channel ids (NOT soccernet) so the id ↔ landmark
+            # ↔ pitch-world lookup in the top-down panel lines up, and the
+            # frame overlay labels match the panel labels.
+            keypoints = det.detect(img, convert_to_soccernet=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("keypoint detection failed")
+            raise HTTPException(500, f"detection failed: {exc}") from exc
+
+        from ..field_registration.shared_vis import draw_vis_keypoints
+
+        vis = draw_vis_keypoints(img, keypoints, conf_threshold=0.3)
+
+        # Stitch a top-down pitch beside the frame so the user can read
+        # off which pitch landmark each detected keypoint maps to. The
+        # panel is built from the video's configured pitch (futsal / kids
+        # / fifa) — each pitch has its own landmark world coords AND
+        # outline — scaled to the frame height so hconcat lines up.
+        try:
+            pitch = _resolve_pitch_for_video(workspace, video_path.stem)
+            topdown = _render_keypoints_topdown(keypoints, pitch, conf_threshold=0.3)
+            fh = vis.shape[0]
+            tw = max(1, int(topdown.shape[1] * fh / topdown.shape[0]))
+            topdown = cv2.resize(topdown, (tw, fh), interpolation=cv2.INTER_AREA)
+            # A thin separator so the two panels read as distinct views.
+            sep = np.full((fh, 4, 3), 30, dtype=np.uint8)
+            vis = cv2.hconcat([vis, sep, topdown])
+        except Exception:  # noqa: BLE001 — panel is a nicety, never fatal
+            logger.exception("top-down panel render failed; serving frame only")
+
+        ok, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            raise HTTPException(500, "jpeg encode failed")
+        n_shown = sum(1 for kp in keypoints if kp.get("confidence", 0) >= 0.3)
+        return Response(
+            content=bytes(buf),
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Keypoints-Detected": str(n_shown),
+            },
+        )
+
     @app.get("/api/library/videos/{name}/config")
     def get_video_config(name: str) -> JSONResponse:
         """Return the saved per-video config for *name* (or empty meta).
@@ -625,16 +916,17 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
         see a fully-populated config, then overlays the wizard's
         physical / camera / mode overrides via ``merge_configs``.
 
-        Two payload variants:
+        Payload variants (the wizard sends several, one per step; each
+        merges into the same per-video config):
 
-        * Regular wizard turn — carries ``pitch_type``,
-          ``camera_profile``, ``camera_mode`` (``"fixed"`` | ``"ptz"``),
-          plus mode-specific extras (``camera_position``,
-          ``focal_hfov_deg_bounds``).
+        * basics — ``pitch_type`` + ``camera_profile`` +
+          ``camera_position`` + ``focal_hfov_deg_bounds``.
+        * model  — ``keypoint_model_id`` (+ ``keypoint_model_path``).
+        * moves  — ``camera_moves`` bool → backend (fixed_camera / physical).
+        * vis    — ``visualizations`` toggles.
         * ``{"first_annotation": true, "annotation_frame_path": "..."}``
-          — the annotator posts this after the user saves their first
-          calibration frame so the physical runner knows where to
-          find the fixed pose.
+          — the annotator posts this after the user saves a calibration
+          frame so the fixed_camera runner can replay that pose.
         """
         safe = _safe_filename(name)
         video_path = workspace.videos_dir / safe
@@ -663,10 +955,20 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
         if pt := payload.get("pitch_type"):
             overlay["pitch_type"] = pt
 
-        # Everything about calibration lives under ``field_registration``.
-        # Backend is always ``physical`` — the same solver handles fixed
-        # (lock_camera_position=true) and PTZ (=false) via a single flag,
-        # so the wizard doesn't force the user to think about backends.
+        # The reordered wizard POSTs this endpoint several times, each
+        # turn carrying one slice of the scene. All slices merge into the
+        # same per-video config under ``field_registration``:
+        #
+        #   step 2 (basics)   pitch_type + camera_profile + camera_position
+        #                     + focal_hfov_deg_bounds → physical block
+        #   step 3 (model)    keypoint_model_id/path → keypoint_detection block
+        #   step 4 (moves)    camera_moves bool → backend + lock flags:
+        #                       moves=false → backend: fixed_camera (solve
+        #                         one pose from the model/annotation, reuse)
+        #                       moves=true  → backend: physical (re-estimate
+        #                         the camera every frame with the model)
+        # Backends are independent — no runtime delegation. Both read the
+        # camera profile + position from the shared ``physical`` block.
         fr_phys: dict[str, Any] = {}
         if profile := payload.get("camera_profile"):
             fr_phys["camera_profile"] = profile
@@ -674,26 +976,44 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
             fr_phys["camera_position"] = [float(v) for v in pos]
         if hfov := payload.get("focal_hfov_deg_bounds"):
             fr_phys["focal_hfov_deg_bounds"] = [float(v) for v in hfov]
-        mode = payload.get("camera_mode")
-        if mode == "fixed":
-            fr_phys["lock_camera_position"] = True
-            fr_phys["position_bounds_m"] = [0.0, 0.0, 0.0]
-            fr_phys["joint_optimize"] = False
-        elif mode == "ptz":
-            fr_phys["lock_camera_position"] = False
-            fr_phys["position_bounds_m"] = [8.0, 8.0, 3.0]
-            fr_phys["joint_optimize"] = True
+
+        backend: str | None = None
+        if "camera_moves" in payload:
+            if payload.get("camera_moves"):
+                backend = "physical"
+                fr_phys["lock_camera_position"] = False
+                fr_phys["position_bounds_m"] = [8.0, 8.0, 3.0]
+                fr_phys["joint_optimize"] = True
+            else:
+                backend = "fixed_camera"
+                fr_phys["lock_camera_position"] = True
+                fr_phys["position_bounds_m"] = [0.0, 0.0, 0.0]
+                fr_phys["joint_optimize"] = False
 
         # First-annotation hook: the annotator calls back with the saved
-        # frame path so the physical runner can short-circuit its
-        # per-frame HRNet inference in fixed mode.
+        # frame path so the fixed_camera runner can replay that pose.
         if payload.get("first_annotation") and (afp := payload.get("annotation_frame_path")):
             fr_phys["annotation_frame_path"] = str(afp)
 
-        if fr_phys or mode:
-            overlay.setdefault("field_registration", {})["backend"] = "physical"
+        # Keypoint-model path → shared ``keypoint_detection`` block, read by
+        # both backends (physical per-frame, fixed_camera one-shot solve).
+        # The builtin SV_kp entry posts a null path; we then omit
+        # ``keypoint_model_path`` so the detector auto-downloads SV_kp.
+        if "keypoint_model_id" in payload:
+            kp_path = payload.get("keypoint_model_path")
+            if kp_path:
+                overlay.setdefault("field_registration", {}).setdefault(
+                    "keypoint_detection", {},
+                )["keypoint_model_path"] = str(kp_path)
+
+        if fr_phys or backend:
+            overlay.setdefault("field_registration", {})
+            if backend:
+                overlay["field_registration"]["backend"] = backend
             if fr_phys:
-                overlay["field_registration"]["physical"] = fr_phys
+                overlay["field_registration"].setdefault("physical", {}).update(
+                    fr_phys,
+                )
 
         # Per-stage visualization toggles from the wizard's step 4.
         # Each key is optional — when unset, the merged base config's
@@ -716,6 +1036,7 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
             )
 
         merged = merge_configs(base, overlay) if overlay else base
+
         try:
             text = yaml.safe_dump(merged, sort_keys=False, width=100)
         except yaml.YAMLError as exc:
@@ -726,5 +1047,4 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
             "path": str(cfg_path),
             "text": text,
             "backend": merged.get("field_registration", {}).get("backend"),
-            "mode": mode,
         })
