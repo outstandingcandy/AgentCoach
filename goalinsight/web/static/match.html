@@ -608,7 +608,12 @@
       for (const t of tracks || []) {
         const bbox = t.bbox;
         if (!bbox) continue;
-        if (!isIdentifiedTrack(t)) continue;
+        // Every on-field player gets a foot ellipse — including ones the
+        // consolidator couldn't put a jersey number to (they're still real
+        // players on the pitch). Only the number-bearing extras (jersey
+        // label, and the roster-driven bits elsewhere) stay gated on
+        // identification; the ellipse itself is drawn for all.
+        const identified = isIdentifiedTrack(t);
         const [x1, y1, x2, y2] = bbox;
         const tid = String(t.track_id);
         const team = t.team || (payload.players.find(p => p.player_id === tid) || {}).team_id || 'unknown';
@@ -642,7 +647,7 @@
           overlayCtx.stroke();
           overlayCtx.restore();
         }
-        if (overlays.jersey) {
+        if (overlays.jersey && identified) {
           const jersey = (t.jersey_number != null) ? t.jersey_number : tid;
           overlayCtx.font = 'bold 13px sans-serif';
           // Place above the ellipse so it doesn't fight with the ring.
