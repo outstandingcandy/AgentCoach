@@ -1913,7 +1913,19 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
                         c2 = (max(-clamp, min(clamp, px2[0])), max(-clamp, min(clamp, px2[1])))
                         cv2.line(vis, c1, c2, (255, 0, 0), 1)
 
-        # Draw projected template keypoints (yellow, matching pitch lines)
+        # Draw projected template keypoints, colour-split by whether the
+        # landmark sits ON a pitch line or is an off-line feature point.
+        #
+        # Some of the 57 landmarks are line endpoints/junctions (corners,
+        # box edges) that MUST lie on a drawn line; others are inherently
+        # off-line features (penalty/kick-off marks, centre point, the
+        # circle/D tangent points). Painting them all the same yellow made
+        # people read the off-line ones as "keypoint failed to land on the
+        # line" when they were never supposed to. So classify each by its
+        # world-space distance to the nearest pitch-line SEGMENT (not
+        # vertex — a landmark can sit mid-segment, e.g. a goal-area edge):
+        #   on-line  → yellow  (should coincide with the yellow lines)
+        #   off-line → magenta (a feature point, not expected on any line)
         from .pnlcalib import KeypointMapper
         all_world = calibrator._field_world_coords
         non_ground = KeypointMapper.NON_GROUND_KEYPOINTS
@@ -1926,13 +1938,45 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
             ground_world, camera_params["rvec"], camera_params["tvec"],
             camera_params["K"], camera_params["dist_coeffs"],
         )
+
+        # Gather all pitch-line segments in world coords from the template
+        # (each entry is a polyline; consecutive vertices form a segment).
+        line_segments: list[tuple[np.ndarray, np.ndarray]] = []
+        for _name, verts in pitch_template.items():
+            for a, b in zip(verts[:-1], verts[1:]):
+                line_segments.append((
+                    np.asarray([a[0], a[1]], dtype=np.float64),
+                    np.asarray([b[0], b[1]], dtype=np.float64),
+                ))
+
+        def _dist_to_segments(pt_xy: np.ndarray) -> float:
+            """Min distance (m) from a world point to any pitch-line segment."""
+            best = float("inf")
+            for a, b in line_segments:
+                ab = b - a
+                denom = float(ab @ ab)
+                t = 0.0 if denom == 0.0 else float((pt_xy - a) @ ab) / denom
+                t = max(0.0, min(1.0, t))
+                proj = a + t * ab
+                best = min(best, float(np.hypot(*(pt_xy - proj))))
+            return best
+
+        # 0.25 m tolerance absorbs the circle/arc polyline discretisation
+        # (the drawn arc is a 36-gon, so a point on the true arc sits up to
+        # ~0.2 m from the nearest chord) without misclassifying the genuine
+        # off-line marks, which are ≥1.5 m from any line.
+        ON_LINE_TOL_M = 0.25
+        ONLINE_COLOR = (0, 255, 255)   # yellow — coincides with lines
+        OFFLINE_COLOR = (255, 0, 255)  # magenta — off-line feature point
         for proj_idx, kid in enumerate(ground_ids):
             ix, iy = ground_proj[proj_idx]
             if -50 < ix < w + 50 and -50 < iy < h + 50:
                 pt = (int(ix), int(iy))
-                cv2.circle(vis, pt, 3, (0, 255, 255), -1)
+                on_line = _dist_to_segments(ground_world[proj_idx][:2]) <= ON_LINE_TOL_M
+                color = ONLINE_COLOR if on_line else OFFLINE_COLOR
+                cv2.circle(vis, pt, 3, color, -1)
                 cv2.putText(vis, str(kid), (pt[0] + 5, pt[1] - 3),
-                            font, 0.3, (0, 255, 255), 1)
+                            font, 0.3, color, 1)
 
         # Header
         err = result.get("final_error", 0)
@@ -1947,6 +1991,16 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
 
     cv2.putText(vis, header, (10, 25), font, 0.6, (255, 255, 255), 2)
     cv2.putText(vis, header, (10, 25), font, 0.6, (0, 200, 0), 1)
+
+    # Legend for the keypoint colour split (drawn just under the header).
+    if result is not None and result.get("camera_params"):
+        cv2.circle(vis, (16, 46), 4, (0, 255, 255), -1)
+        cv2.putText(vis, "on-line kp", (26, 50), font, 0.45, (0, 255, 255), 1)
+        cv2.circle(vis, (146, 46), 4, (255, 0, 255), -1)
+        cv2.putText(vis, "off-line feature kp", (156, 50), font, 0.45, (255, 0, 255), 1)
+        if result.get("img_pts"):
+            cv2.circle(vis, (346, 46), 4, (0, 255, 0), -1)
+            cv2.putText(vis, "detected", (356, 50), font, 0.45, (0, 255, 0), 1)
 
     # Top-down pitch diagram
     class _Stub:
