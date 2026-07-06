@@ -208,6 +208,30 @@ def _solve_from_annotation(
     return camera_pose, diag
 
 
+def _reprojection_residuals(cam, pixel_pts, world_3d_pts) -> np.ndarray:
+    """Per-point reprojection residual (px) for a solved camera.
+
+    Projects each world point with the camera's optimised pose +
+    intrinsics + distortion and returns the pixel distance to its detected
+    location. Used to find the single worst mis-localised detection so the
+    fixed-camera model solve can trim it (the solver's own outlier loop is
+    world-space and never fires for on-ground points).
+    """
+    R = np.asarray(cam.rotation, dtype=np.float64)
+    rvec = np.asarray(
+        getattr(cam, "_pnp_rvec", cv2.Rodrigues(R)[0]), dtype=np.float64,
+    ).reshape(3)
+    pos = np.asarray(cam.position, dtype=np.float64).reshape(3)
+    tvec = (-R @ pos).reshape(3)
+    K = np.asarray(cam.calibration, dtype=np.float64)
+    dist = np.asarray(getattr(cam, "_pnp_dist", np.zeros(5)), dtype=np.float64).ravel()
+    world = np.asarray(world_3d_pts, dtype=np.float64).reshape(-1, 1, 3)
+    proj, _ = cv2.projectPoints(world, rvec, tvec, K, dist)
+    proj = proj.reshape(-1, 2)
+    detected = np.asarray(pixel_pts, dtype=np.float64).reshape(-1, 2)
+    return np.linalg.norm(proj - detected, axis=1)
+
+
 def _candidate_solve_frames(frame_indices: list[int], n: int = 12) -> list[int]:
     """Pick up to *n* candidate frames spread across the sampled range.
 
@@ -410,6 +434,46 @@ def _solve_from_model_detection(
             f"inconsistent — the model likely needs more/better training "
             f"data. Annotate a frame by hand as a fallback.",
         )
+
+    # Pixel-residual outlier rejection. The solver's built-in outlier loop
+    # keys off WORLD-space error, which is identically zero here (every
+    # consensus point is on the ground plane, z=0), so it never fires for a
+    # fixed-camera model solve — a single mis-localised detection (e.g. a
+    # keypoint that landed ~30 px off on a featureless stretch of grass)
+    # then drags the mean reprojection error up even though the median is
+    # low. So re-solve while dropping the single worst-reprojecting point,
+    # as long as it exceeds the threshold AND we keep ≥ the minimum needed
+    # for a stable pose. Bounded iterations; each drop is logged.
+    reject_px = float(solve_cfg.get("model_solve_reject_px", 12.0))
+    MIN_KEEP = 6  # keep enough for a well-conditioned free-intrinsics solve
+    if reject_px > 0 and len(pixel_pts) > MIN_KEEP:
+        cur_px = list(pixel_pts)
+        cur_w3 = list(world_3d_pts)
+        for _ in range(len(cur_px)):
+            resid = _reprojection_residuals(cam, cur_px, cur_w3)
+            worst = int(np.argmax(resid))
+            if resid[worst] <= reject_px or len(cur_px) <= MIN_KEEP:
+                break
+            logger.info(
+                "Stage 1 (Fixed): dropping worst-reprojecting point "
+                "(resid %.1f px > %.1f) and re-solving on %d pts",
+                resid[worst], reject_px, len(cur_px) - 1,
+            )
+            cur_px.pop(worst)
+            cur_w3.pop(worst)
+            cam2, mean_err2, diag2 = solve_camera_physical(
+                cur_px, cur_w3, img_size,
+                physical_cfg=solve_cfg, camera_profiles=camera_profiles,
+            )
+            if cam2 is None:
+                # Re-solve diverged: keep the last good pose, stop trimming.
+                logger.warning(
+                    "Stage 1 (Fixed): re-solve after outlier drop diverged; "
+                    "keeping previous pose.",
+                )
+                break
+            cam, mean_err, diag = cam2, mean_err2, diag2
+            pixel_pts, world_3d_pts = cur_px, cur_w3
 
     npts = len(pixel_pts)
     intr = "free" if solve_cfg.get("free_intrinsics", True) else "locked"
