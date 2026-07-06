@@ -57,7 +57,6 @@ from .jobs import JobManager, register_jobs_routes
 from .library import register_library_routes
 from .match_detail import register_match_detail_routes
 from .pipeline_results import register_pipeline_results_routes
-from .tracking_diag import register_tracking_diag_routes
 
 logger = logging.getLogger(__name__)
 
@@ -221,15 +220,6 @@ def create_workspace_app(
                 path = STATIC_DIR / "index.html"
             return FileResponse(path, headers=no_cache)
 
-    @app.get("/tracking/{run_name}")
-    def tracking_diag_page(run_name: str) -> FileResponse:
-        # Tracking-diagnostics page: client reads run_name from URL and
-        # calls /api/runs/{run_name}/tracking/diag/* (registered below).
-        path = STATIC_DIR / "tracking.html"
-        if not path.exists():
-            raise HTTPException(503, "tracking.html not yet installed")
-        return FileResponse(path, headers=no_cache)
-
     @app.get("/match")
     @app.get("/match/")
     def match_index_page() -> FileResponse:
@@ -250,9 +240,6 @@ def create_workspace_app(
     runs = RunRegistry(ws)
     app.state.runs = runs
     register_analytics_routes(app, runs)
-    # Read-only YOLO-raw + track_audit endpoints back the
-    # /tracking/{run_name} diagnostics page.
-    register_tracking_diag_routes(app, ws)
     # Per-stage manifest endpoints used by the /pipeline page right pane.
     register_pipeline_results_routes(app, ws)
     # Match-detail page payload (roster + events with seek windows).
