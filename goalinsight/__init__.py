@@ -9,7 +9,7 @@ Modules:
 Supports multiple backends for each component:
 - Calibration: PnLCalib (default), BroadTrack, Physical, NBJW
 - ReID: OSNet (default), PRTReID
-- Jersey recognition: Qwen VL (default), MMOCR
+- Jersey recognition: Qwen VL (default), Claude, Gemini
 - Team classification: KMeans (default), Tracklet clustering
 - Visualization: Minimal (default), Step-by-step
 """

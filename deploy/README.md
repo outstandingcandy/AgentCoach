@@ -42,8 +42,8 @@ deployment untouched. With no suffix the names reduce to the originals
 **Caveats**
 
 - `g5.xlarge` (A10G 24 GB) is ~$1/hr on-demand — not free tier.
-- First boot takes ~15–25 min (torch/mmcv/mmocr install). The ALB target
-  stays **unhealthy** until the service is up — that's expected.
+- First boot takes ~10 min (clone + torch/ML-stack pip install). The ALB
+  target stays **unhealthy** until the service is up — that's expected.
 - The self-signed cert makes browsers warn once ("Advanced → Continue").
 - Bedrock model access for `us.anthropic.claude-opus-4-7` in `us-east-1`
   must be enabled in the account, or chat calls will 403.

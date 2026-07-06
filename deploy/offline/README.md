@@ -183,11 +183,6 @@ sudo systemctl restart docker
 Either drop `reid.clip_reid.batch_size` (default 16 → try 4) in your
 config, or switch `reid.backend: osnet` (much lighter).
 
-**mmocr downloading on first run**
-The image pre-bakes mmocr weights at build time but the URLs are
-sometimes flaky. If the first run downloads ~200 MB before starting
-inference, that's normal; subsequent runs are offline.
-
 **The output run already exists**
 Drop `--no-timestamp`, or pass a new `--run-name`.
 
@@ -216,6 +211,5 @@ The image bundles weights and code from several upstream projects:
 | TorchReID OSNet | MIT | |
 | BPBreID / PRTReID | MIT (Zenodo) | |
 | PnLCalib | MIT (GitHub releases) | |
-| MMOCR | Apache-2.0 | |
 | OpenCLIP | MIT | |
 | CLIP-ReID | MIT | Habel et al. 2022 |

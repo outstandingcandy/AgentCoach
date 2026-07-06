@@ -25,7 +25,7 @@ flowchart LR
     subgraph S3["S3: Track Consolidation"]
         direction TB
         S3_RC["ReID-first clustering"]
-        S3_JV["Jersey vote (Claude / Gemini / Qwen / MMOCR)"]
+        S3_JV["Jersey vote (Claude / Gemini / Qwen)"]
         S3_NM["Team split → orphan absorb → naming (A-9, B-10, ...)"]
         S3_RC --> S3_JV --> S3_NM
     end

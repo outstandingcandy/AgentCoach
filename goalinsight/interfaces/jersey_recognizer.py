@@ -11,7 +11,7 @@ class BaseJerseyRecognizer(ABC):
 
     Implementations:
     - Qwen VL: Vision-language model for OCR
-    - MMOCR: DBNet + SAR two-stage OCR
+    - Claude / Gemini: hosted vision-language model backends
     """
 
     @abstractmethod

@@ -93,8 +93,8 @@ docker images --filter "reference=$IMAGE_TAG" --format \
     "  {{.Repository}}:{{.Tag}}  {{.Size}}  (id {{.ID}})"
 
 # Warn if the image got bloated. 8 GB is roughly:
-#   ~3 GB base (pytorch+cuda) + ~3 GB pip wheels (mmocr family +
-#   transformers) + ~1.2 GB clip_reid weights + ~0.5 GB other weights.
+#   ~3 GB base (pytorch+cuda) + ~3 GB pip wheels (transformers +
+#   vllm) + ~1.2 GB clip_reid weights + ~0.5 GB other weights.
 SIZE_BYTES=$(docker image inspect "$IMAGE_TAG" --format '{{.Size}}' 2>/dev/null || echo 0)
 if (( SIZE_BYTES > 8589934592 )); then  # 8 GiB
     echo

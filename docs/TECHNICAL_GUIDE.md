@@ -202,7 +202,7 @@ PnLCalib 的 HRNet keypoint 和 line head 支持 finetune（`scripts/train_finet
 - **D** 孤立 track 在更松阈值下并入已有聚类
 - **E** 命名（A-9 / B-10 / A-GK / B-unk-01）
 
-球衣号识别后端（`track_consolidation.jersey.backend`）：`claude` / `gemini` / `qwen` / `mmocr` / `rapidocr`。
+球衣号识别后端（`track_consolidation.jersey.backend`）：`claude` / `gemini` / `qwen` / `rapidocr`。
 
 ### 4.4 Event Detection — 事件检测
 
@@ -337,7 +337,7 @@ YAML 配置在 `configs/`，user config 通过深合并叠到 `configs/default.y
 | `tracking.dump_yolo_raw` | 把 YOLO raw 检测落盘到 `yolo_raw/` 给离线 audit |
 | `reid.backend` | `osnet` / `prtreid` |
 | `team_classification.backend` | `kmeans` / `tracklet` |
-| `track_consolidation.jersey.backend` | `claude` / `gemini` / `qwen` / `mmocr` |
+| `track_consolidation.jersey.backend` | `claude` / `gemini` / `qwen` |
 | `events.detectors` | enabled detector 列表 |
 | `player_profile.spotlights.*` | spotlight 视频开关 + 输出尺寸 / 球员高度比例 / 出场跳过 / 椭圆 / 名牌 |
 | `highlights.recipes` | 集锦 recipe 列表 |

@@ -111,10 +111,9 @@ def get_jersey_recognizer(config: dict[str, Any] | None = None) -> "BaseJerseyRe
     Args:
         config: Configuration dict with 'jersey_recognition' section.
             Expected keys:
-            - backend: "qwen_vl" or "mmocr"
+            - backend: "qwen_vl", "qwen", "claude", or "gemini"
             - enabled: Whether jersey recognition is enabled
             - qwen_vl: {...} backend-specific config
-            - mmocr: {...} backend-specific config
 
     Returns:
         Jersey recognizer instance implementing BaseJerseyRecognizer.
@@ -126,12 +125,7 @@ def get_jersey_recognizer(config: dict[str, Any] | None = None) -> "BaseJerseyRe
     jr_config = config.get("jersey_recognition", {})
     backend = jr_config.get("backend", "qwen_vl")
 
-    if backend == "mmocr":
-        from ..jersey import MMOCRJerseyRecognizer
-        backend_config = jr_config.get("mmocr", {})
-        backend_config["device"] = config.get("device", "cuda")
-        return MMOCRJerseyRecognizer(backend_config)
-    elif backend == "claude":
+    if backend == "claude":
         from ..jersey.claude_recognizer import ClaudeJerseyRecognizer
         return ClaudeJerseyRecognizer(jr_config.get("claude", jr_config))
     elif backend == "gemini":
@@ -162,7 +156,7 @@ def get_jersey_recognizer(config: dict[str, Any] | None = None) -> "BaseJerseyRe
         # falling back to something the user didn't ask for.
         raise ValueError(
             f"unknown jersey_recognition.backend {backend!r}; "
-            f"expected one of: qwen | qwen_vl | mmocr | claude | gemini",
+            f"expected one of: qwen | qwen_vl | claude | gemini",
         )
 
 

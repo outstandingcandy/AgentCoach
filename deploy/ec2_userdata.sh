@@ -57,14 +57,11 @@ fi
 chown -R ubuntu:ubuntu "$APP_DIR"
 
 # ---- 3. venv + app install (as the ubuntu user) ---------------------------
-# Use the offline requirements set (deploy/offline/requirements.txt), NOT the
-# root requirements.txt. The root set pins the mmocr/mmcv/sam2 family, which
-# needs a fragile ~15-min from-source mmcv compile that breaks under
-# setuptools>=81 (mmcv's build backend imports the removed pkg_resources).
-# The offline set drops those — matching the known-good dev venv, which runs
-# on setuptools 81 with mmcv/mmocr absent. The mmocr jersey backend is
-# optional; defaults use osnet/qwen. pyproject.toml declares no deps, so
-# `-e . --no-deps` just installs the package (mirrors the offline Dockerfile).
+# Install the offline requirements set (deploy/offline/requirements.txt): its
+# exact, known-good pins match the tested image, whereas the root
+# requirements.txt uses looser ranges. It also carries the fastapi/uvicorn web
+# deps this host needs. pyproject.toml declares no deps, so `-e . --no-deps`
+# just installs the package (mirrors the offline Dockerfile).
 echo "==> Building venv and installing the app..."
 sudo -u ubuntu bash -eux <<'INSTALL'
 cd /home/ubuntu/AgentCoach

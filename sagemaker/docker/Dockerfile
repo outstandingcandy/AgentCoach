@@ -25,7 +25,7 @@ WORKDIR /opt/goalinsight
 
 # Install dependencies first so layer caching kicks in when only code
 # changes. requirements.txt is the slim set tailored to fr+tracking;
-# everything else (mmocr/sam2/qwen-vl) lives in the full requirements
+# everything else (qwen-vl/transformers) lives in the full requirements
 # kept for local dev.
 COPY sagemaker/docker/requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
