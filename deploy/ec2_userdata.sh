@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 #
-# EC2 first-boot provisioning for the GoalInsight web app.
+# EC2 first-boot provisioning for the GoalInsight web app (CONTAINERIZED).
 #
 # Passed as --user-data by deploy/deploy_ec2.sh. Runs once as root via
-# cloud-init. Installs OS deps, clones the repo, builds the venv, installs
-# the app, and starts it under systemd. Model weights are NOT baked — they
-# auto-download on the first pipeline run (PnLCalib releases, ultralytics
-# YOLO, torchreid OSNet).
+# cloud-init. Installs Docker + the NVIDIA container toolkit, clones the repo
+# (needed as the docker build context), builds the deployment image on the
+# instance, downloads model weights into the host workspace volume, and starts
+# the container under systemd.
 #
-# Assumes a Deep Learning GPU AMI (NVIDIA driver + CUDA preinstalled). If the
-# launcher fell back to a stock Ubuntu AMI, install the driver first (see the
-# GPU_DRIVER_FALLBACK block below).
+# Model weights are NOT baked into the image — they download into the
+# bind-mounted /home/ubuntu/AgentCoach/workspace at first use (PnLCalib
+# releases, ultralytics YOLO, torchreid OSNet) plus the ev_posw fine-tune
+# fetched below.
+#
+# Assumes a Deep Learning GPU AMI (NVIDIA driver preinstalled). If the launcher
+# fell back to a stock Ubuntu AMI, the driver is installed below.
 #
 # All output is tee'd to /var/log/goal-insight-provision.log.
 set -euo pipefail
@@ -21,20 +25,14 @@ echo "==> goal-insight provisioning started at $(date -u)"
 REPO_URL="__REPO_URL__"
 REPO_BRANCH="__REPO_BRANCH__"
 APP_DIR="/home/ubuntu/AgentCoach"
+IMAGE_TAG="goalinsight:deploy"
 
 export DEBIAN_FRONTEND=noninteractive
 
-# ---- 1. OS packages -------------------------------------------------------
-echo "==> Installing OS packages..."
+# ---- 1. OS packages + git -------------------------------------------------
+echo "==> Installing base packages..."
 apt-get update -y
-apt-get install -y software-properties-common
-add-apt-repository -y ppa:deadsnakes/ppa
-apt-get update -y
-apt-get install -y \
-  git ffmpeg \
-  python3.12 python3.12-venv python3.12-dev \
-  build-essential \
-  libgl1 libglib2.0-0
+apt-get install -y git ca-certificates curl gnupg
 
 # ---- 1b. GPU driver fallback (only if no NVIDIA driver present) -----------
 # The Deep Learning AMI already ships the driver; this is a safety net for a
@@ -45,7 +43,40 @@ if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
   ubuntu-drivers autoinstall || echo "WARN: driver autoinstall failed; GPU pipeline may not work until a driver is installed + reboot."
 fi
 
-# ---- 2. Clone the repo ----------------------------------------------------
+# ---- 2. Docker engine -----------------------------------------------------
+# The Deep Learning AMI usually ships Docker already; install from the
+# official repo only if it's missing.
+if ! command -v docker >/dev/null 2>&1; then
+  echo "==> Installing Docker engine..."
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  UBUNTU_CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $UBUNTU_CODENAME stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update -y
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+fi
+systemctl enable --now docker
+usermod -aG docker ubuntu || true
+
+# ---- 2b. NVIDIA container toolkit (GPU passthrough into containers) -------
+if ! command -v nvidia-ctk >/dev/null 2>&1; then
+  echo "==> Installing NVIDIA container toolkit..."
+  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+    | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+    > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  apt-get update -y
+  apt-get install -y nvidia-container-toolkit
+fi
+nvidia-ctk runtime configure --runtime=docker
+systemctl restart docker
+
+# ---- 3. Clone the repo (docker build context) -----------------------------
 echo "==> Cloning $REPO_URL ($REPO_BRANCH) -> $APP_DIR"
 if [[ -d "$APP_DIR/.git" ]]; then
   git -C "$APP_DIR" fetch --depth 1 origin "$REPO_BRANCH"
@@ -54,30 +85,19 @@ if [[ -d "$APP_DIR/.git" ]]; then
 else
   git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$APP_DIR"
 fi
+mkdir -p "$APP_DIR/workspace"
 chown -R ubuntu:ubuntu "$APP_DIR"
 
-# ---- 3. venv + app install (as the ubuntu user) ---------------------------
-# Install the offline requirements set (deploy/offline/requirements.txt): its
-# exact, known-good pins match the tested image, whereas the root
-# requirements.txt uses looser ranges. It also carries the fastapi/uvicorn web
-# deps this host needs. pyproject.toml declares no deps, so `-e . --no-deps`
-# just installs the package (mirrors the offline Dockerfile).
-echo "==> Building venv and installing the app..."
-sudo -u ubuntu bash -eux <<'INSTALL'
-cd /home/ubuntu/AgentCoach
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip wheel setuptools
-pip install -r deploy/offline/requirements.txt
-pip install --no-deps -e .
-mkdir -p workspace
-INSTALL
+# ---- 4. Build the deployment image ----------------------------------------
+echo "==> Building Docker image $IMAGE_TAG (~10-15 min: torch + ML stack)..."
+docker build -f "$APP_DIR/deploy/Dockerfile" -t "$IMAGE_TAG" "$APP_DIR"
 
-# ---- 3b. Fetch the fine-tuned keypoint model ------------------------------
+# ---- 5. Fetch the fine-tuned keypoint model into the host workspace -------
 # Weights are too large for git (265MB) and workspace/ is gitignored, so the
 # ev_posw futsal keypoint model ships as a GitHub Release asset. Download it
 # into the flat layout the web picker scans (workspace/models/keypoint_*/ with
 # best_model.pt + model_meta.json) so it shows up in "Pick a keypoint model".
+# It lands on the host and is visible in the container via the bind mount.
 # Idempotent: skip when the sha256 already matches.
 echo "==> Fetching ev_posw keypoint model..."
 sudo -u ubuntu bash -eux <<'KPMODEL'
@@ -95,7 +115,7 @@ else
 fi
 KPMODEL
 
-# ---- 4. systemd service ---------------------------------------------------
+# ---- 6. systemd service (manages the container) ---------------------------
 echo "==> Installing systemd unit..."
 install -m 0644 "$APP_DIR/deploy/goal-insight-web.service" \
   /etc/systemd/system/goal-insight-web.service

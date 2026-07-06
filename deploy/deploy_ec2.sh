@@ -32,8 +32,9 @@
 #   --volume-size <gb>    Root EBS size in GiB      (env VOLUME_SIZE,  default 200)
 #
 # Cost note: g5.xlarge (A10G 24GB) is ~$1/hr on-demand — NOT free tier.
-# First boot takes ~15-25 min for the full pip install; the ALB target stays
-# unhealthy until the service is up. That's expected.
+# First boot takes ~15-25 min (install Docker + NVIDIA toolkit, then
+# docker build the image = torch + ML stack); the ALB target stays unhealthy
+# until the container is up. That's expected.
 set -euo pipefail
 
 # ---- args -----------------------------------------------------------------
@@ -272,9 +273,10 @@ echo "Deploy complete."
 echo "  Instance:  $INSTANCE_ID  ($INSTANCE_TYPE, $REGION)"
 echo "  App SG:    $SG_ID  (SSH 22 only; :8000 reachable from the ALB SG only)"
 echo
-echo "The instance is still running its first-boot install (clone + pip"
-echo "install of torch and the ML stack, ~10 min). The ALB target will be"
-echo "UNHEALTHY until 'systemctl status goal-insight-web' is active."
+echo "The instance is still provisioning (install Docker + NVIDIA toolkit,"
+echo "then docker build the image, ~15-25 min). The ALB target will be"
+echo "UNHEALTHY until 'systemctl status goal-insight-web' (the container)"
+echo "is active."
 echo
 echo "Watch progress via SSM:"
 echo "  aws ssm start-session --region $REGION --target $INSTANCE_ID"

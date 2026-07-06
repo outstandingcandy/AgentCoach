@@ -1,32 +1,30 @@
 [Unit]
-Description=GoalInsight web app (FastAPI viewer + Bedrock chat)
-After=network-online.target
+Description=GoalInsight web app (containerized: FastAPI viewer + Bedrock chat)
+After=docker.service network-online.target
+Requires=docker.service
 Wants=network-online.target
 
 [Service]
+# Runs the deployment image (built on-instance by ec2_userdata.sh) as a
+# foreground container systemd can supervise. The bind-mounted workspace
+# holds videos, runs, and downloaded model weights so they survive
+# container recreation. Bound to 0.0.0.0:8000 for the ALB; the instance
+# SG only exposes :8000 to the ALB's SG (SSH 22 is the only public port).
+# Chat is enabled (no GOALINSIGHT_DISABLE_CHAT), so the instance role must
+# grant Bedrock access. Region is us-east-1 (hardcoded in chat.py).
 Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/home/ubuntu/AgentCoach
-# Daemonised form of deploy/start_web.sh. Bound to 0.0.0.0:8000 so the ALB
-# can reach it; the instance security group only exposes :8000 to the ALB's
-# SG (never the public internet — SSH 22 is the only externally-open port).
-# Chat is left enabled (no GOALINSIGHT_DISABLE_CHAT), so the instance role
-# must grant Bedrock access. Region is us-east-1 (hardcoded in chat.py).
-Environment=AWS_REGION=us-east-1
-Environment=PYTHONUNBUFFERED=1
-# Optional video offload to S3/CloudFront — uncomment and fill in to match
-# deploy/start_web.sh's behaviour:
-#Environment=GOALINSIGHT_VIDEO_S3_BUCKET=
-#Environment=GOALINSIGHT_VIDEO_CLOUDFRONT_DOMAIN=
-#Environment=GOALINSIGHT_VIDEO_CF_KEY_PAIR_ID=
-#Environment=GOALINSIGHT_VIDEO_CF_PRIVATE_KEY_PATH=/home/ubuntu/AgentCoach/deploy/cloudfront/cf_private.pem
-ExecStart=/home/ubuntu/AgentCoach/.venv/bin/python -m goalinsight.web \
-    --workspace /home/ubuntu/AgentCoach/workspace \
-    --host 0.0.0.0 --port 8000
+# Clear any stale container from a previous boot before starting.
+ExecStartPre=-/usr/bin/docker rm -f goal-insight-web
+ExecStart=/usr/bin/docker run --rm --name goal-insight-web \
+    --gpus all \
+    -p 8000:8000 \
+    -v /home/ubuntu/AgentCoach/workspace:/workspace \
+    -e AWS_REGION=us-east-1 \
+    goalinsight:deploy
+ExecStop=/usr/bin/docker stop goal-insight-web
 Restart=always
 RestartSec=5
-# The pipeline subprocess can be memory-hungry; give it generous headroom.
+# First boot pulls model weights inside the container start path; give it room.
 TimeoutStartSec=0
 
 [Install]
