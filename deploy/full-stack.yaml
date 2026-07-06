@@ -1,0 +1,336 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  goal-insight full stack — provisions EVERYTHING in one CloudFormation
+  template: the GPU EC2 instance (+ its IAM role, instance profile, and
+  security group) AND the internet-facing ALB + Cognito user pool in front
+  of it. The only out-of-band prerequisite is the self-signed cert imported
+  into ACM (ACM ImportCertificate is not a CFN resource type), passed in via
+  ImportedCertArn — deploy_ec2.sh handles that import.
+
+  Delete the stack to remove every resource this creates (instance, IAM,
+  SGs, ALB, Cognito). Nothing is left dangling outside CFN.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the ALB, instance, and security groups.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      At least two public subnets in different AZs (for the ALB). The
+      instance launches into the first one.
+  LaunchSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: The (public) subnet the EC2 instance launches into.
+  AppPort:
+    Type: Number
+    Default: 8000
+  InstanceType:
+    Type: String
+    Default: g5.xlarge
+    Description: GPU instance type (serves the app + runs the pipeline).
+  VolumeSizeGb:
+    Type: Number
+    Default: 200
+    Description: Root EBS volume size in GiB.
+  AmiId:
+    # Resolve the Deep Learning GPU AMI (driver + CUDA preinstalled) inside
+    # the stack. Override with a plain AMI id if you want a specific image.
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id
+  KeyName:
+    Type: String
+    Default: ""
+    Description: Optional EC2 key pair name for SSH. Empty = SSM-only access.
+  SshCidr:
+    Type: String
+    Default: ""
+    Description: >
+      CIDR allowed to SSH (port 22) to the instance, e.g. 1.2.3.4/32. Empty
+      = no SSH ingress at all (connect via SSM Session Manager).
+  RepoUrl:
+    Type: String
+    Default: https://github.com/outstandingcandy/AgentCoach.git
+  RepoBranch:
+    Type: String
+    Default: master
+  ImportedCertArn:
+    Type: String
+    Description: >
+      ARN of the self-signed certificate imported into ACM (deploy_ec2.sh /
+      bootstrap.sh imports it). ACM ImportCertificate isn't a CFN resource,
+      so this is the one out-of-band prerequisite.
+  CognitoDomainPrefix:
+    Type: String
+    Description: Cognito hosted-UI subdomain prefix (globally unique in region).
+  AdminEmail:
+    Type: String
+    Description: Email created as the first admin user.
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
+  HasSshCidr: !Not [!Equals [!Ref SshCidr, ""]]
+
+Resources:
+  # ---------------- IAM (was created by deploy_ec2.sh via aws-cli) --------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      # Keyless shell via SSM Session Manager.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: goal-insight-bedrock
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntime
+                  - bedrock-agentcore:InvokeCodeInterpreter
+                  - bedrock-agentcore:StartCodeInterpreterSession
+                  - bedrock-agentcore:StopCodeInterpreterSession
+                  - bedrock-agentcore:GetCodeInterpreterSession
+                  - bedrock-agentcore:ListCodeInterpreterSessions
+                Resource: "*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ---------------- Instance security group ------------------------------
+  # SSH 22 only (optional, from SshCidr). App :8000 is opened separately
+  # below, sourced ONLY from the ALB SG — never the public internet.
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: goal-insight web instance — SSH only; :8000 from ALB SG
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        !If
+          - HasSshCidr
+          - - IpProtocol: tcp
+              FromPort: 22
+              ToPort: 22
+              CidrIp: !Ref SshCidr
+              Description: SSH from operator
+          - !Ref "AWS::NoValue"
+
+  # ---------------- EC2 instance -----------------------------------------
+  WebInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      IamInstanceProfile: !Ref InstanceProfile
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref LaunchSubnetId
+      SecurityGroupIds: [!Ref InstanceSecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref VolumeSizeGb
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub "goal-insight-web-${AWS::StackName}"
+      # UserData clones the repo, then execs the repo's provisioning script
+      # (installs Docker + NVIDIA toolkit, builds the image, downloads
+      # weights, starts the container under systemd). All the containerized
+      # provisioning logic lives in deploy/ec2_userdata.sh.
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee -a /var/log/goal-insight-provision.log) 2>&1
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y git
+          APP_DIR=/home/ubuntu/AgentCoach
+          if [ -d "$APP_DIR/.git" ]; then
+            git -C "$APP_DIR" fetch --depth 1 origin "${RepoBranch}"
+            git -C "$APP_DIR" checkout "${RepoBranch}"
+            git -C "$APP_DIR" reset --hard "origin/${RepoBranch}"
+          else
+            git clone --depth 1 --branch "${RepoBranch}" "${RepoUrl}" "$APP_DIR"
+          fi
+          chown -R ubuntu:ubuntu "$APP_DIR"
+          bash "$APP_DIR/deploy/ec2_userdata.sh"
+
+  # ---------------- Cognito ----------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "goal-insight-users-${AWS::StackName}"
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Ref CognitoDomainPrefix
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "goal-insight-alb-${AWS::StackName}"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !Sub "https://${LoadBalancer.DNSName}/oauth2/idpresponse"
+      LogoutURLs:
+        - !Sub "https://${LoadBalancer.DNSName}/"
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  AdminUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref AdminEmail
+      DesiredDeliveryMediums: [EMAIL]
+      UserAttributes:
+        - Name: email
+          Value: !Ref AdminEmail
+        - Name: email_verified
+          Value: "true"
+
+  # ---------------- ALB security group -----------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ingress 80/443 to goal-insight ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP public (redirects to 443)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS public
+
+  # App :8000 open to the ALB SG only (never the public internet).
+  Ec2AppPortFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref AppPort
+      ToPort: !Ref AppPort
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: ALB to goal-insight web
+
+  # ---------------- ALB --------------------------------------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: !Ref AppPort
+      TargetType: instance
+      Targets:
+        - Id: !Ref WebInstance
+          Port: !Ref AppPort
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200-399
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: HTTP_301
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !Ref ImportedCertArn
+      DefaultActions:
+        - Type: authenticate-cognito
+          Order: 1
+          AuthenticateCognitoConfig:
+            UserPoolArn: !GetAtt UserPool.Arn
+            UserPoolClientId: !Ref UserPoolClient
+            UserPoolDomain: !Ref UserPoolDomain
+            Scope: "openid email"
+            OnUnauthenticatedRequest: authenticate
+            SessionTimeout: 86400
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  AlbDns:
+    Value: !GetAtt LoadBalancer.DNSName
+    Description: Open https://<this>/ in a browser (skip the cert warning).
+  InstanceId:
+    Value: !Ref WebInstance
+  InstanceSecurityGroupId:
+    Value: !Ref InstanceSecurityGroup
+  CognitoUserPoolId:
+    Value: !Ref UserPool
+  CognitoClientId:
+    Value: !Ref UserPoolClient
+  CognitoHostedUIDomain:
+    Value: !Sub "${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"
+  TargetGroupArn:
+    Value: !Ref TargetGroup

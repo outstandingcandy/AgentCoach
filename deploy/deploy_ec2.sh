@@ -3,38 +3,35 @@
 # One-click deploy of the GoalInsight web app to a fresh GPU EC2 instance,
 # fronted by an internet-facing ALB + Cognito login.
 #
-# What it does (all steps idempotent — safe to re-run):
+# EVERYTHING is provisioned by a single CloudFormation stack
+# (deploy/full-stack.yaml): the EC2 instance, its IAM role + instance
+# profile, its security group, the ALB, and the Cognito user pool. This
+# script only does what CFN can't:
 #   1. Resolve region + account.
 #   2. Discover the default VPC and >=2 public subnets (unless overridden).
-#   3. Create-or-reuse an IAM role + instance profile granting Bedrock
-#      (chat) + SSM (keyless shell) access.
-#   4. Create-or-reuse the instance security group. IMPORTANT: the only
-#      externally-open port is SSH 22 (locked to the caller's IP). App port
-#      8000 is opened ONLY to the ALB's SG, and that rule is added by the
-#      CloudFormation stack (Ec2AppPortFromAlb) — never to 0.0.0.0/0.
-#   5. Resolve the latest Deep Learning GPU AMI (driver + CUDA preinstalled).
-#   6. Launch the GPU instance with deploy/ec2_userdata.sh (clones repo,
-#      installs the app, starts it under systemd).
-#   7. Wait for the instance, then hand off to deploy/bootstrap.sh which
-#      imports a self-signed cert and deploys the ALB + Cognito stack against
-#      the freshly-provisioned instance/SG.
+#   3. Generate + import a self-signed cert into ACM (ImportCertificate is
+#      not a CFN resource type).
+#   4. Deploy / update the stack, passing those values in.
+#
+# Delete everything later with: bash deploy/teardown.sh [--suffix <s>]
 #
 # Usage:
 #   bash deploy/deploy_ec2.sh <admin-email> [options]
 #
 # Options (also settable via env var):
-#   --region <r>          AWS region                (env AWS_REGION,   default us-east-1)
+#   --region <r>          AWS region                (env AWS_REGION,    default us-east-1)
 #   --instance-type <t>   GPU instance type         (env INSTANCE_TYPE, default g5.xlarge)
-#   --key-name <k>        EC2 SSH key pair name     (env KEY_NAME,     default none/SSM-only)
-#   --branch <b>          Repo branch to deploy     (env REPO_BRANCH,  default master)
+#   --key-name <k>        EC2 SSH key pair name     (env KEY_NAME,      default none/SSM-only)
+#   --branch <b>          Repo branch to deploy     (env REPO_BRANCH,   default master)
 #   --vpc-id <v>          Override VPC discovery     (env VPC_ID)
 #   --subnet-ids <a,b>    Override subnet discovery  (env SUBNET_IDS, comma-separated, >=2 AZs)
-#   --volume-size <gb>    Root EBS size in GiB      (env VOLUME_SIZE,  default 200)
+#   --volume-size <gb>    Root EBS size in GiB      (env VOLUME_SIZE,   default 200)
+#   --suffix <s>          Parallel-deploy suffix     (env SUFFIX) — distinct stack name + Cognito domain
 #
 # Cost note: g5.xlarge (A10G 24GB) is ~$1/hr on-demand — NOT free tier.
 # First boot takes ~15-25 min (install Docker + NVIDIA toolkit, then
-# docker build the image = torch + ML stack); the ALB target stays unhealthy
-# until the container is up. That's expected.
+# docker build the image); the ALB target stays unhealthy until the
+# container is up. That's expected.
 set -euo pipefail
 
 # ---- args -----------------------------------------------------------------
@@ -43,19 +40,17 @@ REGION="${AWS_REGION:-us-east-1}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-g5.xlarge}"
 KEY_NAME="${KEY_NAME:-}"
 REPO_BRANCH="${REPO_BRANCH:-master}"
+REPO_URL="${REPO_URL:-https://github.com/outstandingcandy/AgentCoach.git}"
 VPC_ID="${VPC_ID:-}"
 SUBNET_IDS="${SUBNET_IDS:-}"
 VOLUME_SIZE="${VOLUME_SIZE:-200}"
-# Optional suffix for a parallel deployment in a region that already has a
-# goal-insight stack. It's appended to the CFN stack name, the fixed CFN
-# resource names (ResourceSuffix), the Cognito domain, the instance Name tag,
-# and the instance SG name — so nothing collides with an existing stack.
+# Optional suffix for a parallel deployment alongside an existing stack.
 SUFFIX="${SUFFIX:-}"
 
-REPO_URL="https://github.com/outstandingcandy/AgentCoach.git"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROLE_NAME="goal-insight-ec2-role"
-PROFILE_NAME="goal-insight-ec2-profile"
+TEMPLATE="$SCRIPT_DIR/full-stack.yaml"
+CERT_DIR="$SCRIPT_DIR/.cert"
+CERT_CN="goal-insight-viewer.elb.amazonaws.com"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -67,27 +62,22 @@ while [[ $# -gt 0 ]]; do
     --subnet-ids)    SUBNET_IDS="$2"; shift 2 ;;
     --volume-size)   VOLUME_SIZE="$2"; shift 2 ;;
     --suffix)        SUFFIX="$2"; shift 2 ;;
-    -h|--help)       sed -n '2,45p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)       sed -n '2,38p' "$0" | sed 's/^# \?//'; exit 0 ;;
     -*)              echo "Unknown flag: $1" >&2; exit 2 ;;
     *)               ADMIN_EMAIL="$1"; shift ;;
   esac
 done
 
 if [[ -z "$ADMIN_EMAIL" ]]; then
-  echo "Usage: $0 <admin-email> [--region ...] [--instance-type ...] [--key-name ...]" >&2
+  echo "Usage: $0 <admin-email> [--region ...] [--instance-type ...] [--suffix ...]" >&2
   exit 1
 fi
 
 echo "==> Region: $REGION   Instance type: $INSTANCE_TYPE   Branch: $REPO_BRANCH"
-
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 echo "==> Account: $ACCOUNT_ID"
 
-# Derive suffixed names so a parallel deploy never collides with an existing
-# goal-insight stack. With no --suffix these reduce to the original names.
-STACK_NAME="goal-insight-alb-cognito${SUFFIX}"
-SG_NAME="goal-insight-ec2-sg${SUFFIX}"
-INSTANCE_NAME="goal-insight-web${SUFFIX}"
+STACK_NAME="goal-insight-full${SUFFIX}"
 COGNITO_DOMAIN_PREFIX="goal-insight-${ACCOUNT_ID}${SUFFIX}"
 [[ -n "$SUFFIX" ]] && echo "==> Parallel deploy suffix: '$SUFFIX' (stack $STACK_NAME)"
 
@@ -121,167 +111,84 @@ if [[ -z "$SUBNET_IDS" ]]; then
     echo "       Pass --subnet-ids sub-a,sub-b explicitly." >&2
     exit 1
   fi
-  # ALB wants all AZs it can get; the instance launches into the first.
   SUBNET_IDS="$(IFS=,; echo "${PICKED[*]}")"
   echo "==> Discovered public subnets: $SUBNET_IDS"
 fi
 LAUNCH_SUBNET="${SUBNET_IDS%%,*}"
 
-# ---- 2. IAM role + instance profile ---------------------------------------
-echo "==> Ensuring IAM role $ROLE_NAME..."
-if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-  aws iam create-role --role-name "$ROLE_NAME" \
-    --assume-role-policy-document '{
-      "Version":"2012-10-17",
-      "Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]
-    }' >/dev/null
-  echo "    created role"
+# ---- 2. Self-signed cert -> ACM (the one thing CFN can't do) --------------
+mkdir -p "$CERT_DIR"
+if [[ ! -f "$CERT_DIR/cert.pem" || ! -f "$CERT_DIR/key.pem" ]]; then
+  echo "==> Generating self-signed cert (CN=$CERT_CN)..."
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1825 \
+    -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
+    -subj "/CN=$CERT_CN" \
+    -addext "subjectAltName=DNS:$CERT_CN,DNS:*.elb.amazonaws.com"
+fi
+CERT_ARN="$(aws acm list-certificates --region "$REGION" \
+  --query "CertificateSummaryList[?DomainName=='$CERT_CN'].CertificateArn | [0]" \
+  --output text 2>/dev/null || true)"
+if [[ -n "$CERT_ARN" && "$CERT_ARN" != "None" ]]; then
+  echo "==> Reusing existing ACM cert: $CERT_ARN"
 else
-  echo "    role exists (reuse)"
+  echo "==> Importing cert to ACM..."
+  CERT_ARN="$(aws acm import-certificate --region "$REGION" \
+    --certificate "fileb://$CERT_DIR/cert.pem" \
+    --private-key "fileb://$CERT_DIR/key.pem" \
+    --tags "Key=goal-insight-cert,Value=true" \
+    --query CertificateArn --output text)"
+  echo "    cert arn = $CERT_ARN"
 fi
 
-# Managed policy for keyless SSM shell access.
-aws iam attach-role-policy --role-name "$ROLE_NAME" \
-  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore >/dev/null 2>&1 || true
-
-# Inline policy: Bedrock (chat) + AgentCore (run_python sandbox).
-aws iam put-role-policy --role-name "$ROLE_NAME" \
-  --policy-name goal-insight-bedrock \
-  --policy-document '{
-    "Version":"2012-10-17",
-    "Statement":[
-      {"Effect":"Allow",
-       "Action":["bedrock:InvokeModel","bedrock:InvokeModelWithResponseStream"],
-       "Resource":"*"},
-      {"Effect":"Allow",
-       "Action":["bedrock-agentcore:InvokeAgentRuntime","bedrock-agentcore:InvokeCodeInterpreter",
-                 "bedrock-agentcore:StartCodeInterpreterSession","bedrock-agentcore:StopCodeInterpreterSession",
-                 "bedrock-agentcore:GetCodeInterpreterSession","bedrock-agentcore:ListCodeInterpreterSessions"],
-       "Resource":"*"}
-    ]
-  }' >/dev/null
-echo "    attached SSM + Bedrock policies"
-
-echo "==> Ensuring instance profile $PROFILE_NAME..."
-if ! aws iam get-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/null 2>&1; then
-  aws iam create-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/null
-  aws iam add-role-to-instance-profile --instance-profile-name "$PROFILE_NAME" \
-    --role-name "$ROLE_NAME" >/dev/null
-  echo "    created profile + added role; waiting for propagation..."
-  sleep 15
-else
-  echo "    profile exists (reuse)"
-fi
-
-# ---- 3. Instance security group (SSH 22 only, from caller IP) -------------
-echo "==> Ensuring instance security group $SG_NAME..."
-SG_ID="$(aws ec2 describe-security-groups --region "$REGION" \
-  --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$VPC_ID" \
-  --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)"
-
-if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
-  SG_ID="$(aws ec2 create-security-group --region "$REGION" \
-    --group-name "$SG_NAME" --vpc-id "$VPC_ID" \
-    --description "goal-insight web instance: SSH only; :8000 opened to ALB SG by CFN" \
-    --query 'GroupId' --output text)"
-  echo "    created SG $SG_ID"
-else
-  echo "    SG exists (reuse): $SG_ID"
-fi
-
-# Lock SSH to the caller's current public IP only.
+# ---- 3. Resolve caller IP for SSH (optional) ------------------------------
+SSH_CIDR=""
 MY_IP="$(curl -s https://checkip.amazonaws.com || true)"
-if [[ -n "$MY_IP" ]]; then
-  aws ec2 authorize-security-group-ingress --region "$REGION" \
-    --group-id "$SG_ID" --protocol tcp --port 22 --cidr "${MY_IP}/32" \
-    >/dev/null 2>&1 && echo "    SSH 22 opened to ${MY_IP}/32" \
-    || echo "    SSH 22 rule already present"
-else
-  echo "    WARN: could not determine caller IP; no SSH rule added (use SSM to connect)."
-fi
-# NOTE: we deliberately do NOT open :8000 here. The CFN stack adds an
-# SG-to-SG ingress from the ALB only. No app port is ever public.
+[[ -n "$MY_IP" ]] && SSH_CIDR="${MY_IP}/32"
 
-# ---- 4. Resolve Deep Learning GPU AMI -------------------------------------
-echo "==> Resolving Deep Learning GPU AMI (Ubuntu 22.04)..."
-AMI_ID="$(aws ssm get-parameters --region "$REGION" \
-  --names /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id \
-  --query 'Parameters[0].Value' --output text 2>/dev/null || true)"
+# ---- 4. Deploy the full stack ---------------------------------------------
+echo "==> Deploying CloudFormation stack $STACK_NAME (everything in one place)..."
+aws cloudformation deploy --region "$REGION" \
+  --stack-name "$STACK_NAME" \
+  --template-file "$TEMPLATE" \
+  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_IAM \
+  --parameter-overrides \
+    VpcId="$VPC_ID" \
+    "SubnetIds=$SUBNET_IDS" \
+    LaunchSubnetId="$LAUNCH_SUBNET" \
+    InstanceType="$INSTANCE_TYPE" \
+    VolumeSizeGb="$VOLUME_SIZE" \
+    KeyName="$KEY_NAME" \
+    SshCidr="$SSH_CIDR" \
+    RepoUrl="$REPO_URL" \
+    RepoBranch="$REPO_BRANCH" \
+    ImportedCertArn="$CERT_ARN" \
+    CognitoDomainPrefix="$COGNITO_DOMAIN_PREFIX" \
+    AdminEmail="$ADMIN_EMAIL"
 
-if [[ -z "$AMI_ID" || "$AMI_ID" == "None" ]]; then
-  echo "    DLAMI lookup failed; falling back to stock Ubuntu 22.04 (userdata installs the driver)."
-  AMI_ID="$(aws ssm get-parameters --region "$REGION" \
-    --names /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
-    --query 'Parameters[0].Value' --output text)"
-fi
-echo "    AMI: $AMI_ID"
+echo
+echo "==> Stack deployed. Outputs:"
+aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK_NAME" \
+  --query 'Stacks[0].Outputs' --output table
 
-# ---- 5. Render user-data --------------------------------------------------
-USERDATA_TMP="$(mktemp)"
-trap 'rm -f "$USERDATA_TMP"' EXIT
-sed -e "s|__REPO_URL__|$REPO_URL|g" \
-    -e "s|__REPO_BRANCH__|$REPO_BRANCH|g" \
-    "$SCRIPT_DIR/ec2_userdata.sh" > "$USERDATA_TMP"
-
-# ---- 6. Launch (or reuse) the instance ------------------------------------
-# Reuse an existing running/pending instance tagged Name=$INSTANCE_NAME.
-INSTANCE_ID="$(aws ec2 describe-instances --region "$REGION" \
-  --filters "Name=tag:Name,Values=$INSTANCE_NAME" \
-            "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-  --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || true)"
-
-if [[ -n "$INSTANCE_ID" && "$INSTANCE_ID" != "None" ]]; then
-  echo "==> Reusing existing instance $INSTANCE_ID (skipping run-instances)."
-else
-  echo "==> Launching $INSTANCE_TYPE instance..."
-  KEY_ARGS=()
-  [[ -n "$KEY_NAME" ]] && KEY_ARGS=(--key-name "$KEY_NAME")
-
-  INSTANCE_ID="$(aws ec2 run-instances --region "$REGION" \
-    --image-id "$AMI_ID" \
-    --instance-type "$INSTANCE_TYPE" \
-    --iam-instance-profile "Name=$PROFILE_NAME" \
-    --security-group-ids "$SG_ID" \
-    --subnet-id "$LAUNCH_SUBNET" \
-    --associate-public-ip-address \
-    --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$VOLUME_SIZE,VolumeType=gp3}" \
-    --user-data "file://$USERDATA_TMP" \
-    "${KEY_ARGS[@]}" \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME}]" \
-    --query 'Instances[0].InstanceId' --output text)"
-  echo "    launched $INSTANCE_ID"
-fi
-
-echo "==> Waiting for instance to reach status OK (this can take a few minutes)..."
-aws ec2 wait instance-status-ok --region "$REGION" --instance-ids "$INSTANCE_ID"
-echo "    instance $INSTANCE_ID is up"
-
-# ---- 7. Hand off to bootstrap.sh (cert + ALB + Cognito CFN) ---------------
-echo "==> Deploying ALB + Cognito stack ($STACK_NAME) via bootstrap.sh..."
-export AWS_REGION="$REGION"
-export STACK_NAME
-export VPC_ID SUBNET_IDS
-export EC2_INSTANCE_ID="$INSTANCE_ID"
-export EC2_SG_ID="$SG_ID"
-export COGNITO_DOMAIN_PREFIX
-export RESOURCE_SUFFIX="$SUFFIX"
-bash "$SCRIPT_DIR/bootstrap.sh" "$ADMIN_EMAIL"
+ALB_DNS="$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK_NAME" \
+  --query "Stacks[0].Outputs[?OutputKey=='AlbDns'].OutputValue | [0]" --output text)"
+INSTANCE_ID="$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK_NAME" \
+  --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue | [0]" --output text)"
 
 echo
 echo "============================================================"
-echo "Deploy complete."
+echo "Deploy complete — all resources are in stack $STACK_NAME."
 echo "  Instance:  $INSTANCE_ID  ($INSTANCE_TYPE, $REGION)"
-echo "  App SG:    $SG_ID  (SSH 22 only; :8000 reachable from the ALB SG only)"
+echo "  URL:       https://$ALB_DNS/"
 echo
 echo "The instance is still provisioning (install Docker + NVIDIA toolkit,"
 echo "then docker build the image, ~15-25 min). The ALB target will be"
-echo "UNHEALTHY until 'systemctl status goal-insight-web' (the container)"
-echo "is active."
+echo "UNHEALTHY until the container is up."
 echo
 echo "Watch progress via SSM:"
 echo "  aws ssm start-session --region $REGION --target $INSTANCE_ID"
 echo "  sudo tail -f /var/log/goal-insight-provision.log"
 echo
-echo "Then open the AlbDns URL printed above (accept the self-signed cert),"
-echo "and sign in with $ADMIN_EMAIL + the Cognito temp password emailed to you."
+echo "Sign in with $ADMIN_EMAIL + the Cognito temp password emailed to you."
+echo "Tear down everything with: bash deploy/teardown.sh${SUFFIX:+ --suffix $SUFFIX}"
 echo "============================================================"

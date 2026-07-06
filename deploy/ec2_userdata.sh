@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# EC2 first-boot provisioning for the GoalInsight web app (CONTAINERIZED).
+# EC2 provisioning for the GoalInsight web app (CONTAINERIZED).
 #
-# Passed as --user-data by deploy/deploy_ec2.sh. Runs once as root via
-# cloud-init. Installs Docker + the NVIDIA container toolkit, clones the repo
-# (needed as the docker build context), builds the deployment image on the
+# Invoked by the CloudFormation stack's UserData AFTER it has cloned the repo
+# to /home/ubuntu/AgentCoach (see deploy/full-stack.yaml). This script installs
+# Docker + the NVIDIA container toolkit, builds the deployment image on the
 # instance, downloads model weights into the host workspace volume, and starts
 # the container under systemd.
 #
@@ -16,23 +16,20 @@
 # Assumes a Deep Learning GPU AMI (NVIDIA driver preinstalled). If the launcher
 # fell back to a stock Ubuntu AMI, the driver is installed below.
 #
-# All output is tee'd to /var/log/goal-insight-provision.log.
+# All output is tee'd to /var/log/goal-insight-provision.log (the UserData
+# wrapper already redirects there; this is a no-op safety net when run by hand).
 set -euo pipefail
-exec > >(tee -a /var/log/goal-insight-provision.log) 2>&1
-echo "==> goal-insight provisioning started at $(date -u)"
+echo "==> goal-insight container provisioning started at $(date -u)"
 
-# deploy_ec2.sh substitutes these two placeholders before upload.
-REPO_URL="__REPO_URL__"
-REPO_BRANCH="__REPO_BRANCH__"
 APP_DIR="/home/ubuntu/AgentCoach"
 IMAGE_TAG="goalinsight:deploy"
 
 export DEBIAN_FRONTEND=noninteractive
 
-# ---- 1. OS packages + git -------------------------------------------------
+# ---- 1. Base packages -----------------------------------------------------
 echo "==> Installing base packages..."
 apt-get update -y
-apt-get install -y git ca-certificates curl gnupg
+apt-get install -y ca-certificates curl gnupg
 
 # ---- 1b. GPU driver fallback (only if no NVIDIA driver present) -----------
 # The Deep Learning AMI already ships the driver; this is a safety net for a
@@ -76,23 +73,13 @@ fi
 nvidia-ctk runtime configure --runtime=docker
 systemctl restart docker
 
-# ---- 3. Clone the repo (docker build context) -----------------------------
-echo "==> Cloning $REPO_URL ($REPO_BRANCH) -> $APP_DIR"
-if [[ -d "$APP_DIR/.git" ]]; then
-  git -C "$APP_DIR" fetch --depth 1 origin "$REPO_BRANCH"
-  git -C "$APP_DIR" checkout "$REPO_BRANCH"
-  git -C "$APP_DIR" reset --hard "origin/$REPO_BRANCH"
-else
-  git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$APP_DIR"
-fi
+# ---- 3. Workspace + build the deployment image ----------------------------
 mkdir -p "$APP_DIR/workspace"
 chown -R ubuntu:ubuntu "$APP_DIR"
-
-# ---- 4. Build the deployment image ----------------------------------------
 echo "==> Building Docker image $IMAGE_TAG (~10-15 min: torch + ML stack)..."
 docker build -f "$APP_DIR/deploy/Dockerfile" -t "$IMAGE_TAG" "$APP_DIR"
 
-# ---- 5. Fetch the fine-tuned keypoint model into the host workspace -------
+# ---- 4. Fetch the fine-tuned keypoint model into the host workspace -------
 # Weights are too large for git (265MB) and workspace/ is gitignored, so the
 # ev_posw futsal keypoint model ships as a GitHub Release asset. Download it
 # into the flat layout the web picker scans (workspace/models/keypoint_*/ with
@@ -115,7 +102,7 @@ else
 fi
 KPMODEL
 
-# ---- 6. systemd service (manages the container) ---------------------------
+# ---- 5. systemd service (manages the container) ---------------------------
 echo "==> Installing systemd unit..."
 install -m 0644 "$APP_DIR/deploy/goal-insight-web.service" \
   /etc/systemd/system/goal-insight-web.service
