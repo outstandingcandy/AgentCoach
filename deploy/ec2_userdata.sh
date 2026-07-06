@@ -73,6 +73,28 @@ pip install --no-deps -e .
 mkdir -p workspace
 INSTALL
 
+# ---- 3b. Fetch the fine-tuned keypoint model ------------------------------
+# Weights are too large for git (265MB) and workspace/ is gitignored, so the
+# ev_posw futsal keypoint model ships as a GitHub Release asset. Download it
+# into the flat layout the web picker scans (workspace/models/keypoint_*/ with
+# best_model.pt + model_meta.json) so it shows up in "Pick a keypoint model".
+# Idempotent: skip when the sha256 already matches.
+echo "==> Fetching ev_posw keypoint model..."
+sudo -u ubuntu bash -eux <<'KPMODEL'
+cd /home/ubuntu/AgentCoach
+KP_DIR="workspace/models/keypoint_ev_posw"
+KP_SHA="baf423fc411c045ed7ccc20b201e366359253bf07e04666c7bbe76483ad7550b"
+BASE="https://github.com/outstandingcandy/AgentCoach/releases/download/keypoint-model-ev_posw"
+mkdir -p "$KP_DIR"
+if [ -f "$KP_DIR/best_model.pt" ] && echo "$KP_SHA  $KP_DIR/best_model.pt" | sha256sum -c - >/dev/null 2>&1; then
+  echo "keypoint model already present + verified; skipping download"
+else
+  curl -fSL "$BASE/best_model.pt"   -o "$KP_DIR/best_model.pt"
+  curl -fSL "$BASE/model_meta.json" -o "$KP_DIR/model_meta.json"
+  echo "$KP_SHA  $KP_DIR/best_model.pt" | sha256sum -c -
+fi
+KPMODEL
+
 # ---- 4. systemd service ---------------------------------------------------
 echo "==> Installing systemd unit..."
 install -m 0644 "$APP_DIR/deploy/goal-insight-web.service" \
