@@ -399,7 +399,7 @@ function applyState(state) {
       ? `<button class="tiny" data-manual-apply="${idx}" title="Rename to current dropdown selection">Apply</button>`
       : "";
     return `<li class="${sel}" data-manual-idx="${idx}">
-      <span class="body">[${p.hrnet_index}] ${p.name} → (${p.pixel[0].toFixed(0)}, ${p.pixel[1].toFixed(0)}) ⇒ (${p.world[0].toFixed(1)}, ${p.world[1].toFixed(1)})</span>
+      <span class="body">${p.name} <span style="opacity:.5">(idx ${p.hrnet_index})</span> → (${p.pixel[0].toFixed(0)}, ${p.pixel[1].toFixed(0)}) ⇒ (${p.world[0].toFixed(1)}, ${p.world[1].toFixed(1)})</span>
       ${applyBtn}
       <button class="tiny danger" data-manual-del="${idx}" title="Delete">✕</button>
     </li>`;
@@ -436,7 +436,7 @@ function applyState(state) {
     const flavor = ap.is_ground ? "auto-ground" : "auto-crossbar";
     const tag = ap.is_ground ? "" : "T";
     return `<li class="${cls}" data-auto-idx="${i}" title="Click to toggle">
-      <span class="body ${flavor}">[${ap.hrnet_index}]${tag} ${ap.name} → (${ap.pixel[0].toFixed(0)}, ${ap.pixel[1].toFixed(0)})</span>
+      <span class="body ${flavor}">${ap.name}${tag ? " ["+tag+"]" : ""} <span style="opacity:.5">(idx ${ap.hrnet_index})</span> → (${ap.pixel[0].toFixed(0)}, ${ap.pixel[1].toFixed(0)})</span>
       <button class="tiny" data-auto-promote="${i}" title="Promote to manual">↑M</button>
       <button class="${btnCls}">${btn}</button>
     </li>`;
@@ -462,7 +462,7 @@ async function reloadPitchGeometry() {
     const opt = document.createElement("option");
     opt.value = kp.name;
     const ground = kp.is_ground ? "" : " ⌃";
-    opt.textContent = `[${kp.hrnet_index}] ${kp.name}${ground}`;
+    opt.textContent = `${kp.name}${ground}`;
     kpSel.appendChild(opt);
   }
   if (prevKp && keypoints.some(kp => kp.name === prevKp)) kpSel.value = prevKp;

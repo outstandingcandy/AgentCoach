@@ -37,6 +37,32 @@ from ._runner_base import (
 logger = logging.getLogger(__name__)
 
 
+def _abbrev_landmark(name: str) -> str:
+    """Compact, still-unambiguous label for a keypoint NAME on the vis.
+
+    Full landmark names (e.g. ``B_TOUCH_AND_HALFWAY_LINES_INTERSECTION``)
+    overlap illegibly when ~30 are drawn on a crowded pitch, but a bare
+    channel id is ambiguous (the two id systems disagree). So shorten the
+    name with a fixed token map that preserves which point it is —
+    ``BR_PITCH_CORNER`` → ``BR-corner``, that touch/halfway intersection →
+    ``B-halfway×touch`` — rather than falling back to a number.
+    """
+    repl = [
+        ("_LINES", ""), ("_LINE", ""),  # drop before _AND_/_INTERSECTION
+        ("_AND_", "×"), ("_INTERSECTION", ""), ("PITCH_CORNER", "corner"),
+        ("PENALTY_AREA", "PA"), ("GOAL_AREA", "GA"), ("CENTER_CIRCLE", "CC"),
+        ("HALFWAY", "halfway"),
+        ("TOUCH", "touch"), ("PENALTY_ARC", "arc"), ("PENALTY_MARK", "pmark"),
+        ("MIDDLE_PENALTY", "midpen"), ("CENTER_MARK", "CTR"),
+        ("TANGENT", "tan"), ("16M", "16m"), ("_POST", "-post"),
+        ("_CORNER", "-cnr"), ("CIRCLE", "circ"),
+    ]
+    s = name
+    for a, b in repl:
+        s = s.replace(a, b)
+    return s.strip("_").replace("__", "_")
+
+
 def _stamp_source(vis: np.ndarray, label: str) -> None:
     """Stamp a small bottom-left tag on the calibration vis to identify which
     pipeline pass produced this frame's pose. Lets a reviewer scan the
@@ -1968,14 +1994,30 @@ def _draw_physical_calibration(frame, keypoints, lines, result, pitch_template,
         ON_LINE_TOL_M = 0.25
         ONLINE_COLOR = (0, 255, 255)   # yellow — coincides with lines
         OFFLINE_COLOR = (255, 0, 255)  # magenta — off-line feature point
+        # Label each landmark by its NAME, not a bare channel id. The two id
+        # systems in this codebase (annotator hrnet_index vs model
+        # pnlcalib_id) disagree on which integer means which point, so a
+        # naked number here is ambiguous — "28" is the centre-line/touchline
+        # intersection as a pnlcalib_id but the bottom-right corner as an
+        # hrnet_index. The keypoint NAME is the single unambiguous identity
+        # both systems alias, so show that. ``kid`` indexes
+        # ``_field_world_coords`` (pnlcalib_id order), so invert the
+        # name→pnlcalib_id table to recover the name.
+        try:
+            from ..annotation.pitch.keypoints import PITCH_POINT_TO_PNLCALIB_ID
+            _pnlcalib_id_to_name = {v: k for k, v in PITCH_POINT_TO_PNLCALIB_ID.items()}
+        except Exception:
+            _pnlcalib_id_to_name = {}
         for proj_idx, kid in enumerate(ground_ids):
             ix, iy = ground_proj[proj_idx]
             if -50 < ix < w + 50 and -50 < iy < h + 50:
                 pt = (int(ix), int(iy))
                 on_line = _dist_to_segments(ground_world[proj_idx][:2]) <= ON_LINE_TOL_M
                 color = ONLINE_COLOR if on_line else OFFLINE_COLOR
+                name = _pnlcalib_id_to_name.get(kid)
+                label = _abbrev_landmark(name) if name else str(kid)
                 cv2.circle(vis, pt, 3, color, -1)
-                cv2.putText(vis, str(kid), (pt[0] + 5, pt[1] - 3),
+                cv2.putText(vis, label, (pt[0] + 5, pt[1] - 3),
                             font, 0.3, color, 1)
 
         # Header
