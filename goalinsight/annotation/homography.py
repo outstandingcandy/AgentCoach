@@ -399,9 +399,31 @@ def solve_camera_physical(
     # through; PhysicalCalibrator pads to 5.
     dist_init = profile.get("dist_coeffs")
     w, h = int(img_size[0]), int(img_size[1])
-    focal_bounds = tuple(physical_cfg.get(
-        "focal_bounds", [K_init[0, 0] * 0.5, K_init[0, 0] * 2.0],
-    ))
+    # Focal bounds resolution, most-specific first. The lens field-of-view
+    # is a camera-fixed property, so it belongs on the profile — but a
+    # per-video override still wins for one-off rigs / crops:
+    #   1. per-video ``focal_bounds`` (legacy explicit px) or resolved
+    #      ``focal_hfov_deg_bounds`` — the resolver has already turned the
+    #      latter into ``physical_cfg["focal_bounds"]`` by this point.
+    #   2. profile ``focal_hfov_deg_bounds`` (camera-fixed FOV range).
+    #   3. profile K's fx ±10% (fx is the calibrated focal for K-bearing
+    #      profiles; a tight bracket keeps a physical solve near it).
+    #   4. last-ditch fx ×[0.5, 2.0].
+    import math as _math
+
+    def _hfov_to_focal(deg: float) -> float:
+        return w / (2.0 * _math.tan(_math.radians(deg) / 2.0))
+
+    if physical_cfg.get("focal_bounds") is not None:
+        focal_bounds = tuple(physical_cfg["focal_bounds"])
+    elif profile.get("focal_hfov_deg_bounds"):
+        lo_deg, hi_deg = profile["focal_hfov_deg_bounds"]
+        # wide fov (hi_deg) -> short focal (min); narrow -> long (max)
+        focal_bounds = (_hfov_to_focal(float(hi_deg)), _hfov_to_focal(float(lo_deg)))
+    elif K_init[0, 0] > 0:
+        focal_bounds = (K_init[0, 0] * 0.9, K_init[0, 0] * 1.1)
+    else:
+        focal_bounds = (K_init[0, 0] * 0.5, K_init[0, 0] * 2.0)
     cam_pos = physical_cfg.get("camera_position")
     if cam_pos is not None:
         cam_pos = tuple(float(v) for v in cam_pos)
