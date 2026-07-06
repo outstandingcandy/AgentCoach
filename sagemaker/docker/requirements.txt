@@ -1,7 +1,7 @@
 # Slim dependency set for SageMaker Processing Job — covers
-# field_registration and tracking only. Excludes VLM/OCR backends
-# (mmocr, mmcv, sam2, qwen-vl-utils, transformers) that aren't reachable
-# from these two stages and would balloon the image by GB.
+# field_registration and tracking only. Excludes VLM backends
+# (qwen-vl-utils, transformers) that aren't reachable from these two
+# stages and would balloon the image by GB.
 #
 # Keep in sync with goalinsight imports under field_registration/* and
 # tracking/* (excluding jersey backends, which only fire from

@@ -272,8 +272,8 @@ echo "Deploy complete."
 echo "  Instance:  $INSTANCE_ID  ($INSTANCE_TYPE, $REGION)"
 echo "  App SG:    $SG_ID  (SSH 22 only; :8000 reachable from the ALB SG only)"
 echo
-echo "The instance is still running its first-boot install (~15-25 min:"
-echo "clone + pip install torch/mmcv/mmocr). The ALB target will be"
+echo "The instance is still running its first-boot install (clone + pip"
+echo "install of torch and the ML stack, ~10 min). The ALB target will be"
 echo "UNHEALTHY until 'systemctl status goal-insight-web' is active."
 echo
 echo "Watch progress via SSM:"

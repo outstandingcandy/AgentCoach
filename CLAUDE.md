@@ -272,7 +272,6 @@ clusters. Multiple backends, selected via `track_consolidation.jersey.backend`:
 - **qwen** (`qwen_vlm_recognizer.py` / `qwen_vllm_recognizer.py`) — local
   Qwen-VL via HuggingFace transformers or a vLLM server (start with
   `bash scripts/start_qwen_vllm.sh`).
-- **mmocr** (`mmocr_recognizer.py`) — DBNet+SAR text recognition pipeline.
 - **rapidocr** (`rapidocr.py`) — fast lightweight OCR; `ocr_backend: rapidocr`
   switches the per-crop number reader away from the LLM while keeping the
   LLM for role/team.
@@ -363,7 +362,7 @@ YAML configs in `configs/` override `configs/default.yaml` via deep merge (`merg
 - `tracking.dump_yolo_raw`: dump raw YOLO detections to `yolo_raw/` for offline inspection
 - `reid.backend`: `osnet` | `prtreid`
 - `team_classification.backend`: `kmeans` | `tracklet`
-- `track_consolidation.jersey.backend`: `claude` | `gemini` | `qwen` | `mmocr`
+- `track_consolidation.jersey.backend`: `claude` | `gemini` | `qwen`
 - `track_consolidation.jersey.ocr_backend`: `llm` (LLM does numbers too) | `rapidocr` (LLM does role/team only)
 - `events.detectors`: list of enabled detectors (`possession`, `pass`, `shot`, `carry`, `defensive`)
 - `events.<detector>.*`: per-detector thresholds (distance, speed, angle, etc.)

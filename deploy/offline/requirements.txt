@@ -6,15 +6,6 @@
 # Drops vs repo's top-level requirements.txt:
 #   * fastapi / uvicorn / python-multipart — image is CLI-only
 #   * pytest — image is for end users, not CI
-#   * sam2 — declared in the repo's top-level requirements for future
-#     segmentation work but not imported by any current pipeline stage,
-#     and sam2>=1.1 demands torch>=2.5 which pip resolves into a wider
-#     torch upgrade than we want at build time
-#   * mmocr family — needs a from-source mmcv compile against torch
-#     headers (C++17, ~15 min build time, ~1 GB image bloat). Users
-#     who want OCR-based jersey reading should set
-#     ``track_consolidation.jersey.backend`` to claude / gemini /
-#     qwen and pass the matching API key at ``docker run`` time.
 
 # Detection & Tracking
 ultralytics==8.4.60

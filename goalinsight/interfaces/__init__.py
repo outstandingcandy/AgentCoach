@@ -3,7 +3,7 @@
 This module defines abstract base classes for all swappable components:
 - Calibration (PnLCalib, NBJW)
 - ReID extraction (OSNet, PRTReID)
-- Jersey recognition (Qwen VL, MMOCR)
+- Jersey recognition (Qwen VL, Claude, Gemini)
 - Team classification (KMeans, Tracklet clustering)
 - Team side labeling
 - Visualization (Minimal, Step-by-step)
