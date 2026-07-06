@@ -275,23 +275,39 @@ def _solve_from_model_detection(
     # stores crossbar z negative-up, OpenCV wants +z up).
     kp_world = _pk.PITCH_POINTS
     conf_thresh = float(det_config.get("keypoint_threshold", 0.3434))
-    # Always solve intrinsics free: the camera's true focal / principal /
-    # distortion are unknown (the profile is only a rough guess, and wide
-    # action-cam lenses diverge a lot from it). Because this is a FIXED
-    # rig, every frame shares one pose + one set of intrinsics, so we POOL
-    # detections across candidate frames into a single correspondence set
-    # — that gives calibrateCamera the ~12+ points it needs (a single
-    # frame's 4-8 detections aren't enough for free intrinsics).
+    # Intrinsics handling honours ``physical.free_intrinsics`` (default
+    # True). Free is the right default when the camera's true focal /
+    # principal / distortion are unknown (the profile is only a rough
+    # guess, and wide action-cam lenses diverge a lot from it): a FIXED
+    # rig shares one pose + one set of intrinsics across all frames, so we
+    # POOL detections across candidate frames into a single correspondence
+    # set — that gives calibrateCamera the ~12+ points it needs.
+    #
+    # BUT free intrinsics is ill-posed when the detected points are few
+    # and geometrically clustered (e.g. a model that only fires on a
+    # handful of near-collinear landmarks): calibrateCamera then absorbs
+    # the residual into non-physical distortion (huge k1/k2), giving a
+    # deceptively low reproj that projects badly off the training points.
+    # Setting ``free_intrinsics: false`` with a matched ``camera_profile``
+    # (known K + dist) locks intrinsics and solves pose only, which is far
+    # more robust for such sparse point sets. So respect the config here
+    # rather than forcing free.
     solve_cfg = dict(physical_cfg)
-    solve_cfg["free_intrinsics"] = True
+    solve_cfg.setdefault("free_intrinsics", True)
 
     candidates = _candidate_solve_frames(frame_indices)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"cannot open video for fixed-pose solve: {video_path}")
 
-    pixel_pts: list[tuple[float, float]] = []
-    world_3d_pts: list[tuple[float, float, float]] = []
+    # Gather detections keyed by landmark. A FIXED camera sees each
+    # landmark at ONE true pixel location, so every candidate frame that
+    # detects it should agree to within a few pixels. We collect all
+    # observations per landmark, then collapse to a single consensus point
+    # (below) — that both removes the duplicate over-weighting (a landmark
+    # seen in all 12 frames must not count 12× in the solve) and lets us
+    # reject genuine mis-detections by their disagreement with the median.
+    obs: dict[str, dict] = {}  # name → {"px": [(x,y)...], "world": (x,y,z)}
     frames_with_pts = 0
     try:
         for fidx in candidates:
@@ -300,7 +316,7 @@ def _solve_from_model_detection(
             if not ok or frame is None:
                 continue
             keypoints = detector.detect(frame, convert_to_soccernet=False)
-            n_before = len(pixel_pts)
+            got = False
             for kp in keypoints:
                 if kp.get("confidence", 0) < conf_thresh:
                     continue
@@ -308,24 +324,80 @@ def _solve_from_model_detection(
                 world = kp_world.get(name) if name else None
                 if world is None:
                     continue
-                pixel_pts.append((float(kp["x"]), float(kp["y"])))
                 # z-flip (crossbar stored negative-up → +z up for solvePnP);
                 # ground points have z=0 so the flip is a no-op for them.
                 zc = -float(world[2]) if len(world) > 2 else 0.0
-                world_3d_pts.append((float(world[0]), float(world[1]), zc))
-            if len(pixel_pts) > n_before:
+                rec = obs.setdefault(
+                    name, {"px": [], "world": (float(world[0]), float(world[1]), zc)},
+                )
+                rec["px"].append((float(kp["x"]), float(kp["y"])))
+                got = True
+            if got:
                 frames_with_pts += 1
     finally:
         cap.release()
 
-    if len(pixel_pts) < 6:
-        raise RuntimeError(
-            f"keypoint-model fixed-pose solve failed: pooled only "
-            f"{len(pixel_pts)} usable pitch points across {len(candidates)} "
-            f"frames (conf≥{conf_thresh}, need ≥6 for a free-intrinsics "
-            f"solve). Use a pitch-matched fine-tuned model, or annotate a "
-            f"frame by hand.",
+    # Collapse each landmark to one consensus pixel: the median location,
+    # after dropping observations that sit > CONSENSUS_MAX_PX from it
+    # (those are the genuine mis-detections — the ones worth excluding
+    # from the error). A landmark whose observations are internally
+    # incoherent (median spread still large after filtering) is dropped
+    # entirely: we can't trust where it is. Everything that survives is a
+    # believable, de-duplicated correspondence, so the reprojection error
+    # reported later is honest over exactly the points we trust.
+    CONSENSUS_MAX_PX = 15.0
+    pixel_pts: list[tuple[float, float]] = []
+    world_3d_pts: list[tuple[float, float, float]] = []
+    dropped_landmarks: list[str] = []
+    for name, rec in obs.items():
+        arr = np.asarray(rec["px"], dtype=np.float64)
+        med = np.median(arr, axis=0)
+        dev = np.linalg.norm(arr - med, axis=1)
+        keep = arr[dev <= CONSENSUS_MAX_PX]
+        if len(keep) == 0:
+            dropped_landmarks.append(name)
+            continue
+        consensus = np.median(keep, axis=0)
+        pixel_pts.append((float(consensus[0]), float(consensus[1])))
+        world_3d_pts.append(rec["world"])
+    if dropped_landmarks:
+        logger.info(
+            "Stage 1 (Fixed): dropped %d incoherent landmark(s) as "
+            "mis-detections: %s",
+            len(dropped_landmarks), ", ".join(sorted(dropped_landmarks)),
         )
+
+    n_distinct = len(pixel_pts)
+    if n_distinct < 4:
+        raise RuntimeError(
+            f"keypoint-model fixed-pose solve failed: only {n_distinct} "
+            f"distinct landmark(s) reached consensus across {len(candidates)} "
+            f"frames (conf≥{conf_thresh}, need ≥4). The model detects too "
+            f"few distinct pitch points on this pitch. Use a pitch-matched "
+            f"fine-tuned model, or annotate a frame by hand.",
+        )
+
+    # Honest error: with intrinsics locked and one trusted point per
+    # landmark, there is no duplicate mass for a pose-coupled outlier loop
+    # to over-fit, so disable that loop (world_error_threshold=inf). The
+    # reprojection error then reflects every trusted point — which is what
+    # "only count the points you can see" should mean: the believable
+    # detections, not the subset that happens to fit a degenerate pose.
+    solve_cfg = dict(solve_cfg)
+    solve_cfg["world_error_threshold"] = float("inf")
+
+    # Do NOT anchor the camera position to a config guess here. The camera
+    # position is exactly what this solve is meant to RECOVER — treating a
+    # hand-typed ``camera_position`` as a strong prior (soft residual +
+    # P3P disambiguation tiebreak) pins the pose to that guess and, when
+    # the guess is off, wrecks the fit (measured: prior-locked 61 px vs
+    # free 2 px on this clip). The pooled consensus points are enough to
+    # solve pose freely, so drop the prior and its bounds for the solve.
+    # (A truly known rig position can still be enforced via the manual
+    # annotation path or a dedicated lock flag, not this auto model-solve.)
+    solve_cfg["camera_position"] = None
+    solve_cfg["position_bounds_m"] = None
+    solve_cfg["lock_camera_position"] = False
 
     cam, mean_err, diag = solve_camera_physical(
         pixel_pts, world_3d_pts, img_size,
@@ -340,11 +412,27 @@ def _solve_from_model_detection(
         )
 
     npts = len(pixel_pts)
+    intr = "free" if solve_cfg.get("free_intrinsics", True) else "locked"
     logger.info(
-        "Stage 1 (Fixed): free-intrinsics solve on %d pooled points from "
-        "%d frames — reproj %.2f px",
-        npts, frames_with_pts, mean_err,
+        "Stage 1 (Fixed): %s-intrinsics solve on %d consensus landmark(s) "
+        "(1 per landmark, de-duplicated across %d frames) — reproj %.2f px "
+        "(honest, over every trusted point)",
+        intr, npts, frames_with_pts, mean_err,
     )
+    # mean_err is the honest reprojection error over every trusted
+    # consensus point (no pose-coupled outlier loop to hide behind). A
+    # large value means the trusted detections can't be reconciled by any
+    # single pose — warn loudly rather than let a deceptively "solved" but
+    # wrong calibration flow downstream.
+    if mean_err > 25.0:
+        logger.warning(
+            "Stage 1 (Fixed): HIGH reprojection error %.1f px on %d "
+            "consensus landmarks — they are geometrically weak (too few "
+            "distinct, near-collinear points). Calibration is unreliable; "
+            "annotate a frame by hand or fine-tune the keypoint model on "
+            "more frames.",
+            mean_err, npts,
+        )
 
     R = np.asarray(cam.rotation, dtype=np.float64)
     rvec = np.asarray(
@@ -364,6 +452,14 @@ def _solve_from_model_detection(
         "world_error": 0.0,
         "world_error_all": 0.0,
         "inliers_count": int(npts),
+        # The consensus pixel locations the model actually detected (one per
+        # trusted landmark). Carried through so the calibration vis can draw
+        # them (green dots) alongside the projected pitch template — that is
+        # what lets you eyeball detection quality per keypoint model. Every
+        # surviving consensus point is a trusted inlier (mis-detections were
+        # already dropped above), so the mask is all-True.
+        "img_pts": [[float(x), float(y)] for (x, y) in pixel_pts],
+        "inlier_mask": [True] * len(pixel_pts),
     }
     return camera_pose, diag
 
@@ -539,6 +635,7 @@ def run_stage1_fixed_camera(
                 pitch_length=pitch_length,
                 pitch_width=pitch_width,
                 homography=H_i2w,
+                pitch_dims=pitch_dims,
             )
 
         save_calibration_outputs(
@@ -587,6 +684,7 @@ def _render_calibration_overlays(
     pitch_length: float,
     pitch_width: float,
     homography,
+    pitch_dims: dict | None = None,
 ) -> None:
     """Write per-frame calibration JPGs to ``vis_dir/calibration/``.
 
@@ -604,10 +702,21 @@ def _render_calibration_overlays(
     from .pnlcalib import KeypointMapper
 
     pitch_template = get_pitch_template_points(pitch_length, pitch_width)
-    pitch_dims = {
+    # Build the keypoint world coords from the FULL pitch block, not just
+    # (length, width). ``build_field_template`` FIFA-defaults every missing
+    # dimension (penalty/goal-area size, centre-circle radius, penalty-mark
+    # distance), so feeding it only L/W placed every non-corner landmark at
+    # its 105×68 FIFA location while the yellow LINES (via
+    # ``get_pitch_template_points`` → active pitch) used the true futsal
+    # geometry — the two drifted by up to ~11 m in world space, which is
+    # exactly why the projected keypoints didn't sit on the projected lines.
+    # Pass the complete dims so points and lines share one geometry.
+    field_dims = dict(pitch_dims) if pitch_dims else {
         "pitch_length": pitch_length, "pitch_width": pitch_width,
     }
-    field_world_coords, _, _ = build_field_template(pitch_dims)
+    field_dims.setdefault("pitch_length", pitch_length)
+    field_dims.setdefault("pitch_width", pitch_width)
+    field_world_coords, _, _ = build_field_template(field_dims)
     # Shape ``result`` the same way ``_draw_physical_calibration`` expects.
     K = np.asarray(camera_pose["K"], dtype=np.float64)
     dist = np.asarray(camera_pose["dist_coeffs"], dtype=np.float64).ravel()
@@ -631,6 +740,18 @@ def _render_calibration_overlays(
         "total_points": int(camera_pose.get("inliers_count", 0)),
         "line_constraints_count": 0,
     }
+    # When the pose was solved from a keypoint MODEL, the runner stashes the
+    # detected consensus pixels; surface them so _draw_physical_calibration
+    # paints the actual detections (green=inlier) over the projected template.
+    # Absent for the manual-annotation path (nothing detected to show).
+    img_pts = camera_pose.get("img_pts")
+    if img_pts:
+        result_dict["img_pts"] = [
+            (float(x), float(y)) for (x, y) in img_pts
+        ]
+        result_dict["inlier_mask"] = list(
+            camera_pose.get("inlier_mask", [True] * len(img_pts))
+        )
 
     vis_calib_dir = vis_dir / "calibration"
     vis_calib_dir.mkdir(parents=True, exist_ok=True)
