@@ -80,3 +80,8 @@ profiles:
     - [0.0, 946.25, 619.67]
     - [0.0, 0.0, 1.0]
     dist_coeffs: [0.4783, -0.3896, 0.0328, 0.0671, 0.0000]
+    # Lens field-of-view bounds (camera-fixed property). fx=946.25 → HFOV
+    # ≈90.8°; this range brackets it so a physical solve can nudge focal
+    # a little without drifting off the calibrated value. A per-video
+    # focal_hfov_deg_bounds / focal_bounds still overrides this.
+    focal_hfov_deg_bounds: [88.0, 94.0]
