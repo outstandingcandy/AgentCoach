@@ -178,15 +178,49 @@ def project_pitch_to_image(H, template_points, camera_params=None):
 
 
 def _project_with_camera_model(template_points, camera_params):
-    """Project pitch template using full pinhole + distortion model."""
+    """Project pitch template using full pinhole + distortion model.
+
+    Long straight world segments (e.g. touchlines, which are given as just
+    two corner endpoints) must be densified BEFORE projection: with real
+    lens distortion a straight world line maps to a *curved* image line, so
+    projecting only the endpoints and connecting them with a straight image
+    segment cuts the corner — the midpoint can miss the true projected line
+    by tens or even hundreds of pixels (measured ~480 px at k1≈0.7). This
+    is also why a landmark that genuinely sits on the line (e.g. the
+    centre-line/touchline intersection) appeared to float off the drawn
+    touchline. Sample every segment at a fixed world-space spacing so the
+    projected polyline follows the true distorted curve and passes through
+    such landmarks.
+    """
     rvec = camera_params["rvec"]
     tvec = camera_params["tvec"]
     K = camera_params["K"]
     dist = camera_params["dist_coeffs"]
 
+    # Max world-space gap (metres) between consecutive samples along a
+    # segment. ~0.5 m keeps even a full-length touchline smooth without
+    # exploding the point count.
+    MAX_SEG_M = 0.5
+
     projected = {}
     for name, points in template_points.items():
-        obj = np.array([[pt[0], pt[1], 0.0] for pt in points], dtype=np.float64)
+        # Densify: insert intermediate points along each consecutive pair so
+        # distortion is captured along the whole segment, not just at nodes.
+        dense: list[tuple[float, float]] = []
+        for i, pt in enumerate(points):
+            if i == 0:
+                dense.append((pt[0], pt[1]))
+                continue
+            prev = points[i - 1]
+            seg = np.hypot(pt[0] - prev[0], pt[1] - prev[1])
+            n_sub = max(1, int(np.ceil(seg / MAX_SEG_M)))
+            for s in range(1, n_sub + 1):
+                t = s / n_sub
+                dense.append((
+                    prev[0] + t * (pt[0] - prev[0]),
+                    prev[1] + t * (pt[1] - prev[1]),
+                ))
+        obj = np.array([[x, y, 0.0] for x, y in dense], dtype=np.float64)
         img_pts, in_front = project_points_with_visibility(obj, rvec, tvec, K, dist)
         proj_points = [
             (int(p[0]), int(p[1])) if vis else None
