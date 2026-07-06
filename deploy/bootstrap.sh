@@ -61,14 +61,29 @@ else
 fi
 
 # 3. Deploy CFN stack
+#
+# ImportedCertArn + AdminEmail are always overridden. The remaining CFN
+# params (VpcId / SubnetIds / Ec2InstanceId / Ec2ExistingSecurityGroupId /
+# CognitoDomainPrefix) keep their template defaults unless the matching env
+# var is set — this lets deploy_ec2.sh feed in freshly-provisioned resource
+# IDs while the old raw2real-account defaults keep working when unset.
+PARAM_OVERRIDES=(
+  ImportedCertArn="$CERT_ARN"
+  AdminEmail="$ADMIN_EMAIL"
+)
+[[ -n "${VPC_ID:-}"               ]] && PARAM_OVERRIDES+=( VpcId="$VPC_ID" )
+[[ -n "${SUBNET_IDS:-}"           ]] && PARAM_OVERRIDES+=( "SubnetIds=$SUBNET_IDS" )
+[[ -n "${EC2_INSTANCE_ID:-}"      ]] && PARAM_OVERRIDES+=( Ec2InstanceId="$EC2_INSTANCE_ID" )
+[[ -n "${EC2_SG_ID:-}"            ]] && PARAM_OVERRIDES+=( Ec2ExistingSecurityGroupId="$EC2_SG_ID" )
+[[ -n "${COGNITO_DOMAIN_PREFIX:-}" ]] && PARAM_OVERRIDES+=( CognitoDomainPrefix="$COGNITO_DOMAIN_PREFIX" )
+[[ -n "${RESOURCE_SUFFIX:-}"       ]] && PARAM_OVERRIDES+=( ResourceSuffix="$RESOURCE_SUFFIX" )
+
 echo "==> Deploying CFN stack $STACK_NAME..."
 aws cloudformation deploy --region "$REGION" \
   --stack-name "$STACK_NAME" \
   --template-file "$TEMPLATE" \
   --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides \
-    ImportedCertArn="$CERT_ARN" \
-    AdminEmail="$ADMIN_EMAIL"
+  --parameter-overrides "${PARAM_OVERRIDES[@]}"
 
 # 4. Print outputs
 echo

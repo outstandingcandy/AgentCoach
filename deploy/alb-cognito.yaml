@@ -38,13 +38,21 @@ Parameters:
   AdminEmail:
     Type: String
     Description: Email address that will be created as the first admin user.
+  ResourceSuffix:
+    Type: String
+    Default: ""
+    Description: >
+      Optional suffix appended to the fixed resource names (ALB, target
+      group, ALB SG, Cognito user pool / client) so a second parallel stack
+      can be deployed in the same region without name collisions. Leave empty
+      to keep the original names (backward compatible with the first stack).
 
 Resources:
   # ---------------- Cognito ----------------
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
-      UserPoolName: goal-insight-users
+      UserPoolName: !Sub "goal-insight-users${ResourceSuffix}"
       # Admin-create only; no self-signup. Mirror raw2real if you want signup
       # later, set AllowAdminCreateUserOnly=false here.
       AdminCreateUserConfig:
@@ -68,7 +76,7 @@ Resources:
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
     Properties:
-      ClientName: goal-insight-alb
+      ClientName: !Sub "goal-insight-alb${ResourceSuffix}"
       UserPoolId: !Ref UserPool
       GenerateSecret: true        # required for ALB authenticate-cognito
       AllowedOAuthFlowsUserPoolClient: true
@@ -99,7 +107,7 @@ Resources:
   AlbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: goal-insight-alb-sg
+      GroupName: !Sub "goal-insight-alb-sg${ResourceSuffix}"
       GroupDescription: Public ingress 80/443 to goal-insight ALB
       VpcId: !Ref VpcId
       SecurityGroupIngress:
@@ -130,7 +138,7 @@ Resources:
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: goal-insight-alb
+      Name: !Sub "goal-insight-alb${ResourceSuffix}"
       Scheme: internet-facing
       Type: application
       IpAddressType: ipv4
@@ -140,7 +148,7 @@ Resources:
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: goal-insight-tg
+      Name: !Sub "goal-insight-tg${ResourceSuffix}"
       VpcId: !Ref VpcId
       Protocol: HTTP
       Port: !Ref AppPort
