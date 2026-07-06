@@ -522,10 +522,18 @@ def solve_camera_physical(
         "mode": "physical",
         "inliers": int(result.get("inliers", 0)),
         "total": int(result.get("total_points", len(pixel_pts))),
+        "full_reproj_error": float(result.get("full_reproj_error", result["final_error"])),
+        "n_full_points": int(result.get("n_full_points", len(pixel_pts))),
         "profile": profile_name,
         "unresolved": 0,
     }
-    mean_err = float(result["final_error"])
+    # Report the HONEST error over every input correspondence, not just
+    # the survivors of world-error outlier rejection. The inlier-only
+    # ``final_error`` can read ~0 on a degenerate subset while the pose is
+    # wildly wrong for the rest (see PhysicalCalibrator._calibrate_core);
+    # propagating that fooled every downstream reproj readout. Callers
+    # that specifically want the inlier error can read it from the diag.
+    mean_err = float(result.get("full_reproj_error", result["final_error"]))
     return cam, mean_err, diagnostics
 
 
