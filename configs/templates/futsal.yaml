@@ -12,16 +12,11 @@
 #                                      pnlcalib's HRNet was trained
 #                                      on broadcast 11-a-side and does
 #                                      not transfer to futsal)
-#   * reid.backend: clip_reid          (better player separation when
-#                                      same-coloured kits appear from
-#                                      a low fixed angle; weights live
-#                                      at /opt/goalinsight/models/clip_reid/
-#                                      inside the docker image)
-#   * tracking.max_cosine_distance: 0.012
-#                                     (CLIP-ReID's cosines compress
-#                                      into the [0.96, 1.0] band; the
-#                                      OSNet default 0.2 would never
-#                                      reject a match.)
+#   (reid.backend stays osnet, same as the other pitch templates — the
+#    ReID model is a system choice, not a pitch property. clip_reid is
+#    opt-in: set reid.backend: clip_reid AND fill reid.clip_reid.weights_path
+#    AND drop tracking.max_cosine_distance to ~0.012 for its compressed
+#    cosine band.)
 
 pitch_type: futsal
 
@@ -162,10 +157,13 @@ tracking:
   max_iou_distance_tentative: 0.55
   reid_iou_min: 0.1
   reid_pitch_max_m: 0.8
-  # CLIP-ReID concentrates cosines in [0.96, 1.0]; the OSNet default
-  # max_cosine_distance: 0.2 would accept every nearby track. Flip
-  # back to 0.2 if you switch reid.backend back to osnet/prtreid.
-  max_cosine_distance: 0.012
+  # OSNet cosine distances spread across a wide band, so 0.2 is the right
+  # gate (this matches the fifa/children templates, which leave it at the
+  # code default). The old 0.012 here was tuned for clip_reid, whose
+  # cosines compress into [0.96, 1.0]; keeping 0.012 with osnet would
+  # reject almost every real match and shatter tracks. If you switch
+  # reid.backend back to clip_reid, restore 0.012.
+  max_cosine_distance: 0.2
   # Per-frame visualization JPGs + tracking.mp4 are what the /pipeline
   # page shows for the tracking stage; keep them on so a fresh user
   # sees results end-to-end. Turn any of these off in a per-video
@@ -175,7 +173,13 @@ tracking:
   dump_ball_diag: true
 
 reid:
-  backend: clip_reid
+  # ReID backend is a system/algorithm choice, not a pitch property, so it
+  # matches the other pitch templates (osnet). OSNet loads real imagenet
+  # weights and runs ~4.5× faster than the clip_reid path here, which had
+  # no weights_path wired up and silently fell back to a randomly-init
+  # ViT-L-14 (useless embeddings + ~26 s wasted per 30 s clip). Switch to
+  # clip_reid only after filling in reid.clip_reid.weights_path.
+  backend: osnet
   model: osnet_x1_0
   feature_dim: 512
   batch_size: 32
