@@ -430,6 +430,15 @@ class PhysicalCalibrator:
         # with iterative world-error-based outlier rejection
         MAX_WORLD_OUTLIER_ITERS = 3
 
+        # Preserve the ORIGINAL, unfiltered correspondence set. The
+        # world-error outlier loop below can shrink the working set a lot;
+        # reporting reprojection error only on the survivors is deceptive
+        # (a degenerate 12-point subset can fit near-perfectly while the
+        # pose is wrong for the other 40). ``full_*`` lets us also report
+        # an honest error over everything the caller passed in.
+        full_img_pts = np.asarray(img_pts, dtype=np.float64).reshape(-1, 2)
+        full_world_pts = np.asarray(world_pts, dtype=np.float64).reshape(-1, 3)
+
         cur_img_pts = img_pts
         cur_world_pts = world_pts
         cur_kp_ids = kp_ids
@@ -534,6 +543,13 @@ class PhysicalCalibrator:
         mean_error, inlier_mask, inlier_count = self._compute_reprojection_stats(
             rvec_opt, tvec_opt, img_pts, world_pts, K=K_opt, dist=dist_opt
         )
+        # Honest error over EVERY input correspondence (not just the
+        # survivors of outlier rejection). When the two diverge sharply,
+        # the pose fits a degenerate subset and shouldn't be trusted.
+        full_reproj_err = float(np.mean(np.linalg.norm(
+            project_points_2d(full_world_pts, rvec_opt, tvec_opt, K_opt, dist_opt)
+            - full_img_pts, axis=1,
+        ))) if len(full_img_pts) else float(mean_error)
         world_error, per_point_world_errors = self._compute_world_error(
             rvec_opt, tvec_opt, img_pts, world_pts, K=K_opt, dist=dist_opt
         )
@@ -553,6 +569,8 @@ class PhysicalCalibrator:
         return {
             "homography": H,
             "final_error": float(mean_error),
+            "full_reproj_error": float(full_reproj_err),
+            "n_full_points": int(len(full_img_pts)),
             "world_error": float(world_error),
             "world_error_all": float(world_error_all),
             "per_point_world_errors": per_point_world_errors,
