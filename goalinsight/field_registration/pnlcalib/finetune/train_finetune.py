@@ -168,10 +168,24 @@ class MaskedMSELoss(nn.Module):
 
     Only computes loss for keypoint channels where mask == 1,
     ignoring invisible keypoints during training.
+
+    Args:
+        pos_weight: Extra weight on the Gaussian-peak pixels of a target
+            heatmap (pixels where ``target > pos_thresh``). Each keypoint
+            channel's target is a tiny Gaussian (~a dozen non-zero pixels)
+            surrounded by ~130k zero pixels; under plain per-pixel MSE the
+            network minimises loss by predicting ~0 everywhere, so peaks
+            never climb toward 1.0 and most channels stay dead even on the
+            training frame. Up-weighting the peak pixels forces the network
+            to actually reproduce the Gaussian. ``1.0`` (default) reproduces
+            the original unweighted behaviour exactly.
+        pos_thresh: Target value above which a pixel counts as "peak".
     """
 
-    def __init__(self):
+    def __init__(self, pos_weight: float = 1.0, pos_thresh: float = 0.1):
         super().__init__()
+        self.pos_weight = float(pos_weight)
+        self.pos_thresh = float(pos_thresh)
 
     def forward(
         self,
@@ -196,21 +210,32 @@ class MaskedMSELoss(nn.Module):
         mask_expanded = mask.unsqueeze(-1).unsqueeze(-1)
         mask_spatial = mask_expanded.expand(-1, -1, height, width)
 
-        # Only apply mask to keypoint channels (not background)
-        # Compute loss for keypoint channels
-        kp_loss = ((pred[:, :-1] - target[:, :-1]) ** 2) * mask_spatial
+        # Per-pixel squared error for the keypoint channels.
+        kp_se = (pred[:, :-1] - target[:, :-1]) ** 2
+
+        if self.pos_weight != 1.0:
+            # Weight the peak (Gaussian) pixels more heavily so the network
+            # is pushed to reproduce the peak instead of collapsing to
+            # all-zero. Denominator matches the weighting to keep a proper
+            # weighted mean.
+            peak = (target[:, :-1] > self.pos_thresh).float()
+            weight = 1.0 + (self.pos_weight - 1.0) * peak
+            kp_loss = kp_se * mask_spatial * weight
+            denom = (mask_spatial * weight).sum()
+        else:
+            kp_loss = kp_se * mask_spatial
+            denom = mask_spatial.sum()
 
         # Compute loss for background channel (always included)
         bg_loss = (pred[:, -1:] - target[:, -1:]) ** 2
 
         # Count number of visible keypoint pixels
-        num_visible = mask_spatial.sum()
-        if num_visible == 0:
+        if denom == 0:
             # No visible keypoints, only compute background loss
             return bg_loss.mean()
 
         # Average loss
-        kp_mean = kp_loss.sum() / num_visible
+        kp_mean = kp_loss.sum() / denom
         bg_mean = bg_loss.mean()
 
         return 0.5 * kp_mean + 0.5 * bg_mean
@@ -523,6 +548,23 @@ def main():
         default=0.3,
         help="Confidence threshold for visualization",
     )
+    parser.add_argument(
+        "--pos_weight",
+        type=float,
+        default=1.0,
+        help="Weight on the Gaussian-peak pixels in the heatmap MSE loss. "
+             ">1 forces the network to reproduce peaks instead of collapsing "
+             "to all-zero (fixes dead channels on small datasets, e.g. a "
+             "single annotated frame). 1.0 = original unweighted behaviour. "
+             "Try ~100 for very sparse data.",
+    )
+    parser.add_argument(
+        "--pos_thresh",
+        type=float,
+        default=0.1,
+        help="Target heatmap value above which a pixel is treated as a "
+             "peak for --pos_weight (default: 0.1)",
+    )
 
     args = parser.parse_args()
 
@@ -616,7 +658,15 @@ def main():
     )
 
     # Loss and optimizer
-    loss_fn = MaskedMSELoss()
+    loss_fn = MaskedMSELoss(
+        pos_weight=args.pos_weight,
+        pos_thresh=args.pos_thresh,
+    )
+    if args.pos_weight != 1.0:
+        print(
+            f"Peak-weighted MSE: pos_weight={args.pos_weight}, "
+            f"pos_thresh={args.pos_thresh}"
+        )
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
