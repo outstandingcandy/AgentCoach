@@ -286,17 +286,6 @@
              saveSceneBasics() reads them unchanged. -->
         <input id="wiz-pos-x" type="hidden" value="-20">
         <input id="wiz-pos-y" type="hidden" value="-10">
-        <p style="color:#9aa3ad;font-size:12px;margin:12px 0 6px 0">
-          Horizontal field of view (degrees):
-        </p>
-        <div style="display:flex;gap:6px;align-items:center">
-          <label style="color:#9aa3ad">min</label>
-          <input id="wiz-hfov-lo" type="number" value="70" min="20" max="120"
-                 step="1" style="width:80px">
-          <label style="color:#9aa3ad;margin-left:8px">max</label>
-          <input id="wiz-hfov-hi" type="number" value="90" min="20" max="120"
-                 step="1" style="width:80px">
-        </div>
       </section>
 
       <!-- Step 3: keypoint model + preview -->
@@ -1176,10 +1165,10 @@
           parseFloat($("#wiz-pos-y").value),
           parseFloat($("#wiz-pos-z").value),
         ],
-        focal_hfov_deg_bounds: [
-          parseFloat($("#wiz-hfov-lo").value),
-          parseFloat($("#wiz-hfov-hi").value),
-        ],
+        // Focal / field-of-view bounds are a camera-fixed property and now
+        // live on the camera profile (camera_profiles.yaml:
+        // focal_hfov_deg_bounds), so the wizard no longer collects them —
+        // omitting the key lets the profile drive it.
       };
       const res = await api('POST',
         `/api/library/videos/${encodeURIComponent(wizState.video)}/scene-setup`,
