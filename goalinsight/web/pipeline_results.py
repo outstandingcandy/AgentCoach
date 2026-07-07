@@ -133,6 +133,23 @@ def _digits_of(dir_path: Path, ext: str = ".jpg") -> int:
     return 5
 
 
+def _keypoint_id_names() -> dict[int, str]:
+    """pnlcalib_id → landmark name, for labelling detected keypoints.
+
+    The per-frame calibration sidecars carry keypoint ``id`` (the model
+    output channel == pnlcalib_id) but leave ``class_name`` blank, so the
+    front-end can't name a point on its own. We ship the inverse of
+    ``PITCH_POINT_TO_PNLCALIB_ID`` (name→id) once in the manifest and let
+    JS look each id up. Import lazily so a missing calibration package
+    never breaks the (unrelated) tracking / events manifests.
+    """
+    try:
+        from ..annotation.pitch.keypoints import PITCH_POINT_TO_PNLCALIB_ID
+    except Exception:  # pragma: no cover - defensive: keep manifest usable
+        return {}
+    return {int(pid): name for name, pid in PITCH_POINT_TO_PNLCALIB_ID.items()}
+
+
 def _build_field_registration(run_dir: Path, pipeline_stats: dict) -> StageManifest:
     stage_dir = run_dir / "field_registration"
     if not stage_dir.is_dir():
@@ -158,10 +175,22 @@ def _build_field_registration(run_dir: Path, pipeline_stats: dict) -> StageManif
         if p.exists():
             files.append(_file_entry(p, run_dir))
 
+    stats = dict(pipeline_stats.get("field_registration", {}))
+    # Expose the per-frame calibration sidecar layout + id→name map so the
+    # front-end can render a "calibration inputs" table (which keypoints
+    # fed the solve on a given frame, with their pixel coords / confidence,
+    # plus that frame's reprojection / world error). The JPGs already show
+    # a baked overlay; this surfaces the underlying numbers.
+    calib_dir = vis_root / "calibration"
+    if calib_dir.is_dir():
+        stats["_calibration_frames"] = _frame_indices(calib_dir, ext=".json")
+        stats["_calibration_digits"] = _digits_of(calib_dir, ext=".json")
+        stats["_keypoint_names"] = _keypoint_id_names()
+
     return StageManifest(
         stage="field_registration",
         exists=True,
-        stats=pipeline_stats.get("field_registration", {}),
+        stats=stats,
         vis_dirs=vis,
         files=files,
     )

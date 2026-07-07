@@ -140,6 +140,14 @@
     .events-list .ev .ty { color: #cfe3ff; font-weight: 600; }
     .events-list .ev .meta { color: #9aa3ad; }
 
+    table.calib-kp { width: 100%; border-collapse: collapse; font-size: 12px;
+                     max-height: 340px; }
+    table.calib-kp th { text-align: left; color: #6b7380; font-weight: 600;
+                        padding: 4px 8px; border-bottom: 1px solid #262b33; }
+    table.calib-kp td { padding: 3px 8px; border-bottom: 1px solid #1e242b;
+                        color: #d4dae0; }
+    table.calib-kp tbody tr:hover { background: #1a2027; }
+
     .thumb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
                   gap: 6px; }
     .thumb-grid img { width: 100%; height: 110px; object-fit: cover; border-radius: 4px;
@@ -424,6 +432,7 @@
       const parts = [];
       parts.push(renderStageHeader(mf));
       parts.push(renderStats(mf));
+      parts.push(renderCalibrationInputs(mf));
       parts.push(renderVis(mf));
       parts.push(renderEventList(mf));
       parts.push(renderLLMScene(mf));
@@ -433,6 +442,7 @@
       parts.push(renderTextFiles(mf));
       pane.innerHTML = parts.filter(Boolean).join('');
       wireVisHandlers();
+      wireCalibrationInputs(mf);
       // Restore per-player checkbox state after the panel was rebuilt.
       document.querySelectorAll('[data-pid-toggle]').forEach((cb) => {
         if (_selectedPlayers.has(cb.dataset.pidToggle)) cb.checked = true;
@@ -491,6 +501,124 @@
             </div>`).join('')}
         </div>
       </div>`;
+    }
+
+    // ---- Calibration inputs (field_registration only) ---------------
+    // Shows, per selected frame, exactly which keypoints fed the camera
+    // solve — id + landmark name + pixel coords + detector confidence —
+    // alongside that frame's calibration-quality numbers (reprojection /
+    // world error, inliers). The baked JPGs already draw the points; this
+    // exposes the underlying values the solver actually consumed.
+    function renderCalibrationInputs(mf) {
+      if (mf.stage !== 'field_registration') return '';
+      const frames = mf.stats?._calibration_frames;
+      if (!Array.isArray(frames) || !frames.length) return '';
+      const opts = frames.map((f, i) =>
+        `<option value="${f}"${i === 0 ? ' selected' : ''}>frame ${f}</option>`).join('');
+      return `<div class="stats-card" id="calib-inputs-card">
+        <h3>Calibration inputs
+          <span style="color:#6b7380;font-weight:normal;font-size:12px">
+            — keypoints fed to the solve, per frame
+          </span>
+        </h3>
+        <div class="vis-slider-row" style="margin-bottom:8px">
+          <label style="color:#9aa3ad;font-size:12px">Frame</label>
+          <select id="calib-frame-select" style="padding:2px 6px">${opts}</select>
+          <span id="calib-frame-quality" style="color:#9aa3ad;font-size:12px"></span>
+        </div>
+        <div id="calib-kp-table"><div class="panel-empty">Loading…</div></div>
+      </div>`;
+    }
+
+    function wireCalibrationInputs(mf) {
+      if (mf.stage !== 'field_registration') return;
+      const sel = document.getElementById('calib-frame-select');
+      if (!sel) return;
+      const digits = mf.stats?._calibration_digits || 5;
+      const names = mf.stats?._keypoint_names || {};
+      const load = () => loadCalibrationFrame(parseInt(sel.value, 10), digits, names);
+      sel.addEventListener('change', load);
+      load();  // initial
+    }
+
+    const _calibFrameCache = new Map();   // frame → sidecar json
+
+    async function loadCalibrationFrame(frame, digits, names) {
+      const table = document.getElementById('calib-kp-table');
+      const quality = document.getElementById('calib-frame-quality');
+      if (!table) return;
+      const sample = String(frame).padStart(digits, '0');
+      const url = `/runs_static/${encodeURIComponent(activeRun)}`
+                + `/field_registration/visualizations/calibration/frame_${sample}.json`;
+      let json = _calibFrameCache.get(frame);
+      if (!json) {
+        try {
+          const resp = await fetch(url);
+          if (!resp.ok) throw new Error(`status ${resp.status}`);
+          json = await resp.json();
+          _calibFrameCache.set(frame, json);
+        } catch (e) {
+          table.innerHTML = `<div class="panel-empty">No calibration data for this frame.</div>`;
+          if (quality) quality.textContent = '';
+          return;
+        }
+      }
+
+      // Quality line: reprojection / world error, inliers, focal, flags.
+      if (quality) {
+        const bits = [];
+        if (json.reprojection_error != null)
+          bits.push(`reproj ${(+json.reprojection_error).toFixed(1)}px`);
+        if (json.world_error != null)
+          bits.push(`world ${(+json.world_error).toFixed(2)}m`);
+        if (json.inliers != null && json.total_points != null)
+          bits.push(`inliers ${json.inliers}/${json.total_points}`);
+        const f = json.camera?.focal_length;
+        if (f != null) bits.push(`f ${(+f).toFixed(0)}px`);
+        if (json.warm_start) bits.push('warm-start');
+        if (json.calibrated === false) bits.push('⚠ not calibrated');
+        quality.textContent = bits.length ? '· ' + bits.join('  ·  ') : '';
+      }
+
+      const kps = json.detected_keypoints || [];
+      const lines = json.detected_lines || [];
+      if (!kps.length && !lines.length) {
+        table.innerHTML = `<div class="panel-empty">
+          No keypoints/lines detected on this frame
+          (calibration ${json.warm_start ? 'carried by warm-start pose' : 'may be interpolated'}).
+        </div>`;
+        return;
+      }
+      const rows = kps
+        .slice()
+        .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0))
+        .map(kp => {
+          const nm = kp.class_name || names[kp.id] || '';
+          const conf = kp.confidence != null ? (+kp.confidence).toFixed(2) : '—';
+          const lowConf = kp.confidence != null && kp.confidence < 0.4;
+          return `<tr${lowConf ? ' style="opacity:0.6"' : ''}>
+            <td style="font-family:ui-monospace,monospace">${kp.id}</td>
+            <td style="color:#cfe3ff">${escapeHTML(nm)}</td>
+            <td style="font-family:ui-monospace,monospace">${(+kp.x).toFixed(0)}, ${(+kp.y).toFixed(0)}</td>
+            <td style="font-family:ui-monospace,monospace">${conf}</td>
+          </tr>`;
+        }).join('');
+      const lineNote = lines.length
+        ? `<div style="color:#9aa3ad;font-size:12px;margin-top:6px">
+             + ${lines.length} line constraint${lines.length > 1 ? 's' : ''}</div>`
+        : '';
+      table.innerHTML = `
+        <table class="calib-kp">
+          <thead><tr>
+            <th>id</th><th>landmark</th><th>pixel (x, y)</th><th>conf</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+        <div style="color:#9aa3ad;font-size:12px;margin-top:6px">
+          ${kps.length} keypoint${kps.length > 1 ? 's' : ''} detected;
+          ${json.inliers ?? '?'}/${json.total_points ?? '?'} used as PnP inliers.
+        </div>
+        ${lineNote}`;
     }
 
     function renderVis(mf) {
