@@ -52,8 +52,15 @@ field_registration:
     weights_dir:
   physical:
     camera_profile: dji_osmo_action_4_1080p
-    free_intrinsics: true
-    focal_hfov_deg_bounds: [70.0, 90.0]
+    # Lock to the profile's calibrated intrinsics. Leave-one-out on a DJI
+    # clip showed free intrinsics overfit the sparse consensus points (LOO
+    # reproj median ~25 px, fx/principal-point drifting off physical
+    # values) while locking to the profile K generalises far better (LOO
+    # median ~12 px). Focal bounds now live on the camera profile
+    # (camera_profiles.yaml: focal_hfov_deg_bounds), so no per-video
+    # focal_hfov_deg_bounds here — the old [70,90] there wrongly excluded
+    # the profile's own fx=946.
+    free_intrinsics: false
     camera_position: [-20.0, -10.0, 5.0]
     position_bounds_m: [8.0, 8.0, 3.0]
     vis_interval: 30
@@ -64,7 +71,6 @@ field_registration:
     line_sample_points: 20
     max_reproj_error: 15.0
     use_line_model: false
-    focal_hfov_deg_bounds: [27.0, 50.0]
     cx_bounds: [-100.0, 100.0]
     cy_bounds: [-50.0, 50.0]
     k1_bounds: [-0.35, -0.15]
