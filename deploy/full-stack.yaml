@@ -1,11 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  goal-insight full stack — provisions EVERYTHING in one CloudFormation
+  goal-insight full stack - provisions EVERYTHING in one CloudFormation
   template: the GPU EC2 instance (+ its IAM role, instance profile, and
   security group) AND the internet-facing ALB + Cognito user pool in front
   of it. The only out-of-band prerequisite is the self-signed cert imported
   into ACM (ACM ImportCertificate is not a CFN resource type), passed in via
-  ImportedCertArn — deploy_ec2.sh handles that import.
+  ImportedCertArn - deploy_ec2.sh handles that import.
 
   Delete the stack to remove every resource this creates (instance, IAM,
   SGs, ALB, Cognito). Nothing is left dangling outside CFN.
@@ -112,11 +112,11 @@ Resources:
 
   # ---------------- Instance security group ------------------------------
   # SSH 22 only (optional, from SshCidr). App :8000 is opened separately
-  # below, sourced ONLY from the ALB SG — never the public internet.
+  # below, sourced ONLY from the ALB SG - never the public internet.
   InstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: goal-insight web instance — SSH only; :8000 from ALB SG
+      GroupDescription: goal-insight web instance - SSH only; :8000 from ALB SG
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         !If
