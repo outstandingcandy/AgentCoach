@@ -22,36 +22,24 @@ GoalInsight runs entirely on your own machine and gives you the same kinds of ar
 
 ## What it does
 
-```
-Raw fixed-camera video
-        │
-        ▼
-┌──────────────────┐    Field registration: find where the camera is in the
-│ Calibration      │    world. Five backends (PnLCalib HRNet, BroadTrack,
-│ (camera + pitch) │    NBJW, fixed-intrinsic Physical, plain Homography);
-└──────────────────┘    pick by config based on what your footage looks like.
-        │
-        ▼
-┌──────────────────┐    Players: YOLOv8 detection → ByteTrack/BOTSORT →
-│ Tracking         │    OSNet/PRTReID re-identification → k-means or
-│ (players + ball) │    tracklet team classification.
-└──────────────────┘    Ball: YOLO class 32 + center-distance ByteTrack +
-        │               two-pass segment classification (ground-roll vs
-        ▼               airborne) and per-segment 3D fitting.
-┌──────────────────┐    Possession state machine → pass / shot / carry /
-│ Events           │    tackle / interception detectors. Shot detector
-│ (rule-based      │    subsumes goal detection (Goal/Saved/Off_Target/
-│  detectors)      │    Blocked outcomes with shooter attribution).
-└──────────────────┘
-        │
-        ▼
-┌──────────────────┐    Recipe-based: an event detector, an analyzer that
-│ Highlights       │    plans 4 segments (buildup → strike → celebration →
-│ (per goal)       │    replay), and a composer that crops/zooms per
-└──────────────────┘    segment, draws the shooter spotlight + ball trail,
-                        and produces an MP4 with optional video2x upscaling
-                        + RIFE slow-motion replay.
-```
+A single fixed-camera video flows through four stages:
+
+1. **Calibration (camera + pitch)** — find where the camera is in the world.
+   Five backends (PnLCalib HRNet, BroadTrack, NBJW, fixed-intrinsic Physical,
+   plain Homography); pick by config based on what your footage looks like.
+2. **Tracking (players + ball)** — players via YOLOv8 detection →
+   ByteTrack/BOTSORT → OSNet/PRTReID re-identification → k-means or tracklet
+   team classification. Ball via YOLO class 32 + center-distance ByteTrack +
+   two-pass segment classification (ground-roll vs airborne) and per-segment
+   3D fitting.
+3. **Events (rule-based detectors)** — a possession state machine feeding
+   pass / shot / carry / tackle / interception detectors. The shot detector
+   subsumes goal detection (Goal / Saved / Off_Target / Blocked outcomes with
+   shooter attribution).
+4. **Highlights (per goal)** — a recipe-based event detector, an analyzer that
+   plans 4 segments (buildup → strike → celebration → replay), and a composer
+   that crops/zooms per segment, draws the shooter spotlight + ball trail, and
+   produces an MP4 with optional video2x upscaling + RIFE slow-motion replay.
 
 A still from the tracking stage (annotated player + ball detections, with team colors and IDs):
 
@@ -144,6 +132,51 @@ More detail (image layout, jersey-OCR backend swap to Claude/Gemini,
 troubleshooting, license inventory):
 [`deploy/offline/README.md`](deploy/offline/README.md).
 
+## Cloud deployment (AWS)
+
+To run GoalInsight as a shared, internet-reachable service instead of a
+local container, one script provisions everything on AWS:
+
+```bash
+bash deploy/deploy_ec2.sh you@example.com
+```
+
+This deploys a **single CloudFormation stack** (`deploy/full-stack.yaml`)
+that owns the whole footprint — nothing is left dangling outside CFN:
+
+- **GPU EC2 instance** (default `g5.xlarge`) from the Deep Learning AMI. Its
+  first-boot user-data installs Docker + the NVIDIA container toolkit, builds
+  the deployment image (`deploy/Dockerfile`, chat enabled), and runs it under
+  systemd. Model weights download into a bind-mounted workspace on first use.
+- **IAM role + instance profile** — Bedrock (for the LLM match-chat) + SSM
+  (keyless shell access).
+- **Application Load Balancer + Cognito** — public HTTPS with a login gate.
+  Port 80 redirects to 443; the app port 8000 is reachable **only** from the
+  ALB's security group, never the public internet. The instance's only
+  externally-open port is SSH 22, locked to your current IP.
+
+The script discovers the default VPC + subnets, imports a self-signed cert
+into ACM (the one thing CloudFormation can't create), and deploys the stack.
+First boot takes ~15–25 min (Docker install + image build); the ALB target
+stays unhealthy until the container is up.
+
+```bash
+# Deploy a second, parallel environment (distinct stack + Cognito domain)
+SUFFIX=-staging bash deploy/deploy_ec2.sh you@example.com
+
+# Tear the whole thing down (deletes the stack: instance, IAM, SGs, ALB, Cognito)
+bash deploy/teardown.sh              # add --suffix -staging to match a parallel deploy
+```
+
+Options: `--region`, `--instance-type`, `--branch`, `--vpc-id`,
+`--subnet-ids`, `--volume-size`, `--suffix`. Full walkthrough, cost notes
+(a `g5.xlarge` is ~$1/hr on-demand — not free tier), and the legacy
+"front an existing EC2" path: [`deploy/README.md`](deploy/README.md).
+
+> Heavy pipeline stages (`field_registration`, `tracking`) can alternatively
+> be offloaded to a SageMaker Processing Job — see
+> [`sagemaker/README.md`](sagemaker/README.md).
+
 ## Repository layout
 
 ```
@@ -165,7 +198,10 @@ configs/
                              # (fifa / futsal / children)
   pitches.yaml               # pitch geometry library
   camera_profiles.yaml       # camera intrinsics library
-deploy/offline/              # self-contained Docker image
+deploy/
+  offline/                   # self-contained local Docker image
+  full-stack.yaml            # one-stack AWS deploy (EC2 + ALB + Cognito)
+  deploy_ec2.sh, teardown.sh # cloud deploy / teardown one-click scripts
 scripts/                     # pipeline diagnostics / one-off tooling
 tools/                       # make_comparison.py and other utilities
 ```
