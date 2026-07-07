@@ -695,6 +695,11 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
                 "key": key,
                 "label": entry.get("label", key),
                 "description": entry.get("description", ""),
+                # Physical dimensions (m) so the wizard can draw a correctly
+                # proportioned bird's-eye pitch for the click-to-place camera
+                # picker. Fall back to FIFA if a profile omits them.
+                "pitch_length": float(entry.get("pitch_length", 105.0)),
+                "pitch_width": float(entry.get("pitch_width", 68.0)),
             })
         return JSONResponse(sorted(out, key=lambda p: p["key"]))
 

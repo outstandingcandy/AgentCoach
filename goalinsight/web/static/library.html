@@ -261,16 +261,31 @@
           <select id="wiz-cam" style="flex:1"></select>
         </div>
         <p style="color:#9aa3ad;font-size:12px;margin:12px 0 6px 0">
-          Camera position on the pitch (metres, origin at pitch centre):
+          Click on the bird's-eye pitch to place the camera (origin at
+          pitch centre; the grey margin is off-pitch, where fixed cameras
+          usually sit):
         </p>
-        <div style="display:flex;gap:6px;align-items:center">
-          <label style="color:#9aa3ad">x</label>
-          <input id="wiz-pos-x" type="number" value="-20" step="0.5" style="width:80px">
-          <label style="color:#9aa3ad;margin-left:8px">y</label>
-          <input id="wiz-pos-y" type="number" value="-10" step="0.5" style="width:80px">
-          <label style="color:#9aa3ad;margin-left:8px">z</label>
-          <input id="wiz-pos-z" type="number" value="5" step="0.5" style="width:80px">
+        <canvas id="wiz-cam-canvas" width="440" height="300"
+                style="width:100%;max-width:440px;background:#0c0f13;
+                       border:1px solid #262b33;border-radius:4px;
+                       cursor:crosshair;display:block"></canvas>
+        <div style="display:flex;gap:6px;align-items:center;margin-top:6px;
+                    color:#9aa3ad;font-size:12px">
+          <span id="wiz-pos-readout">x = -20.0 m, y = -10.0 m</span>
         </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+          <label style="color:#9aa3ad;width:150px">Camera height z</label>
+          <input id="wiz-pos-z" type="range" value="5" min="0" max="20"
+                 step="0.5" style="flex:1" oninput="
+                   document.getElementById('wiz-pos-z-val').textContent =
+                     parseFloat(this.value).toFixed(1) + ' m'">
+          <span id="wiz-pos-z-val" style="color:#cfe3ff;width:56px;
+                text-align:right">5.0 m</span>
+        </div>
+        <!-- x/y are set by clicking the canvas; kept as hidden inputs so
+             saveSceneBasics() reads them unchanged. -->
+        <input id="wiz-pos-x" type="hidden" value="-20">
+        <input id="wiz-pos-y" type="hidden" value="-10">
         <p style="color:#9aa3ad;font-size:12px;margin:12px 0 6px 0">
           Horizontal field of view (degrees):
         </p>
@@ -1015,8 +1030,13 @@
           api('GET', '/api/library/camera_profiles'),
         ]);
         const pitchSel = $("#wiz-pitch");
+        wizPitchProfiles = {};
+        pitches.forEach(p => { wizPitchProfiles[p.key] = p; });
         pitchSel.innerHTML = pitches.map(p =>
           `<option value="${p.key}">${p.label}</option>`).join('');
+        // Redraw the bird's-eye picker when the pitch type changes (its
+        // dimensions/aspect change with it).
+        pitchSel.onchange = () => drawCameraPicker();
         const camSel = $("#wiz-cam");
         camSel.innerHTML = cams.map(c =>
           `<option value="${c.key}">${c.label}</option>`).join('');
@@ -1036,8 +1056,87 @@
       // Step 4's primary CTA is the "Launch pipeline" button inside the
       // section; hide the trailing Next button there.
       $("#wiz-next").style.display = (n === 4) ? 'none' : 'inline-block';
+      if (n === 2) drawCameraPicker();
       if (n === 4) populateCoreStages();
     }
+
+    // ---- Step 2: bird's-eye click-to-place camera position -----------
+    // Cache of pitch profiles (key -> {pitch_length, pitch_width, ...}),
+    // filled by populateWizardLibraries. Used to size the picker.
+    let wizPitchProfiles = {};
+
+    // World<->pixel mapping for the current picker draw, captured so the
+    // click handler can invert it. Rebuilt on every drawCameraPicker().
+    let _camPickMap = null;
+
+    function drawCameraPicker() {
+      const cv = document.getElementById('wiz-cam-canvas');
+      if (!cv) return;
+      const prof = wizPitchProfiles[$("#wiz-pitch").value] || {};
+      const PL = prof.pitch_length || 105;
+      const PW = prof.pitch_width || 68;
+      const ctx = cv.getContext('2d');
+      const W = cv.width, H = cv.height;
+      ctx.clearRect(0, 0, W, H);
+
+      // Off-pitch margin so cameras placed outside the touchlines (the
+      // common fixed-rig case) are reachable. Scale keeps aspect ratio.
+      const marginM = Math.max(PL, PW) * 0.35;
+      const worldW = PL + 2 * marginM, worldH = PW + 2 * marginM;
+      const scale = Math.min(W / worldW, H / worldH);
+      const ox = W / 2, oy = H / 2;
+      // World (m, centre origin, y-up) -> canvas px (y flips down).
+      const w2p = (wx, wy) => [ox + wx * scale, oy - wy * scale];
+      const p2w = (px, py) => [(px - ox) / scale, -(py - oy) / scale];
+      _camPickMap = { p2w, PL, PW, marginM };
+
+      // Grass + off-pitch margin already dark from canvas bg; draw pitch.
+      const [x0, y0] = w2p(-PL / 2, PW / 2);
+      const [x1, y1] = w2p(PL / 2, -PW / 2);
+      ctx.fillStyle = '#123a1a';
+      ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+      ctx.strokeStyle = '#4b8f5e';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+      // Halfway line + centre circle.
+      const [mhx0, mhy0] = w2p(0, PW / 2), [mhx1, mhy1] = w2p(0, -PW / 2);
+      ctx.beginPath(); ctx.moveTo(mhx0, mhy0); ctx.lineTo(mhx1, mhy1); ctx.stroke();
+      const [ccx, ccy] = w2p(0, 0);
+      ctx.beginPath();
+      ctx.arc(ccx, ccy, Math.min(PL, PW) * 0.09 * scale, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Current camera marker.
+      const cx = parseFloat($("#wiz-pos-x").value);
+      const cy = parseFloat($("#wiz-pos-y").value);
+      if (isFinite(cx) && isFinite(cy)) {
+        const [mx, my] = w2p(cx, cy);
+        ctx.fillStyle = '#3b82f6';
+        ctx.beginPath(); ctx.arc(mx, my, 6, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+        // Line to pitch centre = rough look direction.
+        ctx.strokeStyle = 'rgba(59,130,246,0.5)';
+        ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(ccx, ccy); ctx.stroke();
+      }
+    }
+
+    (function bindCameraPicker() {
+      const cv = document.getElementById('wiz-cam-canvas');
+      if (!cv) return;
+      cv.addEventListener('click', (e) => {
+        if (!_camPickMap) return;
+        const r = cv.getBoundingClientRect();
+        // Canvas is CSS-scaled to fit; map click back to canvas pixels.
+        const px = (e.clientX - r.left) * (cv.width / r.width);
+        const py = (e.clientY - r.top) * (cv.height / r.height);
+        const [wx, wy] = _camPickMap.p2w(px, py);
+        $("#wiz-pos-x").value = wx.toFixed(1);
+        $("#wiz-pos-y").value = wy.toFixed(1);
+        const ro = document.getElementById('wiz-pos-readout');
+        if (ro) ro.textContent = `x = ${wx.toFixed(1)} m, y = ${wy.toFixed(1)} m`;
+        drawCameraPicker();
+      });
+    })();
 
     // Populate step 4's "Stages to run" checkboxes from the config's
     // pipeline.stages. All ticked by default; the user can untick to run
