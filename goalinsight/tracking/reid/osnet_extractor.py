@@ -3,6 +3,7 @@
 Implements BaseReIDExtractor interface.
 """
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,25 @@ try:
     import torchreid
 except ImportError:
     torchreid = None
+
+logger = logging.getLogger(__name__)
+
+
+def _unwrap_state_dict(checkpoint: Any) -> dict[str, torch.Tensor]:
+    """Pull a flat tensor state_dict out of a torchreid-style checkpoint.
+
+    torchreid training saves under "state_dict"; some forks use "model".
+    DataParallel adds a "module." prefix that we strip.
+    """
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model"):
+            if key in checkpoint and isinstance(checkpoint[key], dict):
+                checkpoint = checkpoint[key]
+                break
+    return {
+        (k[len("module."):] if k.startswith("module.") else k): v
+        for k, v in checkpoint.items()
+    }
 
 
 class OSNetExtractor(BaseReIDExtractor):
@@ -68,8 +88,37 @@ class OSNetExtractor(BaseReIDExtractor):
         )
 
         if model_path:
-            state_dict = torch.load(model_path, map_location=self.device)
-            self.model.load_state_dict(state_dict)
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+            state_dict = _unwrap_state_dict(checkpoint)
+            # Classifier-head shape depends on the training dataset's ID count
+            # and is unused for feature extraction. Drop any tensor whose shape
+            # disagrees with the freshly-built model.
+            model_shapes = {k: v.shape for k, v in self.model.state_dict().items()}
+            filtered, shape_mismatched = {}, []
+            for k, v in state_dict.items():
+                if k in model_shapes and model_shapes[k] != v.shape:
+                    shape_mismatched.append(k)
+                else:
+                    filtered[k] = v
+            result = self.model.load_state_dict(filtered, strict=False)
+            logger.info(
+                "Loaded OSNet weights from %s: matched=%d, missing=%d, "
+                "unexpected=%d, shape_mismatched=%d",
+                model_path,
+                len(filtered) - len(result.unexpected_keys),
+                len(result.missing_keys),
+                len(result.unexpected_keys),
+                len(shape_mismatched),
+            )
+            non_classifier_missing = [
+                k for k in result.missing_keys if not k.startswith("classifier")
+            ]
+            if non_classifier_missing:
+                logger.warning(
+                    "OSNet checkpoint missing %d backbone keys: %s",
+                    len(non_classifier_missing),
+                    non_classifier_missing[:5],
+                )
 
         self.model = self.model.to(self.device)
         self.model.eval()
