@@ -399,6 +399,27 @@ def solve_camera_physical(
     # through; PhysicalCalibrator pads to 5.
     dist_init = profile.get("dist_coeffs")
     w, h = int(img_size[0]), int(img_size[1])
+
+    # Opt-in: skip PhysicalCalibrator's RANSAC + 7-DOF LM and run
+    # cv2.calibrateCamera directly with full intrinsics free. PhysicalCalibrator
+    # locks cx, cy at the image centre and stays on a fixed dist; for cameras
+    # with off-centre principal points (lens not exactly aligned with sensor,
+    # or video downstream of an asymmetric crop) the locked-centre fit can
+    # land on absurd dist values to compensate. This path lets cx, cy, k1, k2,
+    # p1, p2 all move — at the cost of a heavier model and the usual
+    # over-fit risk on small annotation sets (< 12-15 points).
+    #
+    # Free intrinsics solve for the focal directly from the points, so the
+    # focal_hfov / focal_bounds prior is intentionally IGNORED here — it only
+    # constrains the locked-intrinsics PhysicalCalibrator path below. Hence
+    # the focal-bounds resolution lives after this early return.
+    if bool(physical_cfg.get("free_intrinsics", False)):
+        cam, mean_err, diag = _calibrate_free_intrinsics(
+            pixel_pts, world_3d_pts, (w, h), K_init,
+            profile_name=profile_name,
+        )
+        return cam, mean_err, diag
+
     # Focal bounds resolution, most-specific first. The lens field-of-view
     # is a camera-fixed property, so it belongs on the profile — but a
     # per-video override still wins for one-off rigs / crops:
@@ -434,21 +455,6 @@ def solve_camera_physical(
 
     pl = float(physical_cfg.get("pitch_length", 105.0))
     pw = float(physical_cfg.get("pitch_width", 68.0))
-
-    # Opt-in: skip PhysicalCalibrator's RANSAC + 7-DOF LM and run
-    # cv2.calibrateCamera directly with full intrinsics free. PhysicalCalibrator
-    # locks cx, cy at the image centre and stays on a fixed dist; for cameras
-    # with off-centre principal points (lens not exactly aligned with sensor,
-    # or video downstream of an asymmetric crop) the locked-centre fit can
-    # land on absurd dist values to compensate. This path lets cx, cy, k1, k2,
-    # p1, p2 all move — at the cost of a heavier model and the usual
-    # over-fit risk on small annotation sets (< 12-15 points).
-    if bool(physical_cfg.get("free_intrinsics", False)):
-        cam, mean_err, diag = _calibrate_free_intrinsics(
-            pixel_pts, world_3d_pts, (w, h), K_init,
-            profile_name=profile_name,
-        )
-        return cam, mean_err, diag
 
     calibrator = PhysicalCalibrator(
         K=K_init,
