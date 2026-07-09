@@ -43,6 +43,20 @@ profiles:
     center_circle_radius: 3.0
     goal_height: 2.0
     goal_length: 3.0
+    # PnLCalib 57-keypoint ids that actually EXIST and are correctly scaled on
+    # a futsal pitch. The 57-point template is FIFA-shaped, so its rectangular
+    # penalty/goal-area corners (3-10, 19-26), penalty-arc inner tangents
+    # (36,39,40,43 = NaN here) and standard-pitch inner marks (45,46,54,55 —
+    # hardcoded 5.5m / circle-radius offsets that land at meaningless futsal
+    # positions) do NOT correspond to real futsal markings. Synthesis projects
+    # ONLY these ids so the model never learns non-existent / mis-placed points.
+    # Kept: pitch corners + halfway-touchline (0,1,2,27,28,29), goal posts
+    # (11-18), D-arc tangents + halfway/centre-circle intersections
+    # (30-35), centre circle + mark (37,38,41,42,47-53,50), 6m penalty marks
+    # (44,56).
+    valid_keypoint_ids: [0, 1, 2, 11, 12, 13, 14, 15, 16, 17, 18, 27, 28, 29,
+                         30, 31, 32, 33, 34, 35, 37, 38, 41, 42, 44, 47, 48,
+                         49, 50, 51, 52, 53, 56]
 
   kids_soccer:
     label: "Kids 7-a-side (66×43 m)"
@@ -62,3 +76,18 @@ profiles:
     center_circle_radius: 7.0
     goal_height: 2.15
     goal_length: 4.44
+
+  futsal_0626:
+    label: "Futsal 0626 ground (non-standard, tuned from frame_0, LOO-validated)"
+    pitch_length: 40.0
+    pitch_width: 20.0
+    penalty_area_shape: d
+    penalty_area_width: 3.0
+    penalty_area_length: 6.8
+    goal_area_width: 3.5
+    goal_area_length: 3.0
+    goal_line_to_penalty_mark: 6.0
+    center_circle_radius: 2.2
+    goal_height: 2.2
+    goal_length: 3.5
+    valid_keypoint_ids: [0, 1, 2, 11, 12, 13, 14, 15, 16, 17, 18, 27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 38, 41, 42, 44, 47, 48, 49, 50, 51, 52, 53, 56]

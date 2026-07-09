@@ -116,6 +116,11 @@ class AnchorAnnotator:
         self._physical_cfg: dict | None = None
         self._camera_profiles: dict | None = None
         self._active_config_name: str | None = None
+        # Name of the active pitch profile (e.g. ``futsal_0626``), captured
+        # from the per-video config's ``pitch_type`` in set_solver_config.
+        # Written into saved annotations and used for the pitch-consistency
+        # check (comparing names, not per-point world coords).
+        self._active_pitch_type: str | None = None
         self.selected_manual_idx: int | None = None
         self.selected_line_idx: int | None = None
 
@@ -150,9 +155,12 @@ class AnchorAnnotator:
     def _check_pitch_consistency(self, video_name: str) -> str | None:
         """Return error message if saved annotations conflict with active pitch.
 
-        Reads the most recent saved frame's manual world coords and compares
-        against the active pitch's resolved coords for the same keypoint name.
-        Returns None when consistent (or when there's nothing to compare).
+        Compares the ``pitch_type`` recorded in the most recent saved frame
+        against the currently active pitch profile name. Annotations carry
+        only their pitch profile name (not per-point world coords), so a
+        name mismatch is the authoritative signal that the pitch changed
+        under the saved pixels. Returns None when consistent (same name, or
+        when either side is unknown — nothing to assert).
         """
         frames = self.index.get_annotated_frames(video_name)
         if not frames:
@@ -166,23 +174,18 @@ class AnchorAnnotator:
                 data = json.load(fh)
         except (json.JSONDecodeError, IOError):
             return None
-        for pt in data.get("points", []):
-            name = pt.get("keypoint_name") or pt.get("name")
-            saved = pt.get("world")
-            if not name or saved is None:
-                continue
-            active = _pk.PITCH_POINTS.get(name)
-            if active is None:
-                continue
-            if (abs(float(active[0]) - float(saved[0])) > 1e-3
-                    or abs(float(active[1]) - float(saved[1])) > 1e-3):
-                return (
-                    f"Pitch mismatch: '{video_name}' was annotated under "
-                    f"different dimensions (e.g. {name} saved at "
-                    f"({saved[0]:.2f}, {saved[1]:.2f}) vs current "
-                    f"({float(active[0]):.2f}, {float(active[1]):.2f})). "
-                    f"Restart with --config matching that pitch."
-                )
+        saved_type = data.get("pitch_type")
+        active_type = self._active_pitch_type
+        # Only assert when both sides name a pitch and they differ. A missing
+        # name on either side (legacy save, or no per-video config loaded)
+        # can't be adjudicated, so we don't block.
+        if saved_type and active_type and saved_type != active_type:
+            return (
+                f"Pitch mismatch: '{video_name}' was annotated under "
+                f"pitch_type '{saved_type}' but the active config uses "
+                f"'{active_type}'. Load the config whose pitch_type matches "
+                f"the saved annotation, or re-annotate under the new pitch."
+            )
         return None
 
     def _get_frame(self, frame_idx: int) -> np.ndarray:
@@ -317,6 +320,7 @@ class AnchorAnnotator:
             current_frame=self.current_frame,
             vis_frame=vis,
             auto_projected_points=accepted_auto,
+            pitch_type=self._active_pitch_type,
         )
 
         if success:
@@ -477,6 +481,10 @@ class AnchorAnnotator:
         if not cp.exists():
             return f"Config not found: {cp}"
         cfg = yaml.safe_load(cp.read_text()) or {}
+        # Capture the pitch profile name before expand_pitch_type pops it.
+        # This is what gets stamped into saved annotations and checked for
+        # consistency on reload.
+        self._active_pitch_type = cfg.get("pitch_type")
         # Honour ``pitch_type: <name>`` alongside any inline ``pitch:`` block.
         expand_pitch_type(cfg)
         fr = cfg.get("field_registration", {}) or {}

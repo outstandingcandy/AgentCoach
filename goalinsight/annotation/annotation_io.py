@@ -114,10 +114,18 @@ def save_frame_annotation(
     vis_frame: np.ndarray | None = None,
     auto_projected_points: list[tuple] | None = None,
     derived_accepted: list[bool] | None = None,
+    pitch_type: str | None = None,
 ) -> bool:
     """Save annotation artifacts for a frame.
 
     `current_frame` is BGR (OpenCV). `vis_frame` is RGB.
+
+    ``pitch_type`` records which named pitch the annotation was made under
+    (e.g. ``futsal_0626``). It is the sole record of pitch identity — manual
+    keypoint world coords are NOT stored (they are re-resolved from the
+    keypoint name against the active pitch at load time). Derived (line
+    intersection) points DO keep their world coords, since an intersection's
+    world position is not recoverable from a name alone.
     """
     try:
         frame_dir.mkdir(parents=True, exist_ok=True)
@@ -126,6 +134,7 @@ def save_frame_annotation(
             "frame_idx": frame_idx,
             "video_path": video_path,
             "video_name": video_name,
+            "pitch_type": pitch_type,
             "num_manual_points": len(keypoint_names),
             "num_lines": len(annotated_lines),
             "num_derived_points": len(derived_points),
@@ -138,12 +147,14 @@ def save_frame_annotation(
 
         for i, (px, py) in enumerate(clicked_points):
             if i < len(keypoint_names):
-                wx, wy = world_points[i]
                 kp_name = keypoint_names[i]
                 hrnet_idx = PITCH_POINTS_TO_INTERSECTON.get(kp_name, -1)
+                # No ``world`` stored: manual keypoint world coords are
+                # re-resolved from ``keypoint_name`` against the active pitch
+                # on load (see load_frame_annotation). Storing them would go
+                # stale whenever the pitch dims change.
                 annotations_data["points"].append({
                     "pixel": [float(px), float(py)],
-                    "world": [float(wx), float(wy)],
                     "keypoint_name": kp_name,
                     "hrnet_index": hrnet_idx,
                 })
