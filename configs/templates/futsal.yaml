@@ -52,15 +52,23 @@ field_registration:
     weights_dir:
   physical:
     camera_profile: dji_osmo_action_4_1080p
-    # Lock to the profile's calibrated intrinsics. Leave-one-out on a DJI
-    # clip showed free intrinsics overfit the sparse consensus points (LOO
-    # reproj median ~25 px, fx/principal-point drifting off physical
-    # values) while locking to the profile K generalises far better (LOO
-    # median ~12 px). Focal bounds now live on the camera profile
-    # (camera_profiles.yaml: focal_hfov_deg_bounds), so no per-video
-    # focal_hfov_deg_bounds here — the old [70,90] there wrongly excluded
-    # the profile's own fx=946.
-    free_intrinsics: false
+    # Solve intrinsics (focal + principal point + distortion) from the
+    # annotated points rather than trusting the profile. Whether this beats
+    # locking to the profile K depends on the annotation set:
+    #   - Sparse, all-ground (coplanar) points -> free intrinsics is
+    #     under-determined and OVERFITS (an early DJI clip: LOO ~25 px,
+    #     fx/principal-point drift off physical values), so locking wins.
+    #   - A well-distributed set WITH non-coplanar points (goal-post/crossbar
+    #     tops at z != 0) makes intrinsics identifiable: free intrinsics then
+    #     converges to physical values, distortion settles ~0 (these
+    #     lens-corrected action-cam exports have ~no residual distortion),
+    #     and LOO drops to ~4-5 px — better than locking to the profile's
+    #     (often wrong for this footage) distortion.
+    # Default true because the futsal workflow annotates goal posts; if you
+    # only mark ground points, set this false to avoid overfitting.
+    # Focal bounds live on the camera profile (camera_profiles.yaml:
+    # focal_hfov_deg_bounds) and are ignored on the free-intrinsics path.
+    free_intrinsics: true
     camera_position: [-20.0, -10.0, 5.0]
     position_bounds_m: [8.0, 8.0, 3.0]
     vis_interval: 30
