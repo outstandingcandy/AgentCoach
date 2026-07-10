@@ -28,6 +28,8 @@ tracking:
 reid:
   backend: "osnet"
   model: "osnet_x1_0"
+  osnet:
+    weights_path: "models/sportsreid_osnet_x1_0.pth"
 team_classification:
   backend: "kmeans"
   position_weight: 0.1
