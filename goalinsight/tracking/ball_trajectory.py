@@ -94,6 +94,45 @@ def ray_intersect_z(
     return (float(origin[0] + t * direction[0]), float(origin[1] + t * direction[1]))
 
 
+def ray_intersect_x(
+    origin: np.ndarray, direction: np.ndarray, x: float
+) -> tuple[float, float] | None:
+    """Intersect a ray with the vertical plane at pitch-length position x.
+
+    Returns (y, z) on that plane. Used for the goal-mouth plane at the
+    goal line (x=±half_length): unlike ``project_to_ground`` (which
+    forces z=0 and pushes an airborne ball's apparent y sideways along
+    the camera's line of sight), this solves for whatever height the
+    ray is actually at when it reaches the goal line — the ball's true
+    (y, z) there, with no ground assumption.
+    """
+    if abs(direction[0]) < 1e-8:
+        return None
+    t = (x - origin[0]) / direction[0]
+    if t < 0:
+        return None
+    return (float(origin[1] + t * direction[1]), float(origin[2] + t * direction[2]))
+
+
+def ball_pixel_at_goal_plane(
+    pixel: tuple[float, float], pose: dict, goal_x: float
+) -> tuple[float, float] | None:
+    """(y, height) where the ray through ``pixel`` crosses the goal-line plane x=goal_x.
+
+    World z is positive-up (matches ``goalinsight.annotation.pitch.geometry
+    .PITCH_POINTS``), so height is just z directly — no sign flip.
+    """
+    ray = pixel_to_ray(pixel, pose)
+    if ray is None:
+        return None
+    origin, direction = ray
+    hit = ray_intersect_x(origin, direction, goal_x)
+    if hit is None:
+        return None
+    y, z = hit
+    return (y, z)
+
+
 # ---------------------------------------------------------------------------
 # Kick detection (shared between trajectory fitting and event detection)
 # ---------------------------------------------------------------------------
