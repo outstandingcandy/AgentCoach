@@ -43,6 +43,26 @@ PITCHES_PATH = (
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
+def _template_for_pitch(pitch_type: str | None) -> Path:
+    """Pick the seed template file for a ``pitch_type``.
+
+    Custom per-ground profiles (e.g. ``futsal_0626``, ``kids_soccer_xyz``)
+    should inherit the physical/tracking defaults of their base sport, not
+    silently fall back to FIFA. Match by base-name prefix; unknown → fifa.
+    """
+    name = (pitch_type or "fifa").lower()
+    if name.startswith("futsal"):
+        tpl = "futsal.yaml"
+    elif name.startswith(("kids", "children", "youth")):
+        tpl = "children.yaml"
+    elif name.startswith("fifa"):
+        tpl = "fifa.yaml"
+    else:
+        tpl = "fifa.yaml"
+    path = CONFIGS_DIR / tpl
+    return path if path.exists() else CONFIGS_DIR / "fifa.yaml"
+
+
 def _safe_filename(name: str) -> str:
     """Reject path traversal; collapse other unsafe chars to underscore.
 
@@ -725,6 +745,31 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
             })
         return JSONResponse(sorted(out, key=lambda p: p["key"]))
 
+    @app.get("/api/library/calibrations")
+    def list_calibrations() -> JSONResponse:
+        """Return saved fixed-camera calibration presets for the wizard.
+
+        Reads ``workspace/calibrations/*.json`` (written by the annotate
+        page). Each preset carries a pre-solved camera pose + pitch_type so
+        a fixed-camera video can reuse it verbatim instead of re-solving.
+        """
+        out = []
+        cal_dir = workspace.calibrations_dir
+        if cal_dir.is_dir():
+            for p in sorted(cal_dir.glob("*.json")):
+                try:
+                    d = yaml.safe_load(p.read_text()) or {}
+                except (OSError, yaml.YAMLError):
+                    continue
+                out.append({
+                    "name": d.get("name", p.stem),
+                    "pitch_type": d.get("pitch_type"),
+                    "source_video": d.get("source_video"),
+                    "reprojection_error": d.get("reprojection_error"),
+                    "image_size": d.get("image_size"),
+                })
+        return JSONResponse(out)
+
     @app.get("/api/library/keypoint_models")
     def list_keypoint_models() -> JSONResponse:
         """Return ``[{id, label, path, builtin}]`` for the wizard picker.
@@ -942,19 +987,29 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
         cfg_path = workspace.config_for(video_path)
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # If a calibration preset is chosen, read it once up front: its
+        # pitch_type/pitch snapshot drive both the seed-template choice and
+        # the inlined pitch below.
+        preset_data: dict[str, Any] = {}
+        if pn := payload.get("calibration_preset"):
+            _sp = _SAFE_NAME_RE.sub("_", str(pn)).strip("_.")
+            _pf = workspace.calibrations_dir / f"{_sp}.json"
+            if not _pf.exists():
+                raise HTTPException(400, f"calibration preset not found: {_sp}")
+            try:
+                preset_data = yaml.safe_load(_pf.read_text()) or {}
+            except (OSError, yaml.YAMLError):
+                preset_data = {}
+            preset_data["_path"] = str(_pf)
+
         # Load existing per-video config if present, else seed from the
-        # template matching the payload's pitch_type (or FIFA fallback).
+        # template matching the pitch_type (preset's pitch_type wins when
+        # the wizard skipped the pitch step; else the payload's; else FIFA).
         if cfg_path.exists():
             base = load_config(cfg_path)
         else:
-            template_name = payload.get("pitch_type") or "fifa"
-            template_map = {
-                "fifa": "fifa.yaml",
-                "futsal": "futsal.yaml",
-                "kids_soccer": "children.yaml",
-            }
-            tpl_path = CONFIGS_DIR / template_map.get(template_name, "fifa.yaml")
-            base = load_config(tpl_path) if tpl_path.exists() else {}
+            seed_pitch = payload.get("pitch_type") or preset_data.get("pitch_type")
+            base = load_config(_template_for_pitch(seed_pitch))
 
         overlay: dict[str, Any] = {}
         if pt := payload.get("pitch_type"):
@@ -999,6 +1054,23 @@ def register_library_routes(app: FastAPI, workspace: Workspace) -> None:
         # frame path so the fixed_camera runner can replay that pose.
         if payload.get("first_annotation") and (afp := payload.get("annotation_frame_path")):
             fr_phys["annotation_frame_path"] = str(afp)
+
+        # Calibration-preset reuse: point the fixed_camera runner at a
+        # pre-solved pose so it skips PnP entirely and reuses exactly what
+        # the annotate page computed. The preset also carries its pitch_type
+        # (pitch dimensions), which we force into the config so the reused
+        # pose and the pitch geometry always agree.
+        if preset_data:
+            fr_phys["calibration_preset_path"] = preset_data["_path"]
+            backend = "fixed_camera"
+            if ppt := preset_data.get("pitch_type"):
+                overlay["pitch_type"] = ppt
+            # Inline the preset's pitch-dimension snapshot so the reused pose
+            # and its pitch geometry stay locked together even if the named
+            # profile is later edited. Inline ``pitch:`` overrides the
+            # profile field-by-field at resolve time.
+            if isinstance(preset_data.get("pitch"), dict):
+                overlay["pitch"] = dict(preset_data["pitch"])
 
         # Keypoint-model path → shared ``keypoint_detection`` block, read by
         # both backends (physical per-frame, fixed_camera one-shot solve).

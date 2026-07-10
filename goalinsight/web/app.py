@@ -136,6 +136,7 @@ def create_workspace_app(
     register_annotation_routes(
         app, annotator, ws.videos_dir,
         configs_root=ws.configs_dir,
+        calibrations_root=ws.calibrations_dir,
         prefix="/api/annotate",
     )
     # Open the first discovered video AFTER routes are mounted so the

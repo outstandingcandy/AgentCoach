@@ -169,6 +169,7 @@
           <button id="btn-reset">Reset all</button>
           <button id="btn-compute" class="primary">Compute homography</button>
           <button id="btn-save" class="danger">Save frame</button>
+          <button id="btn-save-preset" title="Save the computed camera pose as a reusable fixed-camera calibration preset (Compute first)">Save calibration preset</button>
         </div>
       </div>
       <hr class="thin" />
@@ -702,6 +703,16 @@ async function init() {
   });
   $("#btn-compute").addEventListener("click", async () => { applyState(await api("POST", "/api/annotate/compute")); refreshFrame(); });
   $("#btn-save").addEventListener("click", async () => { applyState(await api("POST", "/api/annotate/save")); refreshFrame(); });
+  $("#btn-save-preset").addEventListener("click", async () => {
+    const suggested = ((lastState && lastState.video_name) || "camera") + "_camA";
+    const name = prompt(
+      "Save the computed camera pose as a reusable calibration preset.\n" +
+      "Reuse only for videos from the SAME camera at the SAME fixed position.\n\n" +
+      "Preset name:", suggested);
+    if (!name) return;
+    const res = await apiOrStatus("POST", "/api/annotate/save_preset", { name });
+    if (res) applyState(res);
+  });
 
   // Confirm/reject bulk
   $("#btn-derived-accept-all").addEventListener("click", async () => {

@@ -208,6 +208,76 @@ def _solve_from_annotation(
     return camera_pose, diag
 
 
+def _load_pose_from_preset(
+    preset_path: Path,
+    img_size: tuple[int, int],
+) -> tuple[dict, dict]:
+    """Load a pre-solved fixed-camera pose from a calibration preset JSON.
+
+    The preset (written by the annotate page's "save calibration preset")
+    stores the camera pose the annotator already computed, so the pipeline
+    can REUSE it verbatim instead of re-solving PnP from the annotation
+    points every run — guaranteeing the run matches what the annotate page
+    showed.
+
+    The preset ``pose`` block uses the same schema as ``camera_poses.json``
+    (``K``, ``dist_coeffs``, ``rvec``, ``tvec``). Intrinsics are pixel-valued,
+    so if the target video's resolution differs from the preset's
+    ``image_size`` we scale ``fx, fy, cx, cy`` accordingly (a pose is only
+    valid for the resolution it was solved at).
+
+    Returns the same ``(camera_pose, diag)`` shape as ``_solve_from_annotation``.
+    """
+    with open(preset_path) as fh:
+        preset = json.load(fh)
+
+    pose = preset.get("pose") or {}
+    K = np.asarray(pose["K"], dtype=np.float64).reshape(3, 3)
+    dist = np.asarray(pose.get("dist_coeffs", np.zeros(5)), dtype=np.float64).ravel()
+    rvec = np.asarray(pose["rvec"], dtype=np.float64).reshape(3)
+    tvec = np.asarray(pose["tvec"], dtype=np.float64).reshape(3)
+
+    # Resolution guard: K is in pixels. Scale it if the video differs from
+    # the resolution the preset was solved at.
+    preset_wh = preset.get("image_size")
+    cur_w, cur_h = int(img_size[0]), int(img_size[1])
+    if preset_wh and len(preset_wh) == 2:
+        pw, ph = int(preset_wh[0]), int(preset_wh[1])
+        if (pw, ph) != (cur_w, cur_h):
+            if pw <= 0 or ph <= 0:
+                raise ValueError(
+                    f"calibration preset {preset_path.name} has invalid "
+                    f"image_size {preset_wh}",
+                )
+            sx, sy = cur_w / pw, cur_h / ph
+            logger.warning(
+                "Stage 1 (Fixed): preset %s solved at %dx%d but video is "
+                "%dx%d — scaling intrinsics by (%.3f, %.3f). Verify the "
+                "overlay; a pose is only strictly valid at its own resolution.",
+                preset_path.name, pw, ph, cur_w, cur_h, sx, sy,
+            )
+            K = K.copy()
+            K[0, 0] *= sx; K[0, 2] *= sx  # fx, cx
+            K[1, 1] *= sy; K[1, 2] *= sy  # fy, cy
+
+    camera_pose = {
+        "K": K.tolist(),
+        "dist_coeffs": dist.tolist(),
+        "rvec": rvec.tolist(),
+        "tvec": tvec.tolist(),
+        "reprojection_error": float(preset.get("reprojection_error", 0.0)),
+        "world_error": 0.0,
+        "world_error_all": 0.0,
+        "inliers_count": 0,
+    }
+    diag = {
+        "mode": "calibration_preset",
+        "preset": preset.get("name") or preset_path.stem,
+        "source_video": preset.get("source_video"),
+    }
+    return camera_pose, diag
+
+
 def _reprojection_residuals(cam, pixel_pts, world_3d_pts) -> np.ndarray:
     """Per-point reprojection residual (px) for a solved camera.
 
@@ -566,6 +636,9 @@ def run_stage1_fixed_camera(
         frame_indices = list(sampler)
 
         # 4. Solve the fixed pose once. Source priority:
+        #   (0) a pre-solved calibration PRESET (``calibration_preset_path``):
+        #       load the pose verbatim, NO re-solve — reuses exactly what the
+        #       annotate page computed (highest priority).
         #   (a) an explicit manual annotation (``annotation_frame_path``),
         #   (b) else the configured keypoint MODEL, detected on a mid-clip
         #       frame (``keypoint_detection.keypoint_model_path`` / SV_kp),
@@ -573,6 +646,7 @@ def run_stage1_fixed_camera(
         # (a)/(c) reuse the annotation JSON; (b) runs the model. Either
         # way the solved pose is replicated to every frame below.
         annotations_dir = _resolve_annotations_dir(video_path)
+        preset_path = phys_config.get("calibration_preset_path")
         explicit_path = phys_config.get("annotation_frame_path")
         # A ``keypoint_detection`` block (always present in the shipped
         # templates) means we can solve the fixed pose from the model when
@@ -581,10 +655,22 @@ def run_stage1_fixed_camera(
         has_model = bool(fr_config.get("keypoint_detection"))
         img_size = (video.width, video.height)
 
-        # ``solve_source`` records where the fixed pose came from (an
-        # annotation file path, or ``model:<name>``) for the run metadata.
+        # ``solve_source`` records where the fixed pose came from (a preset,
+        # an annotation file path, or ``model:<name>``) for the run metadata.
         solve_source: str
-        if explicit_path:
+        if preset_path:
+            preset_p = Path(preset_path)
+            if not preset_p.exists():
+                raise FileNotFoundError(
+                    f"calibration_preset_path={preset_path} does not exist",
+                )
+            logger.info(
+                "Stage 1 (Fixed): loading pre-solved pose from calibration "
+                "preset %s (no re-solve)", preset_p.name,
+            )
+            camera_pose, diag = _load_pose_from_preset(preset_p, img_size)
+            solve_source = f"preset:{preset_p.stem}"
+        elif explicit_path:
             annotation_path = Path(explicit_path)
             if not annotation_path.exists():
                 raise FileNotFoundError(

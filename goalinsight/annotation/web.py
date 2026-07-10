@@ -12,7 +12,10 @@ app uses this so the annotator and the viewer share one process.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -88,6 +91,7 @@ def register_annotation_routes(
     videos_root: Path,
     *,
     configs_root: Path | None = None,
+    calibrations_root: Path | None = None,
     prefix: str = "/api",
 ) -> None:
     """Mount annotator JSON + JPEG endpoints onto an existing FastAPI app.
@@ -107,6 +111,7 @@ def register_annotation_routes(
     index = annotator.index
     videos_root_path = Path(videos_root)
     configs_root_path = Path(configs_root) if configs_root else None
+    calibrations_root_path = Path(calibrations_root) if calibrations_root else None
     p = prefix.rstrip("/")
 
     def _apply_per_video_config(stem: str) -> bool:
@@ -567,6 +572,102 @@ def register_annotation_routes(
         except Exception as exc:  # noqa: BLE001
             logger.warning("failed to update per-video config: %s", exc)
         return _ok(msg)
+
+    @app.post(f"{p}/save_preset")
+    async def save_preset(request: Request) -> JSONResponse:
+        """Persist the just-computed camera pose as a reusable calibration
+        preset under ``workspace/calibrations/<name>.json``.
+
+        For a fixed rig the annotate page's solved pose (K/rvec/tvec/dist,
+        held on ``annotator._solved_camera`` after Compute) is the ground
+        truth. Saving it lets the pipeline REUSE it verbatim — and lets
+        other videos shot with the same camera/position pick it in the
+        wizard — instead of re-solving PnP every run.
+        """
+        if calibrations_root_path is None:
+            raise HTTPException(500, "calibrations directory not configured")
+        cam = getattr(annotator, "_solved_camera", None)
+        if not cam:
+            raise HTTPException(
+                400, "No computed camera yet — click Compute homography first.",
+            )
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 — empty/invalid body is fine
+            body = {}
+        raw_name = (body.get("name") or "").strip()
+        if not raw_name:
+            raise HTTPException(400, "Preset name is required.")
+        # Sanitise to a safe filename stem.
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_name).strip("_.")
+        if not name:
+            raise HTTPException(400, f"Invalid preset name: {raw_name!r}")
+
+        # Image size the pose was solved at (pose intrinsics are pixel-valued).
+        if annotator.current_frame is not None:
+            h, w = annotator.current_frame.shape[:2]
+            img_size = [int(w), int(h)]
+        else:
+            img_size = None
+
+        def _tolist(v):
+            arr = np.asarray(v, dtype=np.float64)
+            return arr.ravel().tolist() if arr.ndim == 1 else arr.tolist()
+
+        K = np.asarray(cam["K"], dtype=np.float64)
+        rvec = np.asarray(cam["rvec"], dtype=np.float64).reshape(3)
+        tvec = np.asarray(cam["tvec"], dtype=np.float64).reshape(3)
+        R = cv2.Rodrigues(rvec)[0]
+        pos = (-R.T @ tvec).ravel()
+        # Snapshot the pitch dimensions the pose was solved against, so the
+        # preset is self-contained: the pose and the pitch geometry it
+        # depends on stay locked together even if the named pitch profile is
+        # later edited. Read from the live active pitch (authoritative — it's
+        # what the solve used).
+        ap = pitch_constants.get_active_pitch()
+        pitch_snapshot = {
+            "pitch_length": float(ap.PITCH_LENGTH),
+            "pitch_width": float(ap.PITCH_WIDTH),
+            "penalty_area_width": float(ap.PENALTY_AREA_WIDTH),
+            "penalty_area_length": float(ap.PENALTY_AREA_LENGTH),
+            "goal_area_width": float(ap.GOAL_AREA_WIDTH),
+            "goal_area_length": float(ap.GOAL_AREA_LENGTH),
+            "goal_line_to_penalty_mark": float(ap.GOAL_LINE_TO_PENALTY_MARK),
+            "center_circle_radius": float(ap.CENTER_CIRCLE_RADIUS),
+            "goal_height": float(ap.GOAL_HEIGHT),
+            "goal_length": float(ap.GOAL_LENGTH),
+        }
+        pa_shape = getattr(ap, "PENALTY_AREA_SHAPE", None)
+        if pa_shape:
+            pitch_snapshot["penalty_area_shape"] = str(pa_shape)
+        preset = {
+            "name": name,
+            "pitch_type": annotator._active_pitch_type,
+            "pitch": pitch_snapshot,
+            "image_size": img_size,
+            "reprojection_error": float(annotator.reprojection_error),
+            "created_at": datetime.now().isoformat(),
+            "source_video": annotator.video_name or None,
+            # ``pose`` mirrors the camera_poses.json single-frame schema so the
+            # fixed_camera runner can load it with zero conversion.
+            "pose": {
+                "K": K.tolist(),
+                "dist_coeffs": _tolist(cam.get("dist", np.zeros(5))),
+                "rvec": rvec.tolist(),
+                "tvec": tvec.tolist(),
+                "camera_position": {
+                    "x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2]),
+                },
+                "focal_length": float(K[0, 0]),
+            },
+        }
+        calibrations_root_path.mkdir(parents=True, exist_ok=True)
+        out_path = calibrations_root_path / f"{name}.json"
+        out_path.write_text(json.dumps(preset, indent=2, ensure_ascii=False))
+        logger.info("saved calibration preset %s (reproj=%.2f px)",
+                    out_path.name, preset["reprojection_error"])
+        return _ok(f"Saved calibration preset '{name}'")
 
     def _thread_annotation_into_config() -> None:
         if configs_root_path is None:

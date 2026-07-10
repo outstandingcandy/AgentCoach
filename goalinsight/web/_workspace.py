@@ -11,6 +11,7 @@ Layout::
       videos/                   # uploaded / discovered source videos
       annotations/<video_stem>/ # AnchorAnnotator output (frame_*.json, ...)
       configs/<video_stem>.yaml # per-video pipeline config authored from /library
+      calibrations/<name>.json  # saved fixed-camera pose presets (reusable)
       models/<run_ts>/          # train_finetune.py outputs (best_model.pt, ...)
       runs/<run_name>/          # pipeline run outputs
         field_registration/
@@ -56,6 +57,13 @@ class Workspace:
         return self.root / "configs"
 
     @property
+    def calibrations_dir(self) -> Path:
+        """Saved fixed-camera calibration presets (<name>.json). Each holds a
+        solved camera pose + pitch_type so it can be reused across videos
+        shot with the same camera at the same fixed position."""
+        return self.root / "calibrations"
+
+    @property
     def jobs_file(self) -> Path:
         return self.root / "jobs.json"
 
@@ -75,6 +83,7 @@ class Workspace:
             self.videos_dir,
             self.annotations_dir,
             self.configs_dir,
+            self.calibrations_dir,
             self.models_dir,
             self.runs_dir,
         ):

@@ -236,19 +236,36 @@
       </div>
       <div id="wiz-steps" style="color:#9aa3ad;font-size:12px"></div>
 
-      <!-- Step 1: pitch -->
+      <!-- Step 1: reuse a saved calibration, else pick the pitch -->
       <section id="wiz-step-1" class="wiz-step">
-        <p style="color:#cfe3ff;margin:0 0 8px 0">
-          What pitch is this?
-        </p>
-        <div style="display:flex;gap:10px;align-items:center;margin:6px 0">
-          <label style="width:110px;color:#9aa3ad">Pitch type</label>
-          <select id="wiz-pitch" style="flex:1"></select>
+        <div id="wiz-preset-wrap" style="margin:0 0 14px 0;padding:10px 12px;
+             background:#16202b;border:1px solid #2a3646;border-radius:6px">
+          <p style="color:#cfe3ff;margin:0 0 6px 0">
+            Already calibrated this camera? Reuse a saved calibration:
+          </p>
+          <select id="wiz-calibration" style="width:100%">
+            <option value="">— none (set up from scratch) —</option>
+          </select>
+          <p style="color:#9aa3ad;font-size:12px;margin:6px 0 0 0">
+            A preset carries the camera pose <strong>and</strong> pitch
+            dimensions already computed on the Annotate page — so the pitch,
+            camera and keypoint-model steps are skipped. Only use one from the
+            <strong>same camera at the same fixed position</strong>.
+          </p>
         </div>
-        <p style="color:#9aa3ad;font-size:12px;margin-top:8px">
-          Sets pitch dimensions + markings the calibration solves against
-          (FIFA / futsal / kids).
-        </p>
+        <div id="wiz-pitch-block">
+          <p style="color:#cfe3ff;margin:0 0 8px 0">
+            What pitch is this?
+          </p>
+          <div style="display:flex;gap:10px;align-items:center;margin:6px 0">
+            <label style="width:110px;color:#9aa3ad">Pitch type</label>
+            <select id="wiz-pitch" style="flex:1"></select>
+          </div>
+          <p style="color:#9aa3ad;font-size:12px;margin-top:8px">
+            Sets pitch dimensions + markings the calibration solves against
+            (FIFA / futsal / kids).
+          </p>
+        </div>
       </section>
 
       <!-- Step 2: camera profile + position -->
@@ -330,6 +347,11 @@
           Solves one pose (via the keypoint model or a hand-annotated
           frame) and reuses it. <em>backend: fixed_camera</em>
         </label>
+        <div style="display:none">
+          <p style="color:#9aa3ad;font-size:12px;margin:4px 0 0 0">
+            (Calibration-preset reuse moved to step 1.)
+          </p>
+        </div>
         <label style="display:block;margin:8px 0;cursor:pointer">
           <input type="radio" name="wiz-moves" value="yes">
           <strong>Yes — moves</strong> — handheld / pan-tilt-zoom.
@@ -1014,9 +1036,10 @@
 
     async function populateWizardLibraries() {
       try {
-        const [pitches, cams] = await Promise.all([
+        const [pitches, cams, calibs] = await Promise.all([
           api('GET', '/api/library/pitch_profiles'),
           api('GET', '/api/library/camera_profiles'),
+          api('GET', '/api/library/calibrations'),
         ]);
         const pitchSel = $("#wiz-pitch");
         wizPitchProfiles = {};
@@ -1029,6 +1052,30 @@
         const camSel = $("#wiz-cam");
         camSel.innerHTML = cams.map(c =>
           `<option value="${c.key}">${c.label}</option>`).join('');
+        // Calibration presets (fixed-camera pose reuse). Label shows the
+        // pitch it carries + its reproj error so the user can judge fit.
+        const calSel = $("#wiz-calibration");
+        if (calSel) {
+          const opts = ['<option value="">— none (solve fresh) —</option>'];
+          (calibs || []).forEach(c => {
+            const err = (c.reprojection_error != null)
+              ? ` · ${Number(c.reprojection_error).toFixed(1)}px` : '';
+            const pt = c.pitch_type ? ` · ${c.pitch_type}` : '';
+            opts.push(`<option value="${c.name}">${c.name}${pt}${err}</option>`);
+          });
+          calSel.innerHTML = opts.join('');
+          // When a preset is chosen it fully defines the calibration, so the
+          // pitch/camera/keypoint-model steps are irrelevant — hide the pitch
+          // block and let step-1 Next jump straight to launch.
+          const pitchBlock = $("#wiz-pitch-block");
+          const nextBtn = $("#wiz-next");
+          calSel.onchange = () => {
+            const usingPreset = !!calSel.value;
+            if (pitchBlock) pitchBlock.style.display = usingPreset ? 'none' : 'block';
+            if (nextBtn) nextBtn.textContent = usingPreset ? 'Skip to launch' : 'Next';
+          };
+          calSel.onchange();
+        }
       } catch (e) {
         wizErrEl.textContent = `Failed to load profiles: ${e.message}`;
       }
@@ -1195,9 +1242,15 @@
     // Write the camera-moves answer → backend (step 4, at launch).
     async function saveCameraMoves() {
       const moves = document.querySelector('input[name="wiz-moves"]:checked').value;
+      const payload = {camera_moves: moves === 'yes'};
+      // A calibration preset only applies to the fixed-rig path.
+      const calSel = $("#wiz-calibration");
+      if (moves === 'no' && calSel && calSel.value) {
+        payload.calibration_preset = calSel.value;
+      }
       const res = await api('POST',
         `/api/library/videos/${encodeURIComponent(wizState.video)}/scene-setup`,
-        {camera_moves: moves === 'yes'});
+        payload);
       wizState.cfg_path = res.path;
       wizState.cfg_text = res.text;
     }
@@ -1287,8 +1340,16 @@
       wizErrEl.textContent = '';
       try {
         if (wizState.step === 1) {
-          // Just advance — pitch is read from the select on step 2 save.
-          showWizStep(2);
+          // If a saved calibration preset is chosen, it fully defines pitch
+          // + camera + pose — skip the pitch/camera/keypoint-model steps and
+          // jump straight to launch (step 4).
+          const calSel = $("#wiz-calibration");
+          if (calSel && calSel.value) {
+            showWizStep(4);
+          } else {
+            // Just advance — pitch is read from the select on step 2 save.
+            showWizStep(2);
+          }
         } else if (wizState.step === 2) {
           // Write pitch + camera + position, then populate the model
           // picker (filtered by the chosen pitch) and its preview.
