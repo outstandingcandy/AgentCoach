@@ -32,6 +32,39 @@ from ._types import (
 )
 
 
+def _dims_from_config(
+    config: dict[str, Any] | None,
+) -> dict[str, float | None]:
+    """Pull pitch / goal dims out of a pipeline config.
+
+    The config carries the pitch as either an already-expanded ``pitch:``
+    block or the ``pitch_type: <name>`` shorthand; expand the shorthand so
+    a per-video config that only says ``pitch_type: futsal`` still yields
+    the futsal goal width (3 m) instead of the FIFA fallback (7.32 m).
+    Without this, a shot that misses a small futsal goal but crosses the
+    goal line within ±3.66 m is mis-scored as a goal.
+
+    Returns ``None`` for any dim the config doesn't define, so callers keep
+    the caller > config > video_info > FIFA priority.
+    """
+    if not config:
+        return {k: None for k in
+                ("pitch_length", "pitch_width", "goal_length", "goal_height")}
+    pitch = config.get("pitch")
+    if not isinstance(pitch, dict) and "pitch_type" in config:
+        # Expand ``pitch_type`` without mutating the caller's config.
+        try:
+            from ..annotation import pitch_types
+            pitch = pitch_types.resolve(str(config["pitch_type"]))
+        except (KeyError, ImportError):
+            pitch = {}
+    pitch = pitch if isinstance(pitch, dict) else {}
+    return {
+        k: (float(pitch[k]) if k in pitch else None)
+        for k in ("pitch_length", "pitch_width", "goal_length", "goal_height")
+    }
+
+
 def detect_events_from_output(
     pipeline_output_dir: str | Path,
     config: dict[str, Any] | None = None,
@@ -43,16 +76,17 @@ def detect_events_from_output(
 ) -> list[MatchEvent]:
     """Detect events from a pipeline output directory.
 
-    Pitch / goal dims default to ``calibration_metadata.video_info`` when
-    omitted; falls back to FIFA only if neither caller nor metadata supply
-    them. Pass an explicit value to override metadata.
+    Pitch / goal dims resolve caller > config (``pitch``/``pitch_type``) >
+    ``calibration_metadata.video_info`` > FIFA fallback. Pass an explicit
+    value to override.
     """
+    cfg_dims = _dims_from_config(config)
     ctx = EventDetectionContext.from_output_dir(
         pipeline_output_dir,
-        pitch_length=pitch_length,
-        pitch_width=pitch_width,
-        goal_length=goal_length,
-        goal_height=goal_height,
+        pitch_length=pitch_length if pitch_length is not None else cfg_dims["pitch_length"],
+        pitch_width=pitch_width if pitch_width is not None else cfg_dims["pitch_width"],
+        goal_length=goal_length if goal_length is not None else cfg_dims["goal_length"],
+        goal_height=goal_height if goal_height is not None else cfg_dims["goal_height"],
         fps=fps,
     )
     orchestrator = EventOrchestrator(config or {})
@@ -69,14 +103,19 @@ def detect_events_from_dirs(
     goal_height: float | None = None,
     fps: float | None = None,
 ) -> list[MatchEvent]:
-    """Detect events from separate stage directories (pipeline stage use)."""
+    """Detect events from separate stage directories (pipeline stage use).
+
+    Pitch / goal dims resolve caller > config (``pitch``/``pitch_type``) >
+    calibration ``video_info`` > FIFA fallback.
+    """
+    cfg_dims = _dims_from_config(config)
     ctx = EventDetectionContext.from_dirs(
         tracking_dir,
         calibration_dir,
-        pitch_length=pitch_length,
-        pitch_width=pitch_width,
-        goal_length=goal_length,
-        goal_height=goal_height,
+        pitch_length=pitch_length if pitch_length is not None else cfg_dims["pitch_length"],
+        pitch_width=pitch_width if pitch_width is not None else cfg_dims["pitch_width"],
+        goal_length=goal_length if goal_length is not None else cfg_dims["goal_length"],
+        goal_height=goal_height if goal_height is not None else cfg_dims["goal_height"],
         fps=fps,
     )
     orchestrator = EventOrchestrator(config or {})

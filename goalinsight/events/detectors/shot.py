@@ -736,9 +736,9 @@ def _validate_with_crossbar(
     goal_3d = np.array(
         [
             [goal_x, goal_half_width, 0],
-            [goal_x, goal_half_width, -goal_height],
+            [goal_x, goal_half_width, goal_height],
             [goal_x, -goal_half_width, 0],
-            [goal_x, -goal_half_width, -goal_height],
+            [goal_x, -goal_half_width, goal_height],
         ],
         dtype=np.float64,
     )
