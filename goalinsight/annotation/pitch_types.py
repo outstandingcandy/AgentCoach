@@ -113,6 +113,12 @@ def resolve(name: str) -> dict:
             out[k] = float(v)
         elif k == "penalty_area_shape" and isinstance(v, str):
             out[k] = v
+        elif k == "valid_keypoint_ids" and isinstance(v, list):
+            # Per-pitch whitelist of PnLCalib keypoint ids that are real +
+            # correctly scaled on this pitch (see pitches.yaml). Passed
+            # through so synthetic-data generation can skip ids that don't
+            # exist on non-FIFA pitches. Left as ints.
+            out[k] = [int(i) for i in v]
     return out
 
 
