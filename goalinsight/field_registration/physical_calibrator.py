@@ -271,7 +271,7 @@ class PhysicalCalibrator:
         Args:
             img_pts: (N, 2) pixel coordinates.
             world_pts: (N, 3) world coordinates (z=0 ground points,
-                z=-2.44 crossbar points). Must have len == len(img_pts).
+                z=+2.44 crossbar points). Must have len == len(img_pts).
             kp_ids: Optional per-correspondence labels for diagnostics.
                 Defaults to range(N).
             line_constraints: Optional pre-built line constraint dicts
@@ -622,7 +622,7 @@ class PhysicalCalibrator:
         img_pts, world_pts, kp_ids = keypoint_mapper.build_3d_correspondence_matrix(
             self._keypoints,
             filter_by_confidence=min_confidence,
-            exclude_non_ground=False,  # Include crossbar points (z=-2.44)
+            exclude_non_ground=False,  # Include crossbar points (z=+2.44)
         )
 
         # Override world coordinates with field template (supports non-standard pitch sizes)
@@ -631,7 +631,7 @@ class PhysicalCalibrator:
             for idx, kid in enumerate(kp_ids):
                 if kid < len(self._field_world_coords):
                     wx, wy = self._field_world_coords[kid]
-                    z = world_pts[idx, 2]  # preserve z (0 or -2.44 for crossbar)
+                    z = world_pts[idx, 2]  # preserve z (0 or +2.44 for crossbar)
                     world_pts[idx] = [wx, wy, z]
 
         # Build confidence array matching the correspondence order

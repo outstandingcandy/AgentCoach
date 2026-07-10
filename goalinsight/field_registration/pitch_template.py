@@ -16,8 +16,9 @@ Conventions follow v3 across the rest of the codebase (see auto-memory
 - Keypoint IDs are **0-indexed** (kp 0 = TL pitch corner). The PnLCalib
   upstream port uses 1-indexed and y-down — that translation lives in
   ``pnlcalib_orig/pitch_template.py``, not here.
-- 4 crossbar-top keypoints (IDs 12, 14, 16, 18) carry ``z = -goal_height``
-  (OpenCV camera convention: z-negative = up).
+- 4 crossbar-top keypoints (IDs 12, 14, 16, 18) carry ``z = +goal_height``
+  (z-positive = up; OpenCV's ``solvePnP`` places no requirement on which
+  world-frame sign means "up" — the choice is ours, and this is it).
 """
 
 from __future__ import annotations
@@ -238,13 +239,8 @@ def build_field_template(
         3:  {"p1": (HL, PA_HW, 0), "p2": (HL - PA_DEPTH, PA_HW, 0)},
         4:  {"p1": (HL - PA_DEPTH, PA_HW, 0), "p2": (HL - PA_DEPTH, -PA_HW, 0)},
         5:  {"p1": (HL - PA_DEPTH, -PA_HW, 0), "p2": (HL, -PA_HW, 0)},
-        # Goal frames. NB: existing physical_calibrator uses z = +G_H here
-        # (positive-up) while KeypointMapper.GOAL_CROSSBAR_HEIGHT is -2.44
-        # (negative-up). The mismatch is pre-existing — calibrator overrides
-        # only x/y of crossbar keypoints and keeps the z that KeypointMapper
-        # provides, so line_defs z sign actually only matters when projecting
-        # the goal frame for visualization. Preserving the legacy +G_H here
-        # to avoid silently flipping rendered crossbars.
+        # Goal frames (z=+G_H, positive-up — matches KeypointMapper.
+        # GOAL_CROSSBAR_HEIGHT and geometry.py's PITCH_POINTS).
         # left goal frame
         6:  {"p1": (-HL, -G_HW, G_H), "p2": (-HL, G_HW, G_H)},   # crossbar
         7:  {"p1": (-HL, -G_HW, 0),   "p2": (-HL, -G_HW, G_H)},  # bot-side post

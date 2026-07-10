@@ -38,17 +38,10 @@ def collect_pnp_points(
     Manual keypoints contribute their full 3D pitch coord. Accepted
     derived points are line intersections, always on the ground plane.
 
-    NOTE on z sign: ``pitch/geometry.py`` stores crossbar keypoints at
-    ``z = -GOAL_HEIGHT`` (legacy convention shared with pnlcalib_orig's
-    Zhang-style calibration, where +z points DOWN). The OpenCV
-    ``solvePnP`` family this annotator's physical backend goes through
-    expects +z UP — feeding it the legacy negative z makes the solver
-    flip the whole pose to compensate, and the solved camera ends up at
-    z>0 (underground in the legacy frame, but mathematically self-
-    consistent) while the projection of any other elevated keypoint
-    lands on the wrong side of the ground. We FLIP the sign here only
-    for the PnP input. The keypoint table itself stays negative-z so
-    pnlcalib_orig and the HRNet head don't break.
+    ``pitch/geometry.py`` stores crossbar keypoints at ``z = +GOAL_HEIGHT``
+    (positive-up), which is what the OpenCV ``solvePnP`` family this
+    annotator's physical backend goes through expects — no sign flip
+    needed here.
     """
     pixel_pts: list[tuple[float, float]] = []
     world_3d_pts: list[tuple[float, float, float]] = []
@@ -57,7 +50,7 @@ def collect_pnp_points(
         pixel_pts.append(state.clicked_points[i])
         pt_3d = _pk.PITCH_POINTS[name]
         world_3d_pts.append(
-            (float(pt_3d[0]), float(pt_3d[1]), -float(pt_3d[2])),
+            (float(pt_3d[0]), float(pt_3d[1]), float(pt_3d[2])),
         )
     for i, (pixel, world, _) in enumerate(state.derived_points):
         accepted = state.derived_accepted[i] if i < len(state.derived_accepted) else False
@@ -119,9 +112,8 @@ def compute_auto_projections(state: "AnchorAnnotator") -> None:
         if not np.all(np.isfinite(pt_3d)):
             continue
 
-        # Flip z to match collect_pnp_points (same legacy-sign reason).
         pixel = project_camera_point(
-            cam, (float(pt_3d[0]), float(pt_3d[1]), -float(pt_3d[2])),
+            cam, (float(pt_3d[0]), float(pt_3d[1]), float(pt_3d[2])),
         )
         if pixel is None:
             continue

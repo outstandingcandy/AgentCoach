@@ -2,9 +2,11 @@
 
 Ported from soccer-redpanda/pitch/camera.py. Provides Camera class that
 extracts intrinsics from homography (Algorithm 8.2, MVG), then solves PnP
-with 3D points (including goal crossbars at z=-2.44) and refines with LM.
+with 3D points (including goal crossbars) and refines with LM.
 
-Z convention: z-negative = up (crossbars at z=-2.44, camera z < 0).
+Z convention: z-positive = up (crossbars at z=+2.44, matching
+``goalinsight.annotation.pitch.geometry.PITCH_POINTS``, the source of
+the 3D points callers pass in).
 """
 
 from __future__ import annotations

@@ -321,9 +321,6 @@ def visualize_annotations(state: "AnchorAnnotator", frame_rgb: np.ndarray) -> np
     # markers sit on top of the green manual circles — otherwise a
     # near-zero residual would hide the cyan ring inside the green
     # blob and the user couldn't tell the solver fit each point.
-    # Crossbar keypoints carry the legacy z = -GOAL_HEIGHT convention
-    # from geometry.py; we mirror that here so the marker lands on the
-    # same physical post-top the solver fit.
     cam = getattr(state, "_solved_camera", None)
     if cam is not None:
         from .pitch import keypoints as _pk
@@ -339,8 +336,7 @@ def visualize_annotations(state: "AnchorAnnotator", frame_rgb: np.ndarray) -> np
             if pt_3d is None:
                 continue
             wx, wy = float(pt_3d[0]), float(pt_3d[1])
-            # Flip z sign — see collect_pnp_points for the rationale.
-            wz = -float(pt_3d[2]) if len(pt_3d) >= 3 else 0.0
+            wz = float(pt_3d[2]) if len(pt_3d) >= 3 else 0.0
             world = np.array([[wx, wy, wz]], dtype=np.float64)
             try:
                 proj, _ = cv2.projectPoints(world, rvec, tvec, K, dist)

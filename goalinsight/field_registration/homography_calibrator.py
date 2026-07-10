@@ -24,7 +24,7 @@ from .pnlcalib.curve_utils import sample_points_on_image_line
 
 logger = logging.getLogger(__name__)
 
-# Non-ground keypoint IDs (crossbar/goal post tops at z=-2.44m)
+# Non-ground keypoint IDs (crossbar/goal post tops at z=+2.44m)
 NON_GROUND_KP_IDS = {12, 14, 16, 18}
 
 

@@ -140,12 +140,11 @@ def _solve_from_annotation(
         pt_3d = _pk.PITCH_POINTS.get(name)
         if pt_3d is None:
             continue
-        # Same z-flip the annotator's collect_pnp_points applies — the
-        # keypoint table stores crossbar z = -GOAL_HEIGHT (legacy),
-        # but OpenCV solvePnP wants +z up.
+        # PITCH_POINTS is already positive-up (crossbar z=+GOAL_HEIGHT) —
+        # no flip needed.
         pixel_pts.append((float(pix[0]), float(pix[1])))
         world_3d_pts.append((
-            float(pt_3d[0]), float(pt_3d[1]), -float(pt_3d[2]),
+            float(pt_3d[0]), float(pt_3d[1]), float(pt_3d[2]),
         ))
 
     # Accepted derived points (line intersections). The JSON stores
@@ -364,9 +363,8 @@ def _solve_from_model_detection(
     id_to_name = {v: k for k, v in PITCH_POINT_TO_PNLCALIB_ID.items()}
     # 3D landmark world coords keyed by name (x, y, z). z != 0 for goal-post
     # tops (on the crossbar) — solvePnP uses their height as extra pose
-    # constraint, so we must NOT flatten them to the ground plane. Matches
-    # the annotation path in _solve_from_annotation (same z-flip: the table
-    # stores crossbar z negative-up, OpenCV wants +z up).
+    # constraint, so we must NOT flatten them to the ground plane.
+    # PITCH_POINTS is already positive-up.
     kp_world = _pk.PITCH_POINTS
     conf_thresh = float(det_config.get("keypoint_threshold", 0.3434))
     # Intrinsics handling honours ``physical.free_intrinsics`` (default
@@ -418,9 +416,9 @@ def _solve_from_model_detection(
                 world = kp_world.get(name) if name else None
                 if world is None:
                     continue
-                # z-flip (crossbar stored negative-up → +z up for solvePnP);
-                # ground points have z=0 so the flip is a no-op for them.
-                zc = -float(world[2]) if len(world) > 2 else 0.0
+                # PITCH_POINTS is already positive-up (crossbar z=+GOAL_HEIGHT,
+                # matching what solvePnP wants) — no flip needed.
+                zc = float(world[2]) if len(world) > 2 else 0.0
                 rec = obs.setdefault(
                     name, {"px": [], "world": (float(world[0]), float(world[1]), zc)},
                 )

@@ -1,7 +1,10 @@
 """SoccerPitch geometry with y-up convention.
 
 Pitch center is the origin. X grows toward the right goal. Y grows toward the
-top of the image / away from the camera (y-up). Goal crossbars have z = -GOAL_HEIGHT.
+top of the image / away from the camera (y-up). Z grows UP (matches OpenCV
+solvePnP's own world-frame freedom — there is no OpenCV requirement that
+world z be down; the sign is ours to pick, and everything that calls
+solvePnP with this table wants +z up). Goal crossbars have z = +GOAL_HEIGHT.
 
 Adapted from soccernet-calibration-sportlight/baseline/soccerpitch.py via
 goal-sight-v2, with the y-axis flipped so top = +W/2 (matches PnLCalib).
@@ -93,13 +96,13 @@ class SoccerPitch:
         bl_corner = pt(-hL, -hW)
 
         l_goal_bl_post = pt(-hL, -g_w, 0.0)
-        l_goal_tl_post = pt(-hL, -g_w, -g_h)
+        l_goal_tl_post = pt(-hL, -g_w, g_h)
         l_goal_br_post = pt(-hL, g_w, 0.0)
-        l_goal_tr_post = pt(-hL, g_w, -g_h)
+        l_goal_tr_post = pt(-hL, g_w, g_h)
         r_goal_bl_post = pt(hL, g_w, 0.0)
-        r_goal_tl_post = pt(hL, g_w, -g_h)
+        r_goal_tl_post = pt(hL, g_w, g_h)
         r_goal_br_post = pt(hL, -g_w, 0.0)
-        r_goal_tr_post = pt(hL, -g_w, -g_h)
+        r_goal_tr_post = pt(hL, -g_w, g_h)
 
         l_pen_mark = pt(-hL + self.GOAL_LINE_TO_PENALTY_MARK, 0)
         r_pen_mark = pt(hL - self.GOAL_LINE_TO_PENALTY_MARK, 0)

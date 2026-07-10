@@ -269,8 +269,9 @@ class KeypointMapper:
         18,  # right_goal_top_post_top (on crossbar)
     }
 
-    # Height of goal crossbar (z-negative = up convention)
-    GOAL_CROSSBAR_HEIGHT = -2.44
+    # Height of goal crossbar (z-positive = up; matches solvePnP's own
+    # world-frame freedom, and goalinsight.annotation.pitch.geometry).
+    GOAL_CROSSBAR_HEIGHT = 2.44
 
     # Edge keypoint IDs (near goal lines, affected by lens distortion)
     # These should be excluded when camera has wide-angle lens distortion
@@ -355,7 +356,7 @@ class KeypointMapper:
         filter_by_confidence: float = 0.3,
         exclude_non_ground: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, list[int]]:
-        """Build 2D-3D correspondences including non-ground points with z=-2.44.
+        """Build 2D-3D correspondences including non-ground points with z=+2.44.
 
         Unlike build_correspondence_matrix, this includes crossbar keypoints
         with their actual 3D height for use with PnP solving.
@@ -369,7 +370,7 @@ class KeypointMapper:
         Returns:
             Tuple of:
                 - image_points: (N, 2)
-                - world_points_3d: (N, 3) with z=-2.44 for crossbar, z=0 otherwise
+                - world_points_3d: (N, 3) with z=+2.44 for crossbar, z=0 otherwise
                 - keypoint_ids: List of keypoint IDs used
         """
         image_points = []

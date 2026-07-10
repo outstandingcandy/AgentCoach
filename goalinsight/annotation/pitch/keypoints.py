@@ -1,7 +1,7 @@
 """57 HRNet pitch keypoints (y-up convention).
 
 Pitch center is the origin. X grows toward the right goal. Y grows toward the
-top of the image (y-up). Crossbar points have z = -GOAL_HEIGHT.
+top of the image (y-up). Z grows up. Crossbar points have z = +GOAL_HEIGHT.
 
 Ported from goal-sight-v2 `pitch/keypoints.py` with the y-axis flipped so that
 labels like CENTER_CIRCLE_TANGENT_TR denote the point with y > 0 and x > 0.
@@ -193,7 +193,7 @@ INTERSECTON_TO_PITCH_POINTS = {
 
 PITCH_POINTS_TO_INTERSECTON = {v: k for k, v in INTERSECTON_TO_PITCH_POINTS.items()}
 
-# Crossbar-top points (z != 0): ids of the four posts at z = -GOAL_HEIGHT.
+# Crossbar-top points (z != 0): ids of the four posts at z = +GOAL_HEIGHT.
 NOT_ON_PLANE: List[int] = [0, 1, 24, 25]
 
 
@@ -219,7 +219,7 @@ PNLCALIB_WORLD_COORDS_2D: List[Tuple[float, float]] = [
 ]
 
 # Crossbar-top channels: pairs that share (x, y) with the ground-post channel
-# but represent the post's top end (z = -GOAL_HEIGHT). 0-indexed.
+# but represent the post's top end (z = +GOAL_HEIGHT). 0-indexed.
 PNLCALIB_CROSSBAR_TOP_IDS = [12, 14, 16, 18]
 
 

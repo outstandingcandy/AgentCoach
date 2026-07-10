@@ -97,10 +97,8 @@ def _build_pitch_polylines() -> tuple[list[np.ndarray], list[tuple[float, float,
             polylines.append(np.column_stack([arr, np.zeros(len(arr))]))
 
         # Goal frames. Pull world coords from PITCH_POINTS so post-top z
-        # and post-base z come from the same dict the solver consumed.
-        # The keypoint table stores crossbar z = -GOAL_HEIGHT (legacy
-        # negative-up convention); flip here so the renderer matches the
-        # PnP solver which works in +z-up.
+        # and post-base z come from the same dict the solver consumed
+        # (positive-up, no flip needed).
         from .pitch import keypoints as _pk
         for names in (
             ("L_GOAL_TL_POST", "L_GOAL_TR_POST",
@@ -113,7 +111,7 @@ def _build_pitch_polylines() -> tuple[list[np.ndarray], list[tuple[float, float,
                 p = _pk.PITCH_POINTS.get(kp_name)
                 if p is None or len(p) < 3:
                     break
-                pts[label] = (float(p[0]), float(p[1]), -float(p[2]))
+                pts[label] = (float(p[0]), float(p[1]), float(p[2]))
             if len(pts) != 4:
                 continue
             tl, tr, bl, br = pts["tl"], pts["tr"], pts["bl"], pts["br"]
