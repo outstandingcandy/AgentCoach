@@ -102,6 +102,7 @@
       border-color: #3b82f6; }
     .vis-body { padding: 12px; }
     .vis-slider-row { display: flex; gap: 10px; align-items: center;
+                      flex-wrap: wrap;
                       font-size: 12px; color: #9aa3ad; margin-bottom: 8px; }
     .vis-slider-row input[type=range] { flex: 1; accent-color: #3b82f6; }
     .vis-frame-label { min-width: 130px; text-align: right;
@@ -690,8 +691,18 @@
             <option value="1920">1920px</option>
             <option value="">original</option>
           </select>
+          <button data-vis-step="${index}" data-dir="-1"
+                  style="padding:3px 8px" title="previous frame">◀</button>
+          <button data-vis-step="${index}" data-dir="1"
+                  style="padding:3px 8px" title="next frame">▶|</button>
           <input type="range" min="0" max="${vd.frames.length - 1}" value="0"
                  data-vis-slider="${index}" style="flex:1">
+          <input type="number" data-vis-jump="${index}" value="${first}"
+                 title="jump to frame number (snaps to nearest available)"
+                 style="width:72px;padding:2px 4px" min="${first}"
+                 max="${vd.frames[vd.frames.length - 1]}">
+          <button data-vis-jump-go="${index}" style="padding:3px 8px"
+                  title="jump to entered frame">Go</button>
           <span class="vis-frame-label" data-vis-label="${index}">
             frame ${first}  (1/${vd.frames.length})
           </span>
@@ -809,6 +820,8 @@
         if (lab) {
           lab.textContent = `frame ${vd.frames[valueIdx]}  (${valueIdx + 1}/${vd.frames.length})`;
         }
+        const jump = document.querySelector(`[data-vis-jump="${idx}"]`);
+        if (jump && document.activeElement !== jump) jump.value = String(vd.frames[valueIdx]);
         if (!img) return;
         // If already decoded, swap immediately. Otherwise kick off
         // the load and only swap when complete (visible image stays
@@ -892,12 +905,74 @@
           imgEl.src = url;
           document.querySelector(`[data-vis-label="${idx}"]`).textContent =
             `frame ${f}  (${i + 1}/${vd.frames.length})`;
+          // Keep the jump box showing the current frame number as the
+          // user drags or plays. Skip while it has focus so we don't
+          // clobber what they're typing.
+          const jump = document.querySelector(`[data-vis-jump="${idx}"]`);
+          if (jump && document.activeElement !== jump) jump.value = String(f);
           // Re-fetch the JSON sidecar + redraw overlay for the
           // consolidation pane. The redraw inside maybeUpdateOverlay
           // would otherwise race against the new img's load: the
           // ResizeObserver / load handler above is the one that
           // settles the final overlay box.
           maybeUpdateOverlay(idx, vd, f);
+        });
+      });
+      // Move a vis pane to a specific slider index: clamp, set the
+      // slider, and re-fire its ``input`` handler so image + label +
+      // overlay all update through the one code path above. Also sync
+      // the jump box to the resolved frame number.
+      function _gotoIndex(idx, valueIdx) {
+        const sl = document.querySelector(`[data-vis-slider="${idx}"]`);
+        const vd = currentManifest?.vis_dirs?.[parseInt(idx)];
+        if (!sl || !vd) return;
+        const max = parseInt(sl.max, 10);
+        const clamped = Math.max(0, Math.min(max, valueIdx));
+        sl.value = String(clamped);
+        sl.dispatchEvent(new Event('input'));
+        const jump = document.querySelector(`[data-vis-jump="${idx}"]`);
+        if (jump) jump.value = String(vd.frames[clamped]);
+      }
+      // Nearest available frame INDEX for a requested frame NUMBER.
+      // vd.frames is sorted ascending but sparse (e.g. every 3rd source
+      // frame), so an exact number often has no jpg — snap to the
+      // closest one that does.
+      function _nearestIndex(vd, frameNum) {
+        let best = 0, bestDist = Infinity;
+        for (let i = 0; i < vd.frames.length; i++) {
+          const d = Math.abs(vd.frames[i] - frameNum);
+          if (d < bestDist) { bestDist = d; best = i; }
+          else if (vd.frames[i] > frameNum) break;  // sorted: no closer ahead
+        }
+        return best;
+      }
+      // ◀ / ▶| single-frame stepping (moves one entry in vd.frames, i.e.
+      // to the adjacent frame that actually has data).
+      document.querySelectorAll('[data-vis-step]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const idx = btn.dataset.visStep;
+          stopPlay(idx);  // stepping while playing would fight the timer
+          const sl = document.querySelector(`[data-vis-slider="${idx}"]`);
+          if (!sl) return;
+          _gotoIndex(idx, parseInt(sl.value, 10) + parseInt(btn.dataset.dir, 10));
+        });
+      });
+      // Frame-number jump box: Go button or Enter snaps to nearest frame.
+      function _doJump(idx) {
+        const inp = document.querySelector(`[data-vis-jump="${idx}"]`);
+        const vd = currentManifest?.vis_dirs?.[parseInt(idx)];
+        if (!inp || !vd) return;
+        const n = parseInt(inp.value, 10);
+        if (Number.isNaN(n)) return;
+        stopPlay(idx);
+        _gotoIndex(idx, _nearestIndex(vd, n));
+      }
+      document.querySelectorAll('[data-vis-jump-go]').forEach((btn) => {
+        btn.addEventListener('click', () => _doJump(btn.dataset.visJumpGo));
+      });
+      document.querySelectorAll('[data-vis-jump]').forEach((inp) => {
+        inp.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); _doJump(inp.dataset.visJump); }
         });
       });
       // "Clear selection" button: wipes the toggle Set + redraws every
