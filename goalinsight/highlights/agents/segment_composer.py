@@ -146,7 +146,10 @@ class SegmentComposer(BaseClipComposer):
         overlay_cfg = config.get("overlays", {})
         overlays_enabled = overlay_cfg.get("enabled", True)
 
-        output_fps = config.get("output_fps", ctx.fps)
+        # output_fps None/0 → follow the source video's fps so normal-speed
+        # segments play at real time (a fixed low value slows a high-fps
+        # source: 60fps source at 25fps output plays 2.4× slow).
+        output_fps = config.get("output_fps") or ctx.fps
         crossfade_frames = config.get("crossfade_frames", 4)
 
         # Output dimensions: full frame for wide, output_size for closeup

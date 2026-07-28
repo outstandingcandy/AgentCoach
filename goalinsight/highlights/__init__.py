@@ -20,7 +20,11 @@ logger = logging.getLogger(__name__)
 
 # Default highlight configuration (merged under any user-provided config)
 _DEFAULT_HIGHLIGHT_CONFIG: dict[str, Any] = {
-    "output_fps": 25.0,
+    # None → follow the source video's fps so normal-speed segments play
+    # at real time. A fixed low value (e.g. 25) here silently slows every
+    # segment when the source is high-fps (a 60fps source at 25fps output
+    # plays 2.4× slow).
+    "output_fps": None,
     "crossfade_frames": 4,
     "closeup": {
         "output_size": [640, 360],

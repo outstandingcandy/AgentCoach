@@ -231,7 +231,7 @@ visualization:
 
 highlights:
   enabled: false
-  output_fps: 25.0
+  output_fps: null   # follow source fps (25 here slows high-fps sources)
   crossfade_frames: 4
   closeup:
     output_size: [640, 360]
