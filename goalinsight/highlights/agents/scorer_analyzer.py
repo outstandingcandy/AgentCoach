@@ -1,14 +1,19 @@
 """ScorerAnalyzer — player attribution and segment planning for goal events.
 
-Produces a broadcast-style 4-segment highlight:
+Produces a two-pass broadcast highlight of the same play:
 
-    buildup → strike → celebration → replay
+    Pass 1 (original / wide view)  →  Pass 2 (closeup replay)
 
-- **Buildup**: wide/medium view following the ball through the attacking play.
-- **Strike**: closeup on the ball from the moment of the kick through the
-  ball entering the net — the narrative climax.
-- **Celebration**: medium view tracking the scorer's reaction.
-- **Replay**: slow-motion replay of the strike with ball trail overlay.
+- **Pass 1 — original view**: the whole play (buildup → shot → ball into
+  the net → celebration) shown once in the uncropped broadcast angle, no
+  camera-follow. This is the "as it happened" pass.
+- **Pass 2 — closeup replay**: the same play again, zoomed in with the
+  camera following the action — whoever is on the ball (passer → shooter),
+  then the ball flying into the net, then the scorer's celebration.
+
+The celebration is hard-capped at 10 s after the shot in either pass.
+No ball-trail effect is drawn; the ball stays visible because the closeup
+pass tracks it directly through the flight.
 """
 
 from __future__ import annotations
@@ -85,7 +90,9 @@ class ScorerAnalyzer(BaseSceneAnalyzer):
         # coincides with the ball being struck (maximum dramatic impact).
         buildup_end = shooter_frame
 
-        # Celebration window
+        # Celebration window. Hard-cap at 10 s *after the shot* (the kick,
+        # shooter_frame) regardless of the configured celebration length —
+        # the requirement is "celebration no longer than 10 s post-shot".
         celebration_dur = temporal_cfg.get("celebration_seconds", 10.0)
         celebration_start = goal_frame
         celebration_max_end = find_celebration_end(
@@ -93,6 +100,13 @@ class ScorerAnalyzer(BaseSceneAnalyzer):
             duration_seconds=celebration_dur,
             total_frames=ctx.frame_count or None,
         )
+        post_shot_cap = shooter_frame + int(10.0 * fps)
+        if celebration_max_end > post_shot_cap:
+            logger.info(
+                "Celebration capped to 10s after shot: %d → %d",
+                celebration_max_end, post_shot_cap,
+            )
+            celebration_max_end = post_shot_cap
 
         # Truncate celebration when scorer track is lost
         scorer_trajectory = ctx.get_player_trajectory(
@@ -110,71 +124,101 @@ class ScorerAnalyzer(BaseSceneAnalyzer):
         else:
             celebration_end = celebration_max_end
 
-        # --- Segment plan: buildup → strike → celebration → replay ---
+        # --- Two-pass segment plan ---
+        # Pass 1: the whole play in the original (wide, uncropped) view —
+        #         "as it happened", no camera-follow.
+        # Pass 2: the same play again, zoomed in with the camera following
+        #         the action (possession → shooter → ball → scorer).
         segments: list[ClipSegment] = []
         min_segment_frames = int(1.0 * fps)
+        play_end = max(strike_end, celebration_end)
 
-        # 1. Build-up: wide/medium view following the ball
-        buildup_view = temporal_cfg.get("buildup_view", "wide")
-        if buildup_end - buildup_start >= min_segment_frames:
-            segments.append(
-                ClipSegment(
-                    name="buildup",
-                    start_frame=buildup_start,
-                    end_frame=buildup_end,
-                    view_type=buildup_view,
-                    focus_target="ball",
-                    transition="cut",
-                )
-            )
-
-        # 2. Strike: closeup following the ball through the shot.
-        #    Hard cut from buildup — the zoom change hits at the same
-        #    instant the ball is kicked (no crossfade blurring the moment).
-        strike_view = temporal_cfg.get("strike_view", "closeup")
+        # ---- Pass 1: original view (single continuous wide shot) ----
         segments.append(
             ClipSegment(
-                name="strike",
-                start_frame=strike_start,
-                end_frame=strike_end,
-                view_type=strike_view,
-                focus_target="ball",
+                name="original",
+                start_frame=buildup_start,
+                end_frame=play_end,
+                view_type="wide",
+                focus_target="ball",  # unused in wide view (full frame)
                 transition="cut",
             )
         )
 
-        # 3. Celebration: medium view following the scorer
+        # ---- Pass 2: closeup replay following the action ----
+        # Each sub-segment carries a REPLAY overlay so the repeat reads as
+        # a replay, not a continuity error. The first sub-segment crossfades
+        # in to separate the two passes.
+        buildup_view = temporal_cfg.get("buildup_view", "medium")
+        strike_view = temporal_cfg.get("strike_view", "closeup")
         celebration_view = temporal_cfg.get("celebration_view", "medium")
+        replay_overlay = [
+            {"type": "text", "text": "REPLAY", "position": "top_center"},
+        ]
+
+        first_pass2 = True
+
+        def _pass2_transition() -> str:
+            nonlocal first_pass2
+            t = "crossfade" if first_pass2 else "cut"
+            first_pass2 = False
+            return t
+
+        # Build-up: follow whoever is on the ball (passer → shooter).
+        if buildup_end - buildup_start >= min_segment_frames:
+            segments.append(
+                ClipSegment(
+                    name="replay_buildup",
+                    start_frame=buildup_start,
+                    end_frame=buildup_end,
+                    view_type=buildup_view,
+                    focus_target="possession",
+                    transition=_pass2_transition(),
+                    overlays=replay_overlay,
+                )
+            )
+
+        # Strike wind-up: lock the closeup on the shooter until the ball
+        # leaves the foot.
+        if shooter_frame - strike_start >= 1:
+            segments.append(
+                ClipSegment(
+                    name="replay_strike",
+                    start_frame=strike_start,
+                    end_frame=shooter_frame,
+                    view_type=strike_view,
+                    focus_target="player",
+                    focus_track_id=scorer_id,
+                    transition=_pass2_transition(),
+                    overlays=replay_overlay,
+                )
+            )
+
+        # Flight: track the ball from the kick into the net.
+        segments.append(
+            ClipSegment(
+                name="replay_flight",
+                start_frame=shooter_frame,
+                end_frame=strike_end,
+                view_type=strike_view,
+                focus_target="ball",
+                transition=_pass2_transition(),
+                overlays=replay_overlay,
+            )
+        )
+
+        # Celebration: follow the scorer (already capped to 10 s post-shot).
         if celebration_end - celebration_start >= min_segment_frames:
             segments.append(
                 ClipSegment(
-                    name="celebration",
+                    name="replay_celebration",
                     start_frame=celebration_start,
                     end_frame=celebration_end,
                     view_type=celebration_view,
                     focus_target="player",
                     focus_track_id=scorer_id,
-                    transition="flash",
-                )
-            )
-
-        # 4. Replay: slow-motion of the strike
-        replay_enabled = temporal_cfg.get("replay_enabled", True)
-        replay_speed = temporal_cfg.get("replay_speed", 0.4)
-        if replay_enabled:
-            segments.append(
-                ClipSegment(
-                    name="replay",
-                    start_frame=strike_start,
-                    end_frame=strike_end,
-                    view_type=strike_view,
-                    focus_target="ball",
-                    transition="crossfade",
-                    speed=replay_speed,
-                    overlays=[
-                        {"type": "text", "text": "REPLAY",
-                         "position": "top_center"},
-                    ],
+                    transition=_pass2_transition(),
+                    overlays=replay_overlay,
                 )
             )
 

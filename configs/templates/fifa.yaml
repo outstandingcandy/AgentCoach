@@ -188,7 +188,7 @@ highlights:
   temporal:
     buildup_max_seconds: 10.0
     buildup_padding_seconds: 2.0
-    buildup_view: wide
+    buildup_view: medium
     strike_pre_seconds: 0.5
     strike_post_seconds: 1.5
     strike_view: closeup
@@ -200,7 +200,7 @@ highlights:
     shooter_spotlight: true
     spotlight_color: [0, 215, 255]
     spotlight_alpha: 0.4
-    ball_trail: true
+    ball_trail: false   # ball effect off: closeup pass follows the ball directly
     trail_length: 15
     trail_color: [0, 255, 255]
   overlays:

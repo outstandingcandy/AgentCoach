@@ -33,6 +33,42 @@ def _sanitize(part: str) -> str:
     return _SAFE_NAME_COMPONENT.sub("_", str(part))
 
 
+def _reencode_h264(path: Path) -> None:
+    """Re-encode an mp4 in place to browser-playable H.264 + faststart.
+
+    OpenCV writes MPEG-4 Part 2, which HTML5 <video> can't decode. This
+    transcodes to yuv420p H.264 via ffmpeg and swaps the file. Silent
+    no-op when ffmpeg is unavailable or errors — the original clip is
+    left intact so the render is never lost.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None:
+        logger.warning("ffmpeg not found; leaving highlight clip as mp4v "
+                       "(may not play in browsers): %s", path)
+        return
+    tmp_out = path.with_suffix(".h264.mp4")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(path),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                str(tmp_out),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        tmp_out.replace(path)
+        logger.info("Re-encoded highlight clip to H.264: %s", path)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        logger.warning("H.264 re-encode failed (%s); keeping mp4v clip: %s",
+                       exc, path)
+        tmp_out.unlink(missing_ok=True)
+
+
 class _UpscaledFrameReader:
     """Disk-backed reader for upscaled video frames.
 
@@ -166,7 +202,11 @@ class SegmentComposer(BaseClipComposer):
             # Pre-load trajectory for closeup/medium segments
             trajectory: list[dict] | None = None
             if segment.view_type in ("closeup", "medium"):
-                if segment.focus_target == "ball":
+                if segment.focus_target == "possession":
+                    trajectory = self._build_possession_trajectory(
+                        ctx, segment.start_frame, segment.end_frame,
+                    )
+                elif segment.focus_target == "ball":
                     trajectory = self._build_ball_trajectory(
                         ctx, segment.start_frame, segment.end_frame,
                     )
@@ -316,6 +356,14 @@ class SegmentComposer(BaseClipComposer):
         if upscale_reader is not None:
             upscale_reader.close()
 
+        # OpenCV's VideoWriter emits MPEG-4 Part 2 (``mp4v``), which
+        # browsers refuse to decode (<video> raises
+        # DEMUXER_ERROR_NO_SUPPORTED_STREAMS). Re-encode to H.264 so the
+        # clip plays inline on the web match page. Best-effort: if
+        # ffmpeg is missing or fails we keep the mp4v file rather than
+        # losing the render.
+        _reencode_h264(output_path)
+
         # Save per-frame crop metadata JSON alongside the video
         meta_path = output_path.with_suffix(".json")
         with open(meta_path, "w") as f:
@@ -437,6 +485,64 @@ class SegmentComposer(BaseClipComposer):
                 "bbox": [cx - BALL_HALF, cy - BALL_HALF,
                          cx + BALL_HALF, cy + BALL_HALF],
             })
+        return trajectory
+
+    @staticmethod
+    def _build_possession_trajectory(
+        ctx: MatchContext,
+        start_frame: int,
+        end_frame: int,
+    ) -> list[dict]:
+        """Build a trajectory that follows the player in possession.
+
+        For each frame, pick the player whose bbox-bottom (feet) is
+        closest to the ball and return that player's bbox. As the ball
+        moves from passer to receiver, the focus hands off between players
+        — the camera tracks the human action rather than the tiny ball.
+
+        Falls back to the ball's synthetic bbox on frames where no player
+        is near enough (e.g. ball in flight), so the crop keeps moving
+        with play instead of freezing.
+        """
+        # Max feet-to-ball distance (px) to consider a player "in
+        # possession". Beyond this the ball is in flight between players.
+        POSSESSION_MAX_PX = 250
+        BALL_HALF = 40
+
+        trajectory: list[dict] = []
+        for f in range(start_frame, end_frame + 1):
+            ball = ctx.get_ball_at_frame(f)
+            if ball is None:
+                continue
+            center = ball.get("center")
+            if center is None:
+                continue
+            bx, by = center
+
+            best_bbox = None
+            best_dist = POSSESSION_MAX_PX
+            for t in ctx.get_tracks_at_frame(f):
+                bbox = t.get("bbox")
+                if not bbox:
+                    continue
+                x1, y1, x2, y2 = bbox
+                feet_x = (x1 + x2) / 2
+                feet_y = y2
+                dist = ((feet_x - bx) ** 2 + (feet_y - by) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_bbox = bbox
+
+            if best_bbox is not None:
+                trajectory.append({"frame": f, "bbox": list(best_bbox)})
+            else:
+                # Ball in flight — fall back to a ball-centred crop so the
+                # framing follows play toward the receiver.
+                trajectory.append({
+                    "frame": f,
+                    "bbox": [bx - BALL_HALF, by - BALL_HALF,
+                             bx + BALL_HALF, by + BALL_HALF],
+                })
         return trajectory
 
     # ------------------------------------------------------------------

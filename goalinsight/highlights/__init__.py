@@ -32,7 +32,7 @@ _DEFAULT_HIGHLIGHT_CONFIG: dict[str, Any] = {
     "temporal": {
         "buildup_max_seconds": 10.0,
         "buildup_padding_seconds": 2.0,
-        "buildup_view": "wide",
+        "buildup_view": "medium",
         "strike_pre_seconds": 0.5,
         "strike_post_seconds": 1.5,
         "strike_view": "closeup",
@@ -45,7 +45,10 @@ _DEFAULT_HIGHLIGHT_CONFIG: dict[str, Any] = {
         "shooter_spotlight": True,
         "spotlight_color": [0, 215, 255],  # gold BGR
         "spotlight_alpha": 0.4,
-        "ball_trail": True,
+        # Ball effect (comet trail) disabled: the closeup pass follows the
+        # ball directly through the flight, so the trail overlay is
+        # redundant clutter.
+        "ball_trail": False,
         "trail_length": 15,
         "trail_color": [0, 255, 255],  # yellow BGR
     },
