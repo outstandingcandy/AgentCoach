@@ -442,6 +442,22 @@ def main():
         help="Number of training epochs",
     )
     parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=8,
+        help="DataLoader worker processes. >0 parallelises the CPU-bound "
+             "augmentation + heatmap generation so the GPU stops starving "
+             "(single biggest speedup for large sets). Use 0 for tiny sets.",
+    )
+    parser.add_argument(
+        "--val_max_samples",
+        type=int,
+        default=200,
+        help="Cap the validation set to this many samples (0 = use all). "
+             "Full-set validation every val_interval epochs dominates wall "
+             "time on large datasets; a fixed subset tracks the trend fine.",
+    )
+    parser.add_argument(
         "--lr",
         type=float,
         default=1e-5,
@@ -639,22 +655,35 @@ def main():
         hflip_prob=args.hflip_prob,
     )
 
+    # Optionally cap validation to a fixed subset (deterministic, evenly spaced)
+    # so large-set validation doesn't dominate wall-clock time.
+    if args.val_max_samples and len(val_dataset) > args.val_max_samples:
+        from torch.utils.data import Subset
+        step = len(val_dataset) / args.val_max_samples
+        idxs = [int(i * step) for i in range(args.val_max_samples)]
+        val_dataset = Subset(val_dataset, idxs)
+
     print(f"Training samples: {len(train_dataset)} (with augmentation)")
     print(f"Validation samples: {len(val_dataset)}")
 
-    # Create dataloaders
+    # Create dataloaders. num_workers>0 parallelises augmentation so the GPU
+    # is not starved (persistent_workers avoids re-spawning each epoch).
+    _dl_kw = {}
+    if args.num_workers > 0:
+        _dl_kw = {"num_workers": args.num_workers, "persistent_workers": True,
+                  "prefetch_factor": 2}
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,  # Use 0 for small datasets
+        **_dl_kw,
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        **_dl_kw,
     )
 
     # Loss and optimizer

@@ -210,6 +210,10 @@ def main():
                         help="Path to pretrained SV_lines weights file")
     parser.add_argument("--output_dir", type=str, default="data/finetuned_line_models")
     parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--num_workers", type=int, default=8,
+                        help="DataLoader workers; >0 parallelises augmentation.")
+    parser.add_argument("--val_max_samples", type=int, default=200,
+                        help="Cap validation set size (0 = all).")
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--freeze_backbone", action="store_true")
@@ -296,13 +300,22 @@ def main():
         hflip_prob=args.hflip_prob,
         seed=args.val_seed,
     )
+    if args.val_max_samples and len(val_dataset) > args.val_max_samples:
+        from torch.utils.data import Subset
+        step = len(val_dataset) / args.val_max_samples
+        val_dataset = Subset(val_dataset, [int(i * step) for i in range(args.val_max_samples)])
+
     print(f"Training samples: {len(train_dataset)}  |  Validation: {len(val_dataset)}")
 
+    _dl_kw = {}
+    if args.num_workers > 0:
+        _dl_kw = {"num_workers": args.num_workers, "persistent_workers": True,
+                  "prefetch_factor": 2}
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0,
+        train_dataset, batch_size=args.batch_size, shuffle=True, **_dl_kw,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0,
+        val_dataset, batch_size=args.batch_size, shuffle=False, **_dl_kw,
     )
 
     loss_fn = PlainMSELoss()
