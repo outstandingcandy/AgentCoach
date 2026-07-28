@@ -488,9 +488,13 @@ def _build_highlights(run_dir: Path, pipeline_stats: dict) -> StageManifest:
     stage_dir = run_dir / "highlights"
     if not stage_dir.is_dir():
         return StageManifest(stage="highlights", exists=False)
+    # Clips live one level down, in per-recipe subdirs (e.g.
+    # highlights/goal_highlight/goal_434_right.mp4), so recurse rather
+    # than scanning only the top level — otherwise the stage lists no
+    # files even when clips exist.
     files = []
-    for p in sorted(stage_dir.iterdir()):
-        if p.suffix in (".mp4", ".json"):
+    for p in sorted(stage_dir.rglob("*")):
+        if p.is_file() and p.suffix in (".mp4", ".json"):
             files.append(_file_entry(p, run_dir))
     return StageManifest(
         stage="highlights",

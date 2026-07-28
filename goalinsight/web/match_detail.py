@@ -118,8 +118,57 @@ def _build_payload(handle: RunHandle, workspace: Any) -> dict[str, Any]:
         "events": _events(ctx),
         "player_clips": _player_clips(ctx),
         "camera_fov": _camera_fov_polygons(ctx),
+        "highlights": _highlights(handle.run_name, handle.run_dir),
     }
     return payload
+
+
+def _highlights(
+    run_name: str | None, run_dir: Any,
+) -> list[dict[str, Any]]:
+    """List rendered highlight clips for the inline highlights player.
+
+    Clips live under ``highlights/<recipe>/<clip>.mp4`` (per-recipe
+    subdirs), so recurse rather than scanning only the top level. Each
+    entry carries a browser-fetchable /runs_static URL plus a recipe
+    label and a human title parsed from the filename (``goal_434_right``
+    → "Goal · frame 434 · right").
+    """
+    from pathlib import Path
+    if not run_dir or not run_name:
+        return []
+    hl_dir = Path(run_dir) / "highlights"
+    if not hl_dir.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for p in sorted(hl_dir.rglob("*.mp4")):
+        rel = p.relative_to(Path(run_dir)).as_posix()
+        recipe = p.parent.name if p.parent != hl_dir else ""
+        size = p.stat().st_size if p.exists() else 0
+        # Cache-bust on file size so a re-rendered / re-encoded clip
+        # (mp4v → H.264) isn't served from a stale browser cache under
+        # the same URL, without disabling caching for the big
+        # broadcast / annotated videos.
+        out.append({
+            "name": p.stem,
+            "title": _highlight_title(p.stem),
+            "recipe": recipe,
+            "url": f"/runs_static/{run_name}/{rel}?v={size}",
+            "size": size,
+        })
+    return out
+
+
+def _highlight_title(stem: str) -> str:
+    """``goal_434_right`` → 'Goal · frame 434 · right'."""
+    parts = stem.split("_")
+    if len(parts) >= 2 and parts[1].isdigit():
+        kind = parts[0].capitalize()
+        frame = parts[1]
+        rest = " ".join(parts[2:])
+        title = f"{kind} · frame {frame}"
+        return f"{title} · {rest}" if rest else title
+    return stem.replace("_", " ")
 
 
 def _pitch_geometry(
