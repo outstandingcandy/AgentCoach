@@ -120,13 +120,22 @@
   // layouts, so we can't just add padding (it would push layouts past
   // the viewport). Instead we shrink body to "viewport minus nav" and
   // place the nav above it. ``html { height: 100% }` stays the same.
+  //
+  // The reserved offset is driven by the `--gi-nav-h` custom property,
+  // NOT a hardcoded constant. `syncNavHeight()` (below) measures the
+  // nav's *real* rendered height and writes it back, so a nav that
+  // grows past its 40px baseline (larger base font, browser zoom
+  // rounding, a late-loading web font, a wrapped run pill) still gets
+  // exactly its own height reserved — the fixed bar can never overflow
+  // down onto the page header / video. The 40px in the var is only a
+  // pre-measurement fallback for the first paint.
   style.textContent = `
     html { height: 100%; }
-    body { height: calc(100vh - ${NAV_HEIGHT}px) !important;
-           min-height: calc(100vh - ${NAV_HEIGHT}px) !important;
-           margin-top: ${NAV_HEIGHT}px !important; }
+    body { height: calc(100vh - var(--gi-nav-h, ${NAV_HEIGHT}px)) !important;
+           min-height: calc(100vh - var(--gi-nav-h, ${NAV_HEIGHT}px)) !important;
+           margin-top: var(--gi-nav-h, ${NAV_HEIGHT}px) !important; }
     #goalinsight-nav { position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
-      height: ${NAV_HEIGHT}px; display: flex; align-items: center; gap: 4px;
+      min-height: ${NAV_HEIGHT}px; display: flex; align-items: center; gap: 4px;
       padding: 0 14px; background: #0f1419; border-bottom: 1px solid #262b33;
       font: 500 13px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     #goalinsight-nav .brand { color: #fff; font-weight: 700; font-size: 14px;
@@ -192,9 +201,29 @@
     nav.appendChild(pill);
   }
 
+  // Keep the reserved body offset exactly equal to the nav's real
+  // rendered height. Without this, the fixed bar is reserved a hardcoded
+  // 40px; if it renders taller (zoom/font/wrap) it spills over the page
+  // header and the top of the video. Round up so a fractional height
+  // never leaves a sub-pixel sliver of the bar overlapping the content.
+  function syncNavHeight() {
+    const h = Math.ceil(nav.getBoundingClientRect().height) || NAV_HEIGHT;
+    document.documentElement.style.setProperty('--gi-nav-h', h + 'px');
+  }
+
   // Insert at the very top so it sits above any page-level header.
   function inject() {
     document.body.insertBefore(nav, document.body.firstChild);
+    syncNavHeight();
+    // Re-measure after layout settles and on any reflow that can change
+    // the bar's height (viewport resize, late web-font swap).
+    window.addEventListener('resize', syncNavHeight);
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(syncNavHeight).catch(() => {});
+    }
+    if (typeof ResizeObserver === 'function') {
+      new ResizeObserver(syncNavHeight).observe(nav);
+    }
   }
   if (document.body) inject();
   else document.addEventListener('DOMContentLoaded', inject);

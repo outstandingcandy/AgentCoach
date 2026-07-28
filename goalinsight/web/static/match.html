@@ -21,7 +21,8 @@
     #stage { display: grid; grid-template-columns: minmax(0, 1.78fr) minmax(0, 1fr);
              gap: 1px; background: #262b33; min-height: 0; overflow: hidden; }
     #video-panel { position: relative; background: #000; min-width: 0; min-height: 0;
-                   overflow: hidden; display: flex; align-items: center; justify-content: center; }
+                   overflow: hidden; display: flex; align-items: center; justify-content: center;
+                   padding-top: 44px; }
     #pitch-panel { position: relative; background: #0d1f0d; min-width: 0; min-height: 0;
                    overflow: hidden; display: flex; align-items: center; justify-content: center; }
     #player { max-width: 100%; max-height: 100%; display: block; }
@@ -149,8 +150,9 @@
                      background: rgba(0,0,0,0.55); }
     #profile-modal.show { display: flex; }
     #profile-card { background: #161b21; border: 1px solid #2a323c;
-                    border-radius: 10px; padding: 18px 20px;
-                    width: min(640px, 92vw); max-height: 90vh; overflow-y: auto;
+                    border-radius: 10px; padding: 14px 18px;
+                    width: min(880px, 94vw); max-height: 96vh; overflow: hidden;
+                    display: flex; flex-direction: column;
                     box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
     #profile-card .head { display: flex; align-items: center; gap: 10px;
                           margin-bottom: 10px; }
@@ -161,31 +163,53 @@
                                   color: #9aa3ad; font-size: 20px; }
     #profile-card .head .close:hover { color: #fff; }
     #profile-card .stats { display: grid; grid-template-columns: repeat(3, 1fr);
-                           gap: 8px; margin: 8px 0 12px; }
+                           gap: 6px; margin: 6px 0 10px; flex: 0 0 auto; }
     #profile-card .stat { background: #1a2027; border: 1px solid #232a32;
-                          border-radius: 6px; padding: 8px 10px; }
-    #profile-card .stat .k { font-size: 11px; color: #9aa3ad;
+                          border-radius: 6px; padding: 6px 9px; }
+    #profile-card .stat .k { font-size: 10px; color: #9aa3ad;
                               text-transform: uppercase; letter-spacing: 0.04em; }
-    #profile-card .stat .v { font-size: 18px; font-weight: 700; color: #cfe3ff;
-                              margin-top: 2px; }
-    #profile-card .crops { display: grid; grid-template-columns: 1fr 1fr;
-                            gap: 8px; margin-bottom: 12px; }
-    #profile-card .crop { background: #0d1116; border: 1px solid #232a32;
-                          border-radius: 6px; padding: 6px;
-                          display: flex; flex-direction: column; align-items: center; }
-    #profile-card .crop .label { font-size: 11px; color: #9aa3ad;
-                                  text-transform: uppercase; letter-spacing: 0.04em;
-                                  margin-bottom: 4px; }
-    #profile-card .crop img { max-width: 100%; max-height: 220px; border-radius: 4px;
-                              image-rendering: -webkit-optimize-contrast; }
-    #profile-card .crop .missing { color: #6b7380; font-size: 12px;
-                                    padding: 30px 10px; text-align: center; }
+    #profile-card .stat .v { font-size: 16px; font-weight: 700; color: #cfe3ff;
+                              margin-top: 1px; }
+    /* Media row: spotlight video on the left, movement heatmap on the
+       right. Flexes to fill remaining card height; each pane letterboxes
+       its content to keep aspect. */
+    #profile-card .media { display: flex; gap: 8px; flex: 1 1 auto; min-height: 0; }
+    #profile-card .spotlight { background: #0d1116; border: 1px solid #232a32;
+                               border-radius: 6px; padding: 6px; text-align: center;
+                               flex: 1 1 60%; min-height: 0; min-width: 0;
+                               display: flex; align-items: center; justify-content: center; }
+    #profile-card .spotlight video { max-width: 100%; max-height: 100%;
+                                      min-height: 0; object-fit: contain;
+                                      border-radius: 4px; background: #000; }
+    #profile-card .spotlight .missing { color: #6b7380; font-size: 12px;
+                                         padding: 30px 10px; text-align: center; }
     #profile-card .heatmap { background: #0d1116; border: 1px solid #232a32;
-                              border-radius: 6px; padding: 6px; text-align: center; }
-    #profile-card .heatmap img { max-width: 100%; max-height: 320px; }
+                             border-radius: 6px; padding: 6px;
+                             flex: 1 1 40%; min-height: 0; min-width: 0;
+                             display: flex; flex-direction: column;
+                             align-items: center; justify-content: center; }
+    #profile-card .heatmap .label { font-size: 10px; color: #9aa3ad;
+                                    text-transform: uppercase; letter-spacing: 0.04em;
+                                    margin-bottom: 4px; flex: 0 0 auto; }
+    #profile-card .heatmap img { max-width: 100%; max-height: 100%;
+                                 min-height: 0; object-fit: contain; border-radius: 4px; }
     #profile-card .heatmap .missing { color: #6b7380; font-size: 12px;
-                                       padding: 18px 10px; }
-    #profile-card .actions { display: flex; gap: 6px; margin-top: 12px; }
+                                      padding: 30px 10px; text-align: center; }
+    /* Clip selector: follow-cam + one chip per event the player was
+       involved in. Sits above the media row. */
+    #profile-card .clipbar { display: flex; gap: 6px; flex-wrap: wrap;
+                             margin: 2px 0 8px; flex: 0 0 auto; }
+    #profile-card .clipbar .clip-chip { background: #1a2027; color: #cfe3ff;
+                             border: 1px solid #2a323c; border-radius: 5px;
+                             padding: 4px 9px; font-size: 11px; font-weight: 600;
+                             cursor: pointer; white-space: nowrap; }
+    #profile-card .clipbar .clip-chip:hover { background: #2a323c; }
+    #profile-card .clipbar .clip-chip.on { background: #3b82f6; color: #fff;
+                             border-color: #3b82f6; }
+    #profile-card .clipbar .clip-chip .t { color: #8b95a1; font-weight: 500;
+                             margin-left: 5px; }
+    #profile-card .clipbar .clip-chip.on .t { color: #dbe8ff; }
+    #profile-card .actions { display: flex; gap: 6px; margin-top: 10px; flex: 0 0 auto; }
     #profile-card .actions button { background: #3b82f6; color: white; border: 0;
                                      border-radius: 5px; padding: 6px 12px;
                                      font-size: 12px; font-weight: 600; cursor: pointer; }
@@ -260,6 +284,14 @@
   </div>
 
   <div id="controls">
+    <!-- Highlights — rendered clips (goal_highlight etc). Clicking a
+         chip swaps the main <video> to the clip; "Back to broadcast"
+         restores the match feed. Hidden when a run has no clips. -->
+    <div class="panel" id="highlights-panel" style="grid-column: 1 / -1; display:none">
+      <h3>Highlights</h3>
+      <div class="chip-row" id="highlight-chips"></div>
+    </div>
+
     <!-- Player roster — primary panel. Cards have the player's
          profile crop as the background and surface an action badge
          (GOAL / SHOT / PASS / …) when the playhead enters an event
@@ -1259,22 +1291,13 @@
       }).join('');
       grid.querySelectorAll('.player-card').forEach(card => {
         card.addEventListener('click', (ev) => {
-          // Info button is a child of the card; intercept its clicks so
-          // they open the profile pane instead of toggling the spotlight.
+          // Info button is a child of the card; its own handler already
+          // opens the profile pane — don't double-handle.
           if (ev.target && ev.target.classList.contains('info-btn')) return;
-          const pid = card.dataset.pid;
-          if (selectedPlayer === pid) {
-            selectedPlayer = null;
-            exitSpotlight();
-          } else {
-            selectedPlayer = pid;
-            const p = (payload.players || []).find(x => x.player_id === pid);
-            if (p && p.spotlight_video_url) enterSpotlight(p);
-            else exitSpotlight();
-          }
-          grid.querySelectorAll('.player-card').forEach(c =>
-            c.classList.toggle('active', c.dataset.pid === selectedPlayer));
-          updatePlayerControls();
+          // Clicking the card shows the player's match stats (shots,
+          // goals, assists, distance, ...). The spotlight follow-cam is
+          // reachable from the "Spotlight" button inside the modal.
+          openProfile(card.dataset.pid);
         });
       });
       grid.querySelectorAll('.info-btn').forEach(btn => {
@@ -1296,9 +1319,143 @@
       if (ev.key === 'Escape' && profileModal.classList.contains('show')) closeProfile();
     });
 
+    // Broadcast video URL used for in-modal event clips (cache-busted so
+    // range requests reuse the same encoded file as the main player).
+    const PROFILE_CLIP_VIDEO = MAIN_VIDEO_URL;
+
+    // Human labels for event clip chips.
+    const _EVENT_LABEL = {
+      goal: 'Goal', shot: 'Shot', pass: 'Pass', carry: 'Carry',
+      tackle: 'Tackle', interception: 'Interception',
+    };
+
+    // Build the ordered clip list for a player's modal:
+    //   [follow-cam spotlight] + one clip per involved event.
+    // Event clips carry {kind:'event', at, start_s, end_s, label}; the
+    // follow-cam carries {kind:'spotlight', url}. Returns [] if neither
+    // a spotlight nor any events exist.
+    function buildProfileClips(p) {
+      const out = [];
+      if (p.spotlight_video_url) {
+        out.push({ kind: 'spotlight', url: p.spotlight_video_url,
+                   framesUrl: p.spotlight_frames_url, pid: p.player_id,
+                   label: 'Follow-cam', at: null });
+      }
+      const pid = p.player_id;
+      const evs = (payload.events || []).filter(e =>
+        e.player_id === pid || e.metadata?.receiver_id === pid);
+      // De-dupe shot+goal on the same frame (goal subsumes the shot).
+      const seen = new Set();
+      for (const e of evs) {
+        const base = _EVENT_LABEL[e.type] || (e.type || 'event');
+        const asRecv = e.metadata?.receiver_id === pid && e.player_id !== pid;
+        const key = `${e.frame}:${asRecv ? 'r' : base}`;
+        if (e.type === 'goal') seen.add(`${e.frame}:Shot`);   // hide the paired shot
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const outcome = e.metadata?.outcome;
+        let label = base;
+        if (asRecv) label = 'Pass received';
+        else if (outcome && !['goal', 'successful'].includes(String(outcome).toLowerCase()))
+          label = `${base} · ${outcome}`;
+        out.push({ kind: 'event', at: e.start_s, start_s: e.start_s,
+                   end_s: e.end_s, label });
+      }
+      // Order event clips chronologically after the follow-cam.
+      const cam = out.filter(c => c.kind === 'spotlight');
+      const events = out.filter(c => c.kind === 'event')
+                        .sort((a, b) => a.at - b.at);
+      return [...cam, ...events];
+    }
+
+    // Play one clip inside the modal's <video>. Follow-cam loops the
+    // stitched file; event clips seek into the broadcast and loop within
+    // [start_s, end_s].
+    let _profileClipBound = null;   // active timeupdate handler for looping
+    function playProfileClip(video, clip) {
+      if (_profileClipBound) {
+        video.removeEventListener('timeupdate', _profileClipBound);
+        _profileClipBound = null;
+      }
+      video.loop = clip.kind === 'spotlight';
+      if (clip.kind === 'spotlight') {
+        if (video.src !== clip.url) video.src = clip.url;
+        try { video.currentTime = 0; } catch {}
+        video.play().catch(() => {});
+        return;
+      }
+      // Event clip: broadcast source, loop within the window.
+      if (!video.src.endsWith('/video')) video.src = PROFILE_CLIP_VIDEO;
+      const seek = () => { try { video.currentTime = clip.start_s; } catch {}
+                           video.play().catch(() => {}); };
+      if (video.readyState >= 1) seek();
+      else video.addEventListener('loadedmetadata', seek, { once: true });
+      _profileClipBound = () => {
+        if (video.currentTime >= clip.end_s || video.currentTime < clip.start_s - 0.5)
+          { try { video.currentTime = clip.start_s; } catch {} }
+      };
+      video.addEventListener('timeupdate', _profileClipBound);
+    }
+
     function closeProfile() {
+      if (_profileClipBound) {
+        const v = profileCard.querySelector('#profile-video');
+        if (v) v.removeEventListener('timeupdate', _profileClipBound);
+        _profileClipBound = null;
+      }
       profileModal.classList.remove('show');
       profileCard.innerHTML = '';
+    }
+
+    // ---------- Mock per-player match stats ----------
+    // Deterministic pseudo-random stats keyed off player_id so a given
+    // player always shows the same numbers across clicks / reloads. Real
+    // profile fields (distance / speeds) win over the mock when present;
+    // shots / goals / assists / passes / touches / tackles are mocked
+    // until the event pipeline surfaces them per-player here.
+    function _seededRand(seed) {
+      // Mulberry32 — tiny deterministic PRNG.
+      let a = seed >>> 0;
+      return function () {
+        a |= 0; a = (a + 0x6D2B79F5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    function _hashStr(s) {
+      let h = 2166136261;
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      return h >>> 0;
+    }
+    function mockMatchStats(p) {
+      const rnd = _seededRand(_hashStr(p.player_id || 'x'));
+      const ri = (lo, hi) => lo + Math.floor(rnd() * (hi - lo + 1));
+      const isGK = (p.role || '') === 'goalkeeper';
+      const isRef = (p.role || '') === 'referee' || (p.role || '') === 'linesman';
+      if (isRef) {
+        return { shots: 0, goals: 0, assists: 0, passes: 0, touches: 0, tackles: 0,
+                 distance_m: p.distance_m, top_speed: p.max_speed_mps };
+      }
+      const shots = isGK ? ri(0, 1) : ri(0, 6);
+      const goals = shots > 0 ? Math.min(shots, ri(0, Math.min(2, shots))) : 0;
+      const passes = isGK ? ri(8, 25) : ri(15, 55);
+      return {
+        shots,
+        goals,
+        assists: isGK ? 0 : ri(0, 3),
+        passes,
+        touches: passes + ri(5, 30),
+        tackles: isGK ? ri(0, 2) : ri(0, 8),
+        // Prefer real values; fall back to plausible mock ranges.
+        distance_m: p.distance_m != null ? p.distance_m
+                    : (isGK ? ri(1500, 3500) : ri(6000, 11000)),
+        top_speed: p.max_speed_mps != null ? p.max_speed_mps
+                    : (isGK ? 4 + rnd() * 3 : 6 + rnd() * 3.5),
+      };
     }
 
     function openProfile(pid) {
@@ -1310,17 +1467,19 @@
       const jersey = p.jersey_number != null ? `#${p.jersey_number}` : '';
       const role = p.role && p.role !== 'player' ? ` · ${p.role}` : '';
 
-      const cropCell = (label, url) => `
-        <div class="crop">
-          <div class="label">${label}</div>
-          ${url
-            ? `<img src="${url}" alt="${pid} ${label}"/>`
-            : `<div class="missing">no ${label} crop</div>`}
-        </div>`;
-
       const stat = (k, v) => `
         <div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`;
       const fmt = (v, unit) => v == null ? '—' : `${v.toFixed(2)}${unit}`;
+
+      const ms = mockMatchStats(p);
+      const fmtDist = (v) => v == null ? '—'
+        : (v >= 1000 ? `${(v / 1000).toFixed(2)} km` : `${v.toFixed(0)} m`);
+
+      // Build the clip list: the follow-cam spotlight first, then one
+      // clip per match event this player was involved in (as actor or
+      // pass receiver). Event clips play against the broadcast timeline;
+      // the follow-cam plays its own stitched file.
+      const clips = buildProfileClips(p);
 
       profileCard.innerHTML = `
         <div class="head">
@@ -1329,26 +1488,54 @@
           <span style="color:#9aa3ad;font-size:12px">${role.replace(/^ · /, '')}</span>
           <span class="close" id="profile-close">&times;</span>
         </div>
-        ${hasProfile ? '' : `<div class="nostage">player_profile stage hasn't run for this match yet.</div>`}
+        ${hasProfile ? '' : `<div class="nostage">player_profile stage hasn't run for this match yet — match stats below are illustrative (mock).</div>`}
         <div class="stats">
-          ${stat('Distance', fmt(p.distance_m, ' m'))}
+          ${stat('Shots', ms.shots)}
+          ${stat('Goals', ms.goals)}
+          ${stat('Assists', ms.assists)}
+          ${stat('Passes', ms.passes)}
+          ${stat('Touches', ms.touches)}
+          ${stat('Tackles', ms.tackles)}
+          ${stat('Distance', fmtDist(ms.distance_m))}
+          ${stat('Top speed', ms.top_speed == null ? '—' : `${ms.top_speed.toFixed(1)} m/s`)}
           ${stat('Avg speed', fmt(p.avg_speed_mps, ' m/s'))}
-          ${stat('Max speed', fmt(p.max_speed_mps, ' m/s'))}
         </div>
-        <div class="crops">
-          ${cropCell('front', p.front_crop_url)}
-          ${cropCell('back', p.back_crop_url)}
-        </div>
-        <div class="heatmap">
-          ${p.heatmap_url
-            ? `<img src="${p.heatmap_url}" alt="${pid} heatmap"/>`
-            : `<div class="missing">no heatmap available</div>`}
+        ${clips.length > 1 ? `<div class="clipbar">${clips.map((c, i) =>
+          `<button class="clip-chip${i === 0 ? ' on' : ''}" data-clip="${i}">${c.label}${
+            c.at != null ? `<span class="t">${fmtTime(c.at)}</span>` : ''}</button>`
+        ).join('')}</div>` : ''}
+        <div class="media">
+          <div class="spotlight">
+            ${clips.length
+              ? `<video id="profile-video" autoplay loop muted playsinline controls></video>`
+              : `<div class="missing">no clip available for this player</div>`}
+          </div>
+          <div class="heatmap">
+            <div class="label">Movement heatmap</div>
+            ${p.heatmap_url
+              ? `<img src="${p.heatmap_url}" alt="${pid} heatmap"/>`
+              : `<div class="missing">no heatmap available</div>`}
+          </div>
         </div>
         <div class="actions">
           <button id="profile-spotlight">${selectedPlayer === pid ? 'Spotlight on' : 'Spotlight'}</button>
           <button id="profile-playall" class="secondary">Play all clips (${((payload.player_clips||{})[pid]||[]).length})</button>
         </div>
       `;
+      // Wire the clip selector + start on the first clip.
+      const pvid = profileCard.querySelector('#profile-video');
+      if (pvid && clips.length) {
+        playProfileClip(pvid, clips[0]);
+        profileCard.querySelectorAll('.clip-chip').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const i = parseInt(btn.dataset.clip, 10);
+            profileCard.querySelectorAll('.clip-chip').forEach(b => b.classList.remove('on'));
+            btn.classList.add('on');
+            playProfileClip(pvid, clips[i]);
+          });
+        });
+      }
+
       profileCard.querySelector('#profile-close').addEventListener('click', closeProfile);
       profileCard.querySelector('#profile-spotlight').addEventListener('click', () => {
         selectedPlayer = (selectedPlayer === pid) ? null : pid;
@@ -1401,6 +1588,12 @@
       // own concatenated timeline that doesn't share frame indices with
       // the broadcast.
       if (queue) { queue = null; updateQueueHud(); }
+      // Clear any active highlight chip — the spotlight takes over the
+      // <video>, and the highlight "on" state would otherwise linger.
+      if (selectedHighlight) {
+        selectedHighlight = null;
+        document.querySelectorAll('#highlight-chips .chip').forEach(c => c.classList.remove('on'));
+      }
       try { player.pause(); } catch {}
       player.src = player_obj.spotlight_video_url;
       try { player.currentTime = 0; } catch {}
@@ -1440,9 +1633,71 @@
     document.getElementById('spotlight-back').addEventListener('click', () => {
       selectedPlayer = null;
       exitSpotlight();
+      exitHighlight();
       document.querySelectorAll('.player-card').forEach(c => c.classList.remove('active'));
       updatePlayerControls();
     });
+
+    // ---------- Highlights (rendered goal/shot clips) ----------
+    // A highlight clip is a cropped/stitched render that doesn't share
+    // the broadcast frame grid, so we lean on the same ``isSpotlight``
+    // gate the follow-cam uses to suppress broadcast overlays / queues /
+    // live-badge updates while it plays. ``selectedHighlight`` tracks
+    // which chip is active for toggle + highlighting.
+    let selectedHighlight = null;
+
+    function renderHighlights() {
+      const panel = document.getElementById('highlights-panel');
+      const row = document.getElementById('highlight-chips');
+      const clips = (payload && payload.highlights) || [];
+      if (!clips.length) { panel.style.display = 'none'; return; }
+      panel.style.display = '';
+      row.innerHTML = clips.map((c, i) =>
+        `<button class="chip" data-hl="${i}">▶ ${c.title || c.name}</button>`
+      ).join('');
+      row.querySelectorAll('.chip').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const i = parseInt(btn.dataset.hl, 10);
+          const clip = clips[i];
+          if (selectedHighlight === clip.url) { exitHighlight(); return; }
+          enterHighlight(clip);
+        });
+      });
+    }
+
+    function enterHighlight(clip) {
+      // Swap the broadcast video for the highlight clip. Drop any player
+      // spotlight / clip queue first so we own the <video> cleanly.
+      if (queue) { queue = null; updateQueueHud(); }
+      selectedPlayer = null;
+      document.querySelectorAll('.player-card').forEach(c => c.classList.remove('active'));
+      updatePlayerControls();
+
+      try { player.pause(); } catch {}
+      player.src = clip.url;
+      try { player.currentTime = 0; } catch {}
+      player.play().catch(() => {});
+      isSpotlight = true;             // reuse the overlay-suppression gate
+      selectedHighlight = clip.url;
+
+      const pill = document.getElementById('spotlight-pill');
+      const label = document.getElementById('spotlight-label');
+      label.textContent = `Highlight: ${clip.title || clip.name}`;
+      pill.style.display = 'flex';
+
+      document.querySelectorAll('#highlight-chips .chip').forEach(c =>
+        c.classList.toggle('on', c.textContent.includes(clip.title || clip.name)));
+    }
+
+    function exitHighlight() {
+      if (!selectedHighlight) return;
+      selectedHighlight = null;
+      document.querySelectorAll('#highlight-chips .chip').forEach(c => c.classList.remove('on'));
+      try { player.pause(); } catch {}
+      player.src = MAIN_VIDEO_URL;
+      isSpotlight = false;
+      document.getElementById('spotlight-pill').style.display = 'none';
+    }
 
     // ---------- Possession spans (load once from raw events) ----------
     async function loadPossessionSpans() {
@@ -1518,6 +1773,7 @@
         buildEventChips();
         renderEventList();
         buildPlayerGrid();
+        renderHighlights();
         updatePlayerControls();
         setFovFrames((payload.camera_fov || {}).frames || []);
         loadPossessionSpans();   // fire-and-forget; not blocking layout
