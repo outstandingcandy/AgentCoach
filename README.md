@@ -1,8 +1,7 @@
 # GoalInsight
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
-[![Code style: ruff](https://img.shields.io/badge/lint-ruff-46a2f1.svg)](https://github.com/astral-sh/ruff)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 
 End-to-end pipeline that turns a single fixed-camera soccer video into player tracks, events, and watchable highlight clips.
 
@@ -22,24 +21,41 @@ GoalInsight runs entirely on your own machine and gives you the same kinds of ar
 
 ## What it does
 
-A single fixed-camera video flows through four stages:
+A single fixed-camera video flows through four stages by default:
 
 1. **Calibration (camera + pitch)** — find where the camera is in the world.
-   Five backends (PnLCalib HRNet, BroadTrack, NBJW, fixed-intrinsic Physical,
-   plain Homography); pick by config based on what your footage looks like.
-2. **Tracking (players + ball)** — players via YOLOv8 detection →
-   ByteTrack/BOTSORT → OSNet/PRTReID re-identification → k-means or tracklet
-   team classification. Ball via YOLO class 32 + center-distance ByteTrack +
-   two-pass segment classification (ground-roll vs airborne) and per-segment
-   3D fitting.
-3. **Events (rule-based detectors)** — a possession state machine feeding
+   Six backends (PnLCalib HRNet, BroadTrack, NBJW, fixed-intrinsic Physical,
+   plain Homography, and `fixed_camera`, which solves one annotated pose and
+   replays it to every frame — the cheapest option and the right one for a
+   truly static rig); pick by config based on what your footage looks like.
+2. **Tracking (players + ball)** — players via YOLOv8 detection → StrongSORT
+   (default) or BoT-SORT → OSNet / PRTReID / CLIP-ReID re-identification →
+   k-means or tracklet team classification. Ball via YOLO class 32 +
+   center-distance ByteTrack + two-pass segment classification (ground-roll
+   vs airborne) and per-segment 3D fitting.
+3. **Track consolidation** — the tracker emits fragmented `track_id`s; this
+   stage merges them into stable player identities. ReID-first greedy
+   clustering, then a jersey-number vote per cluster (Qwen VL / Claude /
+   Gemini / RapidOCR), a team split, orphan absorption, and finally naming:
+   `A-9`, `B-10`, `A-GK`. Everything downstream refers to players by these
+   ids instead of raw ints.
+4. **Events (rule-based detectors)** — a possession state machine feeding
    pass / shot / carry / tackle / interception detectors. The shot detector
    subsumes goal detection (Goal / Saved / Off_Target / Blocked outcomes with
    shooter attribution).
-4. **Highlights (per goal)** — a recipe-based event detector, an analyzer that
-   plans 4 segments (buildup → strike → celebration → replay), and a composer
-   that crops/zooms per segment, draws the shooter spotlight + ball trail, and
-   produces an MP4 with optional video2x upscaling + RIFE slow-motion replay.
+
+Three further stages are available but off by default — enable them with
+`--stages` (and, for highlights, `highlights.enabled: true`):
+
+- **Player profile** — per-player front/back crops, a pitch heatmap, distance
+  run, and optional follow-cam "spotlight" clips. Exposed as a checkbox in the
+  web UI's pipeline wizard.
+- **Highlights (per goal)** — a recipe-based event detector, an analyzer that
+  plans 4 segments (buildup → strike → celebration → replay), and a composer
+  that crops/zooms per segment, draws the shooter spotlight + ball trail, and
+  produces an MP4 with optional video2x upscaling + RIFE slow-motion replay.
+- **Annotated video** — a full-match render with HUD overlays: team-coloured
+  boxes with jersey numbers, ball trail, projected pitch lines, event banners.
 
 A still from the tracking stage (annotated player + ball detections, with team colors and IDs):
 
@@ -50,21 +66,33 @@ A still from the tracking stage (annotated player + ball detections, with team c
 The supported way to run GoalInsight is a self-contained Docker image
 that ships the full pipeline plus a FastAPI web UI (library / pipeline
 launcher / match viewer / annotator). No repo clone, no AWS account,
-no manual model downloads.
+no manual model downloads. The LLM match-chat ("Insights") tab is off in
+this image so it needs no cloud credentials — pass
+`-e GOALINSIGHT_DISABLE_CHAT=0` with AWS creds to turn it on, or use the
+[cloud deployment](#cloud-deployment-aws) below, where it ships enabled.
 
 **Host requirements**
 
 | Item | Requirement |
 |------|-------------|
 | OS | Linux (Ubuntu 22.04+) or Windows + WSL2 |
-| GPU | NVIDIA, ≥ 16 GB VRAM (Qwen VL for jersey OCR + YOLOv8x + CLIP-ReID), driver 530+ |
+| GPU | NVIDIA, ≥ 6 GB VRAM (YOLOv8x + ReID concurrently; the jersey-OCR vLLM daemon is capped at 25% of VRAM), driver 530+ |
 | Docker | 24.0+ with `nvidia-container-toolkit` installed |
-| Disk | ~46 GB for the image; ~3 GB per pipeline run output |
+| Disk | ~8 GB for the image; ~3 GB per pipeline run output |
 | **Mac** | Docker on Mac can't reach an NVIDIA GPU — **not supported**. Run on a Linux host or rent a cloud GPU (Lambda Labs / Vast.ai). |
 
-**Build the image** (one time, ~15 min on first build; needs the fine-tuned
-CLIP-ReID weights at `workspace/models/ViT-L-14_openai/Paper/weights_e4.pth`
-and a short demo video at `workspace/videos/`):
+**Build the image** (one time, ~15 min on first build). Three host inputs
+must be in place first — `build.sh` checks for all of them and exits
+rather than failing mid-`COPY`:
+
+| Path | What it is |
+|------|------------|
+| `workspace/models/ViT-L-14_openai/Paper/weights_e4.pth` | fine-tuned CLIP-ReID weights (from [clip_reid](https://github.com/KonradHabel/clip_reid)) |
+| `workspace/videos/0626_1_part_000.mov` | the bundled demo clip |
+| `workspace/annotations/0626_1_part_000/` | that clip's saved pitch annotation |
+
+The last two are run-time artefacts from a real annotate session; override
+the paths at the top of `build.sh` to bundle your own.
 
 ```bash
 ./deploy/offline/build.sh
@@ -108,7 +136,7 @@ End-to-end runtime on a 10-second futsal clip:
 
 ```
 field_registration:   0.5 s   (fixed-rig short-circuit, replays annotation pose)
-tracking:            32   s   (YOLOv8x + StrongSORT + CLIP-ReID)
+tracking:            32   s   (YOLOv8x + StrongSORT + OSNet ReID)
 track_consolidation: 33   s   (Qwen VL jersey OCR, vLLM daemon already warm)
 event_detection:      3   s
 ─────────────────────────────
@@ -169,7 +197,8 @@ bash deploy/teardown.sh              # add --suffix -staging to match a parallel
 ```
 
 Options: `--region`, `--instance-type`, `--branch`, `--vpc-id`,
-`--subnet-ids`, `--volume-size`, `--suffix`. Full walkthrough, cost notes
+`--subnet-ids`, `--volume-size`, `--suffix`, `--key-name` (SSH keypair;
+omit it and reach the box over SSM only). Full walkthrough, cost notes
 (a `g5.xlarge` is ~$1/hr on-demand — not free tier), and the legacy
 "front an existing EC2" path: [`deploy/README.md`](deploy/README.md).
 
@@ -183,13 +212,16 @@ Options: `--region`, `--instance-type`, `--branch`, `--vpc-id`,
 goalinsight/
   cli.py                     # CLI entry (-> goalinsight)
   pipeline/                  # stage framework, registry, adapters
-  field_registration/        # 5 calibration backends + finetune machinery
-  tracking/                  # detection, ByteTrack, ReID, ball detector + 3D
+  field_registration/        # 6 calibration backends + finetune machinery
+  tracking/                  # detection, StrongSORT/BoT-SORT, ReID, ball + 3D
   track_consolidation/       # ReID + jersey-OCR player id consolidation
   events/                    # detector framework + possession/pass/shot/...
+  player_profile/            # per-player crops, heatmaps, spotlight clips
   highlights/                # MatchContext + recipe agents
+  annotated_video/           # full-match HUD render
   annotation/                # pitch keypoint annotator
-  web/                       # FastAPI viewer (library / pipeline / match)
+  web/                       # FastAPI viewer (library / pipeline / match /
+                             #   insights / annotate)
   jersey/                    # Qwen VL + OCR jersey-number recognizers
   video_enhancement/         # video2x wrapper (binary or docker mode)
   utils/, interfaces/        # factories + ABCs
@@ -202,8 +234,10 @@ deploy/
   offline/                   # self-contained local Docker image
   full-stack.yaml            # one-stack AWS deploy (EC2 + ALB + Cognito)
   deploy_ec2.sh, teardown.sh # cloud deploy / teardown one-click scripts
+sagemaker/                   # optional remote-stage execution
 scripts/                     # pipeline diagnostics / one-off tooling
 tools/                       # make_comparison.py and other utilities
+tests/                       # pytest: StrongSORT + config resolver
 ```
 
 ## Architecture
@@ -225,9 +259,16 @@ bash scripts/pipeline_physical.sh
 
 # Finetune the PnLCalib heads (after annotating frames)
 # see goalinsight/field_registration/pnlcalib/finetune_*.py
+
+# Unit tests
+pytest tests/
 ```
 
-There is no formal test suite. Test/debug scripts at the repo root use the `test_*.py` / `debug_*.py` naming convention and are gitignored.
+Test coverage is partial, not comprehensive: `pytest tests/` covers the
+StrongSORT package (gates, matching stages, lifecycle) and the config
+resolver. Ad-hoc test/debug scripts at the repo root use the `test_*.py` /
+`debug_*.py` naming convention and are gitignored — only `tests/` is
+committed.
 
 ## Security
 

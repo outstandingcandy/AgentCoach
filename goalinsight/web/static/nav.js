@@ -16,9 +16,9 @@
   // Detect which module we're on + extract any run name in the URL.
   // ---------------------------------------------------------------
   const path = window.location.pathname;
-  // /insights/<run>, /tracking/<run>, /match/<run> all carry a run.
+  // /insights/<run> and /match/<run> both carry a run.
   // /match/ (trailing slash) is the index, not a per-run route.
-  const runMatch = path.match(/^\/(insights|tracking|match)\/([^/]+)\/?$/);
+  const runMatch = path.match(/^\/(insights|match)\/([^/]+)\/?$/);
   const RUN = runMatch && runMatch[2] !== '' ? decodeURIComponent(runMatch[2]) : null;
 
   const queryRun = new URLSearchParams(window.location.search).get('run');
@@ -27,10 +27,10 @@
 
   // Fallback for the run-scoped tabs when the current page URL has no
   // run in it (e.g. we're on /library). We fetch the most recently
-  // finished run once and rewrite the Pipeline / Match / Tracking
-  // links to point at it — otherwise clicking those tabs from Library
-  // lands on an empty picker or a 404. Async: happens after the nav
-  // is first rendered so the DOM is available.
+  // finished run once and rewrite the Pipeline / Match links to point
+  // at it — otherwise clicking those tabs from Library lands on an
+  // empty picker. Async: happens after the nav is first rendered so
+  // the DOM is available.
   let FALLBACK_RUN = null;
   async function _loadFallbackRun() {
     if (RUN_NAME) return;
@@ -55,21 +55,10 @@
     const map = {
       pipeline: `/pipeline?run=${encodeURIComponent(FALLBACK_RUN)}`,
       match: `/match/${encodeURIComponent(FALLBACK_RUN)}`,
-      tracking: `/tracking/${encodeURIComponent(FALLBACK_RUN)}`,
     };
     for (const [id, href] of Object.entries(map)) {
       const el = nav.querySelector(`a[data-nav-id="${id}"]`);
       if (el) el.href = href;
-    }
-    // Tracking is rendered as a disabled span when no run was known —
-    // replace it with a real link now that we have one.
-    const span = nav.querySelector('span.disabled');
-    if (span && span.textContent === 'Tracking') {
-      const a = document.createElement('a');
-      a.href = map.tracking;
-      a.textContent = 'Tracking';
-      a.dataset.navId = 'tracking';
-      span.replaceWith(a);
     }
   };
   // ``nav`` is created further down inside this IIFE; wrap the resolve
@@ -83,14 +72,13 @@
     if (path.startsWith('/annotate')) return 'annotate';
     if (path.startsWith('/match')) return 'match';
     if (path.startsWith('/insights')) return 'insights';
-    if (path.startsWith('/tracking')) return 'tracking';
     return null;
   }
   const CURRENT = moduleId();
 
   // Each item: where to go if we have a run vs not. Run-scoped items
-  // (insights / tracking) are disabled when no run is in the URL —
-  // we don't have anywhere meaningful to send the user.
+  // fall back to their own index page (a run picker) when no run is in
+  // the URL, so every tab is always clickable.
   const ITEMS = [
     { id: 'library',  label: 'Library',
       href: () => '/library' },
@@ -105,9 +93,6 @@
       // without one we land on /insights index, which is a run
       // picker. Same UX as Match.
       href: () => RUN_NAME ? `/insights/${encodeURIComponent(RUN_NAME)}` : '/insights' },
-    { id: 'tracking', label: 'Tracking',
-      requiresRun: true,
-      href: () => RUN_NAME ? `/tracking/${encodeURIComponent(RUN_NAME)}` : null },
   ];
 
   // ---------------------------------------------------------------
@@ -144,8 +129,6 @@
       padding: 6px 12px; border-radius: 6px; transition: background 0.1s; }
     #goalinsight-nav a:hover { background: #1e242b; }
     #goalinsight-nav a.active { background: #3b82f6; color: #fff; }
-    #goalinsight-nav span.disabled { color: #4a525c; padding: 6px 12px;
-      cursor: not-allowed; }
     #goalinsight-nav .run-pill { margin-left: auto; color: #9aa3ad;
       font-size: 12px; padding: 4px 10px; background: #1a2027;
       border: 1px solid #232a32; border-radius: 999px; max-width: 32ch;
@@ -162,21 +145,12 @@
   nav.appendChild(brand);
 
   for (const item of ITEMS) {
-    const href = item.href();
-    if (!href && item.requiresRun) {
-      const span = document.createElement('span');
-      span.className = 'disabled';
-      span.textContent = item.label;
-      span.title = 'Open a run from Library or Match to enable this page';
-      nav.appendChild(span);
-    } else {
-      const a = document.createElement('a');
-      a.href = href;
-      a.textContent = item.label;
-      a.dataset.navId = item.id;
-      if (item.id === CURRENT) a.classList.add('active');
-      nav.appendChild(a);
-    }
+    const a = document.createElement('a');
+    a.href = item.href();
+    a.textContent = item.label;
+    a.dataset.navId = item.id;
+    if (item.id === CURRENT) a.classList.add('active');
+    nav.appendChild(a);
   }
 
   // Hide the Insights tab when the server tells us chat is disabled

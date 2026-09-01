@@ -1,11 +1,11 @@
 """FastAPI app: unified GoalInsight workspace product.
 
 Single factory: ``create_workspace_app(workspace_dir)`` hosts the
-viewer, annotator, pipeline console, library, and tracking diagnostics
-against a workspace directory (see ``_workspace.Workspace``). The
-annotator routes, library endpoints, jobs API, analytics endpoints,
-tracking-diag, and pipeline-results route packs are attached by their
-own modules so this file stays a thin assembler.
+viewer, annotator, pipeline console, and library against a workspace
+directory (see ``_workspace.Workspace``). The annotator routes, library
+endpoints, jobs API, analytics endpoints, and pipeline-results route
+packs are attached by their own modules so this file stays a thin
+assembler.
 """
 
 from __future__ import annotations
