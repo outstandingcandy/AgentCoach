@@ -5,7 +5,7 @@
 
 End-to-end pipeline that turns a single fixed-camera soccer video into player tracks, events, and watchable highlight clips.
 
-![Tracking demo: ball + players, team-colored boxes, IDs, and a calibrated minimap](docs/media/tracking_demo.gif)
+![The Match page: broadcast footage with per-player tracking overlays on the left, the calibrated top-down pitch view with camera frustum on the right, and the roster strip with per-player crops, distance run, and event badges below](docs/media/broadcast_vs_topdown.gif)
 
 > **Status: research-grade.** Built on weekends to make my kid's grassroots-league recordings interesting to watch. It works on the cameras I have (Veo, GoPro, phone tripods); it has not been hardened for arbitrary footage.
 
@@ -56,10 +56,6 @@ Three further stages are available but off by default — enable them with
   produces an MP4 with optional video2x upscaling + RIFE slow-motion replay.
 - **Annotated video** — a full-match render with HUD overlays: team-coloured
   boxes with jersey numbers, ball trail, projected pitch lines, event banners.
-
-A still from the tracking stage (annotated player + ball detections, with team colors and IDs):
-
-![Tracking output frame](docs/media/tracking_screenshot.png)
 
 ## Quick start
 
